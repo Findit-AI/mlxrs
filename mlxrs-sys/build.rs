@@ -82,9 +82,30 @@ fn main() {
 }
 
 fn find_libmlx(start: &Path) -> Option<PathBuf> {
-    walkdir::WalkDir::new(start)
+    // Assert exactly one match so we don't silently link a stale or
+    // wrong-architecture libmlx.a if MLX upstream ever produces multiple
+    // archives with this name (e.g., a cpu+metal split, or a stale archive
+    // left from a previous failed build).
+    let matches: Vec<PathBuf> = walkdir::WalkDir::new(start)
         .into_iter()
         .filter_map(Result::ok)
-        .find(|e| e.file_name() == "libmlx.a")
+        .filter(|e| e.file_name() == "libmlx.a")
         .map(|e| e.into_path())
+        .collect();
+    match matches.len() {
+        0 => None,
+        1 => matches.into_iter().next(),
+        _ => panic!(
+            "found {} libmlx.a candidates under {}; expected exactly one. \
+             Either MLX upstream changed its build layout, or a stale archive \
+             was left behind. Candidates:\n  {}",
+            matches.len(),
+            start.display(),
+            matches
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\n  "),
+        ),
+    }
 }
