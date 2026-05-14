@@ -1,0 +1,3 @@
+[submodule "mlxrs-sys/vendor/mlx-c"]
+	path = mlxrs-sys/vendor/mlx-c
+	url = https://github.com/ml-explore/mlx-c.git
