@@ -7,9 +7,19 @@ homepage.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-
+links = "mlxc"
 
 [dependencies]
+libc.workspace = true
+
+[build-dependencies]
+cmake.workspace = true
+walkdir.workspace = true
+bindgen = { workspace = true, optional = true }
+
+[features]
+default = []
+buildtime_bindgen = ["dep:bindgen"]
 
 [lints]
 workspace = true
