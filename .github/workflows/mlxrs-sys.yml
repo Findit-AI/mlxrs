@@ -1,0 +1,81 @@
+name: mlxrs-sys
+
+on:
+  push:
+    branches: [main, mlx]
+    paths:
+      - 'mlxrs-sys/**'
+      - 'vendor/mlx-c/**'
+      - 'wrapper.h'
+      - 'xtask/**'
+      - 'Cargo.toml'
+      - '.github/workflows/mlxrs-sys.yml'
+  pull_request:
+    paths:
+      - 'mlxrs-sys/**'
+      - 'vendor/mlx-c/**'
+      - 'wrapper.h'
+      - 'xtask/**'
+      - 'Cargo.toml'
+      - '.github/workflows/mlxrs-sys.yml'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: mlxrs-sys-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: build-test
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain (stable)
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup component add rustfmt clippy
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-mlxrs-sys-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-mlxrs-sys-
+
+      - name: Cache mlx-c CMake build
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/mlxrs-mlxc
+          key: ${{ runner.os }}-mlxc-${{ hashFiles('mlxrs-sys/vendor/mlx-c/CMakeLists.txt', 'mlxrs-sys/build.rs') }}
+          restore-keys: |
+            ${{ runner.os }}-mlxc-
+
+      - name: cargo fmt
+        run: cargo fmt -p mlxrs-sys -- --check
+
+      - name: cargo clippy -p mlxrs-sys
+        run: cargo clippy -p mlxrs-sys --all-targets -- -D warnings
+
+      - name: cargo build -p mlxrs-sys
+        run: cargo build -p mlxrs-sys
+
+      - name: cargo test -p mlxrs-sys
+        run: cargo test -p mlxrs-sys
+
+      - name: cargo doc -p mlxrs-sys
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc -p mlxrs-sys --no-deps
