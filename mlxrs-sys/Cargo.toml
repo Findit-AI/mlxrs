@@ -9,9 +9,6 @@ license.workspace = true
 rust-version.workspace = true
 links = "mlxc"
 
-[dependencies]
-libc.workspace = true
-
 [build-dependencies]
 cmake.workspace = true
 walkdir.workspace = true

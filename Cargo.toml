@@ -15,15 +15,14 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 mlxrs-sys = { path = "mlxrs-sys", version = "0.1" }
-thiserror = "1"
-libc = "0.2"
+thiserror = "2"
 half = "2"
 smallvec = "1"
 approx = "0.5"
 static_assertions = "1"
-ctor = "0.4"
+ctor = "1"
 trybuild = "1"
-bindgen = "0.69"
+bindgen = "0.72"
 cmake = "0.1"
 walkdir = "2"
 
