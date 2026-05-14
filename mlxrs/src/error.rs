@@ -129,6 +129,24 @@ pub(crate) fn check(rc: c_int) -> Result<()> {
   }
 }
 
+/// Sentinel-handle pattern: for constructors that return `mlx_array` directly
+/// with NULL `ctx` on failure (e.g. `mlx_array_new_data`).
+#[inline]
+pub(crate) fn check_handle(handle: mlxrs_sys::mlx_array) -> Result<crate::Array> {
+  if handle.ctx.is_null() {
+    ensure_init();
+    Err(
+      LAST
+        .with(|c| c.borrow_mut().take())
+        .unwrap_or(Error::Backend {
+          message: "mlx returned null handle".into(),
+        }),
+    )
+  } else {
+    Ok(crate::Array(handle))
+  }
+}
+
 #[cfg(test)]
 mod init_smoke {
   use super::*;

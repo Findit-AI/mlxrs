@@ -17,7 +17,6 @@ unsafe impl Sync for RawStream {}
 
 static DEFAULT_STREAM: OnceLock<RawStream> = OnceLock::new();
 
-#[allow(dead_code)] // first consumer is sub-batch B (Array constructors)
 pub(crate) fn default_stream() -> mlxrs_sys::mlx_stream {
   DEFAULT_STREAM
     .get_or_init(|| {

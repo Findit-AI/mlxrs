@@ -14,11 +14,13 @@
 #![cfg_attr(docsrs, allow(unused_attributes))]
 #![cfg_attr(not(test), deny(missing_docs))]
 
+pub use array::Array;
 pub use dtype::{Dtype, Element};
 pub use error::{Error, Result};
 pub use shape::IntoShape;
 pub use version::version;
 
+pub mod array;
 pub mod dtype;
 pub mod error;
 pub mod shape;
