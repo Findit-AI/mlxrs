@@ -179,3 +179,24 @@ fn from_slice_zero_element_uses_sentinel() {
   // to_vec on a zero-element contiguous array is just an empty Vec.
   assert_eq!(a.to_vec::<f32>().unwrap(), Vec::<f32>::new());
 }
+
+#[test]
+fn from_slice_zero_element_all_element_types() {
+  // Every Element impl provides its own typed sentinel (Codex PR #5 round-3
+  // finding). Verify each compiles + constructs without UB.
+  let mut b = mlxrs::Array::from_slice::<bool>(&[], &[0i32]).unwrap();
+  assert_eq!(b.shape(), vec![0]);
+  assert_eq!(b.to_vec::<bool>().unwrap(), Vec::<bool>::new());
+
+  let mut i = mlxrs::Array::from_slice::<i32>(&[], &[0i32]).unwrap();
+  assert_eq!(i.shape(), vec![0]);
+  assert_eq!(i.to_vec::<i32>().unwrap(), Vec::<i32>::new());
+
+  let mut u = mlxrs::Array::from_slice::<u32>(&[], &[0i32]).unwrap();
+  assert_eq!(u.shape(), vec![0]);
+  assert_eq!(u.to_vec::<u32>().unwrap(), Vec::<u32>::new());
+
+  let mut h = mlxrs::Array::from_slice::<half::f16>(&[], &[0i32]).unwrap();
+  assert_eq!(h.shape(), vec![0]);
+  assert_eq!(h.to_vec::<half::f16>().unwrap(), Vec::<half::f16>::new());
+}
