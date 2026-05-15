@@ -60,6 +60,7 @@ impl Array {
   /// Refcount-sharing clone. Returns `Result` so callers can handle the
   /// rare allocation-failure path explicitly.
   pub fn try_clone(&self) -> Result<Self> {
+    crate::error::ensure_handler_installed();
     // RAII coverage: wrap the fresh handle in `Self` BEFORE the fallible
     // `mlx_array_set` call so panic / early-return drops it via `Drop`.
     let mut out = Self(unsafe { mlxrs_sys::mlx_array_new() });
@@ -76,6 +77,7 @@ impl Array {
   /// would race on it. With `Sync` not implemented (see above), `&mut self`
   /// lets the borrow checker enforce "no other reference is alive during eval."
   pub fn eval(&mut self) -> Result<()> {
+    crate::error::ensure_handler_installed();
     check(unsafe { mlxrs_sys::mlx_array_eval(self.0) })
   }
 

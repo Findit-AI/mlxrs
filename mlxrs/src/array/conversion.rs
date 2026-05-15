@@ -129,18 +129,25 @@ impl std::fmt::Debug for Array {
   }
 }
 
+/// RAII guard for a temporary `mlx_string` handle (e.g. the Display buffer).
+struct StringGuard(mlxrs_sys::mlx_string);
+impl Drop for StringGuard {
+  fn drop(&mut self) {
+    unsafe {
+      let _ = mlxrs_sys::mlx_string_free(self.0);
+    }
+  }
+}
+
 impl std::fmt::Display for Array {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    let mut s = unsafe { mlxrs_sys::mlx_string_new() };
-    let rc = unsafe { mlxrs_sys::mlx_array_tostring(&mut s, self.0) };
+    crate::error::ensure_handler_installed();
+    let mut s = StringGuard(unsafe { mlxrs_sys::mlx_string_new() });
+    let rc = unsafe { mlxrs_sys::mlx_array_tostring(&mut s.0, self.0) };
     if rc != 0 {
       return write!(f, "Array(<tostring failed: rc={rc}>)");
     }
-    let cstr = unsafe { CStr::from_ptr(mlxrs_sys::mlx_string_data(s)) };
-    let r = write!(f, "{}", cstr.to_string_lossy());
-    unsafe {
-      let _ = mlxrs_sys::mlx_string_free(s);
-    }
-    r
+    let cstr = unsafe { CStr::from_ptr(mlxrs_sys::mlx_string_data(s.0)) };
+    write!(f, "{}", cstr.to_string_lossy())
   }
 }

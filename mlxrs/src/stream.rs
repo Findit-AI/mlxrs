@@ -18,9 +18,13 @@ unsafe impl Sync for RawStream {}
 static DEFAULT_STREAM: OnceLock<RawStream> = OnceLock::new();
 
 pub(crate) fn default_stream() -> mlxrs_sys::mlx_stream {
+  // Most safe-layer FFI consumers funnel through here; install the error
+  // handler before any mlx-c call so a stripped/disabled #[ctor] cannot let
+  // the default printf+exit handler fire on the very first failure.
+  crate::error::ensure_handler_installed();
   DEFAULT_STREAM
     .get_or_init(|| {
-      // SAFETY: handler installed by ctor (see error.rs); errors surface via TLS.
+      // SAFETY: handler installed above; errors surface via TLS.
       let s = unsafe { mlxrs_sys::mlx_default_gpu_stream_new() };
       if s.ctx.is_null() {
         panic!(

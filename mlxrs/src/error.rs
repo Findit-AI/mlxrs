@@ -2,14 +2,20 @@
 //!
 //! Two failure-surfacing paths (verified against `mlx-c/mlx/c/array.cpp`):
 //!   - rc pattern: most `int`-returning fns return 0 on success, non-zero on
-//!     failure. Use [`check`].
+//!     failure. Internal `check` helper drains the captured message.
 //!   - sentinel-handle pattern: `mlx_array`-returning constructors return
-//!     a handle with NULL `ctx` on failure. (Helper lands in sub-batch B
-//!     once the safe `Array` newtype exists.)
+//!     a handle with NULL `ctx` on failure. Internal `check_handle` does
+//!     the same drain.
 //!
 //! In both cases the error message itself is delivered via the global
 //! `mlx_set_error_handler` callback we install eagerly via `#[ctor::ctor(unsafe)]`.
 //! That callback writes into a thread-local; check drains it.
+//!
+//! The handler MUST be installed before any fallible mlx-c call. The default
+//! mlx-c handler is `printf + exit(-1)`, which would terminate the process
+//! before our `rc` ever reaches `check()`. Every safe-layer entry point that
+//! invokes mlx-c calls `ensure_handler_installed` first as defense-in-depth
+//! against a stripped/disabled `#[ctor]`.
 
 use std::{
   cell::RefCell,
@@ -100,27 +106,46 @@ fn install_handler() {
   INIT_VIA_CTOR.store(true, Ordering::Relaxed);
 }
 
-/// Lazy fallback for the eager `ctor` install. Defends against (a) older
-/// rustc toolchains in CI matrices below the rust#133491 fix MSRV, (b) the
-/// orthogonal "consumer binary never references any `mlxrs` symbol" stripping
-/// case, and (c) sandbox environments that disable `__attribute__((constructor))`
-/// symbols entirely. One extra branch on a cold path is cheap insurance.
+/// Defense-in-depth installer. Every safe-layer entry point that invokes
+/// mlx-c calls this before the FFI call so that, if the eager `#[ctor]`
+/// install was skipped (older rustc toolchains below the rust#133491 fix
+/// MSRV, consumer binaries that never reference any `mlxrs` symbol so the
+/// linker drops the ctor section, or sandbox environments that disable
+/// `__attribute__((constructor))`), the handler is installed before mlx-c
+/// can invoke its default `printf + exit(-1)` and terminate the process.
+///
+/// Fast path is an atomic load + branch — `INIT_VIA_CTOR` is `true` after
+/// either the ctor or this fallback has run, so subsequent calls return
+/// immediately without touching the OnceLock.
 #[inline]
-fn ensure_init() {
+pub(crate) fn ensure_handler_installed() {
+  if INIT_VIA_CTOR.load(Ordering::Relaxed) {
+    return;
+  }
+  ensure_handler_installed_slow();
+}
+
+#[cold]
+#[inline(never)]
+fn ensure_handler_installed_slow() {
   static FALLBACK: OnceLock<()> = OnceLock::new();
-  FALLBACK.get_or_init(|| unsafe {
-    mlxrs_sys::mlx_set_error_handler(Some(handler), ptr::null_mut(), None);
+  FALLBACK.get_or_init(|| {
+    unsafe {
+      mlxrs_sys::mlx_set_error_handler(Some(handler), ptr::null_mut(), None);
+    }
+    INIT_VIA_CTOR.store(true, Ordering::Relaxed);
   });
 }
 
 /// Hot path: rc-pattern check. Returns `Ok(())` if `rc == 0`, else drains
-/// the TLS slot into `Err`.
+/// the TLS slot into `Err`. Does NOT install the handler — callers must
+/// have called `ensure_handler_installed` before the FFI call, since by the
+/// time `check` runs the default abort handler would already have fired.
 #[inline]
 pub(crate) fn check(rc: c_int) -> Result<()> {
   if rc == 0 {
     Ok(())
   } else {
-    ensure_init();
     Err(
       LAST
         .with(|c| c.borrow_mut().take())
@@ -132,11 +157,11 @@ pub(crate) fn check(rc: c_int) -> Result<()> {
 }
 
 /// Sentinel-handle pattern: for constructors that return `mlx_array` directly
-/// with NULL `ctx` on failure (e.g. `mlx_array_new_data`).
+/// with NULL `ctx` on failure (e.g. `mlx_array_new_data`). Same install
+/// contract as [`check`].
 #[inline]
 pub(crate) fn check_handle(handle: mlxrs_sys::mlx_array) -> Result<crate::Array> {
   if handle.ctx.is_null() {
-    ensure_init();
     Err(
       LAST
         .with(|c| c.borrow_mut().take())

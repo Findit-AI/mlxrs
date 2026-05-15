@@ -140,6 +140,9 @@ impl Array {
 
   /// Creates an array from a contiguous `&[T]` buffer plus shape. Buffer is COPIED.
   pub fn from_slice<T: Element>(data: &[T], shape: &impl IntoShape) -> Result<Self> {
+    // The only Array constructor that doesn't go through default_stream;
+    // install the error handler explicitly so the safety guarantee matches.
+    crate::error::ensure_handler_installed();
     shape.with_shape(|s| {
       // FFI safety boundary: validate the slice we're about to hand to
       // mlx_array_new_data. validate_dims rules out negative dims (so the

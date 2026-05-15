@@ -101,9 +101,11 @@ pub trait Element: sealed::Sealed + Copy + 'static {
   /// Data-slice accessor.
   ///
   /// # Safety
-  /// `arr` must be evaluated, have dtype `DTYPE`, AND be contiguous (caller
-  /// verifies via `mlx_array_is_contiguous` or routes through `Array::as_slice`
-  /// which guards).
+  /// `arr` must be evaluated, have dtype `DTYPE`, AND be row-contiguous.
+  /// mlx-c does not expose a contiguity predicate, so callers either do the
+  /// check themselves (shape × strides — the safe layer's
+  /// `array::conversion::is_row_contiguous` helper) or route through
+  /// `Array::as_slice` / `Array::to_vec`, which guard.
   unsafe fn data(arr: mlxrs_sys::mlx_array) -> (*const Self, usize);
 }
 
