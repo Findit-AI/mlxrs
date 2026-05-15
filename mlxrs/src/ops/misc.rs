@@ -7,7 +7,7 @@ use std::ffi::c_int;
 use crate::{
   array::Array,
   dtype::Dtype,
-  error::{Result, check},
+  error::{Error, Result, check},
   stream::default_stream,
 };
 
@@ -22,6 +22,30 @@ impl Drop for ScalarGuard {
       let _ = mlxrs_sys::mlx_array_free(self.0);
     }
   }
+}
+
+/// Checked f32 scalar constructor. `mlx_array_new_float32` is a fallible
+/// sentinel-handle FFI: it returns NULL `ctx` on allocation failure (and may
+/// invoke the error handler on the way out). This helper installs the safe
+/// error handler before the call so a stripped/disabled `#[ctor]` cannot let
+/// the default `printf+exit` fire, drains the captured backend error if the
+/// returned handle is null, and only then wraps in `ScalarGuard`. Codex PR #8
+/// finding — see `concatenate` in `ops::shape` for the same handler-install +
+/// null-ctx-drain pattern on a different fallible constructor.
+fn checked_scalar_f32(value: f32) -> Result<ScalarGuard> {
+  crate::error::ensure_handler_installed();
+  let raw = unsafe { mlxrs_sys::mlx_array_new_float32(value) };
+  let guard = ScalarGuard(raw);
+  if raw.ctx.is_null() {
+    return Err(
+      crate::error::LAST
+        .with(|c| c.borrow_mut().take())
+        .unwrap_or(Error::Backend {
+          message: "mlx_array_new_float32 returned NULL".into(),
+        }),
+    );
+  }
+  Ok(guard)
 }
 
 /// Index of the maximum value, optionally along `axis`. Output dtype is U32.
@@ -237,8 +261,8 @@ pub fn clip(a: &Array, a_min: &Array, a_max: &Array) -> Result<Array> {
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.clip.html).
 pub fn clip_with_scalar(a: &Array, min: f32, max: f32) -> Result<Array> {
-  let lo = ScalarGuard(unsafe { mlxrs_sys::mlx_array_new_float32(min) });
-  let hi = ScalarGuard(unsafe { mlxrs_sys::mlx_array_new_float32(max) });
+  let lo = checked_scalar_f32(min)?;
+  let hi = checked_scalar_f32(max)?;
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   check(unsafe { mlxrs_sys::mlx_clip(&mut out.0, a.0, lo.0, hi.0, default_stream()) })?;
   Ok(out)
@@ -269,7 +293,7 @@ pub fn zeros_like(a: &Array) -> Result<Array> {
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.full.html).
 pub fn full_like(a: &Array, value: f32) -> Result<Array> {
   let dtype = mlxrs_sys::mlx_dtype::from(a.dtype()?);
-  let scalar = ScalarGuard(unsafe { mlxrs_sys::mlx_array_new_float32(value) });
+  let scalar = checked_scalar_f32(value)?;
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   check(unsafe { mlxrs_sys::mlx_full_like(&mut out.0, a.0, scalar.0, dtype, default_stream()) })?;
   Ok(out)
