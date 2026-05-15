@@ -62,6 +62,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Self-bootstrap the label so the very first weekly breakage isn't
+          # blocked by a missing label (Codex review on PR #10). --force
+          # means "create if missing, update if present" — idempotent.
+          gh -R ${{ github.repository }} label create dep-watch \
+            --description "cargo update --recursive caught a regression" \
+            --color B60205 --force
           ISSUE_TITLE="dep-watch: weekly cargo update broke the build"
           EXISTING=$(gh -R ${{ github.repository }} issue list --label dep-watch --state open --json number,title --jq '.[0].number // empty')
           BODY="Weekly \`cargo update --recursive\` produced a failing build on $(date -u +%F).%0A%0ARun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

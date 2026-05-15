@@ -19,15 +19,37 @@ MLX, MLX-LM, and MLX-VLM for Rust
 
 ## Installation
 
+Core only:
+
 ```toml
 [dependencies]
-mlxrs = "0.1"                                                    # core only
+mlxrs = "0.1"
+```
 
-# Or with feature flags (each enables a stub module that fills in M3-M5):
-mlxrs = { version = "0.1", features = ["lm"] }                   # + LM stub (M3)
-mlxrs = { version = "0.1", features = ["vlm"] }                  # + VLM stub (M4)
-mlxrs = { version = "0.1", features = ["audio"] }                # + audio stub (M5; implies lm)
-mlxrs = { version = "0.1", features = ["embeddings"] }           # + embedding utils stub (M3)
+Or pick exactly one feature variant — each fills in a stub module that lands in M3-M5:
+
+```toml
+# + LM stub (M3)
+[dependencies]
+mlxrs = { version = "0.1", features = ["lm"] }
+```
+
+```toml
+# + VLM stub (M4)
+[dependencies]
+mlxrs = { version = "0.1", features = ["vlm"] }
+```
+
+```toml
+# + audio stub (M5; implies lm)
+[dependencies]
+mlxrs = { version = "0.1", features = ["audio"] }
+```
+
+```toml
+# + embedding utilities stub (M3)
+[dependencies]
+mlxrs = { version = "0.1", features = ["embeddings"] }
 ```
 
 ## Platform support
