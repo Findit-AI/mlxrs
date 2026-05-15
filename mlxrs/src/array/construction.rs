@@ -18,6 +18,24 @@ impl Drop for ScalarGuard {
   }
 }
 
+/// Sized + aligned sentinel for FFI calls that would otherwise pass Rust's
+/// dangling empty-slice data pointer. Zero-element arrays (shape `[0]`,
+/// `[2, 0]`, etc.) are valid in numpy/mlx, so we keep them reachable but
+/// substitute a non-singular pointer at the FFI boundary. `align(16)` covers
+/// every current Element type (max f32/i32 = 4B; future complex64 = 8B).
+#[repr(align(16))]
+struct DataSentinel([u8; 16]);
+static DATA_SENTINEL: DataSentinel = DataSentinel([0; 16]);
+
+#[inline]
+fn data_ptr<T>(data: &[T]) -> *const T {
+  if data.is_empty() {
+    DATA_SENTINEL.0.as_ptr() as *const T
+  } else {
+    data.as_ptr()
+  }
+}
+
 impl Array {
   /// Creates an array filled with ones. Dtype is determined by the type parameter.
   ///
@@ -170,7 +188,7 @@ impl Array {
       })?;
       let arr = unsafe {
         mlxrs_sys::mlx_array_new_data(
-          data.as_ptr().cast::<std::ffi::c_void>(),
+          data_ptr(data).cast::<std::ffi::c_void>(),
           dim_ptr(s),
           dim_i32,
           mlxrs_sys::mlx_dtype::from(T::DTYPE),

@@ -163,3 +163,19 @@ fn concatenate_rejects_empty_input() {
     "expected Err(ShapeMismatch) on empty input, got {r:?}"
   );
 }
+
+#[test]
+fn from_slice_zero_element_uses_sentinel() {
+  // Zero-element arrays are valid in numpy/mlx. The dangling-pointer concern
+  // for Rust's `<&[T]>::as_ptr()` on an empty slice still needs a sentinel —
+  // this exercises the data_ptr helper. Codex PR #5 round-2 finding.
+  let mut a = mlxrs::Array::from_slice::<f32>(&[], &[0i32]).unwrap();
+  assert_eq!(a.shape(), vec![0]);
+  assert_eq!(a.size(), 0);
+  // 2-D zero-element shape too.
+  let b = mlxrs::Array::from_slice::<f32>(&[], &[2i32, 0]).unwrap();
+  assert_eq!(b.shape(), vec![2, 0]);
+  assert_eq!(b.size(), 0);
+  // to_vec on a zero-element contiguous array is just an empty Vec.
+  assert_eq!(a.to_vec::<f32>().unwrap(), Vec::<f32>::new());
+}
