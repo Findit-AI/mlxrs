@@ -5,7 +5,7 @@
 use crate::{
   array::Array,
   error::{Result, check},
-  shape::IntoShape,
+  shape::{IntoShape, validate_dims},
   stream::default_stream,
 };
 
@@ -19,6 +19,7 @@ use crate::{
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.reshape.html).
 pub fn reshape(a: &Array, shape: &impl IntoShape) -> Result<Array> {
   shape.with_shape(|s| {
+    validate_dims(s)?;
     let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
     check(unsafe {
       mlxrs_sys::mlx_reshape(&mut out.0, a.0, s.as_ptr(), s.len(), default_stream())
