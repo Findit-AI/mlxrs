@@ -72,9 +72,11 @@ pub fn greater_equal(a: &Array, b: &Array) -> Result<Array> {
   Ok(out)
 }
 
-/// Returns a scalar Bool: `true` iff every element pair satisfies
-/// `|a - b| <= atol + rtol * |b|`. If `equal_nan` is true, NaN positions are
-/// treated as equal.
+/// Returns a scalar Bool array (a 0-d / 1-element `Array`) whose value is
+/// `true` iff every element pair satisfies `|a - b| <= atol + rtol * |b|`.
+/// If `equal_nan` is true, NaN positions are treated as equal.
+///
+/// Call `.item::<bool>()` on the returned array to extract a Rust `bool`.
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.allclose.html).
 pub fn allclose(a: &Array, b: &Array, rtol: f64, atol: f64, equal_nan: bool) -> Result<Array> {
