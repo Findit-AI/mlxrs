@@ -10,6 +10,7 @@ use crate::error::{Result, check};
 pub mod construction;
 pub mod conversion;
 pub mod ops_impl;
+pub mod shared;
 
 /// MLX N-dimensional array — RAII handle around an mlx-c `mlx_array`.
 #[repr(transparent)]
@@ -28,8 +29,8 @@ pub struct Array(pub(crate) mlxrs_sys::mlx_array);
 // each calls `eval`/`to_vec`/`item` on `&mut self`. Each thread sees a distinct
 // `&mut Array`, so `!Sync` doesn't catch it — but the underlying C++
 // `array_desc->status` write races. To preserve cheap `Clone`, `Send` must go.
-// M2 will provide an explicit cross-thread story (likely `SharedArray =
-// Arc<Mutex<Array>>` newtype with documented contract).
+// Cross-thread sharing is provided explicitly by `array::shared::SharedArray`
+// (an `Arc<Mutex<Array>>` newtype that serializes every access).
 assert_not_impl_any!(Array: Copy, Send, Sync);
 
 impl Drop for Array {

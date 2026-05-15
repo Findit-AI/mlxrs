@@ -4,10 +4,10 @@
 //! `docs/superpowers/specs/` for the full design.
 //!
 //! ## Caveats
-//! - `Array` is **`!Send` and `!Sync`** in M1 — single-thread use only. Cross-thread
-//!   sharing requires care: the underlying C++ `array_desc` is shared by `Clone`
-//!   and mutates non-atomic state internally. M2 will provide a `SharedArray`
-//!   newtype (`Arc<Mutex<Array>>`-style) with a documented cross-thread contract.
+//! - `Array` is **`!Send` and `!Sync`** — single-thread use only. The underlying
+//!   C++ `array_desc` is shared by `Clone` and mutates non-atomic state
+//!   internally. For cross-thread sharing, use [`SharedArray`] (an
+//!   `Arc<Mutex<Array>>` newtype that serializes access).
 //! - **Async Metal kernel failures bypass `Result<T, Error>` and abort the process.**
 //!   The rc/sentinel chain only catches synchronous errors. Recovery via
 //!   `set_terminate` shim is M2 work.
@@ -15,7 +15,7 @@
 #![cfg_attr(docsrs, allow(unused_attributes))]
 #![cfg_attr(not(test), deny(missing_docs))]
 
-pub use array::Array;
+pub use array::{Array, shared::SharedArray};
 pub use device::{Device, DeviceKind};
 pub use dtype::{Dtype, Element};
 pub use error::{Error, Result};
