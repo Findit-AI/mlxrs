@@ -12,6 +12,7 @@ use std::ffi::c_int;
 use crate::{
   array::Array,
   error::{Result, check},
+  shape::dim_ptr,
   stream::default_stream,
 };
 
@@ -53,21 +54,24 @@ pub fn sum(a: &Array, keepdims: bool) -> Result<Array> {
   Ok(out)
 }
 
-/// Mean along the given axes. Empty `axes` is a no-op; see `sum_axes`.
+/// Mean along the given axes.
 ///
-/// `mean` always promotes int inputs to f32+; mlx handles this.
+/// `mean` promotes integer inputs to f32+; mlx handles the promotion. We must
+/// NOT short-circuit `axes.is_empty()` to `try_clone` like the identity-dtype
+/// reductions (`sum`/`max`/`min`) do — that would preserve the input dtype,
+/// producing a dtype split between the empty and non-empty paths (the empty
+/// branch would return int while every other path returns float). Empty axes
+/// route through `mlx_mean_axes` with a `dim_ptr` sentinel so MLX's promotion
+/// runs uniformly. Codex PR #6 finding.
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.mean.html).
 pub fn mean_axes(a: &Array, axes: &[i32], keepdims: bool) -> Result<Array> {
-  if axes.is_empty() {
-    return a.try_clone();
-  }
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   check(unsafe {
     mlxrs_sys::mlx_mean_axes(
       &mut out.0,
       a.0,
-      axes.as_ptr() as *const c_int,
+      dim_ptr(axes),
       axes.len(),
       keepdims,
       default_stream(),

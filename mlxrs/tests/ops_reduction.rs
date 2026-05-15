@@ -24,11 +24,33 @@ fn mean_axes_of_2x2_along_axis0() {
 }
 
 #[test]
-fn mean_axes_empty_returns_clone() {
+fn mean_axes_empty_is_identity_for_float() {
   let a = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
   let mut r = a.mean_axes(&[], false).unwrap();
   assert_eq!(r.shape(), vec![2, 2]);
   assert_eq!(r.to_vec::<f32>().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+}
+
+#[test]
+fn mean_axes_empty_promotes_int_to_float() {
+  // mean over no axes is the identity in shape/value, but `mean` always
+  // promotes int inputs to float — both the empty and non-empty paths must
+  // agree on dtype. The previous short-circuit-via-try_clone preserved the
+  // input dtype, splitting the contract (Codex PR #6 finding).
+  let a = Array::from_slice(&[1_i32, 2, 3, 4], &(2, 2)).unwrap();
+  assert_eq!(a.dtype().unwrap(), mlxrs::Dtype::I32);
+  let r_empty = a.mean_axes(&[], false).unwrap();
+  let r_full = mlxrs::ops::reduction::mean(&a, false).unwrap();
+  assert_eq!(
+    r_empty.dtype().unwrap(),
+    r_full.dtype().unwrap(),
+    "empty-axes and full-reduction must agree on output dtype",
+  );
+  assert_eq!(
+    r_empty.dtype().unwrap(),
+    mlxrs::Dtype::F32,
+    "mean of int promotes to f32",
+  );
 }
 
 // ───────── max ─────────
