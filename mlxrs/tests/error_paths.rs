@@ -116,14 +116,16 @@ fn from_slice_rejects_overflowing_shape_product() {
 }
 
 #[test]
-fn slice_rejects_empty_axes() {
-  // Empty slice metadata would hand mlx-c a Rust dangling pointer.
-  // Codex PR #5 finding 1.
+fn slice_rejects_len_ne_ndim() {
+  // start/stop/strides length must equal a.ndim() — passing empty against a
+  // 2-D array is the "len != ndim" failure mode, not the dangling-pointer
+  // one. (The dangling-pointer concern is now handled by dim_ptr's sentinel,
+  // so the safe-FFI boundary is closed without rejecting 0-D-scalar slicing.)
   let a = mlxrs::Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
   let r = mlxrs::ops::indexing::slice(&a, &[], &[], &[]);
   assert!(
     matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })),
-    "expected Err(ShapeMismatch) on empty axes, got {r:?}"
+    "expected Err(ShapeMismatch) on len != ndim, got {r:?}"
   );
 }
 
@@ -136,6 +138,19 @@ fn slice_rejects_mismatched_lengths() {
     matches!(r, Err(mlxrs::Error::ShapeMismatch { .. })),
     "expected Err(ShapeMismatch) on length mismatch, got {r:?}"
   );
+}
+
+#[test]
+fn slice_accepts_empty_for_zero_dim_scalar() {
+  // 0-D scalar input → all three slice arrays must be empty (one entry per
+  // axis = zero entries). Empty inputs route through dim_ptr's sentinel,
+  // not rejected. Copilot PR #5 finding.
+  let empty: [i32; 0] = [];
+  let a = mlxrs::Array::from_slice::<f32>(&[42.0], &empty).unwrap();
+  assert_eq!(a.ndim(), 0);
+  let mut r = mlxrs::ops::indexing::slice(&a, &[], &[], &[]).unwrap();
+  assert_eq!(r.shape(), Vec::<usize>::new());
+  assert_eq!(r.item::<f32>().unwrap(), 42.0);
 }
 
 #[test]

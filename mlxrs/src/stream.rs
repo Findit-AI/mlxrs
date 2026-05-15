@@ -43,6 +43,15 @@ pub(crate) fn default_stream() -> mlxrs_sys::mlx_stream {
 // before destructors run, so calling mlx_stream_free at exit would crash.
 // Instruments will flag this as a leak on shutdown — that's expected.
 //
+// USAGE GUIDANCE: each thread that ever calls into mlxrs allocates its own
+// GPU stream that lives until process exit. mlxrs is intended to be driven
+// from a small, long-lived set of worker threads (a fixed-size thread pool
+// or the main thread). Patterns that spawn a fresh OS thread per request or
+// per task — rayon-with-thread-recycling, std::thread per HTTP request,
+// short-lived spawn loops — will accumulate one mlx_stream per worker over
+// the process lifetime and grow without bound. M2's public `Stream` API
+// will provide explicit lifetime control for those cases.
+//
 // On first-init failure, the panic propagates; the next call on that thread
 // would re-panic in a hot loop. M1 contract: GPU init failure is a permanent
 // abort. M2 may add a cached-failure path via AtomicBool.
