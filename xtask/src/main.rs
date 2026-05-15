@@ -50,6 +50,11 @@ fn regen_bindings() -> ExitCode {
 
   std::fs::create_dir_all(out.parent().unwrap()).unwrap();
 
+  // mlx-c's `io.h` declares two fns taking `*mut FILE` (mlx_export_to_dot,
+  // mlx_print_graph). Without blocking, bindgen expands `FILE` → macOS's
+  // private `__sFILE` struct with full layout tests, which makes the
+  // bindings drift on every Xcode SDK update. Block both names and let
+  // downstream code use `libc::FILE` (or `*mut c_void`) directly.
   let bindings = bindgen::Builder::default()
     .header(wrapper.to_string_lossy())
     .clang_arg(format!("-I{}", mlx_c.display()))
@@ -59,6 +64,14 @@ fn regen_bindings() -> ExitCode {
     .allowlist_var("MLX_.*")
     .blocklist_item("_mlx_error")
     .blocklist_file(".*/private/.*")
+    .blocklist_type("FILE")
+    .blocklist_type("__sFILE")
+    .blocklist_type("__sbuf")
+    .blocklist_type("__sFILEX")
+    // Re-declare FILE as an opaque c_void since mlx_export_to_dot /
+    // mlx_print_graph still reference it. mlxrs's safe wrapper doesn't
+    // expose graph-export in M1; the bindings just need a type for the FFI.
+    .raw_line("type FILE = ::std::ffi::c_void;")
     .layout_tests(true)
     .derive_default(false)
     .derive_debug(false)
