@@ -2,18 +2,26 @@
 //!
 //! This is **not** a benchmark — it just catches an order-of-magnitude
 //! regression in the canonical add-loop. On Apple silicon (M2-class) the loop
-//! typically runs in single-digit milliseconds; the threshold is set
-//! deliberately loose so noisy CI hardware doesn't flake. If you're seeing
-//! this fire on a real PR, the culprit is usually an FFI-per-op regression
-//! (e.g. accidental clone in the wrapper) — not a Metal-side change.
+//! typically runs in single-digit milliseconds.
 //!
-//! Run release-mode: `cargo test -p mlxrs --release --test perf_floor`.
+//! **`#[ignore]` by default.** Wall-clock assertions in shared CI runners are
+//! fragile (debug-mode build slowdown, cold caches, hyperthreaded scheduling
+//! noise → false reds that obscure real regressions). Run explicitly when
+//! investigating a perf change:
+//!
+//! ```sh
+//! cargo test -p mlxrs --release --test perf_floor -- --ignored
+//! ```
+//!
+//! M2 will introduce a calibrated criterion bench job with retry + baselines;
+//! this file is the M1 stop-gap.
 
 use std::time::Instant;
 
 use mlxrs::{Array, ops};
 
 #[test]
+#[ignore = "perf-floor: explicit invocation only — `cargo test --release -- --ignored perf_floor`"]
 fn perf_floor_canonical_sequence_under_500ms() {
   let mut a = Array::ones::<f32>(&(1024usize, 1024)).expect("ones");
   let b = Array::ones::<f32>(&(1024usize, 1024)).expect("ones");
