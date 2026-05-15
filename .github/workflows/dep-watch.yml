@@ -1,0 +1,63 @@
+name: dep-watch
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'   # Mondays 06:00 UTC
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  update-and-test:
+    name: cargo update + workspace test
+    runs-on: macos-14
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        run: |
+          rustup update stable
+          rustup default stable
+
+      # Force the latest semver-compatible deps; if anything broke upstream,
+      # this is where we find out (the project gitignores Cargo.lock by
+      # policy, so this is the substitute reproducibility check).
+      - name: cargo update --recursive
+        run: cargo update --recursive
+
+      - name: cargo build --workspace
+        run: cargo build --workspace
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+      - name: On failure, manage tracking issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ISSUE_TITLE="dep-watch: weekly cargo update broke the build"
+          EXISTING=$(gh -R ${{ github.repository }} issue list --label dep-watch --state open --json number,title --jq '.[0].number // empty')
+          BODY="Weekly \`cargo update --recursive\` produced a failing build on $(date -u +%F).%0A%0ARun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          if [ -n "$EXISTING" ]; then
+            gh -R ${{ github.repository }} issue comment "$EXISTING" --body "$BODY"
+          else
+            gh -R ${{ github.repository }} issue create --label dep-watch --title "$ISSUE_TITLE" --body "$BODY"
+          fi
+
+      - name: On success, close any open tracking issue
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          OPEN=$(gh -R ${{ github.repository }} issue list --label dep-watch --state open --json number --jq '.[].number')
+          for n in $OPEN; do
+            gh -R ${{ github.repository }} issue close "$n" --comment "Resolved on $(date -u +%F)."
+          done
