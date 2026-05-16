@@ -41,6 +41,10 @@ thread_local! {
 /// at process exit can crash). `norm` / `cross` use the regular GPU stream.
 fn linalg_cpu_stream() -> mlxrs_sys::mlx_stream {
   crate::error::ensure_handler_installed();
+  // Honor the #13 cleared-thread poison contract (as `default_stream()` /
+  // `Stream::default_cpu()` do): a CPU-routed op on a poisoned thread must
+  // fail fast, not continue into mlx with torn-down stream state.
+  crate::stream::assert_streams_not_cleared();
   CPU_STREAM.with(|cell| {
     if let Some(s) = cell.get() {
       return s;
@@ -127,6 +131,9 @@ pub fn qr(a: &Array) -> Result<(Array, Array)> {
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.linalg.svd.html).
 pub fn svd(a: &Array, compute_uv: bool) -> Result<Vec<Array>> {
+  // `mlx_vector_array_new()` is fallible (catches → `mlx_error`) and runs
+  // before `linalg_cpu_stream()` would install the handler — install first.
+  crate::error::ensure_handler_installed();
   let mut vec_out = unsafe { mlxrs_sys::mlx_vector_array_new() };
   let _vec_guard = VectorArrayGuard(vec_out);
   check(unsafe { mlxrs_sys::mlx_linalg_svd(&mut vec_out, a.0, compute_uv, linalg_cpu_stream()) })?;
@@ -138,6 +145,8 @@ pub fn svd(a: &Array, compute_uv: bool) -> Result<Vec<Array>> {
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.linalg.lu.html).
 pub fn lu(a: &Array) -> Result<Vec<Array>> {
+  // See `svd`: install the handler before the fallible `mlx_vector_array_new()`.
+  crate::error::ensure_handler_installed();
   let mut vec_out = unsafe { mlxrs_sys::mlx_vector_array_new() };
   let _vec_guard = VectorArrayGuard(vec_out);
   check(unsafe { mlxrs_sys::mlx_linalg_lu(&mut vec_out, a.0, linalg_cpu_stream()) })?;
