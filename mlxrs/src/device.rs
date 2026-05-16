@@ -251,6 +251,11 @@ impl Eq for Device {}
 
 impl std::fmt::Debug for Device {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    // Reaches fallible mlx-c (mlx_device_tostring); install the handler
+    // first per the error.rs contract so a stripped/disabled ctor can't
+    // let mlx's default printf+exit abort the process. (No poison concept
+    // for Device — it is not thread-affine.)
+    crate::error::ensure_handler_installed();
     // Borrow the raw bytes from mlx_string. RAII via the local guard so a
     // panic in `write!` still frees the string.
     let mut s = unsafe { mlxrs_sys::mlx_string_new() };

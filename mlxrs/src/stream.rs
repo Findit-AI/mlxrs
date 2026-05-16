@@ -356,10 +356,20 @@ impl Stream {
   /// a logic/resource guard — not memory unsafety — which is why this stays
   /// a safe `fn` rather than `unsafe`.
   ///
+  /// "Subsequent mlxrs op" above means subsequent *work* — `eval`, ops,
+  /// `Display`, the public `Stream` methods. **This function is itself
+  /// exempt from the poison guard**: calling it again on an
+  /// already-cleared thread is a deliberate, harmless idempotent no-op
+  /// (mlx's `clear_streams()` just clears an already-empty map), not a
+  /// panic. A defensive double-clear in cleanup code must not blow up.
+  ///
   /// Returns `Err(Backend)` if the underlying C++ call threw (not expected
   /// in practice — it clears an `unordered_map`). The poison flag is set
   /// only on the success path; a thrown clear leaves the thread usable.
   pub fn clear_current_thread_streams() -> Result<()> {
+    // NOTE: intentionally no `assert_streams_not_cleared()` here — see the
+    // "exempt from the poison guard" paragraph in the doc above. Idempotent
+    // by design.
     ensure_handler_installed();
     let rc = unsafe { mlxrs_sys::mlxrs_shim_clear_streams() };
     if rc != 0 {
@@ -454,6 +464,17 @@ impl Eq for Stream {}
 
 impl std::fmt::Debug for Stream {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    // Reaches fallible mlx-c (mlx_stream_tostring); the error.rs contract
+    // requires the handler be installed before any such call so a
+    // stripped/disabled ctor cannot let mlx's default printf+exit abort.
+    // Intentionally NOT poison-guarded: mlx_stream_tostring only formats
+    // the {device, index} POD (no eval / no encoder access), and panicking
+    // inside Debug is hostile — `{stream:?}` is exactly what you reach for
+    // while debugging the poisoned-thread state, and a panic here while
+    // formatting a panic message would double-panic → abort. Same rationale
+    // as Array's Debug. Other Stream entry points (which DO touch encoder
+    // state) remain poison-guarded.
+    crate::error::ensure_handler_installed();
     let mut s = unsafe { mlxrs_sys::mlx_string_new() };
     let rc = unsafe { mlxrs_sys::mlx_stream_tostring(&mut s, self.0) };
     let result = if rc == 0 {

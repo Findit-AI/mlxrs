@@ -5,6 +5,16 @@ use mlxrs::{
   stream::{get_default_stream, set_default_stream},
 };
 
+/// Serializes the tests that mutate mlx's process-global default device.
+/// `Device::{set_default,current}` are internally locked against data
+/// races, but libtest runs `#[test]`s in parallel, so two tests that both
+/// set + then assert the global default can still interleave logically
+/// (test A sets CPU, test B sets GPU, test A asserts CPU → flake). Every
+/// test that sets *and asserts* the global default holds this guard for
+/// its critical section. `unwrap_or_else(PoisonError::into_inner)` so one
+/// failing test doesn't cascade-fail the rest.
+static DEFAULT_DEVICE_TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // ───────────────────────── Device ─────────────────────────
 
 #[test]
@@ -50,6 +60,9 @@ fn device_current_returns_some_device() {
 
 #[test]
 fn device_set_default_round_trip() {
+  let _guard = DEFAULT_DEVICE_TEST_GUARD
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner);
   // Save the original default so we don't poison other tests in the binary.
   let original = Device::current().expect("current");
 
@@ -203,8 +216,17 @@ fn concurrent_set_default_and_current_is_race_free() {
   // a C++ data race. With it, this completes deterministically and the
   // final default is always one of the two valid values. Codex PR #13.
   use std::thread;
+  // Held for the whole test: this one mutates the process-global default
+  // from 8 threads, so it must not interleave with the other tests that
+  // set + assert it (see DEFAULT_DEVICE_TEST_GUARD).
+  let _guard = DEFAULT_DEVICE_TEST_GUARD
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner);
   let cpu = Device::cpu().unwrap();
   let gpu_available = Device::gpu().is_ok();
+  // Save/restore the original default so this test doesn't leave the
+  // process default flipped to CPU for anything that runs afterwards.
+  let original = Device::current().unwrap();
 
   let handles: Vec<_> = (0..8)
     .map(|i| {
@@ -231,6 +253,8 @@ fn concurrent_set_default_and_current_is_race_free() {
     kind == DeviceKind::Cpu || (gpu_available && kind == DeviceKind::Gpu),
     "default device left in an incoherent state: {kind:?}",
   );
+  // Restore so other tests in the binary see the original default.
+  original.set_default().unwrap();
 }
 
 // ───────────────── clear_current_thread_streams (C++ shim) ─────────────────
