@@ -300,3 +300,31 @@ fn reusing_a_cleared_thread_panics_fast_with_actionable_message() {
     "panic message should name the culprit API; got: {msg:?}"
   );
 }
+
+#[test]
+fn post_clear_eval_of_existing_array_also_panics_fast() {
+  // `eval`/`to_vec` reach mlx WITHOUT going through default_stream(), so the
+  // poison guard must also cover that path (Codex PR #13 r5). Build a lazy
+  // array BEFORE clearing, then assert materializing it after the clear
+  // panics immediately rather than failing deep in the backend.
+  let outcome = std::thread::spawn(|| {
+    let mut a = mlxrs::Array::ones::<f32>(&(2usize, 2)).unwrap(); // lazy, not yet eval'd
+    Stream::clear_current_thread_streams().unwrap(); // poisons this thread
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      let _ = a.to_vec::<f32>(); // funnels through eval() → must panic
+    }))
+  })
+  .join()
+  .expect("spawned thread itself should not abort");
+
+  let payload = outcome.expect_err("post-clear eval/to_vec must panic");
+  let msg = payload
+    .downcast_ref::<String>()
+    .map(String::as_str)
+    .or_else(|| payload.downcast_ref::<&str>().copied())
+    .unwrap_or("");
+  assert!(
+    msg.contains("clear_current_thread_streams"),
+    "panic message should name the culprit API; got: {msg:?}"
+  );
+}

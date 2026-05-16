@@ -59,11 +59,14 @@ thread_local! {
   static STREAMS_CLEARED: Cell<bool> = const { Cell::new(false) };
 }
 
-pub(crate) fn default_stream() -> mlxrs_sys::mlx_stream {
-  // Most safe-layer FFI consumers funnel through here; install the error
-  // handler before any mlx-c call so a stripped/disabled #[ctor] cannot let
-  // the default printf+exit handler fire on the very first failure.
-  crate::error::ensure_handler_installed();
+/// Panic IMMEDIATELY if this OS thread has had its streams cleared via
+/// [`super::Stream::clear_current_thread_streams`]. Call this at the top of
+/// every safe entry point that can touch mlx stream/TLS state — not just the
+/// default-stream path. mlx will not re-bootstrap a cleared thread, so the
+/// only useful behavior is a loud, self-explaining fast failure here instead
+/// of a cryptic late failure deep in the mlx backend.
+#[inline]
+pub(crate) fn assert_streams_not_cleared() {
   if STREAMS_CLEARED.with(Cell::get) {
     panic!(
       "mlxrs: Stream::clear_current_thread_streams() was called on this \
@@ -75,6 +78,14 @@ pub(crate) fn default_stream() -> mlxrs_sys::mlx_stream {
        thread truly exits. See the Stream docs."
     );
   }
+}
+
+pub(crate) fn default_stream() -> mlxrs_sys::mlx_stream {
+  // Most safe-layer FFI consumers funnel through here; install the error
+  // handler before any mlx-c call so a stripped/disabled #[ctor] cannot let
+  // the default printf+exit handler fire on the very first failure.
+  crate::error::ensure_handler_installed();
+  assert_streams_not_cleared();
   DEFAULT_STREAM.with(|cell| {
     if let Some(s) = cell.get() {
       return s;
@@ -121,11 +132,15 @@ pub(crate) fn mark_streams_cleared() {
 
 // ───────────────────────── Public Stream API (M2) ─────────────────────────
 
-/// MLX execution stream — RAII handle around `mlxrs_sys::mlx_stream`.
+/// MLX execution stream — an owned wrapper around the `mlxrs_sys::mlx_stream`
+/// **C handle**. NOT a scoped, resource-reclaiming RAII guard: `Drop` frees
+/// only the small mlx-c handle box, NOT the underlying mlx stream or its GPU
+/// command encoder (mlx has no per-stream teardown — see the Lifetime
+/// contract section below).
 ///
 /// A stream targets a specific device and serializes work submitted to it.
 /// Construct via [`Stream::default_gpu`], [`Stream::default_cpu`], or
-/// [`Stream::new_on`]. Drop calls `mlx_stream_free`.
+/// [`Stream::new_on`].
 ///
 /// ## Threading
 /// `Stream` is intentionally **`!Send` and `!Sync`**.
@@ -286,6 +301,9 @@ impl Stream {
   /// `mlx_synchronize`.
   pub fn synchronize(&self) -> Result<()> {
     ensure_handler_installed();
+    // Synchronizing a stream whose thread was cleared touches dead encoder
+    // state — fail fast with the actionable message instead.
+    assert_streams_not_cleared();
     check(unsafe { mlxrs_sys::mlx_synchronize(self.0) })
   }
 
