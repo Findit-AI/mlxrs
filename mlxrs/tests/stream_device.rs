@@ -302,6 +302,55 @@ fn reusing_a_cleared_thread_panics_fast_with_actionable_message() {
 }
 
 #[test]
+fn post_clear_every_public_stream_entry_point_panics_fast() {
+  // The poison guard must cover EVERY safe public Stream API that touches
+  // mlx stream FFI, not just eval/synchronize (Codex PR #13 r6). After a
+  // successful clear, each of these must panic-fast.
+  let outcome = std::thread::spawn(|| {
+    // Construct a Device + a Stream BEFORE poisoning so the accessor checks
+    // (device/index/equal) have a handle to call against post-clear.
+    let dev = Device::gpu().expect("gpu device");
+    let s = Stream::default_gpu().expect("default gpu stream");
+
+    Stream::clear_current_thread_streams().unwrap(); // poison THIS thread
+
+    let mut results: Vec<(&str, bool)> = Vec::new();
+    macro_rules! check_panics {
+      ($label:literal, $body:expr) => {
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+          let _ = $body;
+        }))
+        .is_err();
+        results.push(($label, panicked));
+      };
+    }
+    check_panics!("default_gpu", Stream::default_gpu());
+    check_panics!("default_cpu", Stream::default_cpu());
+    check_panics!("new_on", Stream::new_on(&dev));
+    check_panics!("try_clone", s.try_clone());
+    check_panics!("synchronize", s.synchronize());
+    check_panics!("device", s.device());
+    check_panics!("index", s.index());
+    check_panics!("equal", s.equal(&s));
+    check_panics!(
+      "get_default_stream",
+      mlxrs::stream::get_default_stream(&dev)
+    );
+    check_panics!("set_default_stream", mlxrs::stream::set_default_stream(&s));
+    results
+  })
+  .join()
+  .expect("spawned thread itself should not abort");
+
+  for (label, panicked) in outcome {
+    assert!(
+      panicked,
+      "post-clear `{label}` must panic-fast on a poisoned thread, but returned"
+    );
+  }
+}
+
+#[test]
 fn post_clear_eval_of_existing_array_also_panics_fast() {
   // `eval`/`to_vec` reach mlx WITHOUT going through default_stream(), so the
   // poison guard must also cover that path (Codex PR #13 r5). Build a lazy

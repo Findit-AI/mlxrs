@@ -238,6 +238,7 @@ impl Stream {
   /// returns `Err(Backend { .. })` if the GPU is unavailable.
   pub fn default_gpu() -> Result<Self> {
     ensure_handler_installed();
+    assert_streams_not_cleared();
     let raw = unsafe { mlxrs_sys::mlx_default_gpu_stream_new() };
     if raw.ctx.is_null() {
       return Err(crate::Error::Backend {
@@ -252,6 +253,7 @@ impl Stream {
   /// New default-CPU stream. Wraps `mlx_default_cpu_stream_new`.
   pub fn default_cpu() -> Result<Self> {
     ensure_handler_installed();
+    assert_streams_not_cleared();
     let raw = unsafe { mlxrs_sys::mlx_default_cpu_stream_new() };
     if raw.ctx.is_null() {
       return Err(crate::Error::Backend {
@@ -275,6 +277,7 @@ impl Stream {
   /// this cost — they return the pre-existing per-thread default.)
   pub fn new_on(device: &Device) -> Result<Self> {
     ensure_handler_installed();
+    assert_streams_not_cleared();
     let raw = unsafe { mlxrs_sys::mlx_stream_new_device(device.0) };
     if raw.ctx.is_null() {
       return Err(crate::Error::Backend {
@@ -288,6 +291,7 @@ impl Stream {
   /// can handle the rare allocation-failure path explicitly.
   pub fn try_clone(&self) -> Result<Self> {
     ensure_handler_installed();
+    assert_streams_not_cleared();
     // `mlx_stream_new` returns an empty handle (NULL ctx) intended to be
     // populated by `mlx_stream_set`/`mlx_get_default_stream` — same
     // out-param convention as `mlx_array_new`. Wrap in `Self` first so RAII
@@ -367,6 +371,7 @@ impl Stream {
   /// Returns the [`Device`] this stream targets. Wraps `mlx_stream_get_device`.
   pub fn device(&self) -> Result<Device> {
     ensure_handler_installed();
+    assert_streams_not_cleared();
     let mut dev = Device(unsafe { mlxrs_sys::mlx_device_new() });
     check(unsafe { mlxrs_sys::mlx_stream_get_device(&mut dev.0, self.0) })?;
     Ok(dev)
@@ -376,6 +381,7 @@ impl Stream {
   /// `mlx_stream_get_index`.
   pub fn index(&self) -> Result<i32> {
     ensure_handler_installed();
+    assert_streams_not_cleared();
     let mut idx: i32 = 0;
     check(unsafe { mlxrs_sys::mlx_stream_get_index(&mut idx, self.0) })?;
     Ok(idx)
@@ -384,6 +390,7 @@ impl Stream {
   /// Whether two streams refer to the same `{device, index}` pair. Wraps
   /// `mlx_stream_equal`.
   pub fn equal(&self, other: &Stream) -> bool {
+    assert_streams_not_cleared();
     unsafe { mlxrs_sys::mlx_stream_equal(self.0, other.0) }
   }
 
@@ -402,6 +409,7 @@ impl Stream {
 /// `mlx_get_default_stream`.
 pub fn get_default_stream(device: &Device) -> Result<Stream> {
   ensure_handler_installed();
+  assert_streams_not_cleared();
   let mut out = Stream(unsafe { mlxrs_sys::mlx_stream_new() });
   check(unsafe { mlxrs_sys::mlx_get_default_stream(&mut out.0, device.0) })?;
   Ok(out)
@@ -416,6 +424,7 @@ pub fn get_default_stream(device: &Device) -> Result<Stream> {
 /// `mlx_get_default_stream` API.
 pub fn set_default_stream(stream: &Stream) -> Result<()> {
   ensure_handler_installed();
+  assert_streams_not_cleared();
   check(unsafe { mlxrs_sys::mlx_set_default_stream(stream.0) })
 }
 
