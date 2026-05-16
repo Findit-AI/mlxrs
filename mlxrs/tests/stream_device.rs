@@ -262,9 +262,41 @@ fn clear_current_thread_streams_is_end_of_thread_cleanup() {
 }
 
 #[test]
-fn clear_current_thread_streams_returns_ok() {
+fn clear_current_thread_streams_returns_ok_on_idle_thread() {
   // Calling it on a thread that has done no mlx work is still a valid no-op
-  // (the encoder map is just empty). Locks in the rc=0 success path of the
-  // C++ shim.
-  Stream::clear_current_thread_streams().unwrap();
+  // (the encoder map is just empty). Run in a spawned thread so we never
+  // poison the libtest worker thread. Locks in the rc=0 success path.
+  std::thread::spawn(|| {
+    Stream::clear_current_thread_streams().unwrap();
+  })
+  .join()
+  .expect("idle clear should not panic");
+}
+
+#[test]
+fn reusing_a_cleared_thread_panics_fast_with_actionable_message() {
+  // After a successful clear, the thread is poisoned: the next mlxrs op
+  // must panic IMMEDIATELY (in default_stream's guard) rather than fail
+  // cryptically deep in eval. Done in a spawned thread so the panic + the
+  // poisoned TLS stay contained.
+  let outcome = std::thread::spawn(|| {
+    Stream::clear_current_thread_streams().unwrap(); // poisons THIS thread
+    // The next op funnels through default_stream() → must panic.
+    std::panic::catch_unwind(|| {
+      let _ = mlxrs::Array::ones::<f32>(&(2usize, 2));
+    })
+  })
+  .join()
+  .expect("spawned thread itself should not abort");
+
+  let payload = outcome.expect_err("op on a cleared/poisoned thread must panic");
+  let msg = payload
+    .downcast_ref::<String>()
+    .map(String::as_str)
+    .or_else(|| payload.downcast_ref::<&str>().copied())
+    .unwrap_or("");
+  assert!(
+    msg.contains("clear_current_thread_streams"),
+    "panic message should name the culprit API; got: {msg:?}"
+  );
 }
