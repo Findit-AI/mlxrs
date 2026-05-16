@@ -96,6 +96,35 @@ fn any_axes_along_axis1() {
   assert_eq!(r.to_vec::<bool>().unwrap(), vec![false, true]);
 }
 
+// Regression: empty `axes` for all/any is NOT a dtype-preserving no-op.
+// MLX returns `astype(a, bool)` for empty axes (numpy `all(a, axis=())` is
+// bool too). A prior `try_clone` short-circuit silently returned the input's
+// int dtype/values for a logical op.
+#[test]
+fn all_axes_empty_on_int_casts_to_bool() {
+  let a = Array::from_slice(&[1i32, 0, 2], &(3,)).unwrap();
+  let mut r = a.all_axes(&[], false).unwrap();
+  assert_eq!(r.dtype().unwrap(), mlxrs::Dtype::Bool);
+  assert_eq!(r.to_vec::<bool>().unwrap(), vec![true, false, true]);
+}
+
+#[test]
+fn any_axes_empty_on_int_casts_to_bool() {
+  let a = Array::from_slice(&[1i32, 0, 2], &(3,)).unwrap();
+  let mut r = a.any_axes(&[], false).unwrap();
+  assert_eq!(r.dtype().unwrap(), mlxrs::Dtype::Bool);
+  assert_eq!(r.to_vec::<bool>().unwrap(), vec![true, false, true]);
+}
+
+#[test]
+fn all_axes_empty_on_bool_is_identity() {
+  // bool input + empty axes: still bool, values unchanged (no reduction).
+  let a = Array::from_slice(&[true, false, true], &(3,)).unwrap();
+  let mut r = a.all_axes(&[], false).unwrap();
+  assert_eq!(r.dtype().unwrap(), mlxrs::Dtype::Bool);
+  assert_eq!(r.to_vec::<bool>().unwrap(), vec![true, false, true]);
+}
+
 #[test]
 fn logsumexp_of_zeros_yields_log_n() {
   // logsumexp([0, 0, 0, 0]) = log(4*e^0) = log(4)

@@ -4,12 +4,15 @@
 //! Cum* (cumsum/cumprod/cummax/cummin) live in `misc.rs` per the Phase 4 LoC
 //! rebalancing.
 //!
-//! Identity-dtype reductions (`sum`, `prod`, `all`, `any`) short-circuit
-//! `_axes(empty_slice, _)` to `try_clone()` (matches numpy `op(a, axis=())`
-//! and mlx-python). Promoting reductions (`mean`, `var`, `std`, `logsumexp`)
-//! and `max`/`min` route empty axes through the `_axes` C entry via a
-//! `dim_ptr` sentinel so MLX's dtype-promotion / zero-size checks run
-//! uniformly across paths (see `mean_axes` rationale).
+//! Identity-dtype reductions (`sum`, `prod`) short-circuit
+//! `_axes(empty_slice, _)` to `try_clone()`: MLX itself returns `a`
+//! unchanged for empty axes (`if (axes.empty()) return a;` in mlx
+//! `ops.cpp`), matching numpy `op(a, axis=())`. Every other reduction
+//! routes empty axes through the `_axes` C entry via a `dim_ptr` sentinel
+//! so MLX's own empty-axes semantics run: `mean`/`var`/`std`/`logsumexp`
+//! for dtype promotion, `max`/`min` for zero-size checks, and `all`/`any`
+//! because their empty-axes result is `astype(a, bool)` — a dtype change,
+//! NOT a no-op (numpy `all(a, axis=())` is bool too).
 
 use std::ffi::c_int;
 
@@ -254,21 +257,23 @@ pub fn std(a: &Array, keepdims: bool, ddof: i32) -> Result<Array> {
   Ok(out)
 }
 
-/// Logical AND along the given axes. Empty `axes` is a no-op (returns a
-/// refcount-sharing clone of `a`); `all` is an identity-dtype boolean
-/// reduction so the short-circuit preserves dtype across paths.
+/// Logical AND along the given axes. Result dtype is always `bool`.
+///
+/// Empty `axes` is **not** a dtype-preserving no-op: MLX flags the
+/// empty-axes case `is_noop` in `compute_reduce_shape` and returns
+/// `astype(a, bool)` (numpy `all(a, axis=())` is bool too). It therefore
+/// routes through `mlx_all_axes` with a `dim_ptr` sentinel — a `try_clone`
+/// short-circuit (correct for the identity-dtype `sum_axes`/`prod_axes`)
+/// would here wrongly return `a`'s original dtype/values.
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.all.html).
 pub fn all_axes(a: &Array, axes: &[i32], keepdims: bool) -> Result<Array> {
-  if axes.is_empty() {
-    return a.try_clone();
-  }
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   check(unsafe {
     mlxrs_sys::mlx_all_axes(
       &mut out.0,
       a.0,
-      axes.as_ptr() as *const c_int,
+      dim_ptr(axes),
       axes.len(),
       keepdims,
       default_stream(),
@@ -286,19 +291,20 @@ pub fn all(a: &Array, keepdims: bool) -> Result<Array> {
   Ok(out)
 }
 
-/// Logical OR along the given axes. Empty `axes` is a no-op (see `all_axes`).
+/// Logical OR along the given axes. Result dtype is always `bool`.
+///
+/// Empty `axes` routes through `mlx_any_axes` with a `dim_ptr` sentinel for
+/// the same reason as [`all_axes`]: MLX's empty-axes result is
+/// `astype(a, bool)`, not a dtype-preserving no-op.
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.any.html).
 pub fn any_axes(a: &Array, axes: &[i32], keepdims: bool) -> Result<Array> {
-  if axes.is_empty() {
-    return a.try_clone();
-  }
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   check(unsafe {
     mlxrs_sys::mlx_any_axes(
       &mut out.0,
       a.0,
-      axes.as_ptr() as *const c_int,
+      dim_ptr(axes),
       axes.len(),
       keepdims,
       default_stream(),
