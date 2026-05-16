@@ -14,7 +14,7 @@
 //! supported on the Metal GPU — mlx-c routes them through `linalg::*` C++
 //! kernels that hard-fail with "This op is not yet supported on the GPU.
 //! Explicitly pass a CPU stream to run it." For those ops we maintain a
-//! per-thread CPU stream via [`linalg_cpu_stream`] and route through it,
+//! per-thread CPU stream via `linalg_cpu_stream` and route through it,
 //! mirroring the per-thread GPU stream pattern in `crate::stream`.
 //!
 //! See [mlx linalg docs](https://ml-explore.github.io/mlx/build/html/python/linalg.html).
@@ -60,7 +60,7 @@ fn linalg_cpu_stream() -> mlxrs_sys::mlx_stream {
 // ─────────────────────────── inverses ───────────────────────────
 
 /// Matrix inverse (square `a`). Runs on the per-thread CPU stream
-/// ([`linalg_cpu_stream`]) — GPU kernel not yet implemented in mlx-c.
+/// (`linalg_cpu_stream`) — GPU kernel not yet implemented in mlx-c.
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.linalg.inv.html).
 pub fn inv(a: &Array) -> Result<Array> {

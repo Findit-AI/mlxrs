@@ -5,10 +5,13 @@
 //! one-axis ops also accept an `n` length (for zero-pad/truncate to a target
 //! transform length) and an `axis` index.
 //!
-//! Multi-axis ops (`fft2`, `fftn`, etc.) take parallel `n` and `axes` slices.
-//! Empty `axes` is treated as "all axes" by mlx-python's `fftn`/`ifftn`/etc.;
-//! we route empty slices through `dim_ptr`'s static sentinel rather than the
-//! Rust dangling pointer for empty `&[i32]`.
+//! Multi-axis ops (`fft2`, `fftn`, etc.) take parallel `n` and `axes`
+//! slices. Passing **empty** slices selects mlx-python's defaults, resolved
+//! in this layer exactly like `mlx-swift` (`Source/MLX/FFT.swift`): empty
+//! `axes` → all dims (the last two for the `*2` variants); empty `n` →
+//! the size of each transformed axis. mlx-c only binds the explicit-axes
+//! overload (which returns the input unchanged for empty axes), so the
+//! default is materialized here rather than forwarded as empty.
 //!
 //! See [mlx FFT docs](https://ml-explore.github.io/mlx/build/html/python/fft.html).
 
@@ -41,6 +44,57 @@ impl From<FftNorm> for mlxrs_sys::mlx_fft_norm {
       FftNorm::Forward => mlxrs_sys::mlx_fft_norm__MLX_FFT_NORM_FORWARD,
     }
   }
+}
+
+/// Resolve `(n, axes)` for the multi-axis FFTs the way mlx-python and
+/// `mlx-swift` (`Source/MLX/FFT.swift`) do, so callers can pass empty
+/// slices for the documented defaults instead of hitting mlx-c's
+/// explicit-overload no-op:
+/// - both given: forward as-is.
+/// - axes given, `n` empty: `n` = size of each transformed axis.
+/// - `n` given, axes empty: `axes` = the rightmost `n.len()` dims.
+/// - both empty: `axes` = all dims (the last two for the `*2` variants),
+///   `n` = their sizes.
+///
+/// Returns owned vectors — the FFI needs concrete arrays, and the official
+/// bindings likewise materialize the default axes/n here. An out-of-range
+/// explicit axis is forwarded unchanged so mlx-c emits its own precise
+/// error instead of this panicking.
+fn resolve_fft(a: &Array, n: &[i32], axes: &[i32], last_two: bool) -> (Vec<i32>, Vec<i32>) {
+  let ndim = a.ndim() as i32;
+  let norm = |ax: i32| if ax < 0 { ax + ndim } else { ax };
+  if !axes.is_empty() {
+    if n.is_empty() {
+      let shape = a.shape();
+      let ok = axes.iter().all(|&ax| {
+        let r = norm(ax);
+        r >= 0 && (r as usize) < shape.len()
+      });
+      if ok {
+        let nn = axes
+          .iter()
+          .map(|&ax| shape[norm(ax) as usize] as i32)
+          .collect();
+        return (nn, axes.to_vec());
+      }
+    }
+    return (n.to_vec(), axes.to_vec());
+  }
+  if !n.is_empty() {
+    let cnt = n.len() as i32;
+    return (n.to_vec(), ((ndim - cnt).max(0)..ndim).collect());
+  }
+  let ax: Vec<i32> = if last_two {
+    ((ndim - 2).max(0)..ndim).collect()
+  } else {
+    (0..ndim).collect()
+  };
+  let shape = a.shape();
+  let nn = ax
+    .iter()
+    .map(|&x| shape.get(x as usize).copied().unwrap_or(0) as i32)
+    .collect();
+  (nn, ax)
 }
 
 /// 1-D discrete Fourier transform along `axis`. `n` is the transform length
@@ -119,23 +173,20 @@ pub fn irfft(a: &Array, n: i32, axis: i32, norm: FftNorm) -> Result<Array> {
   Ok(out)
 }
 
-/// N-D FFT over the listed `axes` with per-axis transform lengths `n`. Empty
-/// `axes` is routed through `dim_ptr`'s static sentinel so the FFI never sees
-/// a Rust dangling pointer.
-///
-/// `n` and `axes` must have the same length when `axes` is non-empty (mlx-c
-/// validates and surfaces the error).
+/// N-D FFT. Empty `axes` ⇒ all dims; empty `n` ⇒ each transformed axis's
+/// size (see module docs / `resolve_fft`).
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.fft.fftn.html).
 pub fn fftn(a: &Array, n: &[i32], axes: &[i32], norm: FftNorm) -> Result<Array> {
+  let (n, axes) = resolve_fft(a, n, axes, false);
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   check(unsafe {
     mlxrs_sys::mlx_fft_fftn(
       &mut out.0,
       a.0,
-      dim_ptr(n),
+      dim_ptr(&n),
       n.len(),
-      dim_ptr(axes),
+      dim_ptr(&axes),
       axes.len(),
       norm.into(),
       default_stream(),
@@ -148,14 +199,15 @@ pub fn fftn(a: &Array, n: &[i32], axes: &[i32], norm: FftNorm) -> Result<Array> 
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.fft.ifftn.html).
 pub fn ifftn(a: &Array, n: &[i32], axes: &[i32], norm: FftNorm) -> Result<Array> {
+  let (n, axes) = resolve_fft(a, n, axes, false);
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   check(unsafe {
     mlxrs_sys::mlx_fft_ifftn(
       &mut out.0,
       a.0,
-      dim_ptr(n),
+      dim_ptr(&n),
       n.len(),
-      dim_ptr(axes),
+      dim_ptr(&axes),
       axes.len(),
       norm.into(),
       default_stream(),
@@ -164,18 +216,20 @@ pub fn ifftn(a: &Array, n: &[i32], axes: &[i32], norm: FftNorm) -> Result<Array>
   Ok(out)
 }
 
-/// 2-D FFT over the last two axes by default; pass `axes` to override.
+/// 2-D FFT. Defaults to the last two axes (empty `axes`); empty `n` ⇒
+/// those axes' sizes.
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.fft.fft2.html).
 pub fn fft2(a: &Array, n: &[i32], axes: &[i32], norm: FftNorm) -> Result<Array> {
+  let (n, axes) = resolve_fft(a, n, axes, true);
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   check(unsafe {
     mlxrs_sys::mlx_fft_fft2(
       &mut out.0,
       a.0,
-      dim_ptr(n),
+      dim_ptr(&n),
       n.len(),
-      dim_ptr(axes),
+      dim_ptr(&axes),
       axes.len(),
       norm.into(),
       default_stream(),
@@ -188,14 +242,15 @@ pub fn fft2(a: &Array, n: &[i32], axes: &[i32], norm: FftNorm) -> Result<Array> 
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.fft.ifft2.html).
 pub fn ifft2(a: &Array, n: &[i32], axes: &[i32], norm: FftNorm) -> Result<Array> {
+  let (n, axes) = resolve_fft(a, n, axes, true);
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   check(unsafe {
     mlxrs_sys::mlx_fft_ifft2(
       &mut out.0,
       a.0,
-      dim_ptr(n),
+      dim_ptr(&n),
       n.len(),
-      dim_ptr(axes),
+      dim_ptr(&axes),
       axes.len(),
       norm.into(),
       default_stream(),
@@ -208,14 +263,15 @@ pub fn ifft2(a: &Array, n: &[i32], axes: &[i32], norm: FftNorm) -> Result<Array>
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.fft.rfftn.html).
 pub fn rfftn(a: &Array, n: &[i32], axes: &[i32], norm: FftNorm) -> Result<Array> {
+  let (n, axes) = resolve_fft(a, n, axes, false);
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   check(unsafe {
     mlxrs_sys::mlx_fft_rfftn(
       &mut out.0,
       a.0,
-      dim_ptr(n),
+      dim_ptr(&n),
       n.len(),
-      dim_ptr(axes),
+      dim_ptr(&axes),
       axes.len(),
       norm.into(),
       default_stream(),
@@ -228,14 +284,15 @@ pub fn rfftn(a: &Array, n: &[i32], axes: &[i32], norm: FftNorm) -> Result<Array>
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.fft.irfftn.html).
 pub fn irfftn(a: &Array, n: &[i32], axes: &[i32], norm: FftNorm) -> Result<Array> {
+  let (n, axes) = resolve_fft(a, n, axes, false);
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   check(unsafe {
     mlxrs_sys::mlx_fft_irfftn(
       &mut out.0,
       a.0,
-      dim_ptr(n),
+      dim_ptr(&n),
       n.len(),
-      dim_ptr(axes),
+      dim_ptr(&axes),
       axes.len(),
       norm.into(),
       default_stream(),
@@ -244,18 +301,19 @@ pub fn irfftn(a: &Array, n: &[i32], axes: &[i32], norm: FftNorm) -> Result<Array
   Ok(out)
 }
 
-/// 2-D real-input FFT (last two axes by default).
+/// 2-D real-input FFT. Defaults to the last two axes (empty `axes`).
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.fft.rfft2.html).
 pub fn rfft2(a: &Array, n: &[i32], axes: &[i32], norm: FftNorm) -> Result<Array> {
+  let (n, axes) = resolve_fft(a, n, axes, true);
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   check(unsafe {
     mlxrs_sys::mlx_fft_rfft2(
       &mut out.0,
       a.0,
-      dim_ptr(n),
+      dim_ptr(&n),
       n.len(),
-      dim_ptr(axes),
+      dim_ptr(&axes),
       axes.len(),
       norm.into(),
       default_stream(),
@@ -268,14 +326,15 @@ pub fn rfft2(a: &Array, n: &[i32], axes: &[i32], norm: FftNorm) -> Result<Array>
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.fft.irfft2.html).
 pub fn irfft2(a: &Array, n: &[i32], axes: &[i32], norm: FftNorm) -> Result<Array> {
+  let (n, axes) = resolve_fft(a, n, axes, true);
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   check(unsafe {
     mlxrs_sys::mlx_fft_irfft2(
       &mut out.0,
       a.0,
-      dim_ptr(n),
+      dim_ptr(&n),
       n.len(),
-      dim_ptr(axes),
+      dim_ptr(&axes),
       axes.len(),
       norm.into(),
       default_stream(),
@@ -302,15 +361,21 @@ pub fn rfftfreq(n: i32, d: f64) -> Result<Array> {
   Ok(out)
 }
 
-/// Shift the zero-frequency component to the center along the listed `axes`.
-/// Empty `axes` shifts all axes (mlx-python default), routed through the
-/// `dim_ptr` sentinel for FFI safety.
+/// Shift the zero-frequency component to the center. Empty `axes` shifts
+/// all dims (mlx-python default), expanded here like `mlx-swift`.
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.fft.fftshift.html).
 pub fn fftshift(a: &Array, axes: &[i32]) -> Result<Array> {
+  let (_, axes) = resolve_fft(a, &[], axes, false);
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   check(unsafe {
-    mlxrs_sys::mlx_fft_fftshift(&mut out.0, a.0, dim_ptr(axes), axes.len(), default_stream())
+    mlxrs_sys::mlx_fft_fftshift(
+      &mut out.0,
+      a.0,
+      dim_ptr(&axes),
+      axes.len(),
+      default_stream(),
+    )
   })?;
   Ok(out)
 }
@@ -319,9 +384,16 @@ pub fn fftshift(a: &Array, axes: &[i32]) -> Result<Array> {
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.fft.ifftshift.html).
 pub fn ifftshift(a: &Array, axes: &[i32]) -> Result<Array> {
+  let (_, axes) = resolve_fft(a, &[], axes, false);
   let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
   check(unsafe {
-    mlxrs_sys::mlx_fft_ifftshift(&mut out.0, a.0, dim_ptr(axes), axes.len(), default_stream())
+    mlxrs_sys::mlx_fft_ifftshift(
+      &mut out.0,
+      a.0,
+      dim_ptr(&axes),
+      axes.len(),
+      default_stream(),
+    )
   })?;
   Ok(out)
 }
