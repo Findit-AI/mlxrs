@@ -236,6 +236,32 @@ fn concurrent_set_default_and_current_is_race_free() {
 // ───────────────── clear_current_thread_streams (C++ shim) ─────────────────
 
 #[test]
+fn post_clear_array_display_also_panics_fast() {
+  // `Display::fmt` → mlx_array_tostring → upstream streams via eval(), so it
+  // re-enters eval and must honor the poison guard too (Codex PR #13 r7).
+  let outcome = std::thread::spawn(|| {
+    let a = mlxrs::Array::ones::<f32>(&(2usize, 2)).unwrap(); // lazy
+    Stream::clear_current_thread_streams().unwrap(); // poison this thread
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      let _ = format!("{a}"); // Display → tostring → eval → must panic
+    }))
+  })
+  .join()
+  .expect("spawned thread itself should not abort");
+
+  let payload = outcome.expect_err("post-clear Display must panic");
+  let msg = payload
+    .downcast_ref::<String>()
+    .map(String::as_str)
+    .or_else(|| payload.downcast_ref::<&str>().copied())
+    .unwrap_or("");
+  assert!(
+    msg.contains("clear_current_thread_streams"),
+    "panic message should name the culprit API; got: {msg:?}"
+  );
+}
+
+#[test]
 fn clear_current_thread_streams_is_end_of_thread_cleanup() {
   // REALISTIC CONTRACT: clear_current_thread_streams() is an
   // end-of-thread-lifecycle primitive. A worker thread does mlx work, then
