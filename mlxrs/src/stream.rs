@@ -60,6 +60,18 @@ pub(crate) fn default_stream() -> mlxrs_sys::mlx_stream {
   })
 }
 
+/// Invalidate this thread's cached default-stream handle so the next
+/// [`default_stream`] call re-creates it via `mlx_default_gpu_stream_new`.
+///
+/// Required after `mlx::core::clear_streams()`: that destroys the thread's
+/// Metal command encoders, so the cached `{gpu, 0}` handle is now stale
+/// (eval against it fails with "There is no Stream(gpu, 0) in current
+/// thread"). Resetting the cache lets the next op re-register a fresh
+/// encoder. See [`super::Stream::clear_current_thread_streams`].
+pub(crate) fn reset_default_stream_cache() {
+  DEFAULT_STREAM.with(|cell| cell.set(None));
+}
+
 // INTENTIONAL: never freed at thread/process exit. Metal frameworks tear down
 // before destructors run, so calling mlx_stream_free at exit would crash.
 // Instruments will flag this as a leak on shutdown — that's expected.
@@ -100,6 +112,36 @@ pub(crate) fn default_stream() -> mlxrs_sys::mlx_stream {
 /// CPU/GPU-split API exists (future milestone), `Stream` stays single-thread
 /// like `Array`. (`Device` IS `Send + Sync` — it is a pure `{kind, index}`
 /// descriptor with no thread-local referent.)
+///
+/// # Lifetime contract — NOT per-value RAII
+///
+/// `Stream` is a `Drop` type, but **`Drop` only frees the small C handle
+/// box** (`delete (mlx::core::Stream*)ctx`) — it does NOT reclaim the
+/// underlying mlx stream. mlx's stream model:
+/// - `mlx::core::new_stream` appends `{index, device}` to a process-global
+///   `std::vector<Stream>` (no removal API) and, for GPU, registers a Metal
+///   command encoder in *thread-local* storage.
+/// - mlx's ONLY teardown primitive is `mlx::core::clear_streams()`, which
+///   is **thread-wide and bulk** ("destroy all streams created on the
+///   current thread" — it clears that thread's command-encoder map). There
+///   is no per-stream free, so this fundamentally cannot map to Rust
+///   per-value `Drop`. mlx-c does not expose it either; mlxrs bridges it
+///   via a first-party shim — see [`Stream::clear_current_thread_streams`].
+///
+/// Consequences:
+/// - [`Stream::default_gpu`] / [`Stream::default_cpu`] are cheap — they
+///   return the pre-existing per-thread default; no registry growth.
+/// - [`Stream::new_on`] permanently grows the global registry (+ a GPU
+///   command encoder) on every call. `Drop` does NOT give that back.
+///   Create a bounded set once at startup, never per request/task.
+/// - To bound encoder memory in a worker-pool design, have each worker call
+///   [`Stream::clear_current_thread_streams`] as its LAST mlx action before
+///   the worker thread finishes (end-of-thread cleanup — mlx does not
+///   re-bootstrap a thread's GPU stream afterward, so it is not a mid-life
+///   "reset").
+///
+/// In short: streams are coarse, mostly-process-lifetime resources. Treat
+/// `Stream` as a handle, not a scoped RAII guard.
 #[repr(transparent)]
 pub struct Stream(pub(crate) mlxrs_sys::mlx_stream);
 
@@ -113,10 +155,13 @@ impl Drop for Stream {
     // SAFETY: must NOT touch TLS or panic (drop runs during thread teardown).
     // Discard rc silently — same convention as Array::drop.
     //
-    // NOTE: this is the explicit-ownership path. The internal
-    // `default_stream()` singleton is intentionally leaked at process exit
-    // (Metal frameworks tear down before drop runs); the public `Stream`
-    // type is owned by the caller, so we follow normal RAII.
+    // IMPORTANT: this frees ONLY the small C handle box (`delete
+    // (mlx::core::Stream*)ctx`). It does NOT reclaim the underlying mlx
+    // stream. mlx-c++ has no stream-teardown API: `mlx::core::new_stream`
+    // appends to a process-global `std::vector<Stream>` (and, for GPU,
+    // allocates a Metal command queue) that lives until process exit. See
+    // the `Stream` type docs for the lifetime contract — this is NOT
+    // resource-reclaiming RAII.
     unsafe {
       let _ = mlxrs_sys::mlx_stream_free(self.0);
     }
@@ -134,8 +179,11 @@ impl Clone for Stream {
 }
 
 impl Stream {
-  /// New default-GPU stream. Wraps `mlx_default_gpu_stream_new`. The handle
-  /// is owned by this `Stream` and freed on drop.
+  /// The per-thread default GPU stream. Wraps `mlx_default_gpu_stream_new`.
+  /// Cheap and repeatable — returns the thread's existing default, so it
+  /// does NOT grow mlx's global stream registry (unlike [`Stream::new_on`]).
+  /// See the type-level "Lifetime contract" note: `Drop` frees only the C
+  /// handle box.
   ///
   /// On a thread that never spun up Metal, this triggers GPU initialization;
   /// returns `Err(Backend { .. })` if the GPU is unavailable.
@@ -164,7 +212,18 @@ impl Stream {
     Ok(Self(raw))
   }
 
-  /// New stream targeting `device`. Wraps `mlx_stream_new_device`.
+  /// New distinct stream targeting `device`, for op pipelining /
+  /// concurrency. Wraps `mlx_stream_new_device`.
+  ///
+  /// **PERMANENT ALLOCATION — read before calling in a loop.** mlx-c++'s
+  /// `new_stream` appends to a process-global `std::vector<Stream>` with no
+  /// removal path, and for a GPU device it also allocates a Metal command
+  /// queue that is never reclaimed. Dropping the returned `Stream` frees
+  /// only the tiny C handle box — NOT the registry slot or the command
+  /// queue. Every `new_on` call therefore costs process-lifetime memory
+  /// (and a GPU queue). Create a *bounded* set of streams once at startup;
+  /// never one per request/task. (`default_gpu`/`default_cpu` do not have
+  /// this cost — they return the pre-existing per-thread default.)
   pub fn new_on(device: &Device) -> Result<Self> {
     ensure_handler_installed();
     let raw = unsafe { mlxrs_sys::mlx_stream_new_device(device.0) };
@@ -194,6 +253,52 @@ impl Stream {
   pub fn synchronize(&self) -> Result<()> {
     ensure_handler_installed();
     check(unsafe { mlxrs_sys::mlx_synchronize(self.0) })
+  }
+
+  /// Destroy **every** stream created on the *current thread*, reclaiming
+  /// their Metal command encoders in bulk. This is mlx's only stream-
+  /// teardown primitive (`mlx::core::clear_streams()`); mlx-c does not
+  /// expose it, so this calls a first-party C++ shim
+  /// ([`mlxrs_sys::mlxrs_shim_clear_streams`]).
+  ///
+  /// # This is END-OF-THREAD cleanup, not a mid-life "reset"
+  ///
+  /// mlx does NOT re-bootstrap a thread's GPU stream after `clear_streams()`
+  /// — empirically, even a fresh `mlx_default_gpu_stream_new()` afterward
+  /// still fails eval with "There is no Stream(gpu, 0) in current thread".
+  /// So the contract is strictly: **call this once, as the last mlx action
+  /// on a worker thread, right before that thread finishes.** Do NOT
+  /// continue doing mlx work on the thread afterward.
+  ///
+  /// The intended pattern is a fixed worker pool where each worker, before
+  /// being joined/recycled, calls this to release its GPU encoder memory
+  /// deterministically instead of leaking it until process exit (the
+  /// otherwise-unavoidable cost of dynamic [`Stream::new_on`] usage). It is
+  /// an associated function (not `&self`) because the operation is
+  /// thread-wide and bulk — it cannot be scoped to one `Stream`; every
+  /// `Stream` previously obtained on this thread (including the per-thread
+  /// default) is invalidated.
+  ///
+  /// Returns `Err(Backend)` if the underlying C++ call threw (not expected
+  /// in practice — it clears an `unordered_map`).
+  pub fn clear_current_thread_streams() -> Result<()> {
+    ensure_handler_installed();
+    let rc = unsafe { mlxrs_sys::mlxrs_shim_clear_streams() };
+    // Defensive hygiene: clear_streams() invalidated this thread's command
+    // encoders, so the internally-cached default-stream handle now dangles.
+    // Drop the cache unconditionally so that IF some later code on this
+    // thread calls an op, default_stream() at least doesn't hand back a
+    // known-dead {gpu,0} handle (it will try a fresh new — which mlx itself
+    // won't fully honor; that's why the doc says don't keep working on this
+    // thread). This is not a "resume" guarantee, just not-eval-freed-state.
+    reset_default_stream_cache();
+    if rc == 0 {
+      Ok(())
+    } else {
+      Err(crate::Error::Backend {
+        message: "mlxrs_shim_clear_streams: mlx::core::clear_streams() threw".into(),
+      })
+    }
   }
 
   /// Returns the [`Device`] this stream targets. Wraps `mlx_stream_get_device`.

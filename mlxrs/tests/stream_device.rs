@@ -232,3 +232,39 @@ fn concurrent_set_default_and_current_is_race_free() {
     "default device left in an incoherent state: {kind:?}",
   );
 }
+
+// ───────────────── clear_current_thread_streams (C++ shim) ─────────────────
+
+#[test]
+fn clear_current_thread_streams_is_end_of_thread_cleanup() {
+  // REALISTIC CONTRACT: clear_current_thread_streams() is an
+  // end-of-thread-lifecycle primitive. A worker thread does mlx work, then
+  // reclaims its Metal command encoders before finishing — instead of
+  // leaking them until process exit. It is NOT "clear then keep using mlx
+  // on this thread" (mlx does not re-bootstrap the thread's GPU stream
+  // after clear_streams).
+  let worker = std::thread::spawn(|| {
+    let mut a = mlxrs::Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+    let mut s = mlxrs::ops::reduction::sum(&a, false).unwrap();
+    assert_eq!(s.item::<f32>().unwrap(), 10.0);
+    let _ = a.to_vec::<f32>().unwrap(); // force materialization before clear
+    // Done with mlx on this thread — reclaim its encoders deterministically.
+    Stream::clear_current_thread_streams().unwrap();
+    // Thread exits here; clearing must not abort/crash on the way out.
+  });
+  worker.join().expect("worker thread panicked / aborted");
+
+  // The calling thread's mlx state is independent of the worker's and is
+  // unaffected by the worker's clear_streams call.
+  let mut b = mlxrs::Array::ones::<f32>(&(4usize, 4)).unwrap();
+  b.eval().unwrap();
+  assert_eq!(b.to_vec::<f32>().unwrap(), vec![1.0; 16]);
+}
+
+#[test]
+fn clear_current_thread_streams_returns_ok() {
+  // Calling it on a thread that has done no mlx work is still a valid no-op
+  // (the encoder map is just empty). Locks in the rc=0 success path of the
+  // C++ shim.
+  Stream::clear_current_thread_streams().unwrap();
+}

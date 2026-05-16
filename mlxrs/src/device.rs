@@ -13,7 +13,7 @@
 //! non-atomic function-static (`mlx::core::mutable_default_device()` returns
 //! `&static Device`, NOT `thread_local`). `set_default` writes it and
 //! `current` reads it, so concurrent safe-Rust calls would be a C++ data
-//! race. Both are serialized through [`DEFAULT_DEVICE_LOCK`]. (The default
+//! race. Both are serialized through `DEFAULT_DEVICE_LOCK`. (The default
 //! *stream* getters/setters do NOT need this — mlx stores default streams in
 //! `thread_local` storage, so each thread only touches its own.)
 
@@ -154,7 +154,7 @@ impl Device {
   /// Returns the current process-wide default device. Wraps
   /// `mlx_get_default_device`.
   ///
-  /// Serialized against [`Device::set_default`] via [`DEFAULT_DEVICE_LOCK`] —
+  /// Serialized against [`Device::set_default`] via `DEFAULT_DEVICE_LOCK` —
   /// reading the non-atomic mlx-c++ global concurrently with a write would
   /// be a C++ data race.
   pub fn current() -> Result<Self> {
@@ -184,7 +184,7 @@ impl Device {
   /// that future API.
   ///
   /// Serialized against itself and [`Device::current`] via
-  /// [`DEFAULT_DEVICE_LOCK`]: mlx-c++'s default device is a non-atomic
+  /// `DEFAULT_DEVICE_LOCK`: mlx-c++'s default device is a non-atomic
   /// function-static, so concurrent safe-Rust mutation would be a C++ data
   /// race. The lock makes the safe API race-free; raw `mlxrs-sys` callers
   /// bypass it (their responsibility).
