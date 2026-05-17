@@ -26,7 +26,7 @@ use std::{
 
 use crate::{
   array::Array,
-  error::{Result, check},
+  error::{Result, check, check_vector_array_handle},
   shape::dim_ptr,
   stream::default_stream,
 };
@@ -135,6 +135,10 @@ pub fn svd(a: &Array, compute_uv: bool) -> Result<Vec<Array>> {
   // before `linalg_cpu_stream()` would install the handler — install first.
   crate::error::ensure_handler_installed();
   let mut vec_out = unsafe { mlxrs_sys::mlx_vector_array_new() };
+  // `mlx_vector_array_new` is fallible: a null `ctx` means allocation failed
+  // and an error sits in TLS. Validate (draining handler state) BEFORE the
+  // guard so it only ever wraps a non-null handle (no leak / double-free).
+  check_vector_array_handle(vec_out)?;
   let _vec_guard = VectorArrayGuard(vec_out);
   check(unsafe { mlxrs_sys::mlx_linalg_svd(&mut vec_out, a.0, compute_uv, linalg_cpu_stream()) })?;
   drain_vector(vec_out)
@@ -148,6 +152,9 @@ pub fn lu(a: &Array) -> Result<Vec<Array>> {
   // See `svd`: install the handler before the fallible `mlx_vector_array_new()`.
   crate::error::ensure_handler_installed();
   let mut vec_out = unsafe { mlxrs_sys::mlx_vector_array_new() };
+  // See `svd`: validate the fallible allocation (draining handler state)
+  // before the guard so it only ever wraps a non-null handle.
+  check_vector_array_handle(vec_out)?;
   let _vec_guard = VectorArrayGuard(vec_out);
   check(unsafe { mlxrs_sys::mlx_linalg_lu(&mut vec_out, a.0, linalg_cpu_stream()) })?;
   drain_vector(vec_out)
