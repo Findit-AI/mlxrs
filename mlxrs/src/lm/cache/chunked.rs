@@ -690,4 +690,22 @@ impl KvCache for ChunkedKvCache {
   fn reference_class_name(&self) -> &'static str {
     "ChunkedKVCache"
   }
+
+  /// Transactional override of [`KvCache::from_serialized`] — leaves `self`
+  /// byte-identical to its pre-call state on every recoverable error
+  /// (`set_state` arity/rank failures; the 2-field meta parse —
+  /// `chunk_size` with the `"None"` literal, `start_position`). All
+  /// fallible work runs on a fresh placeholder `ChunkedKvCache::new(None)`
+  /// (the exact placeholder the existing [`super::from_state`] dispatch
+  /// uses); `self` is committed by a single infallible move only after
+  /// both setters succeed. The default trait impl would mutate
+  /// `self.keys`/`self.values`/`self.offset` via `set_state` first and a
+  /// later meta-parse failure would leave the cache half-restored.
+  fn from_serialized(&mut self, state: Vec<Array>, meta: &[String]) -> Result<()> {
+    let mut staged = ChunkedKvCache::new(None);
+    staged.set_state(state)?;
+    staged.set_meta_state(meta)?;
+    *self = staged;
+    Ok(())
+  }
 }

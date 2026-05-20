@@ -715,4 +715,39 @@ impl KvCache for RotatingKvCache {
   fn reference_class_name(&self) -> &'static str {
     "RotatingKVCache"
   }
+
+  /// Transactional override of [`KvCache::from_serialized`] — leaves `self`
+  /// byte-identical to its pre-call state on every recoverable error
+  /// (`set_state` rank failures, `set_meta_state` parse failures). All
+  /// fallible work (rank validation in `set_state`; the 4-field meta parse
+  /// in `set_meta_state` — `keep`, `max_size`, `offset`, `idx`) runs on a
+  /// fresh placeholder `RotatingKvCache::new(0, 0)` (the exact placeholder
+  /// the existing [`super::from_state`] dispatch uses), and `self` is
+  /// committed by a single infallible move only after both succeed. The
+  /// default trait impl would mutate `self.keys`/`self.values` via
+  /// `set_state` first and could then leave them assigned while a malformed
+  /// meta drops `offset`/`idx` to inconsistent values; this override closes
+  /// that window.
+  fn from_serialized(&mut self, state: Vec<Array>, meta: &[String]) -> Result<()> {
+    let mut staged = RotatingKvCache::new(0, 0);
+    staged.set_state(state)?;
+    staged.set_meta_state(meta)?;
+    // Post-setter invariant guard — must match `super::from_state`'s
+    // dispatcher arm (`cache/mod.rs:453`). The setters individually stay
+    // 1:1 with `mlx_lm/models/cache.py:527-540` (no validation), but
+    // `set_state(Vec::new())` accepts an empty state and `set_meta_state`
+    // can then restore non-zero `offset`/`idx` after it — an impossible
+    // combination from a real round-trip (`keys=None ⇒ offset==idx==0`)
+    // that would let the next `update` treat the bogus `offset` as `prev`
+    // and surface placeholder zeros as "prior context". Reject the
+    // forged combination here so the new `from_serialized` public API
+    // is observably identical to the canonical `from_state` loader.
+    if staged.is_empty() && (staged.offset() != 0 || staged.idx() != 0) {
+      return Err(Error::Backend {
+        message: "RotatingKvCache: empty state with non-zero offset/idx is invalid".into(),
+      });
+    }
+    *self = staged;
+    Ok(())
+  }
 }

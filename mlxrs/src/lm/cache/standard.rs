@@ -208,4 +208,25 @@ impl KvCache for StandardKvCache {
   fn reference_class_name(&self) -> &'static str {
     "KVCache"
   }
+
+  /// Transactional override of [`KvCache::from_serialized`] — leaves
+  /// `self` byte-identical to its pre-call state on every recoverable
+  /// error. `StandardKvCache` has no meta (`meta_state() -> []` by
+  /// default), so a caller passing non-empty `meta` here triggers the
+  /// trait default `set_meta_state`'s rejection (mirrors mlx-lm
+  /// `_BaseCache.meta_state` setter, `cache.py:142-145`). Without this
+  /// override the default impl would call `set_state(state)?` first —
+  /// mutating `self.keys`/`self.values`/`self.offset` to the new state —
+  /// THEN error in `set_meta_state(meta)?`, leaving the cache holding
+  /// the rejected serialized state. Stage on a fresh placeholder and
+  /// commit only on success so the rollback contract holds for the
+  /// most common cache kind too.
+  #[allow(clippy::wrong_self_convention)] // see KvCache::from_serialized
+  fn from_serialized(&mut self, state: Vec<Array>, meta: &[String]) -> Result<()> {
+    let mut staged = StandardKvCache::new();
+    staged.set_state(state)?;
+    staged.set_meta_state(meta)?;
+    *self = staged;
+    Ok(())
+  }
 }
