@@ -188,9 +188,10 @@ pub fn load_wav(path: &Path) -> Result<(Vec<f32>, u32)> {
     })?;
 
   // Decode loop. End-of-stream is signalled by `Ok(None)` from
-  // `next_packet`. Decode-side IoError/DecodeError are skipped (per
-  // symphonia GETTING_STARTED.md guidance) rather than aborting the whole
-  // read — a damaged single packet shouldn't drop the whole file.
+  // `next_packet`. Some symphonia format readers surface end-of-stream
+  // as `UnexpectedEof` instead, and that case is also treated as a clean
+  // EOF. All other packet/decode errors are reported to the caller
+  // rather than being skipped.
   loop {
     let packet = match format.next_packet() {
       Ok(Some(p)) => p,
