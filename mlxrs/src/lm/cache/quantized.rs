@@ -783,6 +783,14 @@ impl KvCache for QuantizedKvCacheImpl {
   fn as_quantized_mut(&mut self) -> Option<&mut dyn QuantizedKvCache> {
     Some(self)
   }
+
+  /// `"QuantizedKVCache"` — mlx-lm's `type(QuantizedKVCache).__name__`
+  /// (`cache.py:56`) / mlx-swift-lm
+  /// `case is QuantizedKVCache: return "QuantizedKVCache"`
+  /// (`KVCache.swift:1387`).
+  fn reference_class_name(&self) -> &'static str {
+    "QuantizedKVCache"
+  }
 }
 
 impl QuantizedKvCache for QuantizedKvCacheImpl {
