@@ -1834,18 +1834,29 @@ const MAX_LOUDNESS_SAMPLES: usize = crate::audio::io::MAX_DECODED_SAMPLES;
 const MAX_LOUDNESS_BLOCK_BYTES: usize = 64 * 1024 * 1024;
 /// Hard ceiling on the **total sample-visit work** [`integrated_loudness`]
 /// performs across the per-block mean-square loop: `num_blocks *
-/// block_size_samples <= MAX_LOUDNESS_WORK`. Even when the byte cap above
-/// admits a moderate `num_blocks`, a near-1 overlap combined with a
-/// SMALL block size still drives the per-block CPU sum work to the
-/// trillions of sample-visits — each block re-sums `block_size_samples`
-/// weighted samples, so the visit count is `num_blocks *
-/// block_size_samples` regardless of the matrix byte footprint. Cap the
-/// total visit count at 256 Mi (`block_size = 0.4 s` at 48 kHz =
-/// `19,200 samples/block`, so a default-overlap 256 Mi-visit budget
-/// admits ~13,653 blocks ≈ 91 hours of audio — comfortable for any
-/// realistic loudness analysis, but rejects multi-trillion-visit
-/// pathological cases in microseconds). Pathological work returns a
-/// recoverable [`Error::Backend`] BEFORE the per-block loop.
+/// ceil(block_size_samples) * n_channels <= MAX_LOUDNESS_WORK`. Even
+/// when the byte cap above admits a moderate `num_blocks`, a near-1
+/// overlap combined with a SMALL block size still drives the per-block
+/// CPU sum work to the trillions of sample-visits — each block re-sums
+/// `ceil(block_size_samples)` weighted samples, and the per-block sum
+/// loop runs ONCE PER CHANNEL (the streaming K-weighting loop iterates
+/// `n_channels` times), so the actual visit count is `num_blocks *
+/// ceil(block_size_samples) * n_channels` regardless of the matrix byte
+/// footprint. A prior revision omitted the `n_channels` factor and
+/// admitted a 5-channel pathological case (Codex review:
+/// `num_blocks=1_677_721, block_samples=160, n_channels=5` — channel-less
+/// product `~268 Mi <= 256 Mi cap` BUT actual visits `~1.34 Bi`); the
+/// fix folds `n_channels` into the work product. `ceil` is used because
+/// the per-block bounds `(floor(bi*step*bs*r), floor((bi*step+1)*bs*r))`
+/// can give `upper - lower = ceil(block_size_samples)` in the worst
+/// case for fractional `block_size_samples`. Cap the total visit count
+/// at 256 Mi (`block_size = 0.4 s` at 48 kHz = `19,200 samples/block`,
+/// so a default-overlap 256 Mi-visit budget admits ~13,653 blocks for
+/// mono ≈ 91 hours of audio, or ~2,730 5-channel blocks ≈ 18 hours of
+/// 5-channel audio — comfortable for any realistic loudness analysis,
+/// but rejects multi-trillion-visit pathological cases in microseconds).
+/// Pathological work returns a recoverable [`Error::Backend`] BEFORE
+/// the per-block loop.
 const MAX_LOUDNESS_WORK: usize = 256 * 1024 * 1024;
 
 /// Per-channel BS.1770 weighting gains for up to 5 channels: front L/R/C =
@@ -2379,14 +2390,15 @@ fn k_weight_channel(channel: &[f32], rate: u32) -> Result<Vec<f64>> {
 ///     `(MAX_DECODED_SAMPLES, 5)` can't bypass it),
 ///   - the per-channel `f64` mean-square matrix would exceed the
 ///     `MAX_LOUDNESS_BLOCK_BYTES` byte cap (64 MiB), OR the total
-///     per-block sum work `num_blocks * block_size_samples` exceeds the
-///     `MAX_LOUDNESS_WORK` sample-visit cap (256 Mi) — together these
-///     reject pathological overlaps very close to 1 BEFORE any
-///     `num_blocks`-scaled allocation OR the per-block loop runs (the
-///     byte cap dominates for normal block sizes; the visit cap catches
-///     near-1 overlaps with small block sizes that fit under the byte
-///     cap but multiply the per-block CPU sum work to multi-trillion
-///     visits),
+///     per-block sum work `num_blocks * ceil(block_size_samples) *
+///     n_channels` exceeds the `MAX_LOUDNESS_WORK` sample-visit cap
+///     (256 Mi) — together these reject pathological overlaps very
+///     close to 1 BEFORE any `num_blocks`-scaled allocation OR the
+///     per-block loop runs (the byte cap dominates for normal block
+///     sizes; the visit cap catches near-1 overlaps with small block
+///     sizes that fit under the byte cap but multiply the per-block CPU
+///     sum work — once per channel, since the per-block loop runs once
+///     per channel — to multi-trillion visits),
 ///   - the number of blocks overflows `usize`,
 ///   - any size exceeds `i32::MAX`.
 ///
@@ -2591,14 +2603,26 @@ pub fn integrated_loudness(data: &Array, rate: u32, block_size: f64, overlap: f6
       ),
     });
   }
-  // Work cap: `num_blocks * block_size_samples <= MAX_LOUDNESS_WORK`.
+  // Work cap: `num_blocks * block_size_samples * n_channels <=
+  // MAX_LOUDNESS_WORK`. The per-block mean-square loop runs ONCE PER
+  // CHANNEL (see the per-channel streaming loop below), so the actual
+  // sample-visit count is `num_blocks * block_size_samples * n_channels`
+  // — bounding the channel-less product alone admitted a 5-channel input
+  // (Codex review: `num_blocks=1_677_721, block_samples=160, n_channels=5`
+  // gives a channel-less work product of ~268 Mi ≤ 256 Mi cap BUT actual
+  // visits ~1.34 Bi, defeating the bound for adversarial overlap × multi-
+  // channel). Include `n_channels` in the work product.
+  //
   // `block_samples_f64` was already validated finite + >= 1 + <= n_samples
   // (the audio-length-vs-block-size check above), so it fits in `usize`
-  // for any `n_samples` we accept (bounded by `MAX_LOUDNESS_SAMPLES`).
-  // The `as usize` cast is exact here (block_samples_f64 came from
-  // `block_size * rate` with both finite + positive); `checked_mul`
-  // against `num_blocks` then rejects overflow up-front.
-  let block_samples_usize: usize = block_samples_f64 as usize;
+  // for any `n_samples` we accept (bounded by `MAX_LOUDNESS_SAMPLES`). We
+  // use `ceil` here — the per-block bounds (`lower = floor(bi*step*bs*r)`,
+  // `upper = floor((bi*step+1)*bs*r)`) can produce `upper - lower =
+  // ceil(block_samples_f64)` in the worst case for fractional
+  // `block_samples_f64`, so the conservative bound on actual slice visits
+  // uses `ceil`. `checked_mul` against `num_blocks` and `n_channels`
+  // then rejects overflow up-front.
+  let block_samples_usize: usize = block_samples_f64.ceil() as usize;
   let total_work = num_blocks
     .checked_mul(block_samples_usize)
     .ok_or_else(|| Error::Backend {
@@ -2606,13 +2630,20 @@ pub fn integrated_loudness(data: &Array, rate: u32, block_size: f64, overlap: f6
         "integrated_loudness: total work {num_blocks} * {block_samples_usize} overflows \
          usize (overlap={overlap})"
       ),
+    })?
+    .checked_mul(n_channels)
+    .ok_or_else(|| Error::Backend {
+      message: format!(
+        "integrated_loudness: total work {num_blocks} * {block_samples_usize} * \
+         {n_channels} overflows usize (overlap={overlap})"
+      ),
     })?;
   if total_work > MAX_LOUDNESS_WORK {
     return Err(Error::Backend {
       message: format!(
         "integrated_loudness: total sample-visit work {total_work} (num_blocks={num_blocks} \
-         * block_samples={block_samples_usize}) exceeds the {MAX_LOUDNESS_WORK} cap \
-         (overlap={overlap})"
+         * block_samples={block_samples_usize} * n_channels={n_channels}) exceeds the \
+         {MAX_LOUDNESS_WORK} cap (overlap={overlap})"
       ),
     });
   }
@@ -4153,6 +4184,71 @@ mod tests {
       matches!(res, Err(Error::Backend { .. })),
       "overlap=0.99999990 (under old elements-only cap; over new byte/work \
        caps) must be rejected BEFORE allocation (got {res:?})"
+    );
+  }
+
+  /// Regression: the work cap MUST include `n_channels` (Codex review).
+  /// The per-block mean-square sum loop runs ONCE PER CHANNEL (the
+  /// per-channel streaming K-weighting loop), so the actual sample-visit
+  /// count is `num_blocks * block_samples * n_channels`. A prior revision
+  /// bounded the channel-less product alone, so a 5-channel pathological
+  /// case slipped through: `num_blocks ≈ 500_000, block_samples = 160,
+  /// n_channels = 5` gives a channel-less product of `8e7 < 256 Mi cap`
+  /// (would PASS the broken bound) BUT actual visits of `4e8 > 256 Mi`
+  /// (FAILS the corrected bound).
+  ///
+  /// We pick `rate = 16 kHz, block_size = 0.01 s` (⇒ `block_samples =
+  /// 160`), `n_samples = 161` (just over the block size so the
+  /// audio-length check passes), and an `overlap ≈ 1 - 1.25e-8` to land
+  /// `num_blocks ≈ 500_000` — comfortably under the byte cap
+  /// (`500_000 * 5 * 8 ≈ 19 MiB << 64 MiB`) so byte cap headroom is
+  /// not the rejecting cap; the rejection MUST come from the
+  /// n_channels-aware work cap. The byte and total-elements caps both
+  /// have wide headroom here (total elements = `161 * 5 = 805 << 64 Mi`).
+  ///
+  /// Asserts `Err`: pre-fix this would silently allow ~400 M sample-
+  /// visits across the per-block × per-channel loops (a multi-second
+  /// CPU spike on a small input); post-fix the work cap fires up-front
+  /// in microseconds.
+  #[test]
+  fn integrated_loudness_rejects_work_cap_only_when_n_channels_counted() {
+    let rate = 16_000u32;
+    let n_samples = 161usize;
+    let n_channels = 5usize;
+    // Interleaved 5-channel buffer of zeros — value doesn't matter,
+    // the cap fires BEFORE the per-block loop reads any samples.
+    let buf = vec![0.0_f32; n_samples * n_channels];
+    let x = Array::from_slice::<f32>(&buf, &[n_samples as i32, n_channels as i32]).unwrap();
+    // overlap chosen so num_blocks ≈ 500_000:
+    //   step = 1 - overlap = 1.25e-8
+    //   num_blocks = round((duration - bs) / (bs * step)) + 1
+    //              = round(6.25e-5 / (0.01 * 1.25e-8)) + 1
+    //              ≈ round(500_000) + 1 ≈ 500_001
+    //
+    // Channel-less work product (broken bound):
+    //   500_001 * 160 ≈ 8.0e7 < MAX_LOUDNESS_WORK (256 Mi ≈ 2.68e8) → PASSES (defect)
+    // n_channels-aware work product (corrected bound):
+    //   500_001 * 160 * 5 ≈ 4.0e8 > MAX_LOUDNESS_WORK              → REJECTS (fix)
+    // Byte cap (independent, must NOT be the rejecting cap):
+    //   500_001 * 5 * 8 ≈ 20 MB << MAX_LOUDNESS_BLOCK_BYTES (64 MiB) → PASSES
+    let res = integrated_loudness(&x, rate, 0.01, 0.999_999_987_5);
+    assert!(
+      matches!(res, Err(Error::Backend { .. })),
+      "5-channel input with num_blocks * block_samples just under the cap \
+       but num_blocks * block_samples * n_channels above must be REJECTED \
+       by the n_channels-aware work cap (got {res:?})"
+    );
+    // Verify the rejection actually comes from the WORK cap (not the
+    // byte cap and not the total-elements cap), so a future refactor that
+    // accidentally weakens the work cap surfaces here rather than passing
+    // because some other cap caught the case.
+    let msg = match res {
+      Err(Error::Backend { message }) => message,
+      _ => unreachable!(),
+    };
+    assert!(
+      msg.contains("total sample-visit work") && msg.contains("n_channels=5"),
+      "rejection must come from the n_channels-aware work cap (got: {msg})"
     );
   }
 
