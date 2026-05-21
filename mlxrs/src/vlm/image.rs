@@ -318,22 +318,27 @@ impl Default for ImageProcessorConfig {
 /// [`preprocess`]. Oversized images are rejected with
 /// [`Error::Backend`] (the underlying `image::ImageError::Limits`).
 ///
-/// **EXIF rotate gate (Codex round-5 finding).** The EXIF orientation
-/// step is routed through the private `apply_orientation_fallible`
-/// helper. The decoder-side `set_limits` cap above does NOT protect
-/// the rotate variants (`Rotate90` / `Rotate270` / `Rotate90FlipH` /
-/// `Rotate270FlipH`) which each need a NEW source-sized buffer —
-/// the decoder has already been consumed by `from_decoder` at that
-/// point. The fallible helper allocates that buffer directly via
-/// `Vec::try_reserve_exact` and performs a manual rotation into it
-/// for u8 pixel variants (Luma8 / LumaA8 / Rgb8 / Rgba8 — the only
-/// variants PNG and JPEG decoders emit). Allocator failure surfaces
-/// as [`Error::OutOfMemory`] before the pixel-copy loop runs — no
-/// second alloc, no race between probe and rotate. In-place variants
-/// (`NoTransforms` / `FlipHorizontal` / `FlipVertical` / `Rotate180`)
-/// pass through unchanged with zero allocation. See the helper's doc
-/// for the full rationale and the module-level audit table for the
-/// per-variant bounded-memory vs recoverable-OOM contract.
+/// **EXIF rotate gate (Codex rounds 5–6).** The EXIF orientation step
+/// is routed through the private `apply_orientation_fallible` helper.
+/// The decoder-side `set_limits` cap above does NOT protect the rotate
+/// variants (`Rotate90` / `Rotate270` / `Rotate90FlipH` /
+/// `Rotate270FlipH`) which each need a NEW source-sized buffer — the
+/// decoder has already been consumed by `from_decoder` at that point.
+/// The fallible helper allocates that buffer directly via
+/// `Vec::try_reserve_exact` and performs a manual rotation into it via
+/// the generic `rotate_buf<T: Copy + Default>` helper, which covers
+/// every `image` 0.25 pixel variant: u8 (`Luma8` / `LumaA8` / `Rgb8` /
+/// `Rgba8`), u16 (`Luma16` / `LumaA16` / `Rgb16` / `Rgba16` — image-rs
+/// 0.25's PNG decoder emits these for 16-bit-per-channel PNGs per
+/// `codecs/png.rs:64-71`, and PNG decoders expose EXIF orientation
+/// via `ImageDecoder::orientation`), and f32 (`Rgb32F` / `Rgba32F`).
+/// Allocator failure surfaces as [`Error::OutOfMemory`] before the
+/// pixel-copy loop runs — no probe-then-delegate race, no infallible
+/// `apply_orientation` fallback. In-place variants (`NoTransforms` /
+/// `FlipHorizontal` / `FlipVertical` / `Rotate180`) pass through with
+/// zero allocation. See the helper's doc for the full rationale and
+/// the module-level audit table for the per-variant bounded-memory vs
+/// recoverable-OOM contract.
 pub fn load_image(path: &std::path::Path) -> Result<::image::DynamicImage> {
   // `ImageDecoder` is the trait that provides `.orientation()`; pull it
   // into local scope so the method resolves on the opaque decoder type
