@@ -74,30 +74,34 @@ fn base_pair_freqs(base: f64, dims: i32, half: usize) -> Vec<f64> {
 /// shape `[half]` — the per-dimension inverse-frequency array `mlx_fast_rope`
 /// consumes (mlx-lm stores `self._freqs` as `mx.float32`).
 ///
-/// The host-side `freqs` are checked for **strict positive finiteness** *before*
-/// the `f32` store: every scaled-RoPE formula divides and takes `ln`s of
-/// config-derived terms, so a poisoned input or an arithmetic edge (e.g. a zero
-/// blend denominator) can yield a NaN/±Inf element. *And* `mlx_fast_rope`
-/// itself computes `1 / freqs[i]` from this array at apply time, so a `0.0`
-/// element silently becomes `+Inf` inside the kernel and a *negative* element
-/// reverses the rotation direction — both equally catastrophic. The gate
-/// therefore rejects any non-finite OR non-positive value as the catch-all for
-/// the per-dimension frequencies (closing zero, negative, and NaN/Inf in one
-/// check). The check is on the narrowed `f32` value: a non-finite `f64` source
-/// stays non-finite after the cast, a finite `f64` that overflows the `f32`
-/// range (`±Inf` only after narrowing) is caught too, and a positive `f64`
-/// underflowing to `0.0` in `f32` is also caught. The original `f64` is
-/// reported in the message for diagnosis.
+/// The host-side `freqs` are checked for **strict positive finiteness with a
+/// finite reciprocal** *before* the `f32` store: every scaled-RoPE formula
+/// divides and takes `ln`s of config-derived terms, so a poisoned input or an
+/// arithmetic edge (e.g. a zero blend denominator) can yield a NaN/±Inf
+/// element. *And* `mlx_fast_rope` itself computes `1 / freqs[i]` from this
+/// array at apply time, so a `0.0` element silently becomes `+Inf` inside the
+/// kernel, a *negative* element reverses the rotation direction, and a
+/// positive *subnormal* (e.g. `f32::from_bits(1)` ≈ 1.4e-45) — though finite
+/// and `> 0` — has a reciprocal `~7e44` that overflows `f32` to `+Inf` at
+/// `1/freqs` too. The gate therefore rejects any value that is non-finite,
+/// non-positive, *or* whose `1.0 / f` is not finite — the catch-all for the
+/// per-dimension frequencies in one check. The check is on the narrowed `f32`
+/// value: a non-finite `f64` source stays non-finite after the cast, a finite
+/// `f64` that overflows the `f32` range (`±Inf` only after narrowing) is
+/// caught too, and a positive `f64` underflowing to `0.0` (or to a subnormal
+/// that overflows on reciprocal) in `f32` is also caught. The original `f64`
+/// is reported in the message for diagnosis.
 fn freqs_array(freqs: &[f64]) -> Result<Array> {
   let mut buf: Vec<f32> = Vec::with_capacity(freqs.len());
   for &v in freqs {
     let f = v as f32;
-    if !f.is_finite() || f <= 0.0 {
+    if !f.is_finite() || f <= 0.0 || !(1.0f32 / f).is_finite() {
       return Err(Error::ShapeMismatch {
         message: format!(
-          "scaled RoPE computed a non-positive or non-finite freq ({v}); check the scaling \
-           config (base / factor / embeddings / betas) — freqs are inverted as 1/freqs by \
-           mlx_fast_rope, so a zero element would become +Inf at apply time"
+          "scaled RoPE computed a freq ({v}) that is non-positive, non-finite, or whose \
+           reciprocal 1/f overflows f32; check the scaling config (base / factor / embeddings \
+           / betas) — freqs are inverted as 1/freqs by mlx_fast_rope, so a zero / subnormal \
+           element would become +Inf at apply time"
         ),
       });
     }
@@ -1112,6 +1116,27 @@ mod tests {
     assert!(
       SuScaledRope::new(8, -10000.0, 16384, 4096, &[1.0; 4], None).is_err(),
       "negative base must be rejected"
+    );
+  }
+
+  #[test]
+  fn su_scaled_rejects_subnormal_long_factor_with_inf_reciprocal() {
+    // A positive *subnormal* long_factor entry (e.g. `f32::from_bits(1)` ≈
+    // 1.4e-45) passes `f > 0` and `f.is_finite()` but its reciprocal
+    // `1/f ≈ 7e44` overflows `f32` to `+Inf`. Since `mlx_fast_rope` computes
+    // `1/freqs[i]` at apply time, the constructor must reject before any
+    // `apply()` Inf can occur.
+    assert!(
+      SuScaledRope::new(
+        2,
+        DEFAULT_BASE,
+        16384,
+        4096,
+        &[f32::from_bits(1)],
+        Some(1.0)
+      )
+      .is_err(),
+      "subnormal long_factor entry (1/f overflows) must be rejected at construction"
     );
   }
 
