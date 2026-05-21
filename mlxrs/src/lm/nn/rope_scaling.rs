@@ -106,7 +106,13 @@ fn scale_leading_dims(x: &Array, dims: i32, mscale: f32) -> Result<Array> {
   // inputs to f32 (mirrors the references' in-place-into-`x` store).
   let scalar = Array::from_slice::<f32>(&[mscale], &(1usize,))?.astype(x.dtype()?)?;
   let last = ndim - 1;
-  let head_dim = x.shape()[last] as i32;
+  // `shape()` is `usize`; `dims` and the split index below are `i32`, so a
+  // `head_dim` past `i32::MAX` would silently wrap with `as`. Convert checked
+  // and surface a recoverable error instead.
+  let head_dim_usize = x.shape()[last];
+  let head_dim = i32::try_from(head_dim_usize).map_err(|_| Error::ShapeMismatch {
+    message: format!("scaled RoPE head_dim {head_dim_usize} exceeds i32::MAX"),
+  })?;
   if head_dim == dims {
     // Whole last axis is rotated: scale x directly (scalar broadcasts).
     return x.multiply(&scalar);
@@ -319,16 +325,35 @@ impl SuScaledRope {
       .collect();
     let freqs = freqs_array(&freqs)?;
 
-    let scale = long_mscale.unwrap_or_else(|| {
-      // factor = max_pos / orig_max; scale = 1 if factor <= 1 else default.
-      let factor = f64::from(max_position_embeddings) / f64::from(original_max_position_embeddings);
-      if factor <= 1.0 {
-        1.0
-      } else {
-        // sqrt(1 + ln(factor) / ln(orig_max))
-        (1.0 + factor.ln() / f64::from(original_max_position_embeddings).ln()).sqrt() as f32
+    let scale = match long_mscale {
+      // An explicit override skips the derived formula entirely (the embeddings
+      // values are then unused), so accept it verbatim.
+      Some(mscale) => mscale,
+      None => {
+        // The derived scale divides by, and takes `ln()` of,
+        // `original_max_position_embeddings`, and divides `max_position_embeddings`
+        // by it; a non-positive value would yield a NaN/Inf scale that silently
+        // propagates. Reject it before computing the factor.
+        if original_max_position_embeddings <= 0 || max_position_embeddings <= 0 {
+          return Err(Error::ShapeMismatch {
+            message: format!(
+              "SuScaledRoPE max_position_embeddings ({max_position_embeddings}) and \
+               original_max_position_embeddings ({original_max_position_embeddings}) must be \
+               positive to derive the input scale"
+            ),
+          });
+        }
+        // factor = max_pos / orig_max; scale = 1 if factor <= 1 else default.
+        let factor =
+          f64::from(max_position_embeddings) / f64::from(original_max_position_embeddings);
+        if factor <= 1.0 {
+          1.0
+        } else {
+          // sqrt(1 + ln(factor) / ln(orig_max))
+          (1.0 + factor.ln() / f64::from(original_max_position_embeddings).ln()).sqrt() as f32
+        }
       }
-    });
+    };
 
     Ok(Self { dims, scale, freqs })
   }
@@ -349,6 +374,14 @@ impl SuScaledRope {
   /// Apply dispatching on a [`RopeOffsetRef`] — the per-sequence-offset
   /// counterpart of [`apply`](SuScaledRope::apply).
   pub fn apply_with_offset(&self, x: &Array, offset: RopeOffsetRef<'_>) -> Result<Array> {
+    // Skip the leading-dims rescale when the scale is exactly 1.0 (e.g.
+    // `max_position_embeddings <= original_max_position_embeddings`, or a
+    // `long_mscale` of 1) — the multiply/concat is then a no-op. `self.scale`
+    // is a stored field (no rounding at this point), so an exact `== 1.0` is
+    // safe; mirrors the optimization YaRN already applies.
+    if self.scale == 1.0 {
+      return rope_with_freqs_offset(x, self.dims, false, 1.0, offset, &self.freqs);
+    }
     let scaled = scale_leading_dims(x, self.dims, self.scale)?;
     rope_with_freqs_offset(&scaled, self.dims, false, 1.0, offset, &self.freqs)
   }
@@ -358,9 +391,10 @@ impl SuScaledRope {
 /// swift `YarnRoPE`.
 ///
 /// YaRN blends the un-extended *extrapolation* frequencies with the linearly
-/// *interpolated* (`/ scaling_factor`) frequencies through a per-dimension ramp
-/// derived from a wavelength-based "correction range", and applies a scalar
-/// mscale to the input. See the [YaRN paper](https://arxiv.org/abs/2309.00071).
+/// *interpolated* (`scaling_factor * base_freqs`) frequencies through a
+/// per-dimension ramp derived from a wavelength-based "correction range", and
+/// applies a scalar mscale to the input. See the
+/// [YaRN paper](https://arxiv.org/abs/2309.00071).
 #[derive(Debug)]
 pub struct YarnRope {
   dims: i32,
@@ -417,6 +451,35 @@ impl YarnRope {
     let dims_f = f64::from(dims);
     let scaling_factor = f64::from(config.scaling_factor);
     let orig_max = f64::from(config.original_max_position_embeddings);
+
+    // `find_correction_dim` divides by `2 * ln(base)` and takes
+    // `ln(orig_max / (num_rotations * 2π))`. Reject the inputs that make those
+    // produce NaN/Inf (which would silently propagate into `low`/`high`, the
+    // ramp, and the `freqs`): `base <= 1` (zero/negative `ln(base)`),
+    // `original_max_position_embeddings <= 0` (NaN `ln`), and a non-positive
+    // `beta_fast`/`beta_slow` (the `num_rotations` in the inner denominator —
+    // zero gives Inf, negative gives a NaN `ln`).
+    if base <= 1.0 {
+      return Err(Error::ShapeMismatch {
+        message: format!("YarnRoPE base must be > 1 to derive correction dims, got {base}"),
+      });
+    }
+    if config.original_max_position_embeddings <= 0 {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "YarnRoPE original_max_position_embeddings must be positive, got {}",
+          config.original_max_position_embeddings
+        ),
+      });
+    }
+    if config.beta_fast <= 0.0 || config.beta_slow <= 0.0 {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "YarnRoPE beta_fast ({}) and beta_slow ({}) must be positive",
+          config.beta_fast, config.beta_slow
+        ),
+      });
+    }
 
     // yarn_find_correction_dim(num_rotations)
     let find_correction_dim = |num_rotations: f64| {
@@ -708,6 +771,78 @@ mod tests {
     );
   }
 
+  #[test]
+  fn su_scaled_rejects_nonpositive_embeddings_in_derived_scale() {
+    // The derived (`long_mscale = None`) scale takes `ln(orig_max)` and divides
+    // by it; non-positive embeddings would yield a NaN/Inf scale. The ctor must
+    // reject them up front rather than store a poisoned scale.
+    assert!(SuScaledRope::new(8, DEFAULT_BASE, 16384, 0, &[1.0; 4], None).is_err());
+    assert!(SuScaledRope::new(8, DEFAULT_BASE, 16384, -4096, &[1.0; 4], None).is_err());
+    assert!(SuScaledRope::new(8, DEFAULT_BASE, 0, 4096, &[1.0; 4], None).is_err());
+    assert!(SuScaledRope::new(8, DEFAULT_BASE, -1, 4096, &[1.0; 4], None).is_err());
+    // No accepted ctor here can carry a NaN scale: success implies a finite one.
+  }
+
+  #[test]
+  fn su_scaled_override_skips_embeddings_validation() {
+    // An explicit `long_mscale` bypasses the derived formula, so the embeddings
+    // values are unused — a zero `original_max_position_embeddings` is then fine.
+    let r = SuScaledRope::new(8, DEFAULT_BASE, 0, 0, &[1.0; 4], Some(1.5)).unwrap();
+    assert_eq!(r.scale(), 1.5);
+  }
+
+  #[test]
+  fn su_scaled_scale_one_skip_path_matches_plain_freqs() {
+    // factor = max_pos/orig_max <= 1 ⇒ scale == 1.0 ⇒ apply must skip the
+    // leading-dims rescale and equal a bare freqs-rope (the YaRN-style skip).
+    let long_factor = [1.0f32, 2.0, 3.0, 4.0];
+    let r = SuScaledRope::new(8, DEFAULT_BASE, 4096, 4096, &long_factor, None).unwrap();
+    assert_eq!(r.scale(), 1.0);
+
+    let x = input(8);
+    let freqs = {
+      let base = base_pair_freqs(f64::from(DEFAULT_BASE), 8, 4);
+      let v: Vec<f64> = base
+        .into_iter()
+        .zip(long_factor)
+        .map(|(f, lf)| f64::from(lf) * f)
+        .collect();
+      freqs_array(&v).unwrap()
+    };
+    let mut via_apply = r.apply(&x, 5).unwrap();
+    let mut via_freqs = rope_with_freqs(&x, 8, false, 1.0, 5, &freqs).unwrap();
+    assert_close(
+      &via_apply.to_vec::<f32>().unwrap(),
+      &via_freqs.to_vec::<f32>().unwrap(),
+    );
+  }
+
+  #[test]
+  fn su_scaled_scale_one_override_skip_path() {
+    // A `long_mscale = Some(1.0)` also drives scale == 1.0; the skip path must
+    // still produce the correct (unscaled) rope output.
+    let long_factor = [1.0f32, 2.0, 3.0, 4.0];
+    let r = SuScaledRope::new(8, DEFAULT_BASE, 131072, 4096, &long_factor, Some(1.0)).unwrap();
+    assert_eq!(r.scale(), 1.0);
+
+    let x = input(8);
+    let freqs = {
+      let base = base_pair_freqs(f64::from(DEFAULT_BASE), 8, 4);
+      let v: Vec<f64> = base
+        .into_iter()
+        .zip(long_factor)
+        .map(|(f, lf)| f64::from(lf) * f)
+        .collect();
+      freqs_array(&v).unwrap()
+    };
+    let mut via_apply = r.apply(&x, 2).unwrap();
+    let mut via_freqs = rope_with_freqs(&x, 8, false, 1.0, 2, &freqs).unwrap();
+    assert_close(
+      &via_apply.to_vec::<f32>().unwrap(),
+      &via_freqs.to_vec::<f32>().unwrap(),
+    );
+  }
+
   // ───────── YaRN ─────────
 
   /// Hand-traced YaRN freqs. dims=8, base=10000, scaling_factor=4,
@@ -840,7 +975,58 @@ mod tests {
     );
   }
 
+  #[test]
+  fn yarn_rejects_base_le_one() {
+    // `find_correction_dim` divides by `2 * ln(base)`; base <= 1 makes that
+    // zero/negative (Inf/NaN correction dims). base = 1 ⇒ ln = 0 ⇒ div-by-zero.
+    let cfg = YarnConfig::new(4.0);
+    assert!(YarnRope::new(8, 1.0, false, cfg).is_err());
+    assert!(YarnRope::new(8, 0.0, false, cfg).is_err());
+    assert!(YarnRope::new(8, -10.0, false, cfg).is_err());
+  }
+
+  #[test]
+  fn yarn_rejects_nonpositive_orig_max() {
+    // `ln(orig_max / ...)` is NaN/Inf for a non-positive orig_max.
+    let mut cfg = YarnConfig::new(4.0);
+    cfg.original_max_position_embeddings = 0;
+    assert!(YarnRope::new(8, DEFAULT_BASE, false, cfg).is_err());
+    cfg.original_max_position_embeddings = -4096;
+    assert!(YarnRope::new(8, DEFAULT_BASE, false, cfg).is_err());
+  }
+
+  #[test]
+  fn yarn_rejects_nonpositive_betas() {
+    // betas are the `num_rotations` in the inner denominator: zero ⇒ Inf, a
+    // negative ⇒ a NaN `ln`. Both poison `low`/`high` and the freqs.
+    let mut cfg = YarnConfig::new(4.0);
+    cfg.beta_fast = 0.0;
+    assert!(YarnRope::new(8, DEFAULT_BASE, false, cfg).is_err());
+    let mut cfg = YarnConfig::new(4.0);
+    cfg.beta_slow = -1.0;
+    assert!(YarnRope::new(8, DEFAULT_BASE, false, cfg).is_err());
+  }
+
+  #[test]
+  fn yarn_valid_inputs_yield_finite_freqs_and_mscale() {
+    // A well-formed config must produce a finite mscale and finite freqs (the
+    // positive-control complement of the rejection tests above).
+    let cfg = YarnConfig::new(4.0);
+    let r = YarnRope::new(8, DEFAULT_BASE, false, cfg).unwrap();
+    assert!(r.mscale().is_finite());
+    let mut freqs = r.freqs.try_clone().unwrap();
+    for v in freqs.to_vec::<f32>().unwrap() {
+      assert!(v.is_finite(), "non-finite freq {v}");
+    }
+  }
+
   // ───────── partial-dims (head_dim > dims) mscale path ─────────
+  //
+  // The checked `head_dim usize -> i32` conversion in `scale_leading_dims`
+  // (`i32::try_from`) is not exercised by a dedicated test: triggering the
+  // overflow arm requires a last-axis dimension past `i32::MAX` (> 2.1e9
+  // elements), which cannot be allocated in a unit test. The `head_dim < dims`
+  // and `head_dim == dims` arms below cover the in-range conversion.
 
   #[test]
   fn scale_leading_dims_partial_keeps_tail() {
