@@ -325,57 +325,78 @@ pub struct LoadedModelContext {
 /// to `registry` on the checkpoint's `model_type`.
 ///
 /// The end-to-end port of `mlx_lm.utils.load` restricted to the local-path,
-/// no-network surface (and mlx-swift-lm's `GenericModelFactory._load`):
+/// no-network surface (and mlx-swift-lm's `GenericModelFactory._load`). The
+/// orchestration order is chosen so the *cheap, recoverable* failures come
+/// first — nothing heavy (weights, tokenizer) is touched until the checkpoint
+/// is known to be loadable:
 ///
 /// 1. Resolve the model directory ([`ModelConfiguration::model_directory`] —
-///    local, no Hub download).
-/// 2. Read `config.json` + discover/merge the weights via
-///    [`crate::lm::load::load`] (which also applies the
-///    `generation_config.json` eos override). The raw `config.json` text is
-///    re-read so the constructor can see model-specific keys outside the typed
-///    [`Config`] subset (mlx-swift-lm passes each model the raw config
-///    `Data`).
-/// 3. If [`tokenizer_source`](ModelConfiguration::tokenizer_source) names a
-///    different directory, rebuild the [`Tokenizer`] from there (with the
-///    same resolved eos set); otherwise reuse the one
-///    [`crate::lm::load::load`] already built from the model directory.
-/// 4. Look the `model_type` up in `registry` (after [`remap_model_type`]) and
-///    invoke the constructor on the [`LoadedModel`] (parsed config + raw JSON
-///    + weights).
+///    local, no Hub download) and read `config.json` **once** via
+///    [`crate::lm::load::load_config`], yielding both the typed [`Config`]
+///    (with the `generation_config.json` eos override applied) and the
+///    verbatim JSON body — the *same bytes* the typed config was parsed from,
+///    so the constructor's typed [`Config`] and raw
+///    [`config_json`](LoadedModel::config_json) can never diverge across two
+///    opens.
+/// 2. **Validate the `model_type` is registered** (after [`remap_model_type`])
+///    *before* loading anything heavy: an unsupported checkpoint is a cheap,
+///    recoverable [`Error::Backend`] here, with no weight/tokenizer I/O —
+///    mlx-lm's `ValueError("Model type … not supported.")` /
+///    mlx-swift-lm's `unsupportedModelType`.
+/// 3. Select the tokenizer directory FIRST
+///    ([`tokenizer_source`](ModelConfiguration::tokenizer_source) if set, else
+///    the model directory — mlx-swift-lm's `tokenizerDirectory`).
+/// 4. Discover and merge the weights from the model directory via
+///    [`crate::lm::load::load_weights`].
+/// 5. Build the [`Tokenizer`] EXACTLY ONCE from the selected directory (with
+///    the eos set resolved on the [`Config`] from step 1).
+/// 6. Construct the model via `registry` on the [`LoadedModel`] (parsed config
+///    + raw JSON + weights) and return it with the tokenizer and config.
 ///
 /// Per-model construction is the registry's job (this PR ships no
-/// architectures); an unknown `model_type` is a recoverable [`Error::Backend`]
-/// (mlx-lm's `ValueError`, mlx-swift-lm's `unsupportedModelType`). No implicit
-/// eval — the weights reach the constructor lazily.
+/// architectures). No implicit eval — the weights reach the constructor lazily.
 pub fn load(
   configuration: &ModelConfiguration,
   registry: &ModelTypeRegistry,
 ) -> Result<LoadedModelContext> {
   let model_dir = configuration.model_directory();
 
-  // Reuse the arch-agnostic loader: config.json (+ generation_config eos
-  // override) + merged weights + tokenizer (built from `model_dir`).
-  let (config, weights, tokenizer_from_model_dir) = load::load(model_dir)?;
+  // (1) Read config.json ONCE: typed Config (+ generation_config eos
+  // override) AND the verbatim JSON body, from the same bytes. The constructor
+  // may need model-specific keys outside the typed subset (mlx-swift-lm hands
+  // each model the raw config `Data`); reading once means they can never come
+  // from two different on-disk versions of the file.
+  let (config, config_json) = load::load_config(model_dir)?;
 
-  // The constructor may need model-specific keys outside the typed `Config`
-  // subset, so re-read the verbatim `config.json` body (mlx-swift-lm hands
-  // each model the raw config `Data`). `load::load` succeeded above, so the
-  // file is present, regular, and within the size cap.
-  let config_json = read_config_json(model_dir)?;
+  // (2) Validate the (remapped) model_type is registered BEFORE loading any
+  // weights or the tokenizer. An unsupported checkpoint — the common case,
+  // since per-model architectures are out of scope and the registry is
+  // normally empty — is a cheap, recoverable error here, never paying for
+  // weight/tokenizer I/O (and never surfacing a weight error in place of the
+  // recoverable unsupported-model one).
+  if !registry.contains(&config.model_type) {
+    return Err(Error::Backend {
+      message: format!(
+        "unsupported model type {:?}: no constructor registered (register one via \
+         ModelTypeRegistry::register)",
+        config.model_type
+      ),
+    });
+  }
 
-  // If the tokenizer lives in a separate local directory, rebuild it there
-  // with the SAME resolved eos set; otherwise reuse the one already built
-  // from the model directory (mlx-swift-lm's `tokenizerDirectory` switch).
-  let tokenizer = match &configuration.tokenizer_source {
-    Some(tok_dir) if tok_dir != model_dir => {
-      let resolved_eos = config.eos_token_id.clone().map(load::EosTokenId::into_ids);
-      Tokenizer::from_path(tok_dir, resolved_eos.as_deref()).map_err(|e| Error::Backend {
-        message: format!("cannot load tokenizer from {}: {e}", tok_dir.display()),
-      })?
-    }
-    _ => tokenizer_from_model_dir,
-  };
+  // (3) Select the tokenizer directory FIRST: the separate `tokenizer_source`
+  // if set (a real split layout where the model dir has NO `tokenizer.json`),
+  // else the model directory (mlx-swift-lm's `tokenizerDirectory`).
+  let tokenizer_dir = configuration.tokenizer_directory();
 
+  // (4) Discover/merge the weights from the model directory.
+  let weights = load::load_weights(model_dir)?;
+
+  // (5) Build the tokenizer EXACTLY ONCE from the selected directory, through
+  // the shared eos-resolution path (the eos set already resolved on `config`).
+  let tokenizer = load::load_tokenizer(tokenizer_dir, &config)?;
+
+  // (6) Construct via the registry (already validated as registered in step 2).
   let loaded = LoadedModel {
     config,
     config_json,
@@ -387,71 +408,6 @@ pub fn load(
     model,
     tokenizer,
     config: loaded.config,
-  })
-}
-
-/// Re-read the verbatim `<dir>/config.json` body, bounded by the same
-/// `MAX_CONFIG_BYTES` cap [`crate::lm::load`] enforces (mirrored here since
-/// the cap is private to that module). Called only **after**
-/// [`crate::lm::load::load`] has already validated the file, so this is the
-/// raw-text companion to that parse, not a fresh trust boundary; any failure
-/// is still a recoverable [`Error::Backend`].
-fn read_config_json(dir: &Path) -> Result<String> {
-  use std::io::Read;
-
-  /// Matches `crate::lm::load::MAX_CONFIG_BYTES` (1 MiB) — that constant is
-  /// module-private, so the bound is restated here for the re-read.
-  const MAX_CONFIG_BYTES: u64 = 1 << 20;
-
-  let path = dir.join("config.json");
-
-  #[cfg(unix)]
-  let file = {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-      .read(true)
-      .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-      .open(&path)
-      .map_err(|e| Error::Backend {
-        message: format!("cannot open model config {}: {e}", path.display()),
-      })?
-  };
-  #[cfg(not(unix))]
-  let file = std::fs::File::open(&path).map_err(|e| Error::Backend {
-    message: format!("cannot open model config {}: {e}", path.display()),
-  })?;
-
-  let meta = file.metadata().map_err(|e| Error::Backend {
-    message: format!("cannot stat opened model config {}: {e}", path.display()),
-  })?;
-  if !meta.is_file() {
-    return Err(Error::Backend {
-      message: format!(
-        "model config {} is not a regular file; refusing to read",
-        path.display()
-      ),
-    });
-  }
-
-  let mut bytes = Vec::new();
-  file
-    .take(MAX_CONFIG_BYTES + 1)
-    .read_to_end(&mut bytes)
-    .map_err(|e| Error::Backend {
-      message: format!("cannot read model config {}: {e}", path.display()),
-    })?;
-  if bytes.len() as u64 > MAX_CONFIG_BYTES {
-    return Err(Error::Backend {
-      message: format!(
-        "model config {} exceeds the {}-byte cap; refusing to read",
-        path.display(),
-        MAX_CONFIG_BYTES
-      ),
-    });
-  }
-
-  String::from_utf8(bytes).map_err(|e| Error::Backend {
-    message: format!("model config {} is not valid UTF-8: {e}", path.display()),
   })
 }
 
@@ -589,10 +545,12 @@ mod tests {
     hf.save(dir.join("tokenizer.json"), false).unwrap();
   }
 
-  /// Populate `dir` as a minimal but *loadable* model directory: `config.json`
-  /// (with the given `model_type`), a tiny single-tensor `model.safetensors`,
-  /// and a `tokenizer.json`.
-  fn write_model_dir(dir: &Path, model_type: &str) {
+  /// Populate `dir` with just the model's `config.json` (with the given
+  /// `model_type`) and a tiny single-tensor `model.safetensors` — but **no**
+  /// `tokenizer.json`. The basis for both [`write_model_dir`] (which adds the
+  /// tokenizer) and the real split-layout test (where the tokenizer lives in a
+  /// separate directory).
+  fn write_model_dir_no_tokenizer(dir: &Path, model_type: &str) {
     std::fs::write(dir.join("config.json"), mock_config_json(model_type)).unwrap();
 
     // A tiny one-tensor safetensors so `load_weights` finds non-empty
@@ -603,7 +561,13 @@ mod tests {
       Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2usize, 2)).unwrap(),
     );
     crate::io::save_safetensors(&dir.join("model.safetensors"), &weights).unwrap();
+  }
 
+  /// Populate `dir` as a minimal but *loadable* model directory: `config.json`
+  /// (with the given `model_type`), a tiny single-tensor `model.safetensors`,
+  /// and a `tokenizer.json`.
+  fn write_model_dir(dir: &Path, model_type: &str) {
+    write_model_dir_no_tokenizer(dir, model_type);
     write_tokenizer(dir);
   }
 
@@ -725,10 +689,16 @@ mod tests {
 
   #[test]
   fn tokenizer_source_loads_from_separate_directory() {
-    // The model dir has the config + weights; a SEPARATE dir holds the
-    // tokenizer. `tokenizer_source` points the tokenizer load there.
+    // REAL split layout (Codex finding #1): the model dir has config +
+    // weights but NO `tokenizer.json`; a SEPARATE dir holds the tokenizer, and
+    // `tokenizer_source` points the load there. This MUST fail on the old
+    // orchestration (which always built `Tokenizer::from_path(model_dir)`
+    // first, before ever consulting `tokenizer_source`) and succeed now that
+    // the tokenizer dir is selected up front and loaded exactly once.
     let model_dir = fresh_dir("split-model");
-    write_model_dir(&model_dir, "mockarch");
+    write_model_dir_no_tokenizer(&model_dir, "mockarch");
+    // Prove there is genuinely no tokenizer in the model dir.
+    assert!(!model_dir.join("tokenizer.json").exists());
     let tok_dir = fresh_dir("split-tok");
     write_tokenizer(&tok_dir);
 
@@ -739,5 +709,89 @@ mod tests {
     let ctx = load(&config, &registry).expect("split-tokenizer load should succeed");
     let ids = ctx.tokenizer.encode("a b c", false).unwrap();
     assert_eq!(ids.len(), 3);
+  }
+
+  #[test]
+  fn unsupported_model_type_does_not_touch_weights_or_tokenizer() {
+    // Codex finding #2: an UNREGISTERED `model_type` must be rejected BEFORE
+    // any weights/tokenizer are loaded. The model dir's `config.json` names an
+    // unregistered type and its `model.safetensors` is deliberately INVALID
+    // (not a real safetensors) — if `load()` tried to load weights it would
+    // surface a parse/IO error from that file; instead it must return the
+    // recoverable unsupported-model error, proving weights were never touched.
+    // There is no `tokenizer.json` either, so a tokenizer load would also
+    // fail; the unsupported-model error proves neither was attempted.
+    let dir = fresh_dir("unsupported-cheap");
+    std::fs::write(dir.join("config.json"), mock_config_json("nope")).unwrap();
+    // Garbage where a safetensors would be: loading it would error loudly.
+    std::fs::write(
+      dir.join("model.safetensors"),
+      b"this is not a safetensors file",
+    )
+    .unwrap();
+    assert!(!dir.join("tokenizer.json").exists());
+
+    // Registry knows only "mockarch"; "nope" is unregistered.
+    let registry = ModelTypeRegistry::new().with("mockarch", mock_constructor());
+    let config = ModelConfiguration::from_directory(&dir);
+
+    let Err(err) = load(&config, &registry) else {
+      panic!("unsupported model_type must error");
+    };
+    // The error is the recoverable unsupported-model one (naming the type),
+    // NOT a weights/tokenizer parse error.
+    let msg = err.to_string();
+    assert!(
+      msg.contains("unsupported model type"),
+      "expected the unsupported-model error before any weight load, got: {msg}"
+    );
+    assert!(msg.contains("nope"), "error should name the type: {msg}");
+    // Belt-and-suspenders: the message must not be the invalid-weights one.
+    assert!(
+      !msg.contains("safetensors") && !msg.contains("weights"),
+      "weights must not have been loaded, but the error mentions them: {msg}"
+    );
+  }
+
+  #[test]
+  fn raw_config_json_matches_parsed_config() {
+    // Codex finding #3: the `config_json` handed to the constructor must be the
+    // SAME content that was parsed into the typed `Config` (one read, not two).
+    // The constructor captures both and asserts they agree: the raw JSON
+    // parses back to the same `model_type`/`vocab_size`/`mock_extra`, and is
+    // byte-identical to the on-disk `config.json` the test wrote.
+    let dir = fresh_dir("raw-consistency");
+    write_model_dir(&dir, "mockarch");
+    let on_disk = std::fs::read_to_string(dir.join("config.json")).unwrap();
+
+    let captured: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+      std::sync::Arc::new(std::sync::Mutex::new(None));
+    let captured_in_ctor = std::sync::Arc::clone(&captured);
+    let registry = ModelTypeRegistry::new().with("mockarch", {
+      Box::new(move |loaded: &LoadedModel| -> Result<Box<dyn Model>> {
+        // Raw JSON parses back to the SAME typed fields as `loaded.config`.
+        let raw: serde_json::Value = serde_json::from_str(&loaded.config_json).unwrap();
+        assert_eq!(
+          raw.get("model_type").and_then(|v| v.as_str()),
+          Some(loaded.config.model_type.as_str())
+        );
+        assert_eq!(
+          raw.get("vocab_size").and_then(|v| v.as_i64()),
+          Some(loaded.config.vocab_size as i64)
+        );
+        *captured_in_ctor.lock().unwrap() = Some(loaded.config_json.clone());
+        Ok(Box::new(MockLoadedModel {
+          vocab: loaded.config.vocab_size,
+          mock_extra: 7,
+        }))
+      }) as ModelConstructor
+    });
+    let config = ModelConfiguration::from_directory(&dir);
+    let _ctx = load(&config, &registry).expect("load");
+
+    // The `config_json` the constructor saw is byte-identical to the file the
+    // typed `Config` was parsed from (single read — no divergence window).
+    let seen = captured.lock().unwrap().clone().expect("ctor ran");
+    assert_eq!(seen, on_disk);
   }
 }
