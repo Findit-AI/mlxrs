@@ -1,15 +1,19 @@
 //! Embedding utilities — pooling strategies, normalization, similarity,
 //! and `sentence-transformers` pooling-config parsing.
 //!
-//! Pure `Array`-op helpers ported from
+//! Ported from
 //! [`mlx-embeddings`](https://github.com/Blaizzy/mlx-embeddings)
 //! (`models/pooling.py`, `models/base.py`, `utils.py`) and
 //! [`MLXEmbedders`](https://github.com/ml-explore/mlx-swift-examples)
-//! (`Pooling.swift`, `MLXArray+Helper.swift`). These operate on the
-//! hidden states produced by an embedding model; the model itself,
-//! per-architecture loaders, tokenizer integration, model-id registries,
-//! ColVision, and `generate`/`load` are added per-usecase and are out of
-//! scope here (no-model-arch rule).
+//! (`Pooling.swift`, `MLXArray+Helper.swift`, `EmbeddingModel.swift`,
+//! `EmbedderModelContainer.swift`). The pooling / normalization / similarity
+//! helpers operate on the hidden states produced by an embedding model; the
+//! [`EmbeddingModel`](crate::embeddings::EmbeddingModel) trait + the
+//! [`encode`](crate::embeddings::encode()) entry add the orchestration
+//! (tokenize → pad + mask → forward → pool → normalize). Concrete model
+//! architectures, per-architecture loaders, model-id registries, ColVision,
+//! and `load` are added per-usecase and are out of scope here (no-model-arch
+//! rule).
 //!
 //! ## Conventions
 //! - `token_embeddings`: `(batch, seq_len, hidden)` float array.
@@ -57,9 +61,21 @@
 //! - Similarity:
 //!   [`cosine_similarity`](crate::embeddings::cosine_similarity),
 //!   [`cosine_similarity_matrix`](crate::embeddings::cosine_similarity_matrix).
+//! - Orchestration: the
+//!   [`EmbeddingModel`](crate::embeddings::EmbeddingModel) trait +
+//!   [`EmbeddingModelOutput`](crate::embeddings::EmbeddingModelOutput)
+//!   (the forward-pass seam; python `BaseModelOutput`, swift
+//!   `EmbeddingModelOutput`) and the
+//!   [`encode`](crate::embeddings::encode()) entry +
+//!   [`EncodeConfig`](crate::embeddings::EncodeConfig) (tokenize → pad +
+//!   attention mask → `forward` → [`pool`](crate::embeddings::pool) →
+//!   optional L2-normalize → `(batch, dim)`; mirrors python
+//!   `utils.generate` + swift `EmbedderModelContainer.perform`).
 
 pub mod config;
+pub mod encode;
 pub mod fast;
+pub mod model;
 pub mod normalize;
 pub mod pooling;
 pub mod similarity;
@@ -100,7 +116,9 @@ pub use config::{
   StPoolingConfig, pooling_from_st_config_bytes, pooling_from_st_config_path,
   pooling_from_st_config_str,
 };
+pub use encode::{EncodeConfig, encode};
 pub use fast::{layer_norm, rms_norm};
+pub use model::{EmbeddingModel, EmbeddingModelOutput};
 pub use normalize::{
   DEFAULT_NORMALIZE_EPS, SWIFT_L2_EPS, l2_normalize, l2_normalize_eps, normalize,
 };

@@ -1,0 +1,203 @@
+//! The architecture-agnostic [`EmbeddingModel`] seam for `mlxrs::embeddings`,
+//! mirroring the embedding forward-pass call convention of the references:
+//!
+//! - python `mlx-embeddings` `models/base.py::BaseModelOutput`
+//!   (`last_hidden_state` / `pooler_output`) — the dataclass every encoder
+//!   `Model.__call__` returns;
+//! - swift `MLXEmbedders/EmbeddingModel.swift` (`EmbeddingModelOutput` with
+//!   `hiddenStates` / `pooledOutput`, and the `EmbeddingModel` protocol's
+//!   `callAsFunction(_:positionIds:tokenTypeIds:attentionMask:)`).
+//!
+//! The [`encode`](super::encode::encode) entry is generic over this one trait:
+//! a model is anything that maps token ids plus an attention mask to a
+//! `(batch, seq_len, hidden)` hidden-state tensor (and, optionally, a
+//! pre-pooled `(batch, hidden)` vector). Concrete architectures
+//! (BERT / XLM-RoBERTa / Qwen3-embed / …) are **not** ported here (project
+//! no-model-arch rule); the trait is the contract those impls — and the
+//! deterministic `MockEmbeddingModel` test fixture below — satisfy.
+
+use crate::{array::Array, error::Result};
+
+/// The output of an [`EmbeddingModel`] forward pass.
+///
+/// Mirrors python `mlx-embeddings` `BaseModelOutput`
+/// (`last_hidden_state` + `pooler_output`) and swift `MLXEmbedders`
+/// `EmbeddingModelOutput` (`hiddenStates` + `pooledOutput`), pared to the two
+/// fields the pooling pipeline consumes:
+///
+/// - [`last_hidden_state`](Self::last_hidden_state): the per-token hidden
+///   states `(batch, seq_len, hidden)` — always present (unlike the python
+///   dataclass's `Optional`, the Rust seam makes the contract that every
+///   encoder produces hidden states explicit; a model with nothing to pool is
+///   not representable rather than a `None` the pooler would have to reject).
+/// - [`pooled_output`](Self::pooled_output): an optional model-provided pooled
+///   `(batch, hidden)` vector (a BERT-style `pooler_output` / CLS head). Only
+///   the [`PoolingStrategy::Cls`](super::PoolingStrategy::Cls) and
+///   [`PoolingStrategy::None`](super::PoolingStrategy::None) paths can consume
+///   it, and the current [`pool`](super::pool) dispatcher derives CLS from the
+///   hidden states directly (python `cls_pooling`), so this is carried for
+///   parity / future use and is `None` for models that do not emit one.
+///
+/// No implicit eval: the arrays are lazy graph nodes; materialize via
+/// [`Array`] accessors.
+#[derive(Debug)]
+pub struct EmbeddingModelOutput {
+  /// Per-token hidden states, `(batch, seq_len, hidden)`. Fed to the pooling
+  /// stage. Python `last_hidden_state`, swift `hiddenStates`.
+  pub last_hidden_state: Array,
+  /// Optional model-provided pooled vector, `(batch, hidden)`. Python
+  /// `pooler_output`, swift `pooledOutput`. `None` for models that do not
+  /// emit a dedicated pooler head.
+  pub pooled_output: Option<Array>,
+}
+
+impl EmbeddingModelOutput {
+  /// Construct an output carrying only hidden states (no model-provided
+  /// pooler head) — the common case for encoders pooled externally.
+  pub fn from_hidden_state(last_hidden_state: Array) -> Self {
+    Self {
+      last_hidden_state,
+      pooled_output: None,
+    }
+  }
+}
+
+/// An embedding model: maps token ids and an attention mask to per-token
+/// hidden states (and, optionally, a pre-pooled vector).
+///
+/// Mirrors python `mlx-embeddings`'s encoder `Model.__call__(input_ids,
+/// attention_mask=…)` and swift `MLXEmbedders`'s `EmbeddingModel`
+/// `callAsFunction(_:…:attentionMask:)`. The [`encode`](super::encode::encode)
+/// entry only ever needs [`forward`](Self::forward).
+///
+/// - `&self` — weights are immutable after load, so encoding never needs
+///   `&mut` on the model (matching the references, where the module is frozen
+///   for inference). One model can therefore back many concurrent encode
+///   calls.
+/// - `input_ids` — an integer `(batch, seq_len)` array of token ids, padded to
+///   the batch's max length by the caller ([`encode`](super::encode::encode)
+///   builds it).
+/// - `attention_mask` — a `(batch, seq_len)` array, `1` for real tokens and
+///   `0` for padding. Passed through to the pooling stage so padded positions
+///   are excluded. Models that build internal additive attention biases derive
+///   them from this mask.
+/// - returns — an [`EmbeddingModelOutput`] whose `last_hidden_state` is
+///   `(batch, seq_len, hidden)` in the model's compute dtype. No implicit eval
+///   here; the pooling stage composes lazily and the caller evaluates.
+pub trait EmbeddingModel {
+  /// Run a forward pass and return the hidden states (and optional pooled
+  /// output).
+  ///
+  /// Errors propagate as [`crate::Error`] (shape / backend); a model never
+  /// panics on a recoverable mismatch.
+  fn forward(&self, input_ids: &Array, attention_mask: &Array) -> Result<EmbeddingModelOutput>;
+}
+
+/// A deterministic, dependency-free [`EmbeddingModel`] used across the
+/// embeddings test suite (the [`encode`](super::encode::encode) flow tests
+/// below and in `tests/`).
+///
+/// `forward` ignores the input *values* and returns a fixed
+/// `(batch, seq_len, hidden)` hidden-state tensor whose entry at
+/// `[b, s, :]` is `canned[s]` (one `hidden`-length row per sequence position,
+/// identical across the batch). This makes the pooled result exactly
+/// hand-computable from the mask: e.g. mean pooling over a 2-real-token row
+/// averages `canned[0]` and `canned[1]`. It is intentionally a `#[cfg(test)]`
+/// helper — exported for the crate's own tests, not a public API.
+#[cfg(test)]
+pub(crate) struct MockEmbeddingModel {
+  /// Per-position hidden rows: `canned[s]` is the `(hidden,)` row emitted at
+  /// sequence position `s`. All rows must share the same length (`hidden`).
+  pub canned: Vec<Vec<f32>>,
+}
+
+#[cfg(test)]
+impl MockEmbeddingModel {
+  /// Build a mock whose position-`s` hidden row is `canned[s]`. The longest
+  /// supplied row defines `hidden`; shorter rows are zero-padded on the right
+  /// so every position has a uniform width (keeps the fixture forgiving).
+  pub(crate) fn new(canned: Vec<Vec<f32>>) -> Self {
+    let hidden = canned.iter().map(Vec::len).max().unwrap_or(0);
+    let canned = canned
+      .into_iter()
+      .map(|mut row| {
+        row.resize(hidden, 0.0);
+        row
+      })
+      .collect();
+    Self { canned }
+  }
+}
+
+#[cfg(test)]
+impl EmbeddingModel for MockEmbeddingModel {
+  fn forward(&self, input_ids: &Array, _attention_mask: &Array) -> Result<EmbeddingModelOutput> {
+    // input_ids is (batch, seq_len); tile the canned per-position rows across
+    // the batch. seq_len must not exceed the number of canned positions.
+    let shape = input_ids.shape();
+    let (batch, seq) = match shape.as_slice() {
+      [b, s] => (*b, *s),
+      _ => {
+        return Err(crate::error::Error::ShapeMismatch {
+          message: format!(
+            "MockEmbeddingModel::forward expects (batch, seq_len) ids, got {shape:?}"
+          ),
+        });
+      }
+    };
+    if seq > self.canned.len() {
+      return Err(crate::error::Error::ShapeMismatch {
+        message: format!(
+          "MockEmbeddingModel: seq_len {seq} exceeds canned positions {}",
+          self.canned.len()
+        ),
+      });
+    }
+    let hidden = self.canned.first().map_or(0, Vec::len);
+    let mut data = Vec::with_capacity(batch * seq * hidden);
+    for _ in 0..batch {
+      for row in self.canned.iter().take(seq) {
+        data.extend_from_slice(row);
+      }
+    }
+    let last_hidden_state = Array::from_slice::<f32>(&data, &(batch, seq, hidden))?;
+    Ok(EmbeddingModelOutput::from_hidden_state(last_hidden_state))
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn mock_forward_tiles_canned_rows_across_batch() {
+    let model = MockEmbeddingModel::new(vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]]);
+    // batch 2, seq 2 -> hidden rows canned[0], canned[1] per batch item.
+    let ids = Array::from_slice::<i32>(&[7, 8, 9, 10], &(2, 2)).unwrap();
+    let mask = Array::from_slice::<f32>(&[1.0, 1.0, 1.0, 1.0], &(2, 2)).unwrap();
+    let mut out = model.forward(&ids, &mask).unwrap();
+    assert_eq!(out.last_hidden_state.shape(), vec![2, 2, 2]);
+    assert!(out.pooled_output.is_none());
+    assert_eq!(
+      out.last_hidden_state.to_vec::<f32>().unwrap(),
+      // batch 0: [1,2],[3,4]   batch 1: [1,2],[3,4]
+      vec![1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0]
+    );
+  }
+
+  #[test]
+  fn mock_forward_rejects_wrong_rank() {
+    let model = MockEmbeddingModel::new(vec![vec![1.0, 2.0]]);
+    let bad = Array::from_slice::<i32>(&[1, 2, 3], &(3,)).unwrap(); // rank-1
+    let mask = Array::from_slice::<f32>(&[1.0, 1.0, 1.0], &(3,)).unwrap();
+    assert!(model.forward(&bad, &mask).is_err());
+  }
+
+  #[test]
+  fn mock_forward_rejects_seq_longer_than_canned() {
+    let model = MockEmbeddingModel::new(vec![vec![1.0, 2.0]]); // 1 position
+    let ids = Array::from_slice::<i32>(&[1, 2], &(1, 2)).unwrap(); // seq 2 > 1
+    let mask = Array::from_slice::<f32>(&[1.0, 1.0], &(1, 2)).unwrap();
+    assert!(model.forward(&ids, &mask).is_err());
+  }
+}
