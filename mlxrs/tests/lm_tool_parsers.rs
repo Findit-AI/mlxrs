@@ -656,6 +656,27 @@ fn infer_tool_parser_full_marker_matrix() {
     infer_tool_parser(Some("<|tool_list_start|> for pythonic")),
     Some("pythonic"),
   );
+  // qwen3_coder: `any_of` accepts EITHER the markdown-escaped form
+  // (`<tool_call>\n<function=`) OR the real-newline form
+  // (`<tool_call>\n<function=`); the table carries both because chat
+  // templates appear in source as raw or as JSON-escaped strings.
+  assert_eq!(
+    infer_tool_parser(Some(r"prefer <tool_call>\n<function= here")),
+    Some("qwen3_coder"),
+  );
+  assert_eq!(
+    infer_tool_parser(Some("real newline <tool_call>\n<function= here")),
+    Some("qwen3_coder"),
+  );
+  // Rule precedence: a template that contains BOTH the qwen3_coder marker
+  // and the json_tools markers (`<tool_call>` + `tool_call.name`) must
+  // select qwen3_coder, which is declared earlier in TOOL_PARSER_SELECT.
+  assert_eq!(
+    infer_tool_parser(Some(
+      "uses <tool_call>\n<function= and also tool_call.name field"
+    )),
+    Some("qwen3_coder"),
+  );
   assert_eq!(
     infer_tool_parser(Some("<|tool_calls_section_begin|> kimi")),
     Some("kimi_k2"),
