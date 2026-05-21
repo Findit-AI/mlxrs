@@ -96,38 +96,47 @@ const COVERAGE_EPS: f32 = 1e-10;
 /// When `win_length == n_fft` there is no padding and the two variants are
 /// **identical**. They differ only for `win_length < n_fft`:
 ///
-/// - [`WindowPad::Center`] (the default) places the window as
-///   `[zeros(pad_low), w, zeros(pad_high)]` with `pad_low = (n_fft -
-///   win_length) / 2` and `pad_high = n_fft - win_length - pad_low` — the
-///   librosa `pad_center` convention. This gives full COLA coverage of the
-///   centered output region, so [`istft`]'s coverage guard always passes and
-///   the round-trip is exactly invertible for **every** `win_length <= n_fft`.
-/// - [`WindowPad::Right`] places the window as `[w, zeros(n_fft -
-///   win_length)]` — the convention `mlx_audio.dsp` (and mlxrs's merged
-///   [`stft`]) use. The forward [`stft`] supports it for any `win_length`
-///   (byte-faithful to mlx-audio). **The inverse [`istft`], however, supports
-///   Right only for `win_length == n_fft`**: right-pad short-window inversion
-///   is not a faithful inverse (the forward transform discards / distorts
-///   boundary information, so the reconstruction is wrong even where the
-///   window-sum is nonzero), so [`istft`] rejects `win_length != n_fft` under
-///   Right with a recoverable [`Error::Backend`]. Use [`WindowPad::Center`]
-///   for short-window inversion.
+/// - [`WindowPad::Right`] (the default) places the window right-aligned as
+///   `[w, zeros(n_fft - win_length)]` — the convention `mlx_audio.dsp` (and
+///   mlxrs's merged [`stft`]) use, so [`stft`]'s short-window output is
+///   byte-identical to the reference. The forward [`stft`] supports it for any
+///   `win_length`. **The inverse [`istft`], however, supports Right only for
+///   `win_length == n_fft`**: right-pad short-window inversion is not a
+///   faithful inverse (the forward transform discards / distorts boundary
+///   information, so the reconstruction is wrong even where the window-sum is
+///   nonzero), so [`istft`] rejects `win_length != n_fft` under Right with a
+///   recoverable [`Error::Backend`]. Use [`WindowPad::Center`] for short-window
+///   inversion.
+/// - [`WindowPad::Center`] places the window as `[zeros(pad_low), w,
+///   zeros(pad_high)]` with `pad_low = (n_fft - win_length) / 2` and
+///   `pad_high = n_fft - win_length - pad_low` — the librosa `pad_center`
+///   convention. This gives full COLA coverage of the centered output region,
+///   so [`istft`]'s coverage guard always passes and the round-trip is exactly
+///   invertible for **every** `win_length <= n_fft`. It is the placement
+///   required for an invertible short-window round-trip.
+///
+/// The default is [`WindowPad::Right`] so the forward [`stft`] (and the
+/// mel/log-mel front-ends built on it) stay byte-identical to `mlx_audio.dsp`
+/// for short windows. Pass [`WindowPad::Center`] explicitly when you need
+/// `istft(&stft(x, .., Center)?, .., Center)?` to invert a short window.
 ///
 /// `mlx-audio-swift` has no `win_length` (the window is always `n_fft`), so
 /// it corresponds to `win_length == n_fft`, which both variants handle the
 /// same way (and both invert).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WindowPad {
-  /// `[zeros, w, zeros]` centered in `n_fft` (librosa `pad_center`). The
-  /// default: full COLA coverage, exactly invertible by [`istft`] for every
-  /// `win_length <= n_fft`.
+  /// `[w, zeros]` right-padded in `n_fft` (mlx-audio / mlxrs `stft`). The
+  /// default: keeps [`stft`]'s short-window output byte-identical to
+  /// `mlx_audio.dsp`. Forward [`stft`] supports any `win_length`; the inverse
+  /// [`istft`] supports Right only for `win_length == n_fft` (short-window
+  /// right-pad inversion is not a faithful inverse and is rejected — use
+  /// [`WindowPad::Center`]).
   #[default]
-  Center,
-  /// `[w, zeros]` right-padded in `n_fft` (mlx-audio / mlxrs `stft`). Forward
-  /// [`stft`] supports any `win_length`; the inverse [`istft`] supports Right
-  /// only for `win_length == n_fft` (short-window right-pad inversion is not a
-  /// faithful inverse and is rejected — use [`WindowPad::Center`]).
   Right,
+  /// `[zeros, w, zeros]` centered in `n_fft` (librosa `pad_center`). Full COLA
+  /// coverage, exactly invertible by [`istft`] for every `win_length <=
+  /// n_fft`. Opt in to this for invertible short-window round-trips.
+  Center,
 }
 
 /// Place a `win_length`-wide window `w` into an `n_fft`-wide frame per
@@ -193,6 +202,33 @@ fn place_window(
     &pad_value,
     c"constant",
   )
+}
+
+/// The single source of truth for the `n_fft`-wide frame window shared by
+/// [`stft`] (analysis) and [`istft`] (synthesis).
+///
+/// Builds the **symmetric** Hann window of length `win_length`
+/// ([`hann_window`], `periodic=False`) and places it into the `n_fft`-wide
+/// frame per `window_pad` ([`place_window`]). BOTH the forward and inverse
+/// transforms construct their window through this one function with the same
+/// `(win_length, n_fft, window_pad)` arguments, so the synthesis window is
+/// **identical to the analysis window by construction** — a synthesis/analysis
+/// mismatch (the historical source of silent round-trip corruption) is
+/// structurally impossible. `istft` no longer takes any custom-window input
+/// and `stft` has none to match against, so there is exactly one window per
+/// `(win_length, n_fft, window_pad)` triple.
+///
+/// `caller` only flavors the error-message prefix (forwarded to
+/// [`hann_window`] / [`place_window`]).
+///
+/// # Errors
+/// Propagates [`hann_window`]'s constructor errors (`win_length < 2`, the
+/// [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES) cap,
+/// `i32::MAX`, allocation failure) and [`place_window`]'s placement errors
+/// (`win_length > n_fft`, pad extent exceeding `i32::MAX`).
+fn frame_window(win_length: usize, n_fft: usize, window_pad: WindowPad) -> Result<Array> {
+  let w = hann_window(win_length)?;
+  place_window("frame_window", &w, win_length, n_fft, window_pad)
 }
 
 /// The numerical floor applied to mel energies before `log` to avoid
@@ -497,19 +533,24 @@ fn reflect_pad_1d(samples: &Array, padding: usize) -> Result<Array> {
 /// Short-Time Fourier Transform along axis 0.
 ///
 /// Faithful port of `mlx_audio.dsp.stft(x, n_fft, hop_length, win_length,
-/// window="hann", center=True, pad_mode="reflect")`. The window is
-/// constructed via [`hann_window`] (the only window kind in this PR;
-/// hamming/blackman/bartlett are planned follow-ups). When `win_length`
-/// (default = `n_fft`) is smaller than `n_fft`, the window is zero-padded
-/// up to `n_fft` per `window_pad` ([`WindowPad::Center`] — the librosa
-/// `pad_center` convention and the default — or [`WindowPad::Right`] — the
-/// `mlx_audio.dsp` convention). For `win_length == n_fft` the two are
-/// identical (no padding). `win_length > n_fft` is rejected — the reference
-/// would concatenate zeros, but a longer window than the FFT length cannot
-/// occur in any documented `mlx-audio` config.
+/// window="hann", center=True, pad_mode="reflect")`. The analysis window is
+/// built by the shared `frame_window` — the symmetric [`hann_window`] of
+/// `win_length` (the only window kind in this PR; hamming/blackman/bartlett
+/// are planned follow-ups) placed into the `n_fft` frame per `window_pad`.
+/// When `win_length` (default = `n_fft`) is smaller than `n_fft`, the window
+/// is zero-padded up to `n_fft` per `window_pad` ([`WindowPad::Right`] — the
+/// `mlx_audio.dsp` convention and **the default**, so short-window output is
+/// byte-identical to the reference — or [`WindowPad::Center`] — the librosa
+/// `pad_center` convention, opt in for invertible short windows). For
+/// `win_length == n_fft` the two are identical (no padding). `win_length >
+/// n_fft` is rejected — the reference would concatenate zeros, but a longer
+/// window than the FFT length cannot occur in any documented `mlx-audio`
+/// config.
 ///
 /// **Pair `istft` with the SAME `window_pad` and `win_length`** to invert:
-/// the synthesis window must be placed identically to the analysis window.
+/// `istft` rebuilds the analysis window through the very same `frame_window`
+/// call, so the synthesis window is identical to the analysis window by
+/// construction (a mismatch is structurally impossible).
 /// [`WindowPad::Center`] is exactly invertible for any `win_length <= n_fft`.
 /// [`WindowPad::Right`] is invertible by [`istft`] only when
 /// `win_length == n_fft`; short-window Right inversion is not faithful and
@@ -563,10 +604,11 @@ pub fn stft(
     });
   }
 
-  // Window construction (hann of `win_length`, placed into the `n_fft` frame
-  // per `window_pad`; no-op when `win_length == n_fft`).
-  let window = hann_window(win_length)?;
-  let window = place_window("stft", &window, win_length, n_fft, window_pad)?;
+  // Analysis window via the SHARED `frame_window` (symmetric hann of
+  // `win_length`, placed into the `n_fft` frame per `window_pad`; no-op when
+  // `win_length == n_fft`). `istft` rebuilds its synthesis window through the
+  // exact same call, so analysis and synthesis windows always match.
+  let window = frame_window(win_length, n_fft, window_pad)?;
 
   // `center=True, pad_mode="reflect"` (reference default).
   let padded = reflect_pad_1d(samples, n_fft / 2)?;
@@ -643,35 +685,6 @@ pub fn stft(
   fft::rfft(&windowed, n_fft_i32, 1, FftNorm::Backward)
 }
 
-/// Synthesis window selector for [`istft`], the idiomatic translation of
-/// `mlx_audio.dsp.istft`'s `window: mx.array | str` union:
-/// - [`Window::Named`] resolves a `STR_TO_WINDOW_FN` name to the **periodic**
-///   form the reference uses for synthesis (`window_fn(win_length + 1)`
-///   truncated to `win_length` — i.e. the symmetric window of length
-///   `win_length + 1` with its trailing duplicate sample dropped). This is
-///   the COLA-friendly periodic window. The resulting `win_length`-wide
-///   window is then placed into the `n_fft` frame per [`istft`]'s
-///   `window_pad`.
-/// - [`Window::Array`] supplies the synthesis window directly (the
-///   reference's `else: w = window` branch). Its length must be exactly
-///   `win_length`; it is then placed into the `n_fft` frame per
-///   `window_pad`. Pass the SAME window [`stft`] used internally
-///   ([`hann_window`] of `win_length`) with the SAME `window_pad` /
-///   `win_length` and `normalized = true` for exact `istft(stft(x))`
-///   reconstruction.
-#[derive(Debug, Clone, Copy)]
-pub enum Window<'a> {
-  /// A `STR_TO_WINDOW_FN` name (case-insensitive). Built as the periodic
-  /// window of length `win_length` (via the `win_length + 1` symmetric
-  /// form, last sample dropped), then placed into `n_fft` per `window_pad`,
-  /// matching `mlx_audio.dsp.istft`.
-  Named(&'a str),
-  /// A caller-supplied synthesis window array. Must be 1-D of length exactly
-  /// `win_length`; it is then placed into the `n_fft` frame per `window_pad`
-  /// (any other length is a recoverable [`Error::Backend`]).
-  Array(&'a Array),
-}
-
 /// Inverse Short-Time Fourier Transform — overlap-add reconstruction, the
 /// inverse of [`stft`].
 ///
@@ -679,7 +692,18 @@ pub enum Window<'a> {
 /// center=True, length=None, normalized=False)`, adapted to mlxrs's STFT
 /// layout. **`x` is `(num_frames, n_fft / 2 + 1)` `Dtype::Complex64`** — i.e.
 /// exactly what [`stft`] returns — so `istft(&stft(s, ..)?, ..)` composes
-/// directly. The reference instead documents a frequency-major
+/// directly.
+///
+/// **There is no custom-window parameter.** The synthesis window is rebuilt
+/// internally from `(win_length, n_fft, window_pad)` through the very same
+/// `frame_window` the forward [`stft`] used for its analysis window, so the
+/// synthesis window is **identical to the analysis window by construction** —
+/// the historical synthesis/analysis mismatch (a separately-specified
+/// periodic synthesis window silently differing from `stft`'s symmetric
+/// analysis window) is structurally impossible. Pass the SAME `win_length` /
+/// `n_fft` / `window_pad` you gave [`stft`] (with `normalized = true` for the
+/// exact `Σw²` inverse) and `istft(&stft(x, ..)?, ..)?` reconstructs every
+/// sample. The reference instead documents a frequency-major
 /// `(n_fft / 2 + 1, num_frames)` input and irffts along axis 0 then
 /// transposes; here the frames are already on axis 0, so we irfft along
 /// axis 1 and skip the transpose. This is a semantics-preserving adaptation,
@@ -698,20 +722,19 @@ pub enum Window<'a> {
 /// (`x.shape[1]` in our layout). `hop_length` defaults to `win_length / 4`.
 ///
 /// Both window-padding conventions are accepted via `window_pad`
-/// ([`WindowPad`]). The synthesis window is built (Named periodic / explicit
-/// Array) at width `win_length` and placed into the `n_fft` frame with the
-/// SAME `window_pad` as the forward [`stft`]'s analysis window, then
-/// overlap-added full `n_fft` wide.
-/// - [`WindowPad::Center`] (the default) is exactly invertible for every
-///   `win_length <= n_fft` — full short-window support.
-/// - [`WindowPad::Right`] is supported **only for `win_length == n_fft`**.
-///   Right-pad short-window inversion (`win_length < n_fft`) is not a faithful
-///   inverse: the forward transform discards / distorts boundary information,
-///   so the reconstruction is wrong even where the window-sum is nonzero (a
-///   periodic `Window::Named("hann")` short window mis-reconstructs with the
-///   coverage guard silent). [`istft`] therefore **rejects** Right with
-///   `win_length != n_fft` up front with a recoverable [`Error::Backend`], for
-///   ALL window kinds. Use [`WindowPad::Center`] for short-window inversion.
+/// ([`WindowPad`]). The synthesis window is the symmetric Hann of `win_length`
+/// placed into the `n_fft` frame with the SAME `window_pad` as the forward
+/// [`stft`]'s analysis window (both via `frame_window`), then overlap-added
+/// full `n_fft` wide.
+/// - [`WindowPad::Center`] is exactly invertible for every `win_length <=
+///   n_fft` — full short-window support. Use it for invertible short windows.
+/// - [`WindowPad::Right`] (the [`WindowPad`] default) is supported **only for
+///   `win_length == n_fft`**. Right-pad short-window inversion (`win_length <
+///   n_fft`) is not a faithful inverse: the forward transform discards /
+///   distorts boundary information, so the reconstruction is wrong even where
+///   the window-sum is nonzero. [`istft`] therefore **rejects** Right with
+///   `win_length != n_fft` up front with a recoverable [`Error::Backend`]. Use
+///   [`WindowPad::Center`] for short-window inversion.
 ///
 /// Normalization mirrors the reference: each output sample is divided by the
 /// overlap-add sum of the (optionally squared) synthesis window. With
@@ -756,9 +779,7 @@ pub enum Window<'a> {
 ///   - `hop_length == 0`, `win_length == 0`, or `win_length > n_fft`,
 ///   - `window_pad` is [`WindowPad::Right`] and `win_length != n_fft`
 ///     (short-window right-pad inversion is not a faithful inverse — rejected
-///     up front for ALL window kinds; use [`WindowPad::Center`]),
-///   - an explicit [`Window::Array`] is not 1-D or its length is not exactly
-///     `win_length`,
+///     up front; use [`WindowPad::Center`]),
 ///   - **the coverage guard fires** — some requested output sample has a
 ///     window-sum `<= COVERAGE_EPS` (a supported config should never trigger
 ///     this; if it does it is a real reconstruction bug),
@@ -771,14 +792,14 @@ pub enum Window<'a> {
 ///     `t`),
 ///   - the `length` trim is out of range (with `center = true`,
 ///     `n_fft/2 + length > t`; with `center = false`, `length > t`).
-/// - Propagates window-construction errors from [`window_from_name`].
+/// - Propagates window-construction errors from `frame_window` (the shared
+///   symmetric-Hann builder).
 #[allow(clippy::too_many_arguments)]
 pub fn istft(
   x: &Array,
   n_fft: Option<usize>,
   hop_length: Option<usize>,
   win_length: Option<usize>,
-  window: Window<'_>,
   window_pad: WindowPad,
   center: bool,
   length: Option<usize>,
@@ -856,18 +877,17 @@ pub fn istft(
   }
   // Right-pad short-window inversion is fundamentally NOT a faithful inverse.
   // For `WindowPad::Right` with `win_length < n_fft`, the right-pad geometry
-  // combined with the `n_fft / 2` reflect-pad centering places the analysis
-  // window asymmetrically across the centered output region: boundary samples
-  // are either zero-covered (caught by the coverage guard) OR covered but
-  // reconstructed from distorted/discarded boundary energy (a periodic
-  // `Window::Named("hann")` short window reconstructs with large error while
-  // the coverage guard does NOT fire). Because the forward transform discards /
-  // distorts that boundary information, no partial guard can make it correct.
-  // Reject the entire surface up front — for ALL window kinds, before any
-  // reconstruction — so silent corruption is structurally impossible. Short
-  // windows must use `WindowPad::Center`, which is a faithful inverse. The
-  // forward `stft` keeps Right padding (byte-faithful to mlx-audio); only the
-  // inverse restricts Right to `win_length == n_fft`.
+  // combined with the `n_fft / 2` reflect-pad centering places the (symmetric
+  // Hann) analysis window asymmetrically across the centered output region:
+  // boundary samples are either zero-covered (caught by the coverage guard) OR
+  // covered but reconstructed from distorted/discarded boundary energy (e.g. a
+  // win > n_fft/2 short window reconstructs with large error while the coverage
+  // guard does NOT fire). Because the forward transform discards / distorts
+  // that boundary information, no partial guard can make it correct. Reject the
+  // entire surface up front, before any reconstruction, so silent corruption is
+  // structurally impossible. Short windows must use `WindowPad::Center`, which
+  // is a faithful inverse. The forward `stft` keeps Right padding (byte-faithful
+  // to mlx-audio); only the inverse restricts Right to `win_length == n_fft`.
   if matches!(window_pad, WindowPad::Right) && win_length != n_fft {
     return Err(Error::Backend {
       message: format!(
@@ -889,7 +909,7 @@ pub fn istft(
   // per `window_pad`, so the placed window is always exactly `n_fft` wide).
   // The overlap-add stride / frame width is therefore `n_fft`. Computed here,
   // before any window construction, so the OOM cap below precedes the
-  // (potentially large) named-window allocation.
+  // (potentially large) `frame_window` allocation.
   let frame_width = n_fft;
 
   // Output / window-sum buffer length: `t = (num_frames - 1) * hop + n_fft`.
@@ -945,34 +965,14 @@ pub fn istft(
     message: format!("istft: n_fft {n_fft} exceeds i32::MAX"),
   })?;
 
-  // Synthesis window construction — built at width `win_length`, then placed
-  // into the `n_fft` frame per `window_pad` (the SAME placement the forward
-  // analysis window uses, so the inverse matches the forward exactly). Done
-  // AFTER the OOM cap above so a pathological lazy huge-`n_fft` spectrum is
-  // rejected before the named window (`window_from_name(win_length + 1)`, a
-  // CPU `Vec` up to the work cap) is ever allocated. Named → periodic form
-  // (symmetric window of `win_length + 1` with its trailing duplicate sample
-  // dropped, the COLA-friendly periodic window the reference uses); Array →
-  // used verbatim (length validated against `win_length` inside
-  // `place_window`). The result is always exactly `n_fft` wide.
-  let win_len_i32 = i32::try_from(win_length).map_err(|_| Error::Backend {
-    message: format!("istft: win_length {win_length} exceeds i32::MAX"),
-  })?;
-  let base_window = match window {
-    Window::Named(name) => {
-      let win_p1 = win_length.checked_add(1).ok_or_else(|| Error::Backend {
-        message: format!("istft: win_length {win_length} + 1 overflows usize"),
-      })?;
-      let full = window_from_name(name, win_p1)?;
-      // Drop the trailing duplicate sample: full[0 .. win_length].
-      ops::indexing::slice(&full, &[0], &[win_len_i32], &[1])?
-    }
-    Window::Array(w) => w.try_clone()?,
-  };
-  // Place the `win_length`-wide window into the `n_fft` frame per `window_pad`
-  // (validates 1-D / `len == win_length` / `win_length <= n_fft`). No-op when
-  // `win_length == n_fft`.
-  let window = place_window("istft", &base_window, win_length, n_fft, window_pad)?;
+  // Synthesis window via the SHARED `frame_window` — the symmetric Hann of
+  // `win_length` placed into the `n_fft` frame per `window_pad`, the EXACT
+  // same call the forward `stft` used for its analysis window, so the inverse
+  // matches the forward by construction (no separately-specified window can
+  // drift from `stft`'s). Built AFTER the OOM cap above so a pathological lazy
+  // huge-`n_fft` spectrum is rejected before the window's CPU `Vec` (up to the
+  // work cap) is ever allocated. The result is always exactly `n_fft` wide.
+  let window = frame_window(win_length, n_fft, window_pad)?;
 
   // Inverse FFT of every frame along the frequency axis (axis 1):
   // (num_frames, n_freqs) complex → (num_frames, n_fft) real. Frames are full
@@ -1313,9 +1313,13 @@ pub fn mel_spectrogram(
   f_min: f32,
   f_max: Option<f32>,
 ) -> Result<Array> {
-  // mel uses `win_length == n_fft` (the default), so `window_pad` is
-  // immaterial here; pass the default `WindowPad::Center` for clarity.
-  let spec = stft(samples, n_fft, hop_length, win_length, WindowPad::default())?;
+  // Mel front-end uses `WindowPad::Right` — the `mlx_audio.dsp` convention —
+  // so a short `win_length < n_fft` produces byte-identical mel features to
+  // the reference (and to mlxrs pre-#52). The forward `stft` supports Right
+  // for any `win_length`; inversion is not needed here. Passed explicitly
+  // (rather than relying on `WindowPad::default()`) so the mel placement is
+  // pinned regardless of any future change to the enum default.
+  let spec = stft(samples, n_fft, hop_length, win_length, WindowPad::Right)?;
   // `|stft|^2` — `abs` of Complex64 yields F32 magnitudes, then square.
   let mag = spec.abs()?;
   let power = mag.square()?;
@@ -1503,15 +1507,23 @@ mod tests {
 
   // ---- A1: stft / istft WindowPad round-trips -----------------------------
   //
-  // Every reconstruction test below asserts EVERY output sample value-for-
-  // value against the ORIGINAL signal (no `.take`, no sub-range, no
-  // "intrinsically zero" caveats). Expected values were cross-checked against
-  // a self-contained f64 numpy mirror of stft/istft (`docs/istft_ref.py`,
-  // local-only) implementing the same hann window, reflect-pad, OLA, and
-  // window-sum normalization; that mirror reports max round-trip error
-  // <= 4.5e-16 for every covered case here, so the f32 backend is asserted at
-  // 1e-5. The coverage-guard test asserts the `Err` directly (it does NOT mask
-  // the uncovered sample with a partial assertion).
+  // Every reconstruction test below drives the REAL public `stft` and feeds
+  // its output straight into `istft` (`istft(&stft(signal, ..)?, ..)?`). The
+  // private periodic-forward-helper pattern that hid the historical
+  // synthesis/analysis window mismatch for 7 review rounds is BANNED — there
+  // is no helper that builds spectra with its own window; the only forward is
+  // `stft`, and `istft` rebuilds `stft`'s exact symmetric Hann via the shared
+  // `frame_window`, so a window mismatch would surface here value-for-value.
+  //
+  // Each test asserts EVERY output sample value-for-value against the ORIGINAL
+  // signal (no `.take`, no sub-range, no "intrinsically zero" caveats).
+  // Expected values were cross-checked against a self-contained f64 numpy
+  // mirror of stft/istft (`docs/istft_ref.py`, local-only) implementing the
+  // same symmetric hann window, reflect-pad, OLA, and window-sum
+  // normalization; that mirror reports max round-trip error <= 4.5e-16 for
+  // every covered case here, so the f32 backend is asserted at 1e-5. The
+  // coverage-guard / rejection tests assert the `Err` directly (they do NOT
+  // mask a bad sample with a partial assertion).
 
   /// The 16-sample test signal used for the round-trips (arbitrary but fixed).
   fn signal_16() -> [f32; 16] {
@@ -1529,12 +1541,21 @@ mod tests {
     ]
   }
 
-  /// Round-trip `signal` through `stft`/`istft` with the SAME `win_length` and
-  /// `window_pad`, feeding the matching symmetric-Hann analysis window via
-  /// `Window::Array` with `normalized = true` (the exact `Σw²` inverse), and
-  /// assert EVERY output sample equals the original. `len_override` is the
-  /// `length` passed to `istft` (pass `Some(signal.len())` to recover the full
-  /// input even when the centered region is shorter than the signal).
+  /// Round-trip `signal` through the REAL public [`stft`] then [`istft`] with
+  /// the SAME `win_length` / `n_fft` / `window_pad` and `normalized = true`
+  /// (the exact `Σw²` inverse), and assert EVERY output sample equals the
+  /// original.
+  ///
+  /// This is the canary the previous review rounds were missing: it goes
+  /// through `stft` itself (NOT a private periodic-forward helper), and the
+  /// synthesis window `istft` rebuilds is the SAME symmetric Hann `stft`
+  /// placed (both via `frame_window`) — so if the two ever drifted, this
+  /// would fail value-for-value. `len_override` is the `length` passed to
+  /// `istft` (pass `Some(signal.len())` to recover the full input even when
+  /// the centered region is shorter than the signal). Expected values were
+  /// cross-checked against a self-contained f64 numpy mirror
+  /// (`docs/istft_ref.py`, local-only) reporting max round-trip error
+  /// <= 4.5e-16 for every covered case; the f32 backend is asserted at 1e-5.
   fn assert_roundtrips_all_samples(
     signal: &[f32],
     n_fft: usize,
@@ -1545,13 +1566,11 @@ mod tests {
   ) {
     let x = Array::from_slice::<f32>(signal, &[signal.len() as i32]).unwrap();
     let spec = stft(&x, n_fft, hop, Some(win_length), window_pad).unwrap();
-    let w = hann_window(win_length).unwrap();
     let rec = istft(
       &spec,
       Some(n_fft), // explicit n_fft (required for odd n_fft to round-trip)
       Some(hop),
       Some(win_length),
-      Window::Array(&w),
       window_pad,
       true, // center (undo stft's reflect pad)
       len_override,
@@ -1570,87 +1589,6 @@ mod tests {
       assert!(
         (g - e).abs() < 1e-5,
         "roundtrip[{i}] (n_fft={n_fft} win={win_length} hop={hop} {window_pad:?}): \
-         got {g}, want {e} (diff {})",
-        (g - e).abs()
-      );
-    }
-  }
-
-  /// Forward STFT using an EXPLICIT analysis window (any `n_fft`-wide array),
-  /// mirroring [`stft`]'s exact math (reflect-pad `n_fft / 2`, frame at
-  /// `hop`, multiply by `window`, `rfft` length `n_fft`) but WITHOUT the
-  /// hardcoded symmetric hann. Used so the `Window::Named` istft round-trip
-  /// can pair the inverse's PERIODIC synthesis window with a matching PERIODIC
-  /// analysis window (the faithful inverse — see `docs/istft_ref.py`,
-  /// local-only). Built frame-by-frame via `slice` + `rfft` (no `as_strided`)
-  /// to keep the reference transparent.
-  fn forward_spec_with_window(signal: &[f32], n_fft: usize, hop: usize, window: &Array) -> Array {
-    let x = Array::from_slice::<f32>(signal, &[signal.len() as i32]).unwrap();
-    let padded = reflect_pad_1d(&x, n_fft / 2).unwrap();
-    let padded_len = padded.shape()[0];
-    let num_frames = 1 + (padded_len - n_fft) / hop;
-    let mut rows: Vec<Array> = Vec::with_capacity(num_frames);
-    for m in 0..num_frames {
-      let start = (m * hop) as i32;
-      let stop = (m * hop + n_fft) as i32;
-      let frame = ops::indexing::slice(&padded, &[start], &[stop], &[1]).unwrap();
-      let windowed = ops::arithmetic::multiply(&frame, window).unwrap();
-      let spec_row = fft::rfft(&windowed, n_fft as i32, 0, FftNorm::Backward).unwrap();
-      // (n_freqs,) -> (1, n_freqs) so the rows stack into (num_frames, n_freqs).
-      let n_freqs = spec_row.shape()[0] as i32;
-      rows.push(ops::shape::reshape(&spec_row, &[1i32, n_freqs]).unwrap());
-    }
-    let row_refs: Vec<&Array> = rows.iter().collect();
-    ops::shape::concatenate(&row_refs, 0).unwrap()
-  }
-
-  /// The PERIODIC hann of length `win_length` — exactly what [`istft`]'s
-  /// `Window::Named("hann")` path builds (`hann_window(win_length + 1)` with
-  /// the trailing duplicate sample dropped).
-  fn periodic_hann(win_length: usize) -> Array {
-    let full = hann_window(win_length + 1).unwrap();
-    ops::indexing::slice(&full, &[0], &[win_length as i32], &[1]).unwrap()
-  }
-
-  /// Round-trip `signal` through the PERIODIC-window forward (analysis window =
-  /// periodic hann, placed per `window_pad`) and `istft` with
-  /// `Window::Named("hann")` synthesis, `normalized = true`, asserting EVERY
-  /// output sample. This exercises the istft Named code path on a faithful
-  /// inverse (forward analysis window == inverse synthesis window). Expected
-  /// values cross-checked vs `docs/istft_ref.py` (`win_fn=hann_periodic`):
-  /// max round-trip error <= 2.3e-16, asserted here at 1e-5.
-  fn assert_named_roundtrips_all_samples(
-    signal: &[f32],
-    n_fft: usize,
-    win_length: usize,
-    hop: usize,
-    window_pad: WindowPad,
-  ) {
-    let base = periodic_hann(win_length);
-    let placed = place_window("test", &base, win_length, n_fft, window_pad).unwrap();
-    let spec = forward_spec_with_window(signal, n_fft, hop, &placed);
-    let rec = istft(
-      &spec,
-      Some(n_fft),
-      Some(hop),
-      Some(win_length),
-      Window::Named("hann"),
-      window_pad,
-      true,               // center
-      Some(signal.len()), // recover the full input
-      true,               // normalized (Σw²)
-    )
-    .unwrap();
-    let r = to_vec(&rec);
-    assert_eq!(
-      r.len(),
-      signal.len(),
-      "Named round-trip length mismatch (n_fft={n_fft} win={win_length} hop={hop} {window_pad:?})"
-    );
-    for (i, (g, e)) in r.iter().zip(signal.iter()).enumerate() {
-      assert!(
-        (g - e).abs() < 1e-5,
-        "Named roundtrip[{i}] (n_fft={n_fft} win={win_length} hop={hop} {window_pad:?}): \
          got {g}, want {e} (diff {})",
         (g - e).abs()
       );
@@ -1704,101 +1642,66 @@ mod tests {
   #[test]
   fn istft_center_short_window_all_samples() {
     // WindowPad::Center, win_length < n_fft: full COLA coverage, exactly
-    // invertible — for BOTH window kinds:
-    //  - Window::Array(symmetric hann): forward stft (symmetric) + the SAME
-    //    symmetric synthesis window, normalized=true. (min window-sum 0.41 for
-    //    win=8, 1.01 for win=12; max err 1.1e-16 vs numpy.)
-    //  - Window::Named("hann") (PERIODIC): forward analysis window is the
-    //    matching periodic hann (the faithful pairing for the Named path),
-    //    istft Window::Named, normalized=true. (min window-sum 0.50 for win=8,
-    //    1.06 for win=12; max err <= 2.3e-16 vs numpy.)
-    // n_fft=16, hop=4, win=8 and win=12 — both cover the centered 16-sample
-    // region. Asserts ALL 16 samples. This is the correctness payoff of the
-    // Center convention: the short-window inverse the Right convention cannot
-    // do safely (Right short-window inversion is rejected — see
-    // `istft_right_short_window_rejected_all_window_kinds`).
+    // invertible through the REAL public stft. `stft` places the symmetric Hann
+    // of `win_length` center-padded into n_fft; `istft` rebuilds that EXACT
+    // window via the shared `frame_window` and overlap-adds with normalized=true
+    // (Σw²). (min window-sum 0.41 for win=8, 1.01 for win=12; max err 1.1e-16 vs
+    // the numpy mirror.) n_fft=16, hop=4, win=8 and win=12 — both cover the
+    // centered 16-sample region. Asserts ALL 16 samples. This is the correctness
+    // payoff of the Center convention (and of unifying the windows): the
+    // short-window inverse the Right convention cannot do safely (Right
+    // short-window inversion is rejected — see
+    // `istft_right_short_window_rejected`).
     let buf = signal_16();
     for &win in &[8usize, 12usize] {
-      // Window::Array (symmetric) short-window round-trip.
       assert_roundtrips_all_samples(&buf, 16, win, 4, WindowPad::Center, None);
-      // Window::Named (periodic) short-window round-trip — the previously
-      // untested Named path under a short Center window.
-      assert_named_roundtrips_all_samples(&buf, 16, win, 4, WindowPad::Center);
     }
   }
 
   #[test]
-  fn istft_right_short_window_rejected_all_window_kinds() {
+  fn istft_right_short_window_rejected() {
     // THE FIX. WindowPad::Right inversion supports ONLY win_length == n_fft.
     // For win_length < n_fft the right-pad geometry is not a faithful inverse
-    // (the forward transform discards/distorts boundary info), so istft must
-    // REJECT it up front with a recoverable Err — for ALL window kinds, BEFORE
-    // any reconstruction. Critically this includes Window::Named("hann"): its
-    // PERIODIC window has nonzero endpoints, so the boundary sample is COVERED
-    // (window-sum well above COVERAGE_EPS) yet still mis-reconstructs (numpy
-    // mirror, sym-forward / periodic-Named-synth: min window-sum 2.1e-2 with
-    // MAX RECON ERROR 0.44 for win=8) — the coverage guard does NOT fire, so
-    // ONLY the up-front rejection prevents silent corruption. We assert the
-    // Err DIRECTLY (no masked / partial sample assertion).
+    // (the forward transform discards/distorts boundary info), so istft REJECTS
+    // it up front with a recoverable Err, BEFORE any reconstruction. The forward
+    // stft (real, public) still produces the Right short-window spectrum — it is
+    // the INVERSE that is rejected. We assert the Err DIRECTLY (no masked /
+    // partial sample assertion).
     //
-    // Probe win=8 (== n_fft/2; symmetric endpoints are zero so this would also
-    // hit the old coverage guard) AND win=12 (> n_fft/2; symmetric AND periodic
-    // are both COVERED, so the OLD coverage guard would NOT have caught the
-    // periodic mis-reconstruction here — this case is the heart of the fix).
+    // Probe win=8 (== n_fft/2; the symmetric Hann endpoints are zero, so this
+    // boundary sample is ALSO zero-covered) AND win=12 (> n_fft/2; the boundary
+    // sample is COVERED — window-sum well above COVERAGE_EPS — yet would still
+    // mis-reconstruct, so the coverage guard alone would NOT catch it; this is
+    // the heart of the fix and why the rejection is up-front, not guard-based).
     let buf = signal_16();
     let x = Array::from_slice::<f32>(&buf, &[16i32]).unwrap();
     for &win in &[8usize, 12usize] {
-      // The forward stft uses the symmetric hann (this is what mlxrs does);
-      // the Right short-window spectrum is producible — it is the INVERSE that
-      // is rejected.
       let spec = stft(&x, 16, 4, Some(win), WindowPad::Right).unwrap();
       assert_eq!(spec.shape(), vec![5, 9]); // (num_frames, n_fft/2+1), n_fft=16
-      let sym = hann_window(win).unwrap(); // symmetric Array window
       for len in [None, Some(16usize)] {
-        // Window::Array short-window under Right → Err.
-        let res_arr = istft(
+        let res = istft(
           &spec,
           Some(16),
           Some(4),
           Some(win),
-          Window::Array(&sym),
           WindowPad::Right,
           true,
           len,
           true,
         );
         assert!(
-          matches!(res_arr, Err(Error::Backend { .. })),
-          "Right + win={win} < n_fft=16 (Window::Array, length={len:?}) must be \
-           rejected, got {res_arr:?}"
-        );
-        // Window::Named("hann") short-window under Right → Err. THIS is the
-        // case that previously slipped through (covered-but-wrong).
-        let res_named = istft(
-          &spec,
-          Some(16),
-          Some(4),
-          Some(win),
-          Window::Named("hann"),
-          WindowPad::Right,
-          true,
-          len,
-          true,
-        );
-        assert!(
-          matches!(res_named, Err(Error::Backend { .. })),
-          "Right + win={win} < n_fft=16 (Window::Named, length={len:?}) must be \
-           rejected (periodic window is COVERED-but-WRONG; the coverage guard \
-           does NOT catch it), got {res_named:?}"
+          matches!(res, Err(Error::Backend { .. })),
+          "Right + win={win} < n_fft=16 (length={len:?}) must be rejected up front \
+           (covered-but-wrong for win=12; the coverage guard does NOT catch it), \
+           got {res:?}"
         );
       }
     }
     // Contrast: the SAME short window under WindowPad::Center is a faithful
-    // inverse and reconstructs EVERY sample (both kinds) — proving it is the
-    // Right placement, not the short window per se, that is rejected.
+    // inverse through the real stft and reconstructs EVERY sample — proving it is
+    // the Right placement, not the short window per se, that is rejected.
     for &win in &[8usize, 12usize] {
       assert_roundtrips_all_samples(&buf, 16, win, 4, WindowPad::Center, None);
-      assert_named_roundtrips_all_samples(&buf, 16, win, 4, WindowPad::Center);
     }
   }
 
@@ -1824,13 +1727,11 @@ mod tests {
     let x = Array::from_slice::<f32>(&buf, &[16i32]).unwrap();
     let spec = stft(&x, 9, 3, Some(9), WindowPad::Center).unwrap();
     assert_eq!(spec.shape()[1], 5); // n_freqs
-    let w = hann_window(9).unwrap();
     let bad = istft(
       &spec,
       Some(11), // 11/2+1 = 6 != n_freqs (5)
       Some(3),
       Some(9),
-      Window::Array(&w),
       WindowPad::Center,
       true,
       None,
@@ -1839,31 +1740,6 @@ mod tests {
     assert!(
       matches!(bad, Err(Error::Backend { .. })),
       "explicit n_fft inconsistent with n_freqs must Err, got {bad:?}"
-    );
-  }
-
-  #[test]
-  fn istft_array_window_wrong_length_errors() {
-    // Window::Array length must equal win_length (it is then placed per
-    // window_pad). n_fft=8, win_length=8 but a length-6 array → Err.
-    let buf = signal_16();
-    let x = Array::from_slice::<f32>(&buf, &[16i32]).unwrap();
-    let spec = stft(&x, 8, 4, Some(8), WindowPad::Center).unwrap();
-    let short = hann_window(6).unwrap(); // length 6 != win_length 8
-    let res = istft(
-      &spec,
-      Some(8),
-      Some(4),
-      Some(8),
-      Window::Array(&short),
-      WindowPad::Center,
-      true,
-      None,
-      true,
-    );
-    assert!(
-      matches!(res, Err(Error::Backend { .. })),
-      "Window::Array length != win_length must Err, got {res:?}"
     );
   }
 
@@ -1893,14 +1769,12 @@ mod tests {
     let buf = signal_16();
     let x = Array::from_slice::<f32>(&buf, &[16i32]).unwrap();
     let spec = stft(&x, 8, 4, Some(8), WindowPad::Center).unwrap();
-    let w = hann_window(8).unwrap();
     for len in [None, Some(10usize)] {
       let res = istft(
         &spec,
         Some(8),
         Some(4),
         Some(8),
-        Window::Array(&w),
         WindowPad::Center,
         false, // center=false: requested region starts at the uncovered index 0
         len,
@@ -1915,29 +1789,6 @@ mod tests {
   }
 
   #[test]
-  fn istft_named_window_is_periodic_no_trailing_zero() {
-    // Regression on the `window_fn(win_length + 1)[:-1]` periodic
-    // construction: the synthesis window must have its trailing sample dropped
-    // (so it is NOT the symmetric window with a zero at the end). periodic
-    // hann(8) = hann(9)[:-1] = [0, .1464.., .5, .8535.., 1, .8535.., .5,
-    // .1464..] — the LAST sample is 0.1464.., not 0.
-    let full = hann_window(9).unwrap();
-    let periodic = ops::indexing::slice(&full, &[0], &[8], &[1]).unwrap();
-    let v = to_vec(&periodic);
-    assert_eq!(v.len(), 8);
-    assert!(
-      v[0].abs() < WIN_TOL,
-      "periodic[0] should be 0, got {}",
-      v[0]
-    );
-    assert!(
-      (v[7] - 0.146_447).abs() < 1e-4,
-      "periodic[7] should be ~0.1464 (NOT 0), got {}",
-      v[7]
-    );
-  }
-
-  #[test]
   fn istft_rejects_bad_shapes_and_params() {
     // 1-D input (must be 2-D).
     let one_d = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3i32]).unwrap();
@@ -1947,7 +1798,6 @@ mod tests {
         None,
         None,
         None,
-        Window::Named("hann"),
         WindowPad::Center,
         true,
         None,
@@ -1960,7 +1810,6 @@ mod tests {
     let buf = signal_16();
     let x = Array::from_slice::<f32>(&buf, &[16i32]).unwrap();
     let spec = stft(&x, 8, 4, Some(8), WindowPad::Center).unwrap();
-    let w = hann_window(8).unwrap();
     // hop_length == 0.
     assert!(matches!(
       istft(
@@ -1968,7 +1817,6 @@ mod tests {
         None,
         Some(0),
         Some(8),
-        Window::Array(&w),
         WindowPad::Center,
         true,
         None,
@@ -1984,7 +1832,6 @@ mod tests {
         None,
         Some(4),
         Some(16),
-        Window::Array(&w),
         WindowPad::Center,
         true,
         None,
@@ -1999,7 +1846,6 @@ mod tests {
         None,
         Some(4),
         Some(8),
-        Window::Array(&w),
         WindowPad::Center,
         true,
         Some(1000),
@@ -2011,19 +1857,19 @@ mod tests {
 
   #[test]
   fn istft_rejects_pathological_scatter_work_before_window_alloc() {
-    // Codex OOM finding (+ the medium "work cap runs after named-window alloc"
+    // Codex OOM finding (+ the medium "work cap runs after window alloc"
     // finding): the real scatter/update workload is `num_frames * n_fft`, which
     // can dwarf the OLA *output* length `t` for small hops. The
     // `t <= MAX_DECODED_SAMPLES` cap does NOT catch this; the dedicated
-    // MAX_OLA_WORK guard must reject it BEFORE any window construction
-    // (`window_from_name(win_length + 1)`, a CPU Vec up to the cap) and before
-    // any broadcast/flatten/`try_reserve`/irfft.
+    // MAX_OLA_WORK guard must reject it BEFORE the shared `frame_window`
+    // (`hann_window(win_length)`, a CPU Vec up to the cap) and before any
+    // broadcast/flatten/`try_reserve`/irfft.
     //
     // We use a LAZY mlx spectrum (`zeros(...).astype(Complex64)`) — nothing is
-    // materialized — and `Window::Named("hann")` with the DEFAULT `win_length`
-    // (= n_fft). If the cap ran after window construction, the Named path would
-    // first allocate `hann_window(n_fft + 1)` ≈ 18 Mi f32s; because the cap
-    // precedes window construction, that allocation never happens.
+    // materialized — with the DEFAULT `win_length` (= n_fft). If the cap ran
+    // after window construction, `frame_window` would first allocate
+    // `hann_window(n_fft)` ≈ 18 Mi f32s; because the cap precedes window
+    // construction, that allocation never happens.
     //
     // num_frames=4, n_freqs=9 Mi+1 → n_fft=(n_freqs-1)*2=18 Mi, win_length=18 Mi.
     //   work = num_frames * n_fft = 4 * 18 Mi = 72 Mi  > MAX_OLA_WORK (64 Mi) ✓
@@ -2037,10 +1883,9 @@ mod tests {
       .unwrap();
     let res = istft(
       &spec,
-      None,                  // n_fft defaults to (n_freqs-1)*2
-      Some(2),               // small hop → t stays under the decoded cap
-      None,                  // win_length defaults to n_fft
-      Window::Named("hann"), // would alloc hann(win+1) AFTER the cap — never reached
+      None,    // n_fft defaults to (n_freqs-1)*2
+      Some(2), // small hop → t stays under the decoded cap
+      None,    // win_length defaults to n_fft
       WindowPad::Center,
       true,
       None,
@@ -2049,7 +1894,68 @@ mod tests {
     assert!(
       matches!(res, Err(Error::Backend { .. })),
       "pathological num_frames*n_fft must be rejected by the MAX_OLA_WORK cap \
-       before the named-window allocation"
+       before the frame_window allocation"
+    );
+  }
+
+  #[test]
+  fn mel_spectrogram_short_window_uses_right_pad_unchanged() {
+    // Pin that `mel_spectrogram` keeps its `mlx_audio.dsp` `WindowPad::Right`
+    // placement for a SHORT `win_length < n_fft`, so its features are
+    // byte-identical to building the mel by hand on the Right-padded stft (and
+    // to mlxrs pre-#52). Making `WindowPad::Right` the stft default is exactly
+    // so this front-end stays unchanged. n_fft=16, win=8 (< n_fft), hop=4.
+    //
+    // Expected = mel_filter_bank @ |stft(.., Right)|² (the canonical
+    // mel-spectrogram pipeline), computed directly here. This both confirms the
+    // value is unchanged AND pins the pad: the SAME mel built on the Center-
+    // padded stft differs (asserted below), so a silent flip of mel's pad to
+    // Center would fail this test.
+    let buf = signal_16();
+    let x = Array::from_slice::<f32>(&buf, &[16i32]).unwrap();
+    let n_fft = 16usize;
+    let win = 8usize;
+    let hop = 4usize;
+    let n_mels = 6usize;
+    let sr = 16_000u32;
+
+    let got = to_vec(&mel_spectrogram(&x, n_fft, hop, Some(win), n_mels, sr, 0.0, None).unwrap());
+
+    // Hand-built reference on the Right-padded stft.
+    let expected_mel = {
+      let spec = stft(&x, n_fft, hop, Some(win), WindowPad::Right).unwrap();
+      let power = spec.abs().unwrap().square().unwrap();
+      let bank = mel_filter_bank(n_mels, n_fft, sr, 0.0, None).unwrap();
+      let power_t = power.transpose().unwrap();
+      to_vec(&ops::linalg_basic::matmul(&bank, &power_t).unwrap())
+    };
+    assert_eq!(got.len(), expected_mel.len(), "mel length mismatch");
+    for (i, (g, e)) in got.iter().zip(expected_mel.iter()).enumerate() {
+      assert!(
+        (g - e).abs() < 1e-5,
+        "mel_spectrogram[{i}] must match the Right-padded reference: got {g}, want {e}"
+      );
+    }
+
+    // Pin the pad: the Center-padded stft gives a DIFFERENT mel, so if mel ever
+    // silently switched to Center this test would catch it (the short window is
+    // placed at a different offset, shifting the spectral energy).
+    let center_mel = {
+      let spec = stft(&x, n_fft, hop, Some(win), WindowPad::Center).unwrap();
+      let power = spec.abs().unwrap().square().unwrap();
+      let bank = mel_filter_bank(n_mels, n_fft, sr, 0.0, None).unwrap();
+      let power_t = power.transpose().unwrap();
+      to_vec(&ops::linalg_basic::matmul(&bank, &power_t).unwrap())
+    };
+    let max_diff = got
+      .iter()
+      .zip(center_mel.iter())
+      .map(|(r, c)| (r - c).abs())
+      .fold(0.0_f32, f32::max);
+    assert!(
+      max_diff > 1e-4,
+      "Right- and Center-padded short-window mel must DIFFER (else the pad pin \
+       is vacuous); max diff was {max_diff}"
     );
   }
 }
