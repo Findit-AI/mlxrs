@@ -15,13 +15,16 @@
 //!   ([`crate::audio::dsp::istft`], overlap-add reconstruction over
 //!   [`crate::ops::fft::irfft`] +
 //!   [`crate::ops::indexing::scatter_add_axis`]), mel filterbank, mel +
-//!   log-mel spectrogram.
+//!   log-mel spectrogram, 1-D IIR [`crate::audio::dsp::lfilter`], ITU-R
+//!   BS.1770 K-weighted integrated loudness
+//!   ([`crate::audio::dsp::integrated_loudness`]) +
+//!   [`crate::audio::dsp::normalize_loudness`].
 //!
 //! Out of scope for this PR (separate follow-ups per the M5 plan):
 //! - The `ISTFTCache` batched/cached overlap-add helper.
 //! - High-quality resampling (polyphase sinc, libsamplerate-style).
-//! - Pitch shifting, time stretching, voice activity detection, BS.1770
-//!   loudness, biquad filters, Kaldi-compatible feature extraction.
+//! - Pitch shifting, time stretching, voice activity detection,
+//!   `normalize_peak`, Kaldi-compatible feature extraction.
 //! - MP3/FLAC/OGG codecs (additional symphonia feature flags become
 //!   opt-in in future PRs; the `symphonia` crate already supports them,
 //!   we just don't enable them yet to keep the dep tree minimal).
