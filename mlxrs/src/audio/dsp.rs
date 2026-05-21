@@ -777,8 +777,7 @@ fn reflect_pad_1d(samples: &Array, padding: usize) -> Result<Array> {
 /// `mlx_audio.dsp` convention and **the default**, so short-window output is
 /// byte-identical to the reference — or [`WindowPad::Center`] — the librosa
 /// `pad_center` convention, opt in for invertible short windows). For
-/// `win_length == n_fft` the two are identical (no padding). `win_length >
-/// `win_length == n_fft` the two are identical (no padding). `win_length >
+/// `win_length == n_fft`, the two are identical (no padding). `win_length >
 /// n_fft` is rejected — the reference would concatenate zeros, but a longer
 /// window than the FFT length cannot occur in any documented `mlx-audio`
 /// config.
@@ -1915,7 +1914,8 @@ mod tests {
   /// would fail value-for-value. `n_fft` is passed to `stft` only (even values
   /// only; `istft` reads it from the typed spectrum metadata, not the bin
   /// count). `len_override` is the `length` passed to `istft` (pass
-  /// `Some(signal.len())` to recover the full input even when the centered
+  /// `Some(signal.len())` to recover the full original input length when
+  /// `center=true`, including non-hop-aligned cases). The expected sample
   /// values were cross-checked against a self-contained f64 numpy mirror
   /// (`docs/istft_ref.py`, local-only) reporting max round-trip error
   /// <= 4.5e-16 for every covered case; the f32 backend is asserted at 1e-5.
