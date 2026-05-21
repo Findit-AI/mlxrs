@@ -514,8 +514,16 @@ pub fn build_multimodal_mask_with_past(
     })?;
 
   // block_id[i] = 1-indexed chunk-local image span index for chunk position
-  // i; 0 = not in any image. Length seq_len (chunk-local).
-  let mut block_id = vec![0u32; seq_len];
+  // i; 0 = not in any image. Length seq_len (chunk-local). Allocated
+  // fallibly for the same reason as `buf` below — a large valid `seq_len`
+  // would otherwise abort the process in `vec![0u32; seq_len]` BEFORE the
+  // recoverable `buf.try_reserve_exact` could report OOM (Codex VLM-8
+  // R4F1: every allocation in this public mask helper must be recoverable).
+  let mut block_id: Vec<u32> = Vec::new();
+  block_id
+    .try_reserve_exact(seq_len)
+    .map_err(|_| Error::OutOfMemory)?;
+  block_id.resize(seq_len, 0);
   for (idx, &(s, e)) in sorted.iter().enumerate() {
     let block = (idx + 1) as u32;
     for slot in block_id.iter_mut().take(e).skip(s) {
