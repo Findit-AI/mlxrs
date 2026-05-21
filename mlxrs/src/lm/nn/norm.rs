@@ -237,6 +237,12 @@ pub struct GroupNorm {
   /// rely on the same `dims / num_groups` integer division and would
   /// produce a malformed reshape otherwise).
   pub num_groups: i32,
+  /// Configured feature width (last axis of the expected input). Stored
+  /// so [`forward`](Self::forward) can reject a checkpoint/config mismatch
+  /// up-front instead of silently normalizing whatever last-axis width
+  /// happens to be divisible by `num_groups`. The references store it on
+  /// the module unconditionally; we mirror that here.
+  pub dims: i32,
   /// Optional per-feature affine scale of shape `(dims,)`. `None` ⇒
   /// `affine=False` in the references.
   pub weight: Option<Array>,
@@ -252,13 +258,21 @@ impl GroupNorm {
   /// Construct a GroupNorm matching the swift `GroupNorm(groupCount:,
   /// dimensions:, eps:, affine:, pytorchCompatible:)` init signature.
   ///
+  /// Validates `(num_groups, dims)` up-front: both must be positive and
+  /// `dims` must be evenly divisible by `num_groups`. This applies to
+  /// BOTH `affine = true` and `affine = false` — without it, an
+  /// `affine = false` GroupNorm with an invalid `dims` would silently
+  /// pass at construction and then [`Self::forward`] would derive the
+  /// feature width from the input's last axis, normalizing whatever
+  /// happens to be divisible by `num_groups` (config/checkpoint mismatch
+  /// silently corrupting activations).
+  ///
   /// `affine = true` materializes the references' `weight = ones((dims,))`
   /// and `bias = zeros((dims,))` (a small fallible alloc), so this is
   /// `Result<Self>`. `affine = false` skips the alloc and leaves both
-  /// fields `None`. Pass `dims` even when `affine = false` — it is the
-  /// (informational) feature width and is currently used only to allocate
-  /// the affine params (matching the references, which also store it on
-  /// the module unconditionally).
+  /// fields `None`. `dims` is stored on the struct unconditionally
+  /// (matching the references) and is checked against the input's last
+  /// axis inside [`Self::forward`].
   pub fn new(
     num_groups: i32,
     dims: i32,
@@ -266,10 +280,27 @@ impl GroupNorm {
     affine: bool,
     pytorch_compatible: bool,
   ) -> Result<Self> {
+    if num_groups <= 0 {
+      return Err(crate::error::Error::ShapeMismatch {
+        message: format!("GroupNorm: num_groups ({num_groups}) must be positive"),
+      });
+    }
+    if dims <= 0 {
+      return Err(crate::error::Error::ShapeMismatch {
+        message: format!("GroupNorm: dims ({dims}) must be positive"),
+      });
+    }
+    if dims % num_groups != 0 {
+      return Err(crate::error::Error::ShapeMismatch {
+        message: format!(
+          "GroupNorm: dims ({dims}) must be evenly divisible by num_groups ({num_groups})"
+        ),
+      });
+    }
     let (weight, bias) = if affine {
-      let d = usize::try_from(dims).map_err(|_| crate::error::Error::ShapeMismatch {
-        message: format!("GroupNorm: dims = {dims} must be non-negative"),
-      })?;
+      // `dims > 0` guaranteed above ⇒ `usize::try_from` cannot fail; the
+      // `expect` documents the invariant rather than re-erroring.
+      let d = usize::try_from(dims).expect("dims > 0 guarded above");
       (
         Some(Array::ones::<f32>(&(d,))?),
         Some(Array::zeros::<f32>(&(d,))?),
@@ -279,6 +310,7 @@ impl GroupNorm {
     };
     Ok(Self {
       num_groups,
+      dims,
       weight,
       bias,
       eps,
@@ -306,19 +338,29 @@ impl GroupNorm {
   }
 
   /// Validate the input shape against GroupNorm's invariants: rank ≥ 2
-  /// (so there is a feature axis distinct from the batch axis),
-  /// `num_groups > 0`, and the last (feature) axis evenly divisible by
-  /// `num_groups`. Returns the feature dim as `i32` for downstream
-  /// `group_size = dims / num_groups` arithmetic.
+  /// (so there is a feature axis distinct from the batch axis), and the
+  /// last (feature) axis matches the configured [`Self::dims`]. Returns
+  /// the feature dim as `i32` for downstream `group_size = dims /
+  /// num_groups` arithmetic.
+  ///
+  /// Constructor invariants the dims-equality check piggybacks on:
+  /// `Self::new` already rejected `num_groups <= 0`, `dims <= 0`, and
+  /// `dims % num_groups != 0`, so once the last axis equals
+  /// `self.dims` the divisibility/positivity follow transitively. The
+  /// rank check stays explicit (the input shape is per-call, not a
+  /// constructor invariant), and the divisibility check is kept as
+  /// belt-and-suspenders (the dims-equality assertion makes it
+  /// unreachable, but a future refactor that reorders the checks
+  /// wouldn't silently regress the bug class).
   ///
   /// Both [`Self::group_norm`] and [`Self::pytorch_group_norm`] call this
   /// up-front. The references don't run an explicit guard (they rely on
   /// the user / framework wiring), but in the safe layer skipping it
   /// produces *silent* activation corruption (e.g. rank-1 `[C]` with
   /// `num_groups=1` would pass as `[C, 1, 1]` and normalize singleton
-  /// groups to zero; `[1, 3]` with `num_groups=2` would pass the
-  /// element-count divisibility but the 3-wide feature axis isn't
-  /// splittable) — surface the misuse as `Err(ShapeMismatch)` instead.
+  /// groups to zero; a checkpoint configured for `dims=4` fed an `[1, 8]`
+  /// input would pass the divisibility check but normalize the wrong
+  /// channel count) — surface the misuse as `Err(ShapeMismatch)` instead.
   fn validate_input_shape(&self, orig_shape: &[usize]) -> Result<i32> {
     if orig_shape.len() < 2 {
       return Err(crate::error::Error::ShapeMismatch {
@@ -328,20 +370,24 @@ impl GroupNorm {
         ),
       });
     }
-    if self.num_groups <= 0 {
-      return Err(crate::error::Error::ShapeMismatch {
-        message: format!(
-          "GroupNorm: num_groups ({}) must be positive",
-          self.num_groups
-        ),
-      });
-    }
     let dims = *orig_shape
       .last()
       .expect("rank-≥-2 guarded above ⇒ last() is Some");
     let dims_i32 = i32::try_from(dims).map_err(|_| crate::error::Error::ShapeMismatch {
       message: format!("GroupNorm: feature dim {dims} exceeds i32::MAX"),
     })?;
+    if dims_i32 != self.dims {
+      return Err(crate::error::Error::ShapeMismatch {
+        message: format!(
+          "GroupNorm: input last-axis ({dims_i32}) must match configured dims ({})",
+          self.dims
+        ),
+      });
+    }
+    // Constructor already enforces `dims % num_groups == 0`, so once
+    // `dims_i32 == self.dims` this is unreachable. Kept as
+    // belt-and-suspenders against a future refactor that reorders the
+    // invariant checks.
     if dims_i32 % self.num_groups != 0 {
       return Err(crate::error::Error::ShapeMismatch {
         message: format!(
@@ -833,16 +879,19 @@ mod tests {
 
   /// Rank-2 `[1, 3]` with `num_groups=2` used to silently pass (element
   /// count is divisible — 6/2 = 3 — but the 3-wide feature axis isn't
-  /// splittable). Now an explicit `Err(ShapeMismatch)`.
+  /// splittable). The new constructor catches `dims % num_groups != 0`
+  /// before construction; constructing with valid `dims=4` and then
+  /// forwarding `[1, 3]` (whose last-axis 3 != configured 4) exercises
+  /// the dims-equality enforcement in the forward.
   #[test]
-  fn group_norm_feature_dim_not_divisible_errors() {
+  fn group_norm_feature_dim_mismatch_errors() {
     let x = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &(1, 3)).unwrap();
-    let gn = GroupNorm::new(2, 3, 1e-5, false, false).unwrap();
+    let gn = GroupNorm::new(2, 4, 1e-5, false, false).unwrap();
     let err = gn.forward(&x).unwrap_err();
     match err {
       crate::error::Error::ShapeMismatch { message } => {
         assert!(
-          message.contains("divisible"),
+          message.contains("last-axis") && message.contains("4") && message.contains("3"),
           "unexpected message: {message}"
         );
       }
@@ -865,17 +914,18 @@ mod tests {
     }
   }
 
-  /// Same invariants on the `pytorch_compatible` path: non-divisible
-  /// feature dim rejected.
+  /// Same dims-equality invariant on the `pytorch_compatible` path:
+  /// mismatch between configured `dims=4` and input last-axis 3 is
+  /// rejected.
   #[test]
-  fn group_norm_pytorch_compat_feature_dim_not_divisible_errors() {
+  fn group_norm_pytorch_compat_feature_dim_mismatch_errors() {
     let x = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &(1, 3)).unwrap();
-    let gn = GroupNorm::new(2, 3, 1e-5, false, true).unwrap();
+    let gn = GroupNorm::new(2, 4, 1e-5, false, true).unwrap();
     let err = gn.forward(&x).unwrap_err();
     match err {
       crate::error::Error::ShapeMismatch { message } => {
         assert!(
-          message.contains("divisible"),
+          message.contains("last-axis") && message.contains("4") && message.contains("3"),
           "unexpected message: {message}"
         );
       }
@@ -893,6 +943,102 @@ mod tests {
     let v = y.to_vec::<f32>().unwrap();
     assert_eq!(v.len(), 4);
     assert!(v.iter().all(|x| x.is_finite()));
+  }
+
+  // ─── GroupNorm constructor validation regressions (Codex R2) ───
+
+  /// Constructor must reject negative `dims` on BOTH affine paths.
+  /// Previously only the `affine=true` branch ran `usize::try_from`; the
+  /// `affine=false` branch silently accepted any `dims` (including
+  /// nonsense) and the forward derived the feature width from
+  /// `x.shape().last()`.
+  #[test]
+  fn group_norm_constructor_rejects_negative_dims() {
+    let err = GroupNorm::new(2, -1, 1e-5, false, false).unwrap_err();
+    match err {
+      crate::error::Error::ShapeMismatch { message } => {
+        assert!(
+          message.contains("dims") && message.contains("positive"),
+          "unexpected message: {message}"
+        );
+      }
+      other => panic!("expected ShapeMismatch, got {other:?}"),
+    }
+  }
+
+  /// Constructor must reject `dims` not divisible by `num_groups` on
+  /// BOTH affine paths. Previously the divisibility was only checked at
+  /// forward-time against `x.shape().last()`, so an `affine=false`
+  /// GroupNorm could be constructed with `dims=3, num_groups=2` and
+  /// later normalize a `[1, 4]` input (whose last axis happens to
+  /// divide 2) — silent config/checkpoint mismatch.
+  #[test]
+  fn group_norm_constructor_rejects_non_divisible_dims() {
+    let err = GroupNorm::new(2, 3, 1e-5, false, false).unwrap_err();
+    match err {
+      crate::error::Error::ShapeMismatch { message } => {
+        assert!(
+          message.contains("divisible"),
+          "unexpected message: {message}"
+        );
+      }
+      other => panic!("expected ShapeMismatch, got {other:?}"),
+    }
+  }
+
+  /// `dims == 0` is rejected (`positive` ⇒ `> 0`, not `>= 0`). A
+  /// zero-dim GroupNorm has no feature axis to normalize and the
+  /// downstream `dims / num_groups` would yield `group_size = 0`.
+  #[test]
+  fn group_norm_constructor_rejects_zero_dims() {
+    let err = GroupNorm::new(2, 0, 1e-5, false, false).unwrap_err();
+    match err {
+      crate::error::Error::ShapeMismatch { message } => {
+        assert!(
+          message.contains("dims") && message.contains("positive"),
+          "unexpected message: {message}"
+        );
+      }
+      other => panic!("expected ShapeMismatch, got {other:?}"),
+    }
+  }
+
+  /// Regression: a valid `affine=false` GroupNorm still constructs Ok
+  /// after the new constructor checks. (Belt for the suspenders — the
+  /// existing `group_norm_default_constructor_no_affine` test already
+  /// covers this; keep an explicit one named for the constructor-spec
+  /// item.)
+  #[test]
+  fn group_norm_constructor_accepts_valid_non_affine() {
+    let gn = GroupNorm::new(2, 4, 1e-5, false, false).unwrap();
+    assert_eq!(gn.dims, 4);
+    assert_eq!(gn.num_groups, 2);
+    assert!(gn.weight.is_none());
+    assert!(gn.bias.is_none());
+  }
+
+  /// Forward rejects a config/checkpoint dim mismatch: construct with
+  /// `dims=4` and call forward on `[1, 8]`. The 8-wide input is
+  /// divisible by `num_groups=2` (would have silently normalized
+  /// previously), but doesn't match the configured `dims=4` ⇒
+  /// `Err(ShapeMismatch)` naming both expected (4) and actual (8).
+  #[test]
+  fn group_norm_forward_rejects_dim_mismatch() {
+    let x = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &(1, 8)).unwrap();
+    let gn = GroupNorm::new(2, 4, 1e-5, false, false).unwrap();
+    let err = gn.forward(&x).unwrap_err();
+    match err {
+      crate::error::Error::ShapeMismatch { message } => {
+        assert!(
+          message.contains("last-axis")
+            && message.contains("dims")
+            && message.contains("4")
+            && message.contains("8"),
+          "expected message to name configured dims (4) and actual (8): {message}"
+        );
+      }
+      other => panic!("expected ShapeMismatch, got {other:?}"),
+    }
   }
 
   // ─── inferred_dim overflow regression (Codex review) ───
