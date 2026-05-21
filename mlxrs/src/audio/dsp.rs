@@ -771,13 +771,13 @@ fn reflect_pad_1d(samples: &Array, padding: usize) -> Result<Array> {
 /// Faithful port of `mlx_audio.dsp.stft(x, n_fft, hop_length, win_length,
 /// window="hann", center=True, pad_mode="reflect")`. The analysis window is
 /// built by the shared `frame_window` — the symmetric [`hann_window`] of
-/// `win_length` (the only window kind in this PR; hamming/blackman/bartlett
-/// are planned follow-ups) placed into the `n_fft` frame per `window_pad`.
+/// `win_length`, placed into the `n_fft` frame per `window_pad`.
 /// When `win_length` (default = `n_fft`) is smaller than `n_fft`, the window
 /// is zero-padded up to `n_fft` per `window_pad` ([`WindowPad::Right`] — the
 /// `mlx_audio.dsp` convention and **the default**, so short-window output is
 /// byte-identical to the reference — or [`WindowPad::Center`] — the librosa
 /// `pad_center` convention, opt in for invertible short windows). For
+/// `win_length == n_fft` the two are identical (no padding). `win_length >
 /// `win_length == n_fft` the two are identical (no padding). `win_length >
 /// n_fft` is rejected — the reference would concatenate zeros, but a longer
 /// window than the FFT length cannot occur in any documented `mlx-audio`
@@ -1904,18 +1904,18 @@ mod tests {
   }
 
   /// Round-trip `signal` through the REAL public [`stft`] then [`istft`] with
-  /// the SAME `win_length` / `window_pad` (`istft` infers the even `n_fft`
-  /// itself and always uses the `Σw²` inverse), and assert EVERY output sample
-  /// equals the original.
+  /// the SAME `win_length` / `window_pad` (`istft` reads `n_fft` from the
+  /// typed spectrum metadata and always uses the `Σw²` inverse), and assert
+  /// EVERY output sample equals the original.
   ///
   /// This is the canary the previous review rounds were missing: it goes
   /// through `stft` itself (NOT a private periodic-forward helper), and the
   /// synthesis window `istft` rebuilds is the SAME symmetric Hann `stft`
   /// placed (both via `frame_window`) — so if the two ever drifted, this
   /// would fail value-for-value. `n_fft` is passed to `stft` only (even values
-  /// only; `istft` re-derives it from the bin count). `len_override` is the
-  /// `length` passed to `istft` (pass `Some(signal.len())` to recover the full
-  /// input even when the centered region is shorter than the signal). Expected
+  /// only; `istft` reads it from the typed spectrum metadata, not the bin
+  /// count). `len_override` is the `length` passed to `istft` (pass
+  /// `Some(signal.len())` to recover the full input even when the centered
   /// values were cross-checked against a self-contained f64 numpy mirror
   /// (`docs/istft_ref.py`, local-only) reporting max round-trip error
   /// <= 4.5e-16 for every covered case; the f32 backend is asserted at 1e-5.
