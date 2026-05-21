@@ -88,6 +88,17 @@ use crate::{
   },
 };
 
+/// Upper bound on decoded RGB pixel-buffer size accepted by host-side
+/// allocators in this module (e.g. [`pad_to_square`]'s `size × size × 3`
+/// canvas). Matches `image::Limits::default().max_alloc = 512 * 1024 *
+/// 1024` (the same 512 MiB ceiling [`load_image`] enforces via
+/// `Limits::default().reserve(decoder.total_bytes())?` — see the
+/// `Allocation guard` block in [`load_image`]'s doc). Exposing a single
+/// shared constant here keeps the per-step caps consistent: a
+/// `DynamicImage` that fit through `load_image` still has to clear this
+/// gate before any quadratic-canvas builder allocates.
+pub const MAX_DECODED_IMAGE_BYTES: u64 = 512 * 1024 * 1024;
+
 /// Interpolation filter for [`resize`], mirroring swift
 /// `MediaProcessing.swift`'s resampler choices (lines 81-132):
 /// [`resampleLanczos`](https://github.com/ml-explore/mlx-swift-lm/blob/main/Libraries/MLXVLM/MediaProcessing.swift#L81-L103)
@@ -433,11 +444,19 @@ pub fn resize_lanczos(
 /// Mirrors swift
 /// [`MediaProcessing.centerCrop(_:size:)`](https://github.com/ml-explore/mlx-swift-lm/blob/main/Libraries/MLXVLM/MediaProcessing.swift#L213-L224)
 /// and the python HF `BaseImageProcessor.center_crop` (`crop_size` field
-/// at `mlx_vlm/models/base.py:140-153`). If the source is smaller than
-/// the target along either axis, the source is returned unchanged —
-/// faithful to swift's `rectSmallerOrEqual` early-return on lines
-/// 215-217. Otherwise the geometric center `(W - target_w) / 2`,
-/// `(H - target_h) / 2` is taken via `image::DynamicImage::crop_imm`
+/// at `mlx_vlm/models/base.py:140-153`).
+///
+/// **Early-return parity:** swift `rectSmallerOrEqual`
+/// (`MediaProcessing.swift:196-198`) returns true only when *both* axes
+/// already fit within the target (`source.width <= target.width &&
+/// source.height <= target.height`); only then is the source returned
+/// unchanged. When just one axis exceeds the target, swift's
+/// `centerCrop` helper at lines 201-210 clamps each crop dim with
+/// `min(source, target)` and computes centered offsets — the bigger
+/// axis is cropped, the smaller axis is kept at the source extent
+/// (centered offset of 0).
+///
+/// The geometric center is `(W - crop_w) / 2`, `(H - crop_h) / 2`
 /// (integer division — for an even-sized source with odd-sized target
 /// the crop is biased toward the top-left pixel by 0.5, matching
 /// `crop_imm`'s unsigned-floor semantics and PIL `Image.crop` behavior).
@@ -451,18 +470,26 @@ pub fn center_crop(
 ) -> ::image::DynamicImage {
   let w = img.width();
   let h = img.height();
-  // Swift `rectSmallerOrEqual` (`MediaProcessing.swift:196-198`): if
-  // either source axis fits within the target, return the source
-  // unchanged. (`min(extent, target)` in the swift `centerCrop` helper
-  // at line 201-210 produces the identical behavior.)
-  if w <= target_w || h <= target_h {
+  // Swift `rectSmallerOrEqual` early-return: BOTH axes must already
+  // fit. If only one axis is larger than the target we still need to
+  // crop that bigger axis (using `min(source, target)` for the smaller
+  // axis), matching swift's `min(extent, target)` clamp at
+  // `MediaProcessing.swift:201-210`.
+  if w <= target_w && h <= target_h {
     return img.clone();
   }
+  // Clamp each crop dimension to `min(source, target)` so a partial-fit
+  // case crops only the bigger axis (the smaller axis is kept at the
+  // source extent with a centered offset of 0). For the fully-bigger
+  // case (both axes > target) this collapses to `(target_w, target_h)`.
+  let crop_w = w.min(target_w);
+  let crop_h = h.min(target_h);
   // Integer-floor center offsets; PIL `Image.crop` and the swift
-  // `centerCrop` rect helper compute `(extent - target) / 2` likewise.
-  let x = (w - target_w) / 2;
-  let y = (h - target_h) / 2;
-  img.crop_imm(x, y, target_w, target_h)
+  // `centerCrop` rect helper compute `(extent - crop) / 2` likewise.
+  // When `crop_x == w` (smaller axis kept whole) this is `0`.
+  let x = (w - crop_w) / 2;
+  let y = (h - crop_h) / 2;
+  img.crop_imm(x, y, crop_w, crop_h)
 }
 
 /// Pad `img` to a square by filling the shorter side with `fill`.
@@ -488,19 +515,86 @@ pub fn center_crop(
 /// [`image_to_array`] + [`rescale`] steps in array space (one `pad` op,
 /// not yet exposed here; per-model concern when needed).
 ///
-/// Infallible by reference parity (python `expand2square` returns
-/// `Image` non-throwing).
-pub fn pad_to_square(img: &::image::DynamicImage, fill: [u8; 3]) -> ::image::DynamicImage {
+/// **Bounded canvas (fallible by Rust safety, not parity):** the python
+/// reference is infallible because `PIL.Image.new(size, size)` raises
+/// `MemoryError` on OOM — an exception that propagates cleanly up the
+/// processor stack. Rust's `RgbImage::from_pixel(size, size, ...)` and
+/// `Vec::with_capacity` *abort* the process on allocator failure. A
+/// `100_000 x 1` source would otherwise drive a `100_000² × 3` = 30 GiB
+/// canvas allocation. To preserve the exception-like recoverability
+/// the python contract assumes, this function:
+/// 1. Checks `size × size × 3` for `u64` overflow *and* against
+///    [`MAX_DECODED_IMAGE_BYTES`] (the same 512 MiB ceiling
+///    [`load_image`] enforces);
+/// 2. Allocates the pixel buffer via `Vec::try_reserve_exact` so an
+///    allocator failure surfaces as [`Error::OutOfMemory`] rather than
+///    a panic-abort;
+/// 3. Uses `image::ImageBuffer::from_raw` on a uniform-fill buffer to
+///    keep the `RgbImage::from_pixel` semantics without its panicking
+///    backing alloc.
+///
+/// Oversized inputs return [`Error::ShapeMismatch`] with the requested
+/// vs allowed byte count; allocator failures return
+/// [`Error::OutOfMemory`].
+pub fn pad_to_square(img: &::image::DynamicImage, fill: [u8; 3]) -> Result<::image::DynamicImage> {
   use ::image::GenericImage as _;
 
   let w = img.width();
   let h = img.height();
   if w == h {
-    return img.clone();
+    return Ok(img.clone());
   }
   let size = w.max(h);
-  let fill_px = ::image::Rgb(fill);
-  let mut canvas = ::image::RgbImage::from_pixel(size, size, fill_px);
+  // `size * size * 3` byte budget. Use u64 throughout so the check is
+  // identical on 32-bit and 64-bit hosts (and so `MAX_DECODED_IMAGE_BYTES`
+  // can be compared without lossy casts). `u32::MAX^2 * 3 ≈ 5.5e19` fits
+  // in u64, so the `checked_mul` chain only fires for a truly hostile
+  // dimension product.
+  let size_u64 = u64::from(size);
+  let bytes = size_u64
+    .checked_mul(size_u64)
+    .and_then(|sq| sq.checked_mul(3))
+    .ok_or_else(|| Error::ShapeMismatch {
+      message: format!("pad_to_square: size*size*3 overflows u64 for {size}x{size}"),
+    })?;
+  if bytes > MAX_DECODED_IMAGE_BYTES {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "pad_to_square: {size}x{size} canvas would need {bytes} bytes, \
+         exceeds MAX_DECODED_IMAGE_BYTES={MAX_DECODED_IMAGE_BYTES} (source was {w}x{h})"
+      ),
+    });
+  }
+  // `bytes <= MAX_DECODED_IMAGE_BYTES = 512 MiB`, well under `usize::MAX`
+  // on every supported host (we ship aarch64-darwin and x86_64-linux —
+  // both 64-bit; the 32-bit edge case is bounded by the u64 check
+  // above). Cast is lossless given the prior gate.
+  let bytes_usize = bytes as usize;
+  // Recoverable OOM at the canvas allocation. `vec![value; n]` and
+  // `Vec::with_capacity` would `abort()` on allocator failure;
+  // `try_reserve_exact` surfaces it as `Error::OutOfMemory`.
+  let mut canvas_buf: Vec<u8> = Vec::new();
+  canvas_buf
+    .try_reserve_exact(bytes_usize)
+    .map_err(|_| Error::OutOfMemory)?;
+  // Uniform RGB fill — equivalent to `RgbImage::from_pixel(size, size,
+  // Rgb(fill))` but without the panic-on-OOM backing alloc. Each pixel
+  // is the same 3-byte triple, so a single `extend_from_slice` per row
+  // would also work; the per-pixel loop here is straight-line code that
+  // LLVM auto-vectorizes (and the byte budget is already capped above).
+  for _ in 0..(bytes_usize / 3) {
+    canvas_buf.extend_from_slice(&fill);
+  }
+  debug_assert_eq!(
+    canvas_buf.len(),
+    bytes_usize,
+    "canvas fill length must equal pre-computed bytes",
+  );
+  // `from_raw` only returns `None` when `buf.len() < width * height *
+  // channels`. By construction `canvas_buf.len() == size * size * 3`
+  // (the loop above pushes exactly `bytes_usize / 3` × 3 bytes).
+  let mut canvas: ::image::RgbImage = ::image::ImageBuffer::from_raw(size, size, canvas_buf)
+    .expect("ImageBuffer::from_raw: canvas buffer length matches size * size * 3 by construction");
   // Project the source onto an Rgb8 view so `copy_from` succeeds
   // regardless of source variant (Luma8 broadcasts, Rgba* drops alpha
   // — same projection [`image_to_array`] uses).
@@ -519,7 +613,7 @@ pub fn pad_to_square(img: &::image::DynamicImage, fill: [u8; 3]) -> ::image::Dyn
     // and `x_off + w <= (h-w) + w = h = size`; when w > h: `x_off = 0`,
     // `x_off + w = w <= max(w, h) = size`). Identical reasoning for y.
     .expect("copy_from: src extent fits canvas by construction");
-  ::image::DynamicImage::ImageRgb8(canvas)
+  Ok(::image::DynamicImage::ImageRgb8(canvas))
 }
 
 /// Convert a [`image::DynamicImage`] to an `Array` of shape `[H, W, 3]`,

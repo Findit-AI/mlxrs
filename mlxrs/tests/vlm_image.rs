@@ -657,14 +657,46 @@ fn center_crop_source_smaller_returns_source_unchanged() {
 }
 
 #[test]
-fn center_crop_one_axis_smaller_returns_source_unchanged() {
-  // Mirrors swift `rectSmallerOrEqual`: if EITHER axis fits within
-  // the target, the source is returned unchanged. A 4x8 source asked
-  // for a 6x4 crop keeps the source as-is (width 4 <= target_w 6).
+fn center_crop_one_axis_smaller_clamps_and_crops_bigger_axis() {
+  // Mirrors swift `rectSmallerOrEqual` + `centerCrop`'s `min(source,
+  // target)` clamp (`MediaProcessing.swift:201-210`): when only one
+  // axis exceeds the target, `crop_w = min(source_w, target_w)`,
+  // `crop_h = min(source_h, target_h)`, and the bigger axis is
+  // center-cropped. Source `(w=4, h=8)`, target `(target_h=4,
+  // target_w=6)` → `crop_w = min(4, 6) = 4`, `crop_h = min(8, 4) = 4`,
+  // y-offset = `(8 - 4) / 2 = 2` → output 4x4 taken from y=2..6.
   let img = synthetic_image(4, 8);
   let out = center_crop(&img, 4, 6);
   assert_eq!(out.width(), 4);
-  assert_eq!(out.height(), 8);
+  assert_eq!(out.height(), 4);
+  // synthetic_image: pixel (x, y) = (10*y, 10*x, 100). The cropped
+  // window starts at y=2, so out's (0, 0) pixel is the source's
+  // (0, 2) = (20, 0, 100).
+  assert_eq!(out.to_rgb8().get_pixel(0, 0).0, [20, 0, 100]);
+  assert_eq!(out.to_rgb8().get_pixel(3, 3).0, [50, 30, 100]); // src (3, 5)
+}
+
+#[test]
+fn center_crop_height_only_larger_crops_height_keeps_width() {
+  // Regression for Codex Finding 1 (OR-bug): a source whose width
+  // exactly equals `target_w` but whose height exceeds `target_h`
+  // must still crop the height. Pre-fix code returned the source
+  // unchanged because `w <= target_w` short-circuited the OR.
+  //
+  // Source `(w=2, h=8)`, target `(target_h=4, target_w=2)` →
+  // `crop_w = min(2, 2) = 2`, `crop_h = min(8, 4) = 4`,
+  // y-offset = `(8 - 4) / 2 = 2` → output 2 (W) x 4 (H).
+  let img = synthetic_image(2, 8);
+  let out = center_crop(&img, 4, 2);
+  assert_eq!(out.width(), 2);
+  assert_eq!(out.height(), 4);
+  // synthetic_image: pixel (x, y) = (10*y, 10*x, 100). Cropped window
+  // starts at y=2 → out's (0, 0) is source (0, 2) = (20, 0, 100).
+  let rgb = out.to_rgb8();
+  assert_eq!(rgb.get_pixel(0, 0).0, [20, 0, 100]);
+  assert_eq!(rgb.get_pixel(1, 0).0, [20, 10, 100]); // src (1, 2)
+  assert_eq!(rgb.get_pixel(0, 3).0, [50, 0, 100]); // src (0, 5)
+  assert_eq!(rgb.get_pixel(1, 3).0, [50, 10, 100]); // src (1, 5)
 }
 
 // ---------- pad_to_square ----------
@@ -682,7 +714,7 @@ fn pad_to_square_4x2_with_black_fill_produces_4x4_with_pad_rows() {
     }
   }
   let img = ::image::DynamicImage::ImageRgb8(buf);
-  let out = pad_to_square(&img, [0, 0, 0]);
+  let out = pad_to_square(&img, [0, 0, 0]).unwrap();
   assert_eq!(out.width(), 4);
   assert_eq!(out.height(), 4);
   let rgb = out.to_rgb8();
@@ -725,7 +757,7 @@ fn pad_to_square_2x4_pads_left_and_right() {
     }
   }
   let img = ::image::DynamicImage::ImageRgb8(buf);
-  let out = pad_to_square(&img, [255, 128, 64]);
+  let out = pad_to_square(&img, [255, 128, 64]).unwrap();
   assert_eq!(out.width(), 4);
   assert_eq!(out.height(), 4);
   let rgb = out.to_rgb8();
@@ -750,7 +782,7 @@ fn pad_to_square_already_square_returns_clone() {
   // No alloc / no padding when w == h; output dims and a sample
   // pixel must match the source.
   let img = synthetic_image(4, 4);
-  let out = pad_to_square(&img, [99, 99, 99]);
+  let out = pad_to_square(&img, [99, 99, 99]).unwrap();
   assert_eq!(out.width(), 4);
   assert_eq!(out.height(), 4);
   // synthetic_image pixel (2, 3) = (10*3, 10*2, 100) = (30, 20, 100).
@@ -770,7 +802,7 @@ fn pad_to_square_odd_difference_extra_row_on_bottom() {
     }
   }
   let img = ::image::DynamicImage::ImageRgb8(buf);
-  let out = pad_to_square(&img, [42, 43, 44]);
+  let out = pad_to_square(&img, [42, 43, 44]).unwrap();
   assert_eq!((out.width(), out.height()), (3, 3));
   let rgb = out.to_rgb8();
   // Source at rows 0 and 1, pad row at row 2.
@@ -785,6 +817,32 @@ fn pad_to_square_odd_difference_extra_row_on_bottom() {
   }
   for x in 0..3 {
     assert_eq!(rgb.get_pixel(x, 2).0, [42, 43, 44], "pad row x={x}");
+  }
+}
+
+#[test]
+fn pad_to_square_rejects_oversized_canvas() {
+  // Regression for Codex Finding 2 (quadratic alloc OOM): a 100_000 x 1
+  // source would drive a 100_000² × 3 ≈ 30 GiB canvas — the prior
+  // infallible `RgbImage::from_pixel(size, size, ...)` would
+  // vec-overflow / OOM-abort the process. The fallible signature
+  // must surface this as a recoverable `Error::ShapeMismatch`,
+  // bounded by `MAX_DECODED_IMAGE_BYTES` (matches `load_image`'s 512
+  // MiB ceiling).
+  //
+  // The source itself is only 100_000 × 1 × 3 = ~300 KiB (fine to
+  // allocate as the test fixture). Only the would-be `pad_to_square`
+  // output trips the bound.
+  let img = ::image::DynamicImage::ImageRgb8(::image::RgbImage::new(100_000, 1));
+  let err = pad_to_square(&img, [0, 0, 0]).expect_err("oversized canvas must be rejected");
+  match err {
+    Error::ShapeMismatch { message } => {
+      assert!(
+        message.contains("pad_to_square") && message.contains("MAX_DECODED_IMAGE_BYTES"),
+        "expected ShapeMismatch mentioning the budget; got: {message}"
+      );
+    }
+    other => panic!("expected ShapeMismatch, got {other:?}"),
   }
 }
 
