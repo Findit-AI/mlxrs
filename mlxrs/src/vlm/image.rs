@@ -20,6 +20,17 @@
 //!   primitives. Video frame preprocessing is also out of scope (the
 //!   `MediaProcessing.asProcessedSequence` family on lines 288-526 of the
 //!   swift reference) — VLM video support is a sibling concern.
+//!   The swift
+//!   [`inSRGBToneCurveSpace`](https://github.com/ml-explore/mlx-swift-lm/blob/main/Libraries/MLXVLM/MediaProcessing.swift#L50-L54)
+//!   sRGB gamma conversion is also deferred: it is a piecewise nonlinear
+//!   transform (`x <= 0.0031308 ? 12.92*x : 1.055*x^(1/2.4) - 0.055`),
+//!   not a color-matrix multiply, and requires a `where`/conditional-select
+//!   op that is not yet exposed in `mlxrs::ops`. The swift reference uses
+//!   CoreImage's `CIFilter.linearToSRGBToneCurve()` (an Apple-only
+//!   primitive); python `mlx-vlm` processors operate on already-decoded
+//!   sRGB-tagged inputs and do not perform an explicit linear→sRGB step.
+//!   When sRGB gamma is needed it can be added as a follow-up once the
+//!   `where_` op is exposed.
 //!
 //! ## Conventions
 //! - **Channel layout (intentional divergence from swift):** outputs from
@@ -388,6 +399,129 @@ pub fn resize(
   )
 }
 
+/// Resize `img` to `(target_h, target_w)` using Lanczos3 interpolation.
+///
+/// Convenience wrapper around [`resize`] that fixes the filter to
+/// [`ResizeFilter::Lanczos3`]. Mirrors swift
+/// [`MediaProcessing.resampleLanczos`](https://github.com/ml-explore/mlx-swift-lm/blob/main/Libraries/MLXVLM/MediaProcessing.swift#L81-L103)
+/// and PIL `Image.resize(LANCZOS)`. Lanczos3 (`a = 3`, sinc-windowed sinc)
+/// matches PIL's `Image.LANCZOS` kernel exactly (Pillow renamed the old
+/// `ANTIALIAS` to `LANCZOS` in 9.1.0; both are the `a=3` Lanczos
+/// convolution).
+///
+/// The argument order is `(target_h, target_w)` — the swift API takes a
+/// `CGSize(width:, height:)` but we mirror the python image-processor
+/// convention (`(height, width)`) that the rest of [`resize`] /
+/// [`ImageProcessorConfig::size`] uses. Output dimensions are exact —
+/// `fast_image_resize` resizes to the requested `(w, h)` precisely (no
+/// trailing crop step needed, unlike the swift implementation which has
+/// to `cropped(to: exactRect)` after `lanczosScaleTransform` produces a
+/// near-target output).
+///
+/// Infallible by reference parity — see [`resize`]'s NOTE block for the
+/// faithful-port rationale.
+pub fn resize_lanczos(
+  img: &::image::DynamicImage,
+  target_h: u32,
+  target_w: u32,
+) -> ::image::DynamicImage {
+  resize(img, (target_h, target_w), ResizeFilter::Lanczos3)
+}
+
+/// Center crop `img` to `(target_h, target_w)`.
+///
+/// Mirrors swift
+/// [`MediaProcessing.centerCrop(_:size:)`](https://github.com/ml-explore/mlx-swift-lm/blob/main/Libraries/MLXVLM/MediaProcessing.swift#L213-L224)
+/// and the python HF `BaseImageProcessor.center_crop` (`crop_size` field
+/// at `mlx_vlm/models/base.py:140-153`). If the source is smaller than
+/// the target along either axis, the source is returned unchanged —
+/// faithful to swift's `rectSmallerOrEqual` early-return on lines
+/// 215-217. Otherwise the geometric center `(W - target_w) / 2`,
+/// `(H - target_h) / 2` is taken via `image::DynamicImage::crop_imm`
+/// (integer division — for an even-sized source with odd-sized target
+/// the crop is biased toward the top-left pixel by 0.5, matching
+/// `crop_imm`'s unsigned-floor semantics and PIL `Image.crop` behavior).
+///
+/// Infallible by reference parity (swift signature returns `CIImage`
+/// non-throwing; python `center_crop` returns `np.ndarray`).
+pub fn center_crop(
+  img: &::image::DynamicImage,
+  target_h: u32,
+  target_w: u32,
+) -> ::image::DynamicImage {
+  let w = img.width();
+  let h = img.height();
+  // Swift `rectSmallerOrEqual` (`MediaProcessing.swift:196-198`): if
+  // either source axis fits within the target, return the source
+  // unchanged. (`min(extent, target)` in the swift `centerCrop` helper
+  // at line 201-210 produces the identical behavior.)
+  if w <= target_w || h <= target_h {
+    return img.clone();
+  }
+  // Integer-floor center offsets; PIL `Image.crop` and the swift
+  // `centerCrop` rect helper compute `(extent - target) / 2` likewise.
+  let x = (w - target_w) / 2;
+  let y = (h - target_h) / 2;
+  img.crop_imm(x, y, target_w, target_h)
+}
+
+/// Pad `img` to a square by filling the shorter side with `fill`.
+///
+/// Mirrors python `expand2square` (`mlx_vlm/models/base.py:251-262`)
+/// and `expand_to_square` (`mlx_vlm/models/fastvlm/processing.py:29-61`)
+/// — the canonical pre-resize step that LLaVA-family processors apply
+/// to preserve aspect ratio before a square encoder resize. The swift
+/// `MediaProcessing` module does not expose a `padSquare` helper
+/// directly; the per-model swift processors handle aspect-ratio
+/// preservation in their own `preprocess` step.
+///
+/// **Padding policy:** the shorter side is symmetrically padded —
+/// `(long - short) / 2` pixels on each edge (integer floor; for odd
+/// differences the bottom / right edge gets the extra row / column,
+/// matching python `Image.new(...).paste(img, ((width - height) // 2,
+/// 0))` which centers the input). If `width == height`, the source is
+/// returned unchanged (no allocation).
+///
+/// **Color order:** `fill` is an `[R, G, B]` u8 triple regardless of the
+/// source dtype — the output is always `Rgb8`. Callers needing
+/// `[0.0, 1.0]` float-space padding should pad after the
+/// [`image_to_array`] + [`rescale`] steps in array space (one `pad` op,
+/// not yet exposed here; per-model concern when needed).
+///
+/// Infallible by reference parity (python `expand2square` returns
+/// `Image` non-throwing).
+pub fn pad_to_square(img: &::image::DynamicImage, fill: [u8; 3]) -> ::image::DynamicImage {
+  use ::image::GenericImage as _;
+
+  let w = img.width();
+  let h = img.height();
+  if w == h {
+    return img.clone();
+  }
+  let size = w.max(h);
+  let fill_px = ::image::Rgb(fill);
+  let mut canvas = ::image::RgbImage::from_pixel(size, size, fill_px);
+  // Project the source onto an Rgb8 view so `copy_from` succeeds
+  // regardless of source variant (Luma8 broadcasts, Rgba* drops alpha
+  // — same projection [`image_to_array`] uses).
+  let src = img.to_rgb8();
+  // Symmetric center offset on the shorter axis; longer axis stays at 0.
+  let (x_off, y_off) = if w > h {
+    (0u32, (w - h) / 2)
+  } else {
+    ((h - w) / 2, 0u32)
+  };
+  canvas
+    .copy_from(&src, x_off, y_off)
+    // `copy_from` only errors when the source extent
+    // `(x_off + src_w, y_off + src_h)` exceeds the destination bounds.
+    // By construction: `x_off + w <= size` (when h > w: `x_off = (h-w)/2`
+    // and `x_off + w <= (h-w) + w = h = size`; when w > h: `x_off = 0`,
+    // `x_off + w = w <= max(w, h) = size`). Identical reasoning for y.
+    .expect("copy_from: src extent fits canvas by construction");
+  ::image::DynamicImage::ImageRgb8(canvas)
+}
+
 /// Convert a [`image::DynamicImage`] to an `Array` of shape `[H, W, 3]`,
 /// dtype `f32`, value range `[0.0, 255.0]` (BEFORE [`rescale`]).
 ///
@@ -567,19 +701,22 @@ pub fn rescale(arr: &Array, scale: f32) -> Result<Array> {
   multiply(arr, &s)
 }
 
-/// Per-channel ImageNet-style normalization: `(x - mean[c]) / std[c]`.
+/// Per-channel normalization: `(x - mean[c]) / std[c]`.
 ///
 /// `arr` shape: `[..., 3]` (channel-last). The mean/std tuples are
 /// broadcast across all leading dims by reshaping them to `[1, 1, 3]`
 /// (when `arr` is `[H, W, 3]`) — generally `arr.ndim() - 1` leading
 /// 1-dims so the broadcast applies cleanly regardless of batch axis.
 ///
-/// Mirrors swift `MediaProcessing.normalize` (`MediaProcessing.swift:
-/// 135-157`): the swift implementation expresses
-/// `(x - mean) / std` via the CIFilter colorMatrix
-/// "input * (1/std) + (-mean/std)" trick (algebraically equivalent — see
-/// the swift comment block lines 142-148). We use the direct subtract +
-/// divide for readability; the math is the same.
+/// Mirrors swift
+/// [`MediaProcessing.normalize`](https://github.com/ml-explore/mlx-swift-lm/blob/main/Libraries/MLXVLM/MediaProcessing.swift#L135-L157)
+/// and torchvision
+/// [`Normalize`](https://pytorch.org/vision/main/generated/torchvision.transforms.Normalize.html)
+/// (`output[c] = (input[c] - mean[c]) / std[c]`). The swift
+/// implementation expresses `(x - mean) / std` via the CIFilter
+/// colorMatrix "input * (1/std) + (-mean/std)" trick (algebraically
+/// equivalent — see the swift comment block lines 142-148). We use the
+/// direct subtract + divide for readability; the math is the same.
 ///
 /// **Dtype requirement:** `arr` must be a floating-point dtype
 /// (`F16` / `BF16` / `F32` / `F64`). ImageNet mean/std values are
@@ -595,11 +732,21 @@ pub fn rescale(arr: &Array, scale: f32) -> Result<Array> {
 /// **Dtype fidelity (float inputs):** the mean/std arrays adopt the
 /// input dtype (so an f16/bf16 input is not silently promoted to f32),
 /// matching the embeddings crate's `scalar_like` discipline.
-pub fn normalize_imagenet(arr: &Array, mean: &[f32; 3], std: &[f32; 3]) -> Result<Array> {
+///
+/// **Layout note:** the swift / torchvision references both operate on
+/// the layout natural to their stack (CIFilter on `[H, W, C]`-rendered
+/// CIFormat.RGBAf; torchvision on planar `[C, H, W]` with a `[C, 1, 1]`
+/// broadcast). We chose channel-last `[..., 3]` because [`image_to_array`]
+/// emits that layout and the `(3,)` mean/std broadcasts over the trailing
+/// axis without an extra transpose. Per-model processors that operate
+/// post planar-conversion can adapt by adding leading singleton axes to
+/// the mean/std tensors themselves before calling [`subtract`] /
+/// [`divide`] directly.
+pub fn normalize(arr: &Array, mean: &[f32; 3], std: &[f32; 3]) -> Result<Array> {
   let ndim = arr.ndim();
   if ndim == 0 {
     return Err(Error::ShapeMismatch {
-      message: "normalize_imagenet: input must have at least 1 dimension".into(),
+      message: "normalize: input must have at least 1 dimension".into(),
     });
   }
   // Validate trailing channel dim == 3 with a clear error before falling
@@ -608,17 +755,25 @@ pub fn normalize_imagenet(arr: &Array, mean: &[f32; 3], std: &[f32; 3]) -> Resul
   let trailing = shape[ndim - 1];
   if trailing != 3 {
     return Err(Error::ShapeMismatch {
-      message: format!("normalize_imagenet: trailing dim must be 3 (RGB), got shape {shape:?}"),
+      message: format!("normalize: trailing dim must be 3 (RGB), got shape {shape:?}"),
     });
   }
   let dtype = arr.dtype()?;
-  require_float_dtype("normalize_imagenet", dtype)?;
+  require_float_dtype("normalize", dtype)?;
   // Build (3,) mean and std arrays in the input dtype, then reshape to
   // [1, ..., 1, 3] so they broadcast over every leading axis of `arr`.
   let mean_arr = make_channel_broadcast(mean, ndim, dtype)?;
   let std_arr = make_channel_broadcast(std, ndim, dtype)?;
   let centered = subtract(arr, &mean_arr)?;
   divide(&centered, &std_arr)
+}
+
+/// ImageNet-named alias for [`normalize`] — same `(x - mean) / std`
+/// per-channel semantics. Retained for source-compatibility; new code
+/// should prefer [`normalize`] (matches swift `MediaProcessing.normalize`
+/// and torchvision `Normalize` naming).
+pub fn normalize_imagenet(arr: &Array, mean: &[f32; 3], std: &[f32; 3]) -> Result<Array> {
+  normalize(arr, mean, std)
 }
 
 /// Reject non-float dtypes for primitives that need fractional arithmetic.
@@ -642,7 +797,7 @@ fn require_float_dtype(op: &str, dtype: Dtype) -> Result<()> {
 }
 
 /// Build a `[1, ..., 1, 3]`-shaped broadcast tensor from a length-3 f32
-/// slice, cast to `dtype`. Helper for [`normalize_imagenet`].
+/// slice, cast to `dtype`. Helper for [`normalize`].
 fn make_channel_broadcast(vals: &[f32; 3], ndim: usize, dtype: Dtype) -> Result<Array> {
   // 1-D (3,) constant in f32, then astype to the input dtype.
   let a = Array::from_slice(vals, &(3usize,))?;
@@ -660,9 +815,7 @@ fn make_channel_broadcast(vals: &[f32; 3], ndim: usize, dtype: Dtype) -> Result<
   const MAX_NDIM: usize = 16;
   if ndim > MAX_NDIM {
     return Err(Error::ShapeMismatch {
-      message: format!(
-        "normalize_imagenet: input ndim {ndim} exceeds supported maximum {MAX_NDIM}"
-      ),
+      message: format!("normalize: input ndim {ndim} exceeds supported maximum {MAX_NDIM}"),
     });
   }
   let mut buf = [1usize; MAX_NDIM];
@@ -783,7 +936,7 @@ pub fn preprocess(img: &::image::DynamicImage, cfg: &ImageProcessorConfig) -> Re
     arr
   };
   if cfg.do_normalize {
-    normalize_imagenet(&arr, &cfg.mean, &cfg.std)
+    normalize(&arr, &cfg.mean, &cfg.std)
   } else {
     Ok(arr)
   }

@@ -15,8 +15,9 @@
 use mlxrs::{
   Array, Dtype, Error,
   vlm::image::{
-    ColorOrder, ImageProcessorConfig, ResizeFilter, image_to_array, load_image, normalize_imagenet,
-    patchify, preprocess, rescale, resize,
+    ColorOrder, ImageProcessorConfig, ResizeFilter, center_crop, image_to_array, load_image,
+    normalize, normalize_imagenet, pad_to_square, patchify, preprocess, rescale, resize,
+    resize_lanczos,
   },
 };
 
@@ -559,4 +560,273 @@ fn load_image_nonexistent_path_returns_err() {
   ));
   let err = load_image(&path).unwrap_err();
   assert!(matches!(err, Error::Backend { .. }), "got {err:?}");
+}
+
+// ---------- resize_lanczos ----------
+
+#[test]
+fn resize_lanczos_target_dimensions() {
+  // 8x6 source → 16x32 target via Lanczos3. Argument order is
+  // (target_h, target_w) matching the python image-processor
+  // convention; output width/height must match exactly.
+  let img = synthetic_image(8, 6);
+  let out = resize_lanczos(&img, 16, 32);
+  assert_eq!(out.width(), 32);
+  assert_eq!(out.height(), 16);
+}
+
+#[test]
+fn resize_lanczos_equivalent_to_resize_with_lanczos3_filter() {
+  // resize_lanczos is documented as a thin wrapper around
+  // resize(..., Lanczos3) — byte-for-byte output equality is the
+  // strongest assertion of that contract.
+  let img = synthetic_image(12, 10);
+  let a = resize_lanczos(&img, 8, 16);
+  let b = resize(&img, (8, 16), ResizeFilter::Lanczos3);
+  assert_eq!(a.to_rgba8().into_raw(), b.to_rgba8().into_raw());
+}
+
+#[test]
+fn resize_lanczos_smooth_on_constant_input_preserves_value() {
+  // Lanczos3 on a constant-color input must reproduce the constant
+  // (up to small floating-point error) at every output pixel — the
+  // sinc kernel sums to 1, so any value `c` survives. Use a
+  // mid-grey RGB pixel; check that downsample-then-upsample stays
+  // tightly bounded near the source value.
+  let mut buf = ::image::RgbImage::new(8, 8);
+  for y in 0..8 {
+    for x in 0..8 {
+      buf.put_pixel(x, y, ::image::Rgb([128, 64, 200]));
+    }
+  }
+  let img = ::image::DynamicImage::ImageRgb8(buf);
+  let out = resize_lanczos(&img, 4, 4);
+  assert_eq!(out.width(), 4);
+  assert_eq!(out.height(), 4);
+  // Every output pixel should land within 1 LSB of the source value
+  // — Lanczos3 on a constant-color image is exact up to integer
+  // rounding (rounding bias at the edge of the kernel may shift by
+  // at most 1 byte).
+  let rgba = out.to_rgba8();
+  for px in rgba.pixels() {
+    let [r, g, b, _] = px.0;
+    assert!(r.abs_diff(128) <= 1, "R={r} expected ~128");
+    assert!(g.abs_diff(64) <= 1, "G={g} expected ~64");
+    assert!(b.abs_diff(200) <= 1, "B={b} expected ~200");
+  }
+}
+
+// ---------- center_crop ----------
+
+#[test]
+fn center_crop_4x4_to_2x2_returns_center_pixels() {
+  // Hand-traced: source = 4x4 with pixel (x, y) = (10*x + y, 0, 0).
+  // The center 2x2 crop is rows y=1..3, cols x=1..3, so the cropped
+  // R values are:
+  //   (1, 1)=11  (2, 1)=21
+  //   (1, 2)=12  (2, 2)=22
+  let mut buf = ::image::RgbImage::new(4, 4);
+  for y in 0..4 {
+    for x in 0..4 {
+      buf.put_pixel(x, y, ::image::Rgb([(10 * x + y) as u8, 0, 0]));
+    }
+  }
+  let img = ::image::DynamicImage::ImageRgb8(buf);
+  let out = center_crop(&img, 2, 2);
+  assert_eq!(out.width(), 2);
+  assert_eq!(out.height(), 2);
+  let rgb = out.to_rgb8();
+  // Row-major: (0, 0)=11, (1, 0)=21, (0, 1)=12, (1, 1)=22.
+  assert_eq!(rgb.get_pixel(0, 0).0, [11, 0, 0]);
+  assert_eq!(rgb.get_pixel(1, 0).0, [21, 0, 0]);
+  assert_eq!(rgb.get_pixel(0, 1).0, [12, 0, 0]);
+  assert_eq!(rgb.get_pixel(1, 1).0, [22, 0, 0]);
+}
+
+#[test]
+fn center_crop_source_smaller_returns_source_unchanged() {
+  // Swift `rectSmallerOrEqual` early-return: a 4x4 source asked for
+  // an 8x8 crop returns the original image untouched. We check
+  // dimensions + a sample pixel.
+  let img = synthetic_image(4, 4);
+  let out = center_crop(&img, 8, 8);
+  assert_eq!(out.width(), 4);
+  assert_eq!(out.height(), 4);
+  // synthetic_image: pixel (x, y) = (10*y, 10*x, 100).
+  assert_eq!(out.to_rgb8().get_pixel(2, 3).0, [30, 20, 100]);
+}
+
+#[test]
+fn center_crop_one_axis_smaller_returns_source_unchanged() {
+  // Mirrors swift `rectSmallerOrEqual`: if EITHER axis fits within
+  // the target, the source is returned unchanged. A 4x8 source asked
+  // for a 6x4 crop keeps the source as-is (width 4 <= target_w 6).
+  let img = synthetic_image(4, 8);
+  let out = center_crop(&img, 4, 6);
+  assert_eq!(out.width(), 4);
+  assert_eq!(out.height(), 8);
+}
+
+// ---------- pad_to_square ----------
+
+#[test]
+fn pad_to_square_4x2_with_black_fill_produces_4x4_with_pad_rows() {
+  // Source = 4 wide × 2 tall, R-channel = 10*x at every y.
+  // (long - short) / 2 = (4 - 2) / 2 = 1 row of fill on top, 1 on
+  // bottom. Result: 4x4 with rows 0 and 3 filled, rows 1 and 2 the
+  // source.
+  let mut buf = ::image::RgbImage::new(4, 2);
+  for y in 0..2 {
+    for x in 0..4 {
+      buf.put_pixel(x, y, ::image::Rgb([(10 * x) as u8, 200, 50]));
+    }
+  }
+  let img = ::image::DynamicImage::ImageRgb8(buf);
+  let out = pad_to_square(&img, [0, 0, 0]);
+  assert_eq!(out.width(), 4);
+  assert_eq!(out.height(), 4);
+  let rgb = out.to_rgb8();
+  // Top pad row.
+  for x in 0..4 {
+    assert_eq!(
+      rgb.get_pixel(x, 0).0,
+      [0, 0, 0],
+      "row 0 must be fill; x={x}"
+    );
+  }
+  // Source rows at y=1 and y=2.
+  for y in 1..3 {
+    for x in 0..4 {
+      assert_eq!(
+        rgb.get_pixel(x, y).0,
+        [(10 * x) as u8, 200, 50],
+        "source row y={y} x={x}"
+      );
+    }
+  }
+  // Bottom pad row.
+  for x in 0..4 {
+    assert_eq!(
+      rgb.get_pixel(x, 3).0,
+      [0, 0, 0],
+      "row 3 must be fill; x={x}"
+    );
+  }
+}
+
+#[test]
+fn pad_to_square_2x4_pads_left_and_right() {
+  // Source = 2 wide × 4 tall, asymmetric R channel. Pad symmetric on
+  // the x axis: 1 col fill, 2 cols source, 1 col fill.
+  let mut buf = ::image::RgbImage::new(2, 4);
+  for y in 0..4 {
+    for x in 0..2 {
+      buf.put_pixel(x, y, ::image::Rgb([(10 * x + y) as u8, 1, 2]));
+    }
+  }
+  let img = ::image::DynamicImage::ImageRgb8(buf);
+  let out = pad_to_square(&img, [255, 128, 64]);
+  assert_eq!(out.width(), 4);
+  assert_eq!(out.height(), 4);
+  let rgb = out.to_rgb8();
+  // Pad columns.
+  for y in 0..4 {
+    assert_eq!(rgb.get_pixel(0, y).0, [255, 128, 64]);
+    assert_eq!(rgb.get_pixel(3, y).0, [255, 128, 64]);
+  }
+  // Source columns x=1..3 → source x=0..2 (offset by x_off=1).
+  for y in 0..4 {
+    for x_src in 0..2u32 {
+      assert_eq!(
+        rgb.get_pixel(1 + x_src, y).0,
+        [(10 * x_src + y) as u8, 1, 2],
+      );
+    }
+  }
+}
+
+#[test]
+fn pad_to_square_already_square_returns_clone() {
+  // No alloc / no padding when w == h; output dims and a sample
+  // pixel must match the source.
+  let img = synthetic_image(4, 4);
+  let out = pad_to_square(&img, [99, 99, 99]);
+  assert_eq!(out.width(), 4);
+  assert_eq!(out.height(), 4);
+  // synthetic_image pixel (2, 3) = (10*3, 10*2, 100) = (30, 20, 100).
+  assert_eq!(out.to_rgb8().get_pixel(2, 3).0, [30, 20, 100]);
+}
+
+#[test]
+fn pad_to_square_odd_difference_extra_row_on_bottom() {
+  // Source = 3 wide × 2 tall. (long - short) = 1 → integer floor
+  // puts 0 rows on top, 1 row of pad on the bottom (matching python
+  // `Image.new(...).paste(img, (0, 0))` with the source at the top
+  // when (width - height) // 2 == 0).
+  let mut buf = ::image::RgbImage::new(3, 2);
+  for y in 0..2 {
+    for x in 0..3 {
+      buf.put_pixel(x, y, ::image::Rgb([(x + 10 * y) as u8, 7, 8]));
+    }
+  }
+  let img = ::image::DynamicImage::ImageRgb8(buf);
+  let out = pad_to_square(&img, [42, 43, 44]);
+  assert_eq!((out.width(), out.height()), (3, 3));
+  let rgb = out.to_rgb8();
+  // Source at rows 0 and 1, pad row at row 2.
+  for y in 0..2 {
+    for x in 0..3 {
+      assert_eq!(
+        rgb.get_pixel(x, y).0,
+        [(x + 10 * y) as u8, 7, 8],
+        "source y={y} x={x}",
+      );
+    }
+  }
+  for x in 0..3 {
+    assert_eq!(rgb.get_pixel(x, 2).0, [42, 43, 44], "pad row x={x}");
+  }
+}
+
+// ---------- normalize (alias + standalone) ----------
+
+#[test]
+fn normalize_hand_computed_1x1x3() {
+  // Tiny 1x1x3 array: x = [3.0, 5.0, 7.0]; mean = [1.0, 2.0, 3.0];
+  // std = [2.0, 1.0, 0.5]. Expected (x - mean) / std =
+  //   (3-1)/2 = 1.0,  (5-2)/1 = 3.0,  (7-3)/0.5 = 8.0.
+  let arr = Array::from_slice(&[3.0_f32, 5.0, 7.0], &(1usize, 1, 3)).unwrap();
+  let mean = [1.0_f32, 2.0, 3.0];
+  let std = [2.0_f32, 1.0, 0.5];
+  let mut out = normalize(&arr, &mean, &std).unwrap();
+  let v: Vec<f32> = out.to_vec().unwrap();
+  assert!(vclose(&v, &[1.0, 3.0, 8.0]), "got {v:?}");
+}
+
+#[test]
+fn normalize_imagenet_is_alias_for_normalize() {
+  // The deprecated `normalize_imagenet` name must produce
+  // byte-identical output to the new `normalize` for the same inputs.
+  let arr = Array::from_slice(&[0.1_f32, 0.2, 0.3, 0.4, 0.5, 0.6], &(2usize, 1, 3)).unwrap();
+  let mean = [0.485_f32, 0.456, 0.406];
+  let std = [0.229_f32, 0.224, 0.225];
+  let mut a = normalize(&arr, &mean, &std).unwrap();
+  let mut b = normalize_imagenet(&arr, &mean, &std).unwrap();
+  let va: Vec<f32> = a.to_vec().unwrap();
+  let vb: Vec<f32> = b.to_vec().unwrap();
+  assert!(vclose(&va, &vb));
+}
+
+#[test]
+fn normalize_rejects_integer_dtypes() {
+  // Integer input rejected with ShapeMismatch (mean/std cast to U8
+  // would floor to zero → division undefined). Mirror the
+  // `rescale_rejects_integer_dtypes` coverage for the renamed
+  // function.
+  let arr = Array::from_slice(&[0_u8; 3], &(1usize, 1, 3)).unwrap();
+  let err = normalize(&arr, &[0.485, 0.456, 0.406], &[0.229, 0.224, 0.225]).unwrap_err();
+  assert!(
+    matches!(err, Error::ShapeMismatch { .. }),
+    "want ShapeMismatch, got {err:?}",
+  );
 }
