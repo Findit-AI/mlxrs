@@ -1722,7 +1722,7 @@ pub fn preprocess(img: &::image::DynamicImage, cfg: &ImageProcessorConfig) -> Re
 }
 
 /// Private regression tests for [`apply_orientation_fallible`] and
-/// the round-5 truly-fallible [`rotate_u8_buf`] helper.
+/// the round-5 truly-fallible [`rotate_buf`] helper.
 ///
 /// **Round-5 coverage.** The four EXIF rotate orientations
 /// (Rotate90 / Rotate270 / Rotate90FlipH / Rotate270FlipH) are
@@ -1733,7 +1733,7 @@ pub fn preprocess(img: &::image::DynamicImage, cfg: &ImageProcessorConfig) -> Re
 /// at the test boundary (output dims must be 3x4, not 4x3).
 ///
 /// These live inline (not in the `tests/vlm_image.rs` integration
-/// suite) because [`apply_orientation_fallible`] / [`rotate_u8_buf`]
+/// suite) because [`apply_orientation_fallible`] / [`rotate_buf`]
 /// are private — exposing them just to test would widen the public
 /// surface for no caller benefit.
 #[cfg(test)]
@@ -1862,7 +1862,7 @@ mod apply_orientation_tests {
   #[test]
   fn rotate90_rgb8_manual_matches_reference() {
     // ROUND-5: Rotate90 on Rgb8 now goes through the truly-fallible
-    // manual `rotate_u8_buf` path. Must:
+    // manual `rotate_buf` path. Must:
     //   (1) succeed for a small input under `MAX_DECODED_IMAGE_BYTES`,
     //   (2) swap dimensions (4x3 → 3x4),
     //   (3) produce byte-identical pixels to `image::imageops::rotate90`.
@@ -1895,7 +1895,7 @@ mod apply_orientation_tests {
   #[test]
   fn rotate90_fliph_rgb8_composite_matches_reference() {
     // Rotate90FlipH = rotate90 + fliph (the composite collapses to
-    // `dst.put_pixel(y, x, src.get_pixel(x, y))` in `rotate_u8_buf`).
+    // `dst.put_pixel(y, x, src.get_pixel(x, y))` in `rotate_buf`).
     // Verify the composite output is byte-identical to the
     // image-rs dispatch.
     let img = xy_encoded_rgb8(4, 3);
@@ -1931,7 +1931,7 @@ mod apply_orientation_tests {
   #[test]
   fn rotate90_rgba8_manual_matches_reference() {
     // Rgba8 has 4 channels (R, G, B, A) — verify the per-pixel
-    // 4-byte memcpy in `rotate_u8_buf` preserves the alpha channel
+    // 4-byte memcpy in `rotate_buf` preserves the alpha channel
     // alongside RGB.
     let img = xy_encoded_rgba8(4, 3);
     let reference = ::image::imageops::rotate90(img.as_rgba8().expect("rgba8 source"));
@@ -1968,7 +1968,7 @@ mod apply_orientation_tests {
   #[test]
   fn rotate90_luma8_manual_matches_reference() {
     // Luma8 has 1 channel — verify the per-pixel 1-byte memcpy in
-    // `rotate_u8_buf` produces the same byte order as image-rs.
+    // `rotate_buf` produces the same byte order as image-rs.
     let img = xy_encoded_luma8(4, 3);
     let reference = ::image::imageops::rotate90(img.as_luma8().expect("luma8 source"));
     let out = apply_orientation_fallible(img, Orientation::Rotate90).expect("luma8 rotate90 ok");

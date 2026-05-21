@@ -608,11 +608,14 @@ fn imageprocessor_config_default_is_imagenet() {
 #[test]
 fn load_image_decodes_png_round_trip() {
   // Encode a small synthetic image as PNG into a tempfile, then
-  // load_image it back and assert the decoded dimensions match. PNG
-  // does not carry EXIF orientation, so `decoder.orientation()` returns
-  // `Orientation::NoTransforms` and `apply_orientation` is a no-op —
-  // this verifies the new `ImageReader` + orientation pipeline is a
-  // clean drop-in for the common non-rotating case.
+  // load_image it back and assert the decoded dimensions match. This
+  // synthetic PNG carries no EXIF orientation metadata (image-rs 0.25
+  // PNG decoders CAN expose EXIF orientation via `exif_metadata` —
+  // see the `load_image` doc — but our `synthetic_image` builder
+  // doesn't write one), so `decoder.orientation()` returns
+  // `Orientation::NoTransforms` and `apply_orientation_fallible` is a
+  // no-op here — this verifies the `ImageReader` + orientation
+  // pipeline is a clean drop-in for the common non-rotating case.
   let img = synthetic_image(5, 7); // 5 wide, 7 tall
   let dir = std::env::temp_dir().join(format!("mlxrs-vlm-image-test-{}", std::process::id(),));
   std::fs::create_dir_all(&dir).unwrap();
