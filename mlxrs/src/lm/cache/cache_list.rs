@@ -625,7 +625,7 @@ fn build_cache_list_children(
   depth_budget: usize,
 ) -> Result<Vec<Box<dyn KvCache>>> {
   let err = |m: &str| Error::Backend {
-    message: format!("CacheList::from_state: {m}"),
+    message: format!("CacheList: {m}"),
   };
 
   // Reject the over-deep chain BEFORE parsing this level's frame: a forged

@@ -184,8 +184,8 @@ pub trait KvCache {
     Ok(())
   }
 
-  /// Transactionally restore the cache from a serialized `(state, meta)`
-  /// pair. The default implementation calls
+  /// Restore the cache from a serialized `(state, meta)` pair. The
+  /// default implementation calls
   /// [`set_state`](KvCache::set_state) then
   /// [`set_meta_state`](KvCache::set_meta_state) sequentially — faithful
   /// to `mlx_lm/models/cache.py:170-175` (`obj.state = state; obj.meta_state

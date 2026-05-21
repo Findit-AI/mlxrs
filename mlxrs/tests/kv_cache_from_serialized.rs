@@ -11,8 +11,9 @@
 //!    with a deliberately malformed `meta`, assert `Err`, then re-read
 //!    `state()` / `meta_state()` and assert they equal the snapshot.
 //!
-//! Plus the trait-default sequential-setter path (StandardKvCache) for
-//! coverage of the no-override default impl.
+//! This file covers concrete cache implementations under their current
+//! `from_serialized` behavior. It does not claim coverage of the trait-
+//! default sequential-setter implementation.
 
 #![cfg(feature = "lm")]
 
