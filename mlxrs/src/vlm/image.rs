@@ -878,8 +878,13 @@ pub fn resize(
   // Pixel-type: RGBA8 for parity with the prior behavior (image-rs's
   // `imageops::resize` over a `DynamicImage` projects to `Rgba8`
   // unconditionally; downstream `image_to_array` drops alpha as before).
-  // `img.to_rgba8()` is a borrow-or-convert (no-copy when the source is
-  // already `ImageRgba8`).
+  // `img.to_rgba8()` is an OWNED source-sized copy/convert — image 0.25
+  // returns a fresh `RgbaImage` and clones even when the source is
+  // already `ImageRgba8` (only the consuming `into_rgba8()` path avoids
+  // that clone, and we can't use it here because `img: &DynamicImage`).
+  // This is the infallible RGBA conversion captured in the module
+  // audit table and the `resize` doc's bounded-memory-but-NOT-
+  // recoverable-OOM contract (Codex review R10).
   let src = img.to_rgba8();
   let src_view = ::fast_image_resize::images::ImageRef::new(
     src.width(),
