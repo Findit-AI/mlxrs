@@ -810,6 +810,17 @@ fn reflect_pad_1d(samples: &Array, padding: usize) -> Result<Array> {
 /// input (e.g. 64 Mi samples with `n_fft = 1024, hop = 1`) is rejected before
 /// any allocation, so it cannot drive a multi-GB framing/FFT allocation.
 ///
+/// **Input-length cap.** The reflect pad (`center = true`) is a lazy
+/// slice+concatenate, but *evaluating* it materializes a signal proportional to
+/// the INPUT length — independent of `num_frames`. Because the `MAX_STFT_WORK`
+/// cap only bounds `num_frames * n_fft`, a lazily-shaped huge input with a LARGE
+/// `hop_length` (few frames) would slip past it while the reflect-pad
+/// concatenate still ballooned. So BEFORE the reflect pad, `stft` rejects any
+/// input whose sample count — or padded length `samples_len + n_fft` (checked
+/// arithmetic) — exceeds the per-call
+/// [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES) budget,
+/// bounding the reflect-pad allocation regardless of hop.
+///
 /// **`n_fft` must be even.** The one-sided spectrum has
 /// `n_freqs == n_fft / 2 + 1` for BOTH `n_fft = 2k` and `n_fft = 2k + 1`, so
 /// the bin count alone cannot disambiguate an odd `n_fft` from the adjacent
@@ -826,6 +837,10 @@ fn reflect_pad_1d(samples: &Array, padding: usize) -> Result<Array> {
 ///   - `n_fft` is odd (the one-sided spectrum cannot be inverted
 ///     unambiguously; see above and [`istft`]),
 ///   - `win_length > n_fft`,
+///   - the input sample count, or the padded length `samples_len + n_fft`,
+///     exceeds the [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES)
+///     budget (a lazily-shaped huge input is rejected before the reflect pad,
+///     regardless of `hop_length`),
 ///   - the post-pad sample count is too short to fit a single frame
 ///     (matches the reference's `Input is too short` raise),
 ///   - the frame work `num_frames * n_fft` or output element count
@@ -881,6 +896,47 @@ pub fn stft(
     });
   }
 
+  // INPUT-LENGTH CAP (Codex OOM finding). The reflect pad below
+  // (`reflect_pad_1d`) is a lazy slice+concatenate, but *evaluating* the graph
+  // materializes a padded signal proportional to the INPUT length — independent
+  // of `num_frames`. The post-framing `MAX_STFT_WORK` cap bounds
+  // `num_frames * n_fft`, but a lazily-shaped huge 1-D input with a LARGE
+  // `hop_length` yields few frames, so `frame_work` stays under that cap while
+  // the reflect-pad concatenate still balloons proportional to the input. We
+  // therefore reject any input whose sample count — or padded length
+  // `samples_len + n_fft` (reflect pad adds `n_fft / 2` on each side) — exceeds
+  // the per-call sample budget [`MAX_DECODED_SAMPLES`] BEFORE building the
+  // padded signal or any frame view, bounding the reflect-pad allocation
+  // regardless of hop. Checked arithmetic so the `+ n_fft` itself can't wrap.
+  let samples_len = shape[0];
+  if samples_len > crate::audio::io::MAX_DECODED_SAMPLES {
+    return Err(Error::Backend {
+      message: format!(
+        "stft: input sample count {samples_len} exceeds the {} sample budget \
+         (would force a reflect-pad allocation proportional to the input)",
+        crate::audio::io::MAX_DECODED_SAMPLES
+      ),
+    });
+  }
+  let padded_len_budget = samples_len
+    .checked_add(n_fft)
+    .ok_or_else(|| Error::Backend {
+      message: format!(
+        "stft: padded length samples_len + n_fft overflows usize \
+         (samples_len={samples_len}, n_fft={n_fft})"
+      ),
+    })?;
+  if padded_len_budget > crate::audio::io::MAX_DECODED_SAMPLES {
+    return Err(Error::Backend {
+      message: format!(
+        "stft: padded length {padded_len_budget} (samples_len={samples_len} + \
+         n_fft={n_fft}) exceeds the {} sample budget (would force a reflect-pad \
+         allocation proportional to the input)",
+        crate::audio::io::MAX_DECODED_SAMPLES
+      ),
+    });
+  }
+
   // Analysis window via the SHARED `frame_window` (symmetric hann of
   // `win_length`, placed into the `n_fft` frame per `window_pad`; no-op when
   // `win_length == n_fft`). Built AFTER the work cap below so a lazily-shaped
@@ -888,9 +944,11 @@ pub fn stft(
   // elements) is allocated. `istft` rebuilds its synthesis window through the
   // exact same call, so analysis and synthesis windows always match.
 
-  // `center=True, pad_mode="reflect"` (reference default). The reflect pad is
-  // a lazy slice+concatenate (no large host allocation), so it precedes the
-  // work cap; the cap then gates the strided view / window / rfft.
+  // `center=True, pad_mode="reflect"` (reference default). The reflect pad is a
+  // lazy slice+concatenate, but evaluating it materializes a signal
+  // proportional to the input length, so the input/padded-length cap above
+  // gates it; the post-framing `MAX_STFT_WORK` cap then gates the strided view /
+  // window / rfft (frame work + FFT output).
   let padded = reflect_pad_1d(samples, n_fft / 2)?;
   let padded_len = padded.shape()[0];
 
@@ -2285,6 +2343,35 @@ mod tests {
       matches!(res, Err(Error::Backend { .. })),
       "pathological lazy huge-shape stft input (num_frames * n_fft) must be \
        rejected by the MAX_STFT_WORK cap before any framing/FFT allocation, got {res:?}"
+    );
+  }
+
+  #[test]
+  fn stft_rejects_oversized_input_before_reflect_pad_large_hop() {
+    // Codex OOM finding: the reflect pad (`center=true`) is a lazy
+    // slice+concatenate, but *evaluating* it materializes a signal proportional
+    // to the INPUT length — independent of num_frames. The `MAX_STFT_WORK` cap
+    // only bounds `num_frames * n_fft`, so a lazily-shaped huge input with a
+    // LARGE hop (few frames) slips past it while the reflect-pad concatenate
+    // still balloons. The input/padded-length cap must reject it BEFORE the
+    // reflect pad.
+    //
+    // We use a lazy `zeros` 1-D array of MAX_DECODED_SAMPLES + 16 samples (just
+    // ABOVE the budget) with n_fft=16 and a LARGE hop (= MAX_DECODED_SAMPLES):
+    //   samples_len = 64 Mi + 16  > MAX_DECODED_SAMPLES (64 Mi)  → new cap fires
+    // and, crucially, the OLD work cap would NOT catch this:
+    //   padded_len ≈ 64 Mi + 32, num_frames = 1 + (64 Mi + 16)/64 Mi = 2,
+    //   frame_work = num_frames * n_fft = 2 * 16 = 32  ≪ MAX_STFT_WORK (64 Mi).
+    // So ONLY the input/padded-length cap (checked before the reflect-pad
+    // concatenate) can reject this; asserting Err proves it fired first.
+    let n_samples = (crate::audio::io::MAX_DECODED_SAMPLES + 16) as i32;
+    let lazy = Array::zeros::<f32>(&[n_samples]).unwrap();
+    let large_hop = crate::audio::io::MAX_DECODED_SAMPLES;
+    let res = stft(&lazy, 16, large_hop, None, WindowPad::Right);
+    assert!(
+      matches!(res, Err(Error::Backend { .. })),
+      "oversized lazy stft input with a large hop (work cap would pass) must be \
+       rejected by the input/padded-length cap before the reflect pad, got {res:?}"
     );
   }
 
