@@ -274,6 +274,34 @@ pub fn encode(
   if matches!(cfg.strategy, PoolingStrategy::Cls | PoolingStrategy::None)
     && let Some(pooled) = output.pooled_output
   {
+    // This path bypasses the hidden-state poolers' rank/mask guards
+    // (`validate_token_embeddings_*` in `pooling.rs`), so validate the
+    // model-provided pooler here with the same panic→`Err` discipline: it
+    // must be exactly rank-2 `(batch, hidden)` whose batch covers the
+    // request. A squeezed `[hidden]` or a stale `[1, hidden]` pooler for a
+    // multi-text batch would otherwise be normalized / truncated and
+    // returned as if it covered every text — silent wrong/missing
+    // embeddings rather than a recoverable shape error.
+    let pooled_shape = pooled.shape();
+    if pooled_shape.len() != 2 {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "encode: model pooled_output must be rank-2 (batch, hidden), got rank {} shape {:?}",
+          pooled_shape.len(),
+          pooled_shape
+        ),
+      });
+    }
+    if pooled_shape[0] != texts.len() {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "encode: model pooled_output batch {} must match texts {}, got shape {:?}",
+          pooled_shape[0],
+          texts.len(),
+          pooled_shape
+        ),
+      });
+    }
     return pool_post(
       pooled,
       cfg.normalize,
@@ -302,9 +330,33 @@ mod tests {
   //! values computed by hand from the canned hidden states.
 
   use super::*;
-  use crate::embeddings::model::MockEmbeddingModel;
+  use crate::embeddings::model::{EmbeddingModel, EmbeddingModelOutput, MockEmbeddingModel};
 
   const TOL: f32 = 1e-5;
+
+  /// A model that returns hidden states like [`MockEmbeddingModel`] but emits a
+  /// **caller-supplied raw `pooled_output` array** verbatim — so a test can
+  /// inject a deliberately malformed pooler (wrong rank or wrong batch) that
+  /// [`MockEmbeddingModel::with_pooled`] (which always tiles to a well-formed
+  /// `(batch, hidden)`) cannot produce. Used to exercise the encode-side
+  /// `pooled_output` shape guard.
+  struct RawPooledModel {
+    inner: MockEmbeddingModel,
+    /// The exact `(hidden,)`-flat data and shape to return as `pooled_output`.
+    pooled_data: Vec<f32>,
+    pooled_shape: Vec<usize>,
+  }
+
+  impl EmbeddingModel for RawPooledModel {
+    fn forward(&self, input_ids: &Array, attention_mask: &Array) -> Result<EmbeddingModelOutput> {
+      let mut out = self.inner.forward(input_ids, attention_mask)?;
+      out.pooled_output = Some(Array::from_slice::<f32>(
+        &self.pooled_data,
+        &self.pooled_shape.as_slice(),
+      )?);
+      Ok(out)
+    }
+  }
 
   fn close(a: f32, b: f32) -> bool {
     (a - b).abs() <= TOL
@@ -627,5 +679,106 @@ mod tests {
     // Hidden-states CLS = first real token = pos0 = [9, 3] for both rows.
     assert!(vclose(&v[0..2], &[9.0, 3.0]));
     assert!(vclose(&v[2..4], &[9.0, 3.0]));
+  }
+
+  // ---- Regression: validate pooled_output shape before bypassing pooling ----
+
+  /// Build a [`RawPooledModel`] over the standard 3-position canned hidden
+  /// states, emitting `pooled_data` reshaped to `pooled_shape` verbatim.
+  fn raw_pooled_model(pooled_data: Vec<f32>, pooled_shape: Vec<usize>) -> RawPooledModel {
+    RawPooledModel {
+      inner: MockEmbeddingModel::new(vec![vec![9.0, 3.0], vec![0.0, 1.0], vec![1.0, 1.0]]),
+      pooled_data,
+      pooled_shape,
+    }
+  }
+
+  /// A rank-1 (squeezed `[hidden]`) `pooled_output` must be rejected with
+  /// [`Error::ShapeMismatch`] for `Cls` — not normalized and returned as if it
+  /// covered the batch. Without the guard a custom / version-skewed model that
+  /// squeezed a batch-1 pooler would silently yield a wrong-shape embedding.
+  #[test]
+  fn encode_cls_rejects_wrong_rank_pooled_output() {
+    let tok = word_tokenizer();
+    // Squeezed rank-1 [hidden] pooler instead of (batch, hidden).
+    let model = raw_pooled_model(vec![7.0, 5.0], vec![2]);
+    let cfg = EncodeConfig::new()
+      .add_special_tokens(false)
+      .strategy(PoolingStrategy::Cls)
+      .normalize(false);
+    let err = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap_err();
+    assert!(
+      matches!(err, Error::ShapeMismatch { .. }),
+      "expected ShapeMismatch, got {err:?}"
+    );
+  }
+
+  /// Same wrong-rank guard for the `None` strategy's `pooled_output` bypass.
+  #[test]
+  fn encode_none_rejects_wrong_rank_pooled_output() {
+    let tok = word_tokenizer();
+    let model = raw_pooled_model(vec![7.0, 5.0], vec![2]);
+    let cfg = EncodeConfig::new()
+      .add_special_tokens(false)
+      .strategy(PoolingStrategy::None)
+      .normalize(false);
+    let err = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap_err();
+    assert!(
+      matches!(err, Error::ShapeMismatch { .. }),
+      "expected ShapeMismatch, got {err:?}"
+    );
+  }
+
+  /// A stale `[1, hidden]` `pooled_output` for a 2-text batch must be rejected
+  /// with [`Error::ShapeMismatch`] for `Cls` — the batch dim (1) does not cover
+  /// the request (2), so normalizing / returning it would silently drop a text.
+  #[test]
+  fn encode_cls_rejects_wrong_batch_pooled_output() {
+    let tok = word_tokenizer();
+    // (1, hidden) pooler for a 2-text batch.
+    let model = raw_pooled_model(vec![7.0, 5.0], vec![1, 2]);
+    let cfg = EncodeConfig::new()
+      .add_special_tokens(false)
+      .strategy(PoolingStrategy::Cls)
+      .normalize(false);
+    let err = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap_err();
+    assert!(
+      matches!(err, Error::ShapeMismatch { .. }),
+      "expected ShapeMismatch, got {err:?}"
+    );
+  }
+
+  /// Same wrong-batch guard for the `None` strategy's `pooled_output` bypass.
+  #[test]
+  fn encode_none_rejects_wrong_batch_pooled_output() {
+    let tok = word_tokenizer();
+    let model = raw_pooled_model(vec![7.0, 5.0], vec![1, 2]);
+    let cfg = EncodeConfig::new()
+      .add_special_tokens(false)
+      .strategy(PoolingStrategy::None)
+      .normalize(false);
+    let err = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap_err();
+    assert!(
+      matches!(err, Error::ShapeMismatch { .. }),
+      "expected ShapeMismatch, got {err:?}"
+    );
+  }
+
+  /// A correctly-shaped `(batch, hidden)` raw `pooled_output` still passes the
+  /// guard and is returned (sanity: the guard rejects only malformed shapes,
+  /// not the valid path that the `with_pooled` tests already cover).
+  #[test]
+  fn encode_cls_accepts_correct_shape_raw_pooled_output() {
+    let tok = word_tokenizer();
+    let model = raw_pooled_model(vec![7.0, 5.0, 6.0, 4.0], vec![2, 2]);
+    let cfg = EncodeConfig::new()
+      .add_special_tokens(false)
+      .strategy(PoolingStrategy::Cls)
+      .normalize(false);
+    let mut emb = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap();
+    assert_eq!(emb.shape(), vec![2, 2]);
+    let v = emb.to_vec::<f32>().unwrap();
+    assert!(vclose(&v[0..2], &[7.0, 5.0]));
+    assert!(vclose(&v[2..4], &[6.0, 4.0]));
   }
 }
