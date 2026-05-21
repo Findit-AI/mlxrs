@@ -98,6 +98,39 @@ impl Error {
 /// Convenience alias for `Result<T, Error>`.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Allocate a `Vec<T>` reserving exactly `cap` capacity, returning
+/// [`Error::OutOfMemory`] instead of aborting the process on allocator
+/// failure (which `Vec::with_capacity` / `vec![…; n]` do). Use for any
+/// REQUEST-SCALED allocation on a hot path (sequence length, token /
+/// image counts) so an oversized or hostile input fails recoverably
+/// rather than terminating the process.
+///
+/// For small fixed-size allocations (a handful of elements) the infallible
+/// `Vec::with_capacity` remains fine — this is for input-proportional
+/// buffers.
+///
+/// Currently consumed only by the `vlm` module (the VLM-8 allocation-
+/// hardening pass); the gate widens as the lm/audio/embeddings follow-up
+/// adopts these helpers (tracked as VLM-9 / the coordinated
+/// allocation-policy PR).
+#[cfg(feature = "vlm")]
+pub(crate) fn try_with_capacity<T>(cap: usize) -> Result<Vec<T>> {
+  let mut v = Vec::new();
+  v.try_reserve_exact(cap).map_err(|_| Error::OutOfMemory)?;
+  Ok(v)
+}
+
+/// Fallible [`slice::to_vec`]: clone `slice` into a freshly-reserved
+/// `Vec`, returning [`Error::OutOfMemory`] instead of aborting on
+/// allocation failure. The recoverable analogue of `slice.to_vec()` for
+/// request-scaled slices.
+#[cfg(feature = "vlm")]
+pub(crate) fn try_to_vec<T: Clone>(slice: &[T]) -> Result<Vec<T>> {
+  let mut v = try_with_capacity(slice.len())?;
+  v.extend_from_slice(slice);
+  Ok(v)
+}
+
 thread_local! {
   pub(crate) static LAST: RefCell<Option<Error>> = const { RefCell::new(None) };
 }

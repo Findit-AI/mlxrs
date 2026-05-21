@@ -47,7 +47,7 @@
 
 use crate::{
   array::Array,
-  error::{Error, Result},
+  error::{Error, Result, try_to_vec, try_with_capacity},
 };
 
 /// Inclusive-start / exclusive-end half-open token-index ranges marking
@@ -213,7 +213,7 @@ pub fn insert_image_tokens(
   policy: MarkerPolicy,
 ) -> Result<Vec<u32>> {
   if image_count == 0 {
-    return Ok(text_tokens.to_vec());
+    return try_to_vec(text_tokens);
   }
 
   // Reject `image_count > 0 && num_tokens_per_image == 0` — a degenerate
@@ -309,8 +309,7 @@ pub fn insert_image_tokens(
     // the process via `Vec::with_capacity`; `try_reserve_exact` surfaces
     // it as `Error::OutOfMemory`. `vlm_generate` calls this before any
     // other recoverable boundary.
-    let mut out: Vec<u32> = Vec::new();
-    out.try_reserve_exact(cap).map_err(|_| Error::OutOfMemory)?;
+    let mut out: Vec<u32> = try_with_capacity(cap)?;
     out.extend_from_slice(&text_tokens[..run_start]);
     out.extend(std::iter::repeat_n(image_token_id, placeholder_total));
     out.extend_from_slice(&text_tokens[run_end..]);
@@ -340,8 +339,7 @@ pub fn insert_image_tokens(
       })?;
     // Recoverable reservation (Codex VLM-8 R3F1) — see the marker-present
     // branch above.
-    let mut out: Vec<u32> = Vec::new();
-    out.try_reserve_exact(cap).map_err(|_| Error::OutOfMemory)?;
+    let mut out: Vec<u32> = try_with_capacity(cap)?;
     out.extend(std::iter::repeat_n(image_token_id, placeholder_total));
     out.extend_from_slice(text_tokens);
     Ok(out)
@@ -476,7 +474,7 @@ pub fn build_multimodal_mask_with_past(
   }
 
   // Validate chunk-local spans (start<end, end<=seq_len, ordered/non-overlapping).
-  let mut sorted: Vec<(usize, usize)> = image_spans.to_vec();
+  let mut sorted: Vec<(usize, usize)> = try_to_vec(image_spans)?;
   sorted.sort_unstable_by_key(|&(s, _)| s);
   let mut prev_end = 0usize;
   for &(s, e) in &sorted {
@@ -528,10 +526,7 @@ pub fn build_multimodal_mask_with_past(
   // mlxrs + the python/swift references without a real threat-model gain
   // (see VLM-9 in docs/rust-golden-standard-followups.md for the
   // coordinated allocation-policy deferral).
-  let mut block_id: Vec<u32> = Vec::new();
-  block_id
-    .try_reserve_exact(seq_len)
-    .map_err(|_| Error::OutOfMemory)?;
+  let mut block_id: Vec<u32> = try_with_capacity(seq_len)?;
   block_id.resize(seq_len, 0);
   for (idx, &(s, e)) in sorted.iter().enumerate() {
     let block = (idx + 1) as u32;
@@ -731,7 +726,7 @@ pub fn assemble_multimodal_prompt(
   // pathological inputs as recoverable errors rather than panic.
   let mut image_spans = ImageTokenSpans::new();
   if image_count > 0 && num_tokens_per_image > 0 {
-    image_spans.reserve(image_count);
+    image_spans = try_with_capacity(image_count)?;
     for i in 0..image_count {
       let start = base
         .checked_add(

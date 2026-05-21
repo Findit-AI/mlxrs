@@ -17,7 +17,7 @@
 
 use crate::{
   array::Array,
-  error::{Error, Result},
+  error::{Error, Result, try_with_capacity},
   ops,
   vlm::image::ImageProcessorConfig,
 };
@@ -305,7 +305,22 @@ fn default_merge_embeddings(
   // i32::MAX in any realistic prompt; the upstream
   // `assemble_multimodal_prompt` already enforces T <= i32::MAX before
   // this point) so the i32 cast for `slice` is safe.
-  let mut pieces: Vec<Array> = Vec::with_capacity(image_spans.len() * 2 + 1);
+  // Capacity = up to 2 pieces per span (leading text + image) + 1 trailing
+  // text slice. `checked_mul`/`checked_add` so a pathological span count
+  // can't overflow the capacity arithmetic before the recoverable
+  // `try_with_capacity` (request-scaled in the image count).
+  let pieces_cap = image_spans
+    .len()
+    .checked_mul(2)
+    .and_then(|n| n.checked_add(1))
+    .ok_or_else(|| Error::ShapeMismatch {
+      message: format!(
+        "merge_embeddings: piece-count capacity (image_spans.len() * 2 + 1) overflows usize \
+         (image_spans.len()={})",
+        image_spans.len()
+      ),
+    })?;
+  let mut pieces: Vec<Array> = try_with_capacity(pieces_cap)?;
   let d_i32 = d_text as i32;
   let t_i32 = t as i32;
   let mut text_cursor: usize = 0;
@@ -339,7 +354,9 @@ fn default_merge_embeddings(
   }
 
   // Concatenate along the sequence axis. `pieces` is guaranteed non-empty
-  // because `image_spans` is non-empty (guarded above).
-  let refs: Vec<&Array> = pieces.iter().collect();
+  // because `image_spans` is non-empty (guarded above). Recoverable
+  // reservation for the `&Array` ref vec (request-scaled in piece count).
+  let mut refs: Vec<&Array> = try_with_capacity(pieces.len())?;
+  refs.extend(pieces.iter());
   ops::shape::concatenate(&refs, 1)
 }

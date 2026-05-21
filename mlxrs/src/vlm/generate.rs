@@ -98,7 +98,7 @@ use std::{cell::RefCell, path::PathBuf};
 
 use crate::{
   array::Array,
-  error::{Error, Result},
+  error::{Error, Result, try_with_capacity},
   lm::{
     cache::KvCache,
     generate::{
@@ -271,7 +271,7 @@ pub fn vlm_generate<'a, M: Model>(
     .iter()
     .position(|&t| t == marker_id)
     .unwrap_or_default();
-  let mut image_spans: Vec<(usize, usize)> = Vec::with_capacity(images.len());
+  let mut image_spans: Vec<(usize, usize)> = try_with_capacity(images.len())?;
   for i in 0..images.len() {
     let start = base + i * cfg.num_tokens_per_image;
     let end = start + cfg.num_tokens_per_image;
@@ -301,7 +301,7 @@ pub fn vlm_generate<'a, M: Model>(
   // 2 rows from image 1 plus 1 row from image 2). Surface as
   // `Error::ShapeMismatch` instead.
   let processor_cfg = model.image_processor_config();
-  let mut image_slabs: Vec<Array> = Vec::with_capacity(images.len());
+  let mut image_slabs: Vec<Array> = try_with_capacity(images.len())?;
   for (idx, path) in images.iter().enumerate() {
     let img = load_image(path)?;
     let pre = preprocess(&img, &processor_cfg)?;
@@ -668,10 +668,8 @@ impl<M: Model> VlmDecode<'_, M> {
       // placeholder ids embed to throwaway vectors that the per-chunk
       // merge overwrites at the chunk-local span positions.)
       let chunk_window = {
-        let row: Vec<i32> = prompt_tokens[cursor..end]
-          .iter()
-          .map(|&x| x as i32)
-          .collect();
+        let mut row: Vec<i32> = try_with_capacity(chunk_len)?;
+        row.extend(prompt_tokens[cursor..end].iter().map(|&x| x as i32));
         Array::from_slice::<i32>(&row, &(1_usize, chunk_len))?
       };
       let chunk_text_embeds = self.model.embed_tokens(&chunk_window)?;
@@ -679,8 +677,9 @@ impl<M: Model> VlmDecode<'_, M> {
       // Invariant 2: chunk-local spans (and the matching slabs). Image
       // `i` is in this chunk iff `image_spans[i] ⊆ [cursor, end)`
       // (guaranteed whole by invariant 1). Collect both in index order.
-      let mut chunk_spans: Vec<(usize, usize)> = Vec::new();
-      let mut chunk_slab_refs: Vec<&Array> = Vec::new();
+      // Pre-reserve to the image count (upper bound on spans in one chunk).
+      let mut chunk_spans: Vec<(usize, usize)> = try_with_capacity(image_spans.len())?;
+      let mut chunk_slab_refs: Vec<&Array> = try_with_capacity(image_spans.len())?;
       for (i, &(s, e)) in image_spans.iter().enumerate() {
         if cursor <= s && e <= end {
           chunk_spans.push((s - cursor, e - cursor));
