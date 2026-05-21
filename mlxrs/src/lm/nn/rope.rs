@@ -35,11 +35,55 @@
 use crate::{
   array::Array,
   error::{Result, check},
+  lm::cache::RopeOffset,
   stream::default_stream,
 };
 
 /// mlx's default angular-frequency base (`mlx.nn.RoPE`'s `base=10000`).
 pub const DEFAULT_BASE: f32 = 10000.0;
+
+/// A borrowed RoPE position offset — either one scalar position shared by every
+/// sequence, or a per-sequence `[B]` (or `[1]`) integer array.
+///
+/// This is the *applied* (borrowed) counterpart of the cache contract's owned
+/// [`RopeOffset`] (swift `RoPEOffset`): a cache's
+/// [`rope_offset`](crate::lm::cache::KvCache::rope_offset) yields an owned
+/// `RopeOffset`, and `&RopeOffset` converts here via [`From`] with **no clone**
+/// (`(&offset).into()`), so the per-step rotation borrows the cache's offset
+/// array rather than duplicating it.
+///
+/// The scalar arm is `i32` (mlx-c `mlx_fast_rope`'s `offset` is `int`, and the
+/// existing scalar [`rope`] / [`Rope::apply`] entry points already take `i32`),
+/// while the owned `RopeOffset::Scalar(usize)` is narrowed on conversion. The
+/// array arm routes through `mlx_fast_rope_dynamic`; mlx itself implements the
+/// scalar `int` overload as the array overload over `array(offset, int32)`, so
+/// `Scalar(p)` and `Array([p])` are numerically identical — the split is purely
+/// to keep the cheaper scalar primitive for the common single-position case.
+#[derive(Debug, Clone, Copy)]
+pub enum RopeOffsetRef<'a> {
+  /// A single scalar position shared by every sequence (mlx-lm's
+  /// `rope(x, offset=cache.offset)`); routed through scalar `mlx_fast_rope`.
+  Scalar(i32),
+  /// Per-sequence positions with shape `[B]` (matching `x.shape(0)`) or `[1]`,
+  /// and an **integer** dtype (mlx casts non-`int32` integers to `int32`).
+  /// Routed through `mlx_fast_rope_dynamic`. The padded/batched-decode path
+  /// (cache `RopeOffset::Batch`).
+  Array(&'a Array),
+}
+
+impl<'a> From<&'a RopeOffset> for RopeOffsetRef<'a> {
+  /// Borrow a cache's owned [`RopeOffset`]
+  /// without cloning the `Batch` array. The owned scalar is `usize`; it is
+  /// narrowed to the `i32` mlx-c offset (`as`, saturating semantics are
+  /// irrelevant in practice — positions never approach `i32::MAX`, and mlx
+  /// itself takes `int`).
+  fn from(offset: &'a RopeOffset) -> Self {
+    match offset {
+      RopeOffset::Scalar(p) => RopeOffsetRef::Scalar(*p as i32),
+      RopeOffset::Batch(arr) => RopeOffsetRef::Array(arr),
+    }
+  }
+}
 
 /// Apply base rotary position embedding to `x`, rotating its first `dims`
 /// features. Free-fn mirror of python `mx.fast.rope(x, dims, traditional=,
@@ -111,6 +155,96 @@ pub fn rope(
   Ok(out)
 }
 
+/// Apply base rotary position embedding to `x` with a **per-sequence** offset
+/// array — the array (`mlx_fast_rope_dynamic`) counterpart of [`rope`]. Mirrors
+/// `mx.fast.rope(x, dims, ..., offset=<array>)` (mlx's array-`offset`
+/// overload), the path mlx-lm's batched/padded decode takes when each sequence
+/// in the batch sits at a distinct absolute position.
+///
+/// Identical to [`rope`] except `offset` is an [`Array`] instead of a scalar:
+///
+/// - `offset`: an **integer** array (mlx casts a non-`int32` integer dtype to
+///   `int32`) of shape `[B]` — one position per batch row, where `B` is
+///   `x.shape(0)` — or shape `[1]`/scalar (broadcast to all rows, equivalent to
+///   the scalar [`rope`]). mlx validates and surfaces a recoverable error for
+///   any other rank/length/dtype. Row `i` of `x` is then rotated as if its
+///   tokens start at absolute position `offset[i]`.
+///
+/// Returns a new array the same shape/dtype as `x`; does **not** evaluate
+/// (lazy, like every `mlxrs` op). See [`rope`] for the `dims` / `traditional` /
+/// `base` / `scale` semantics.
+pub fn rope_dynamic(
+  x: &Array,
+  dims: i32,
+  traditional: bool,
+  base: f32,
+  scale: f32,
+  offset: &Array,
+) -> Result<Array> {
+  // Base path: `base` present, `freqs` the null handle — the same "exactly one
+  // of `base`/`freqs` is None" contract as scalar `rope`; the only difference
+  // from that wrapper is the array `offset` and the `_dynamic` entry point.
+  let base_opt = mlxrs_sys::mlx_optional_float {
+    value: base,
+    has_value: true,
+  };
+  // SAFETY: `mlx_array_new()` returns a fresh empty handle (NULL ctx) per the
+  // mlx-c convention. It is wrapped in the RAII newtype so it is freed on
+  // drop; a NULL-ctx `mlx_array` *is* the absent-optional `freqs` value mlx-c
+  // accepts, and the guard keeps it alive across the FFI call below.
+  let null_freqs = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: `mlx_array_new()` yields a fresh empty out-param handle (NULL ctx);
+  // it is wrapped in the RAII newtype FIRST so an early return / panic frees
+  // it, then populated by the following call.
+  let mut out = Array(unsafe { mlxrs_sys::mlx_array_new() });
+  // SAFETY: all `mlx_*` handle args are valid borrowed handles, live for the
+  // call and not retained by mlx past it — `x.0` is the input, `offset.0` is
+  // the borrowed per-sequence position array (not consumed), and `null_freqs.0`
+  // is the NULL-ctx placeholder mlx-c accepts for the absent `freqs` (kept alive
+  // by `null_freqs`); the out-param was freshly allocated above and is written
+  // by this call; the backend rc (incl. mlx's offset shape/dtype validation) is
+  // surfaced via `check()`.
+  check(unsafe {
+    mlxrs_sys::mlx_fast_rope_dynamic(
+      &mut out.0,
+      x.0,
+      dims,
+      traditional,
+      base_opt,
+      scale,
+      offset.0,
+      null_freqs.0,
+      default_stream(),
+    )
+  })?;
+  Ok(out)
+}
+
+/// Apply base rotary position embedding to `x` dispatching on a
+/// [`RopeOffsetRef`]: a [`Scalar`](RopeOffsetRef::Scalar) routes through scalar
+/// [`rope`] (`mlx_fast_rope`), an [`Array`](RopeOffsetRef::Array) through
+/// [`rope_dynamic`] (`mlx_fast_rope_dynamic`).
+///
+/// This is the single entry an attention layer calls with a cache's
+/// [`rope_offset`](crate::lm::cache::KvCache::rope_offset): an owned
+/// [`RopeOffset`] borrows in as
+/// `(&offset).into()` (no clone), so a `Batch` cache rotates each sequence at
+/// its own absolute position instead of collapsing to one scalar. See [`rope`]
+/// for the `dims` / `traditional` / `base` / `scale` semantics.
+pub fn rope_with_offset(
+  x: &Array,
+  dims: i32,
+  traditional: bool,
+  base: f32,
+  scale: f32,
+  offset: RopeOffsetRef<'_>,
+) -> Result<Array> {
+  match offset {
+    RopeOffsetRef::Scalar(p) => rope(x, dims, traditional, base, scale, p),
+    RopeOffsetRef::Array(arr) => rope_dynamic(x, dims, traditional, base, scale, arr),
+  }
+}
+
 /// Base rotary position embedding as a reusable config, mirroring the python
 /// `mlx.nn.RoPE` Module and swift `RoPE` layer: it holds the fixed
 /// `dims` / `traditional` / `base` / `scale` and is applied per-step with an
@@ -156,6 +290,27 @@ impl Rope {
   /// offset for incremental decode. Returns a new lazy array (no eval).
   pub fn apply(&self, x: &Array, offset: i32) -> Result<Array> {
     rope(
+      x,
+      self.dims,
+      self.traditional,
+      self.base,
+      self.scale,
+      offset,
+    )
+  }
+
+  /// Apply this RoPE to `x` at a [`RopeOffsetRef`] — the offset-dispatching
+  /// counterpart of [`apply`](Rope::apply). A
+  /// [`Scalar`](RopeOffsetRef::Scalar) behaves exactly like
+  /// [`apply`](Rope::apply); an [`Array`](RopeOffsetRef::Array) rotates each
+  /// batch row at its own absolute position via [`rope_dynamic`].
+  ///
+  /// This is what an attention layer calls with a cache's
+  /// [`rope_offset`](crate::lm::cache::KvCache::rope_offset): an owned
+  /// [`RopeOffset`] borrows in clone-free as
+  /// `self.rope.apply_with_offset(&queries, (&cache.rope_offset()?).into())?`.
+  pub fn apply_with_offset(&self, x: &Array, offset: RopeOffsetRef<'_>) -> Result<Array> {
+    rope_with_offset(
       x,
       self.dims,
       self.traditional,
@@ -302,5 +457,149 @@ mod tests {
     assert!(!r.traditional);
     assert_eq!(r.base, DEFAULT_BASE);
     assert_eq!(r.scale, 1.0);
+  }
+
+  /// `[B=2, 1, 2, 4]` batch: both rows hold the same two tokens
+  /// `[[0,1,2,3],[4,5,6,7]]` (head_dim 4) as the scalar tests' `input()`, so a
+  /// per-row offset just selects which absolute positions each row is rotated
+  /// at — letting the dynamic-path goldens reuse the already-hand-traced scalar
+  /// goldens exactly. `x.shape(0)` is `B = 2`, the dim the `[B]` offset indexes.
+  fn batch_input() -> Array {
+    Array::from_slice::<f32>(
+      &[
+        0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, // row 0
+        0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, // row 1
+      ],
+      &(2, 1, 2, 4),
+    )
+    .unwrap()
+  }
+
+  #[test]
+  fn dynamic_per_row_offsets() {
+    let x = batch_input();
+    // Per-sequence offsets: row 0 starts at position 0, row 1 at position 2.
+    let offset = Array::from_slice::<i32>(&[0, 2], &(2,)).unwrap();
+    let mut y = rope_dynamic(&x, 4, false, DEFAULT_BASE, 1.0, &offset).unwrap();
+    // Row 0 @ offset 0 == the `non_traditional_offset0` golden; row 1 @ offset 2
+    // == the `non_traditional_offset2` golden. If the wrapper instead collapsed
+    // to one scalar, one of the two rows would be rotated at the wrong absolute
+    // positions and these would not both hold.
+    assert_close(
+      &y.to_vec::<f32>().unwrap(),
+      &[
+        // row 0 @ offset 0
+        0.0, 1.0, 2.0, 3.0, // token 0 (pos 0) unchanged
+        -2.8876167, 4.9297512, 6.6076978, 7.0496492, // token 1 (pos 1)
+        // row 1 @ offset 2
+        -1.8185949, 0.9398040, -0.8322937, 3.0193987, // token 0 (pos 2)
+        -4.8066900, 4.7877817, -5.3754749, 7.1468277, // token 1 (pos 3)
+      ],
+    );
+  }
+
+  #[test]
+  fn dynamic_offsets_swapped_rotate_independently() {
+    // Same rows, offsets swapped (row 0 @ 2, row 1 @ 0): the goldens swap with
+    // them — confirming each row truly tracks its own offset, not row index.
+    let x = batch_input();
+    let offset = Array::from_slice::<i32>(&[2, 0], &(2,)).unwrap();
+    let mut y = rope_dynamic(&x, 4, false, DEFAULT_BASE, 1.0, &offset).unwrap();
+    assert_close(
+      &y.to_vec::<f32>().unwrap(),
+      &[
+        // row 0 @ offset 2 (now the offset-2 golden)
+        -1.8185949, 0.9398040, -0.8322937, 3.0193987, // token 0 (pos 2)
+        -4.8066900, 4.7877817, -5.3754749, 7.1468277, // token 1 (pos 3)
+        // row 1 @ offset 0 (now the offset-0 golden)
+        0.0, 1.0, 2.0, 3.0, // token 0 (pos 0) unchanged
+        -2.8876167, 4.9297512, 6.6076978, 7.0496492, // token 1 (pos 1)
+      ],
+    );
+  }
+
+  #[test]
+  fn dynamic_scalar_array_matches_scalar_rope() {
+    // A length-1 offset array broadcasts to every row, so it must reproduce the
+    // scalar `rope` path bit-for-bit (mlx implements scalar `int` offset as the
+    // array overload over `array(offset, int32)`).
+    let x = input();
+    let offset = Array::from_slice::<i32>(&[2], &(1,)).unwrap();
+    let mut via_dynamic = rope_dynamic(&x, 4, false, DEFAULT_BASE, 1.0, &offset).unwrap();
+    let mut via_scalar = rope(&x, 4, false, DEFAULT_BASE, 1.0, 2).unwrap();
+    assert_close(
+      &via_dynamic.to_vec::<f32>().unwrap(),
+      &via_scalar.to_vec::<f32>().unwrap(),
+    );
+  }
+
+  #[test]
+  fn rope_with_offset_dispatches_both_arms() {
+    let x = batch_input();
+    // Scalar arm == scalar `rope` (here offset 2 applied to both rows).
+    let mut via_scalar =
+      rope_with_offset(&x, 4, false, DEFAULT_BASE, 1.0, RopeOffsetRef::Scalar(2)).unwrap();
+    let mut via_plain = rope(&x, 4, false, DEFAULT_BASE, 1.0, 2).unwrap();
+    assert_close(
+      &via_scalar.to_vec::<f32>().unwrap(),
+      &via_plain.to_vec::<f32>().unwrap(),
+    );
+    // Array arm == `rope_dynamic`.
+    let offset = Array::from_slice::<i32>(&[0, 2], &(2,)).unwrap();
+    let mut via_dispatch = rope_with_offset(
+      &x,
+      4,
+      false,
+      DEFAULT_BASE,
+      1.0,
+      RopeOffsetRef::Array(&offset),
+    )
+    .unwrap();
+    let mut via_direct = rope_dynamic(&x, 4, false, DEFAULT_BASE, 1.0, &offset).unwrap();
+    assert_close(
+      &via_dispatch.to_vec::<f32>().unwrap(),
+      &via_direct.to_vec::<f32>().unwrap(),
+    );
+  }
+
+  #[test]
+  fn apply_with_offset_matches_free_fn() {
+    let x = batch_input();
+    let r = Rope::standard(4);
+    let offset = Array::from_slice::<i32>(&[0, 2], &(2,)).unwrap();
+    let mut via_config = r
+      .apply_with_offset(&x, RopeOffsetRef::Array(&offset))
+      .unwrap();
+    let mut via_fn = rope_dynamic(&x, 4, false, DEFAULT_BASE, 1.0, &offset).unwrap();
+    assert_close(
+      &via_config.to_vec::<f32>().unwrap(),
+      &via_fn.to_vec::<f32>().unwrap(),
+    );
+  }
+
+  #[test]
+  fn rope_offset_ref_borrows_cache_offset_without_clone() {
+    // The cache contract's owned `RopeOffset` must borrow into `RopeOffsetRef`
+    // (the `From` bridge) and drive the same result as the borrowed array — this
+    // is the integration path an attention layer uses with `cache.rope_offset()`.
+    let x = batch_input();
+    let arr = Array::from_slice::<i32>(&[0, 2], &(2,)).unwrap();
+    let owned = RopeOffset::Batch(arr.try_clone().unwrap());
+    let r = Rope::standard(4);
+    let mut via_bridge = r.apply_with_offset(&x, (&owned).into()).unwrap();
+    let mut via_direct = rope_dynamic(&x, 4, false, DEFAULT_BASE, 1.0, &arr).unwrap();
+    assert_close(
+      &via_bridge.to_vec::<f32>().unwrap(),
+      &via_direct.to_vec::<f32>().unwrap(),
+    );
+
+    // Scalar arm of the bridge narrows `usize -> i32` and routes to scalar rope.
+    let owned_scalar = RopeOffset::Scalar(2);
+    let mut via_scalar_bridge = r.apply_with_offset(&x, (&owned_scalar).into()).unwrap();
+    let mut via_scalar = rope(&x, 4, false, DEFAULT_BASE, 1.0, 2).unwrap();
+    assert_close(
+      &via_scalar_bridge.to_vec::<f32>().unwrap(),
+      &via_scalar.to_vec::<f32>().unwrap(),
+    );
   }
 }

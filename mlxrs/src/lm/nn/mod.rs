@@ -17,4 +17,4 @@
 
 pub mod rope;
 
-pub use rope::{Rope, rope};
+pub use rope::{Rope, RopeOffsetRef, rope, rope_dynamic, rope_with_offset};
