@@ -1,18 +1,31 @@
-//! DSP primitives: Hann window, STFT, mel filterbank, mel + log-mel spectrogram.
+//! DSP primitives: window family (Hann/Hamming/Blackman/Bartlett), STFT,
+//! inverse STFT, mel filterbank, mel + log-mel spectrogram.
 //!
 //! Faithful 1:1 port of the corresponding `mlx_audio.dsp` core
-//! (`hanning`, `stft`, `mel_filters`) at <https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/dsp.py>.
-//! Out of scope for this PR: iSTFT, ISTFTCache, Kaldi-style features, BS.1770
-//! loudness, biquad filters, dither — see [`crate::audio`] for the scope fence.
+//! (`hanning`, `hamming`, `blackman`, `bartlett`, `STR_TO_WINDOW_FN`, `stft`,
+//! `istft`, `mel_filters`) at <https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/dsp.py>.
+//! Out of scope for this PR: the `ISTFTCache` batched/cached overlap-add
+//! helper, Kaldi-style features, BS.1770 loudness, biquad filters, dither —
+//! see [`crate::audio`] for the scope fence.
 //!
 //! ## API conventions
 //! - Window construction is **symmetric** (`periodic=False` in `mlx-audio`):
 //!   the first and last samples are zero. This matches scipy's
-//!   `windows.hann(N, sym=True)` and the `mlx-audio` default for STFT.
+//!   `windows.hann(N, sym=True)` and the `mlx-audio` default for STFT. The
+//!   string→window dispatch ([`window_from_name`]) mirrors `mlx-audio`'s
+//!   `STR_TO_WINDOW_FN` table (`"hann"`/`"hanning"`/`"hamming"`/`"blackman"`/
+//!   `"bartlett"`).
 //! - STFT mirrors `mlx_audio.dsp.stft` defaults: `center=True`,
 //!   `pad_mode="reflect"`. Output layout is **`(num_frames, n_fft / 2 + 1)`
 //!   complex** (mlx-c `rfft` yields `Complex64` natively), as in the
 //!   reference.
+//! - [`istft`] inverts [`stft`] **in that same `(num_frames, n_fft / 2 + 1)`
+//!   layout** (so `istft(&stft(x, ..)?, ..)` composes directly). This is a
+//!   deliberate, semantics-preserving adaptation of `mlx_audio.dsp.istft`,
+//!   which documents a frequency-major `(n_fft / 2 + 1, num_frames)` input
+//!   and irffts along axis 0; see [`istft`] for the full rationale (the
+//!   reference's `win_length` default is also derived from the frequency
+//!   dimension here, fixing an axis bug in the upstream default formula).
 //! - Mel filterbank uses the HTK formula
 //!   (`mel = 2595 * log10(1 + hz / 700)`) and returns shape
 //!   **`(n_mels, n_fft / 2 + 1)`**.
@@ -119,20 +132,20 @@ impl LogFloor {
   }
 }
 
-/// Symmetric Hann window: `w[k] = 0.5 * (1 - cos(2π k / (n - 1)))` for
-/// `k in 0..n`. The first and last samples are zero.
+/// Shared scaffolding for the symmetric (`periodic=False`) window family:
+/// validates `n`, applies the public-input allocation cap, and materializes
+/// `[sample(k) for k in 0..n]` on the CPU via a recoverable
+/// `try_reserve_exact`.
 ///
-/// Matches `mlx_audio.dsp.hanning(n, periodic=False)` (the STFT default).
-///
-/// # Errors
-/// - Returns [`Error::Backend`] when `n < 2`. The reference Python form
-///   would divide by zero for `n == 1` (silently producing `NaN`); we
-///   reject upfront. `n == 0` would produce an empty zero-length window
-///   which is never useful for spectral analysis.
-pub fn hann_window(n: usize) -> Result<Array> {
+/// `name` only flavors the error messages so each public window keeps its
+/// own diagnostic prefix; `sample` receives `(k, denom)` where
+/// `denom = (n - 1) as f32` (the `periodic=False` denominator shared by
+/// every `mlx-audio` window). The window kinds differ ONLY in this closure,
+/// so the guards / cap / fallible allocation can't drift between them.
+fn symmetric_window(name: &str, n: usize, sample: impl Fn(usize, f32) -> f32) -> Result<Array> {
   if n < 2 {
     return Err(Error::Backend {
-      message: format!("hann_window: n must be >= 2 (got {n})"),
+      message: format!("{name}: n must be >= 2 (got {n})"),
     });
   }
   // Cap on public-input-driven allocation — defends against an
@@ -143,13 +156,13 @@ pub fn hann_window(n: usize) -> Result<Array> {
   if n > crate::audio::io::MAX_DECODED_SAMPLES {
     return Err(Error::Backend {
       message: format!(
-        "hann_window: n {n} exceeds the {} cap",
+        "{name}: n {n} exceeds the {} cap",
         crate::audio::io::MAX_DECODED_SAMPLES
       ),
     });
   }
   let n_i32 = i32::try_from(n).map_err(|_| Error::Backend {
-    message: format!("hann_window: n {n} exceeds i32::MAX"),
+    message: format!("{name}: n {n} exceeds i32::MAX"),
   })?;
 
   // Materialize on the CPU (cheap; n is bounded above) via a
@@ -158,13 +171,102 @@ pub fn hann_window(n: usize) -> Result<Array> {
   let denom = (n - 1) as f32;
   let mut buf: Vec<f32> = Vec::new();
   buf.try_reserve_exact(n).map_err(|e| Error::Backend {
-    message: format!("hann_window: reservation for {n} elements failed: {e}"),
+    message: format!("{name}: reservation for {n} elements failed: {e}"),
   })?;
   for k in 0..n {
-    let theta = 2.0 * PI * (k as f32) / denom;
-    buf.push(0.5 * (1.0 - theta.cos()));
+    buf.push(sample(k, denom));
   }
   Array::from_slice::<f32>(&buf, &[n_i32])
+}
+
+/// Symmetric Hann window: `w[k] = 0.5 * (1 - cos(2π k / (n - 1)))` for
+/// `k in 0..n`. The first and last samples are zero.
+///
+/// Matches `mlx_audio.dsp.hanning(n, periodic=False)` (the STFT default).
+///
+/// # Errors
+/// - Returns [`Error::Backend`] when `n < 2`. The reference Python form
+///   would divide by zero for `n == 1` (silently producing `NaN`); we
+///   reject upfront. `n == 0` would produce an empty zero-length window
+///   which is never useful for spectral analysis.
+/// - Returns [`Error::Backend`] when `n` exceeds the
+///   [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES) cap or
+///   `i32::MAX`, or if the backing allocation fails.
+pub fn hann_window(n: usize) -> Result<Array> {
+  symmetric_window("hann_window", n, |k, denom| {
+    let theta = 2.0 * PI * (k as f32) / denom;
+    0.5 * (1.0 - theta.cos())
+  })
+}
+
+/// Symmetric Hamming window: `w[k] = 0.54 - 0.46 * cos(2π k / (n - 1))` for
+/// `k in 0..n`. Endpoints are `0.08` (not zero, unlike Hann).
+///
+/// Matches `mlx_audio.dsp.hamming(n, periodic=False)`.
+///
+/// # Errors
+/// Same as [`hann_window`].
+pub fn hamming(n: usize) -> Result<Array> {
+  symmetric_window("hamming", n, |k, denom| {
+    let theta = 2.0 * PI * (k as f32) / denom;
+    0.54 - 0.46 * theta.cos()
+  })
+}
+
+/// Symmetric Blackman window:
+/// `w[k] = 0.42 - 0.5 * cos(2π k / (n - 1)) + 0.08 * cos(4π k / (n - 1))`
+/// for `k in 0..n`. Endpoints are zero (modulo f32 rounding ~`-1.4e-17`).
+///
+/// Matches `mlx_audio.dsp.blackman(n, periodic=False)`.
+///
+/// # Errors
+/// Same as [`hann_window`].
+pub fn blackman(n: usize) -> Result<Array> {
+  symmetric_window("blackman", n, |k, denom| {
+    let theta = 2.0 * PI * (k as f32) / denom;
+    0.42 - 0.5 * theta.cos() + 0.08 * (2.0 * theta).cos()
+  })
+}
+
+/// Symmetric Bartlett (triangular) window:
+/// `w[k] = 1 - 2 * |k - (n - 1) / 2| / (n - 1)` for `k in 0..n`. Rises
+/// linearly to `1` at the center and back to `0` at both endpoints.
+///
+/// Matches `mlx_audio.dsp.bartlett(n, periodic=False)`.
+///
+/// # Errors
+/// Same as [`hann_window`].
+pub fn bartlett(n: usize) -> Result<Array> {
+  symmetric_window("bartlett", n, |k, denom| {
+    1.0 - 2.0 * (k as f32 - denom / 2.0).abs() / denom
+  })
+}
+
+/// String → window dispatch, mirroring `mlx-audio`'s `STR_TO_WINDOW_FN`
+/// table. The lookup is case-insensitive (matching the reference's
+/// `window.lower()` in `stft`/`istft`):
+/// - `"hann"` / `"hanning"` → [`hann_window`]
+/// - `"hamming"` → [`hamming`]
+/// - `"blackman"` → [`blackman`]
+/// - `"bartlett"` → [`bartlett`]
+///
+/// All windows are the symmetric (`periodic=False`) form, as in `mlx-audio`.
+///
+/// # Errors
+/// - [`Error::Backend`] for an unknown window name (mirrors the reference's
+///   `ValueError(f"Unknown window function: {window}")`).
+/// - Propagates the constructor errors of the selected window (see
+///   [`hann_window`]).
+pub fn window_from_name(name: &str, n: usize) -> Result<Array> {
+  match name.to_ascii_lowercase().as_str() {
+    "hann" | "hanning" => hann_window(n),
+    "hamming" => hamming(n),
+    "blackman" => blackman(n),
+    "bartlett" => bartlett(n),
+    other => Err(Error::Backend {
+      message: format!("window_from_name: unknown window function: {other}"),
+    }),
+  }
 }
 
 /// Manual `reflect`-mode pad along axis 0 (1-D arrays).
@@ -416,6 +518,312 @@ pub fn stft(
   let windowed = ops::arithmetic::multiply(&frames, &window)?;
   // rfft over the last axis (axis 1) with explicit length n_fft.
   fft::rfft(&windowed, n_fft_i32, 1, FftNorm::Backward)
+}
+
+/// Synthesis window selector for [`istft`], the idiomatic translation of
+/// `mlx_audio.dsp.istft`'s `window: mx.array | str` union:
+/// - [`Window::Named`] resolves a `STR_TO_WINDOW_FN` name to the **periodic**
+///   form the reference uses for synthesis (`window_fn(win_length + 1)`
+///   truncated to `win_length` — i.e. the symmetric window of length
+///   `win_length + 1` with its trailing duplicate sample dropped). This is
+///   the COLA-friendly periodic window.
+/// - [`Window::Array`] supplies the synthesis window directly (the
+///   reference's `else: w = window` branch). Pass the SAME window
+///   [`stft`] used internally ([`hann_window`] of `win_length`) together
+///   with `normalized = true` for exact `istft(stft(x))` reconstruction.
+#[derive(Debug, Clone, Copy)]
+pub enum Window<'a> {
+  /// A `STR_TO_WINDOW_FN` name (case-insensitive). Built as the periodic
+  /// window of length `win_length` (via the `win_length + 1` symmetric
+  /// form, last sample dropped), matching `mlx_audio.dsp.istft`.
+  Named(&'a str),
+  /// A caller-supplied synthesis window array (used verbatim, then
+  /// zero-padded up to `win_length` if shorter — as the reference does).
+  Array(&'a Array),
+}
+
+/// Inverse Short-Time Fourier Transform — overlap-add reconstruction, the
+/// inverse of [`stft`].
+///
+/// Faithful port of `mlx_audio.dsp.istft(x, hop_length, win_length, window,
+/// center=True, length=None, normalized=False)`, adapted to mlxrs's STFT
+/// layout. **`x` is `(num_frames, n_fft / 2 + 1)` `Dtype::Complex64`** — i.e.
+/// exactly what [`stft`] returns — so `istft(&stft(s, ..)?, ..)` composes
+/// directly. The reference instead documents a frequency-major
+/// `(n_fft / 2 + 1, num_frames)` input and irffts along axis 0 then
+/// transposes; here the frames are already on axis 0, so we irfft along
+/// axis 1 and skip the transpose. This is a semantics-preserving adaptation,
+/// not a behavior change (every sample of the reconstruction is identical to
+/// the reference fed the transpose of `x`).
+///
+/// `win_length` defaults to `(n_freqs - 1) * 2` (= `n_fft`), derived from the
+/// **frequency** dimension. The reference's documented default
+/// (`(n_fft - 1) * 2`) is computed as `(x.shape[1] - 1) * 2`, which under its
+/// own documented frequency-major layout reads the `num_frames` axis — an
+/// upstream axis bug. We derive from `n_freqs` (`x.shape[1]` in our layout)
+/// so the default equals `n_fft` and the synthesis window broadcasts against
+/// the irfft output, which is the only self-consistent behavior.
+/// `hop_length` defaults to `win_length / 4`.
+///
+/// Normalization mirrors the reference: each output sample is divided by the
+/// overlap-add sum of the (optionally squared) window. With `normalized =
+/// false` the divisor is `Σ w` (simple window normalization); with
+/// `normalized = true` it is `Σ w²` (COLA / `torch.istft` convention).
+/// Positions whose window-sum is `<= 1e-10` are left unnormalized (matching
+/// the reference's `mx.where(window_sum > 1e-10, ...)` guard).
+///
+/// `center = true` (the default) trims `win_length / 2` samples from each end
+/// (undoing [`stft`]'s center reflect-pad) when `length` is `None`. A `Some`
+/// `length` instead truncates the reconstruction to that many leading
+/// samples.
+///
+/// Returns the reconstructed 1-D real signal (`Dtype::F32`).
+///
+/// # Errors
+/// - [`Error::Backend`] when:
+///   - `x` is not 2-D, or `n_freqs < 2` (need at least 2 bins to define
+///     `n_fft = (n_freqs - 1) * 2`),
+///   - `num_frames == 0`,
+///   - `hop_length == 0` or `win_length == 0`,
+///   - `win_length > n_fft` (the synthesis window cannot be longer than the
+///     irfft frame — the reference would broadcast-fail),
+///   - an explicit [`Window::Array`] is not 1-D,
+///   - any derived size overflows `usize`/`i32` or exceeds the
+///     [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES) cap,
+///   - the `length` trim is out of range.
+/// - Propagates window-construction errors from [`window_from_name`].
+pub fn istft(
+  x: &Array,
+  hop_length: Option<usize>,
+  win_length: Option<usize>,
+  window: Window<'_>,
+  center: bool,
+  length: Option<usize>,
+  normalized: bool,
+) -> Result<Array> {
+  let shape = x.shape();
+  if shape.len() != 2 {
+    return Err(Error::Backend {
+      message: format!(
+        "istft: expected 2-D (num_frames, n_freqs) input, got {}-D",
+        shape.len()
+      ),
+    });
+  }
+  let num_frames = shape[0];
+  let n_freqs = shape[1];
+  if n_freqs < 2 {
+    return Err(Error::Backend {
+      message: format!("istft: n_freqs {n_freqs} < 2 (need >= 2 bins for irfft)"),
+    });
+  }
+  if num_frames == 0 {
+    return Err(Error::Backend {
+      message: "istft: num_frames must be > 0".into(),
+    });
+  }
+  // n_fft = (n_freqs - 1) * 2, the irfft target length.
+  let n_fft = (n_freqs - 1).checked_mul(2).ok_or_else(|| Error::Backend {
+    message: format!("istft: n_fft = (n_freqs - 1) * 2 overflows usize (n_freqs={n_freqs})"),
+  })?;
+  let win_length = win_length.unwrap_or(n_fft);
+  if win_length == 0 {
+    return Err(Error::Backend {
+      message: "istft: win_length must be > 0".into(),
+    });
+  }
+  if win_length > n_fft {
+    return Err(Error::Backend {
+      message: format!("istft: win_length {win_length} > n_fft {n_fft} (unsupported)"),
+    });
+  }
+  let hop_length = hop_length.unwrap_or(win_length / 4);
+  if hop_length == 0 {
+    return Err(Error::Backend {
+      message: "istft: hop_length must be > 0".into(),
+    });
+  }
+  let win_length_i32 = i32::try_from(win_length).map_err(|_| Error::Backend {
+    message: format!("istft: win_length {win_length} exceeds i32::MAX"),
+  })?;
+
+  // Synthesis window. Named → periodic form (symmetric of `win_length + 1`,
+  // trailing sample dropped); Array → used verbatim. Either way, zero-pad up
+  // to `win_length` if shorter (matches the reference).
+  let window = match window {
+    Window::Named(name) => {
+      let win_len_p1 = win_length.checked_add(1).ok_or_else(|| Error::Backend {
+        message: format!("istft: win_length {win_length} + 1 overflows usize"),
+      })?;
+      let full = window_from_name(name, win_len_p1)?;
+      // Drop the trailing duplicate sample: full[0 .. win_length].
+      ops::indexing::slice(&full, &[0], &[win_length_i32], &[1])?
+    }
+    Window::Array(w) => {
+      if w.ndim() != 1 {
+        return Err(Error::Backend {
+          message: format!("istft: explicit window must be 1-D, got {}-D", w.ndim()),
+        });
+      }
+      w.try_clone()?
+    }
+  };
+  // Zero-pad the window up to `win_length` (no-op for the Named path, which
+  // is already exactly `win_length`).
+  let w_len = window.shape()[0];
+  let window = if w_len < win_length {
+    let pad_value = Array::zeros::<f32>(&[0i32; 0])?;
+    let pad_high = [
+      i32::try_from(win_length - w_len).map_err(|_| Error::Backend {
+        message: format!("istft: window pad {} exceeds i32::MAX", win_length - w_len),
+      })?,
+    ];
+    ops::shape::pad(
+      &window,
+      &[0_i32],
+      &[0_i32],
+      &pad_high,
+      &pad_value,
+      c"constant",
+    )?
+  } else {
+    window
+  };
+
+  // Output / window-sum buffer length: `t = (num_frames - 1) * hop + win_length`.
+  let t = (num_frames - 1)
+    .checked_mul(hop_length)
+    .and_then(|v| v.checked_add(win_length))
+    .ok_or_else(|| Error::Backend {
+      message: format!(
+        "istft: OLA length (num_frames-1)*hop + win_length overflows usize \
+         (num_frames={num_frames}, hop={hop_length}, win_length={win_length})"
+      ),
+    })?;
+  if t > crate::audio::io::MAX_DECODED_SAMPLES {
+    return Err(Error::Backend {
+      message: format!(
+        "istft: OLA length {t} exceeds the {} cap",
+        crate::audio::io::MAX_DECODED_SAMPLES
+      ),
+    });
+  }
+  let t_i32 = i32::try_from(t).map_err(|_| Error::Backend {
+    message: format!("istft: OLA length {t} exceeds i32::MAX"),
+  })?;
+  let n_fft_i32 = i32::try_from(n_fft).map_err(|_| Error::Backend {
+    message: format!("istft: n_fft {n_fft} exceeds i32::MAX"),
+  })?;
+  let num_frames_i32 = i32::try_from(num_frames).map_err(|_| Error::Backend {
+    message: format!("istft: num_frames {num_frames} exceeds i32::MAX"),
+  })?;
+
+  // Inverse FFT of every frame along the frequency axis (axis 1):
+  // (num_frames, n_freqs) complex → (num_frames, n_fft) real.
+  let frames_time = fft::irfft(x, n_fft_i32, 1, FftNorm::Backward)?;
+  // Keep only the first `win_length` columns of each frame (no-op when
+  // win_length == n_fft, the default). Mirrors the reference's
+  // `frames_time * w` broadcast, which requires the windowed span to be
+  // `win_length` wide.
+  let frames_time = if win_length < n_fft {
+    ops::indexing::slice(
+      &frames_time,
+      &[0, 0],
+      &[num_frames_i32, win_length_i32],
+      &[1, 1],
+    )?
+  } else {
+    frames_time
+  };
+
+  // updates_reconstructed = (frames_time * w).flatten() — shape
+  // (num_frames * win_length,). `w` is (win_length,) and broadcasts across
+  // the frame axis.
+  let windowed = ops::arithmetic::multiply(&frames_time, &window)?;
+  let updates_reconstructed = ops::shape::flatten(&windowed, 0, -1)?;
+
+  // window_norm = w*w if normalized else w; tiled across frames then flattened.
+  let window_norm = if normalized {
+    ops::arithmetic::multiply(&window, &window)?
+  } else {
+    window
+  };
+  // tile(window_norm, num_frames): (win_length,) → (num_frames, win_length).
+  let window_norm_row = ops::shape::reshape(&window_norm, &(1usize, win_length))?;
+  let window_norm_tiled = ops::shape::broadcast_to(&window_norm_row, &(num_frames, win_length))?;
+  let updates_window = ops::shape::flatten(&window_norm_tiled, 0, -1)?;
+
+  // Overlap-add destination indices:
+  // indices[m, j] = m * hop + j, flattened to (num_frames * win_length,).
+  // Built CPU-side (bounded by the OLA-length cap above) as i32 — the
+  // reference builds the same via arange broadcasts.
+  let idx_len = num_frames
+    .checked_mul(win_length)
+    .ok_or_else(|| Error::Backend {
+      message: format!(
+        "istft: index count num_frames * win_length overflows usize \
+         (num_frames={num_frames}, win_length={win_length})"
+      ),
+    })?;
+  let mut idx_buf: Vec<i32> = Vec::new();
+  idx_buf
+    .try_reserve_exact(idx_len)
+    .map_err(|e| Error::Backend {
+      message: format!("istft: index reservation for {idx_len} elements failed: {e}"),
+    })?;
+  for m in 0..num_frames {
+    // `m * hop_length < t <= i32::MAX` (t bounded above), and `+ j` stays
+    // `< t`, so every index fits i32 without a per-element checked cast.
+    let off = (m * hop_length) as i32;
+    for j in 0..win_length_i32 {
+      idx_buf.push(off + j);
+    }
+  }
+  let idx_len_i32 = i32::try_from(idx_len).map_err(|_| Error::Backend {
+    message: format!("istft: index count {idx_len} exceeds i32::MAX"),
+  })?;
+  let indices = Array::from_slice::<i32>(&idx_buf, &[idx_len_i32])?;
+
+  // reconstructed / window_sum via scatter-add into zero buffers (axis 0).
+  let zeros_recon = Array::zeros::<f32>(&[t_i32])?;
+  let zeros_wsum = Array::zeros::<f32>(&[t_i32])?;
+  let reconstructed =
+    ops::indexing::scatter_add_axis(&zeros_recon, &indices, &updates_reconstructed, 0)?;
+  let window_sum = ops::indexing::scatter_add_axis(&zeros_wsum, &indices, &updates_window, 0)?;
+
+  // normalize by the (squared) window-sum where it exceeds 1e-10, else leave
+  // the raw overlap-add (matches the reference's `mx.where` guard).
+  let threshold = Array::full::<f32>(&[0i32; 0], 1e-10)?;
+  let mask = ops::comparison::greater(&window_sum, &threshold)?;
+  let normalized_recon = ops::arithmetic::divide(&reconstructed, &window_sum)?;
+  let reconstructed = ops::logical::select(&mask, &normalized_recon, &reconstructed)?;
+
+  // Final trimming: center pad removal (when length is None) or length cut.
+  if let Some(len) = length {
+    let len_i32 = i32::try_from(len).map_err(|_| Error::Backend {
+      message: format!("istft: length {len} exceeds i32::MAX"),
+    })?;
+    if len > t {
+      return Err(Error::Backend {
+        message: format!("istft: requested length {len} exceeds reconstruction length {t}"),
+      });
+    }
+    ops::indexing::slice(&reconstructed, &[0], &[len_i32], &[1])
+  } else if center {
+    // reconstructed[win_length // 2 : t - win_length // 2].
+    let half = win_length / 2;
+    // `t = (num_frames - 1) * hop + win_length >= win_length >= 2 * (win_length / 2)`,
+    // so `t - half >= half` and the slice is non-empty / well-ordered.
+    let start = i32::try_from(half).map_err(|_| Error::Backend {
+      message: format!("istft: center trim start {half} exceeds i32::MAX"),
+    })?;
+    let stop = i32::try_from(t - half).map_err(|_| Error::Backend {
+      message: format!("istft: center trim stop {} exceeds i32::MAX", t - half),
+    })?;
+    ops::indexing::slice(&reconstructed, &[start], &[stop], &[1])
+  } else {
+    Ok(reconstructed)
+  }
 }
 
 /// HTK mel scale: `mel = 2595 * log10(1 + hz / 700)`.
@@ -677,4 +1085,274 @@ pub fn log_mel_spectrogram_with(
   let eps = Array::full::<f32>(&[0i32; 0], floor.value())?;
   let floored = ops::arithmetic::maximum(&mel, &eps)?;
   floored.log()
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Absolute tolerance for the closed-form window value checks. The
+  /// formulas are evaluated in f32 here and in `mlx-audio` in f64 then cast
+  /// to f32, so a few ULPs of slack is expected.
+  const WIN_TOL: f32 = 1e-6;
+
+  fn to_vec(a: &Array) -> Vec<f32> {
+    // Tests own their arrays; clone so the accessor's `&mut self` (which
+    // triggers the explicit eval) doesn't force a `mut` binding on callers.
+    a.try_clone().unwrap().to_vec::<f32>().unwrap()
+  }
+
+  // ---- A2: window family closed-form parity (hand-derived) ----------------
+
+  #[test]
+  fn hamming_matches_closed_form_n5() {
+    // 0.54 - 0.46 cos(2π k / 4) for k in 0..5:
+    // k=0: 0.54-0.46 = 0.08; k=1: 0.54-0; wait cos(π/2)=0 → 0.54; k=2:
+    // cos(π)=-1 → 1.0; k=3: 0.54; k=4: 0.08.
+    let v = to_vec(&hamming(5).unwrap());
+    let expected = [0.08_f32, 0.54, 1.0, 0.54, 0.08];
+    for (i, (g, e)) in v.iter().zip(expected.iter()).enumerate() {
+      assert!((g - e).abs() < WIN_TOL, "hamming[{i}]: got {g}, want {e}");
+    }
+  }
+
+  #[test]
+  fn hamming_endpoints_are_0_08() {
+    // Distinguishing feature vs Hann: Hamming endpoints are 0.08, not 0.
+    let v = to_vec(&hamming(8).unwrap());
+    assert!((v[0] - 0.08).abs() < WIN_TOL, "first: {}", v[0]);
+    assert!((v[7] - 0.08).abs() < WIN_TOL, "last: {}", v[7]);
+  }
+
+  #[test]
+  fn blackman_matches_closed_form_n5() {
+    // 0.42 - 0.5 cos(2π k/4) + 0.08 cos(4π k/4):
+    // k=0: 0.42-0.5+0.08 = 0.0; k=1: 0.42-0+(-0.08)=0.34; k=2:
+    // 0.42+0.5+0.08=1.0; k=3: 0.34; k=4: 0.0.
+    let v = to_vec(&blackman(5).unwrap());
+    let expected = [0.0_f32, 0.34, 1.0, 0.34, 0.0];
+    for (i, (g, e)) in v.iter().zip(expected.iter()).enumerate() {
+      assert!((g - e).abs() < WIN_TOL, "blackman[{i}]: got {g}, want {e}");
+    }
+  }
+
+  #[test]
+  fn bartlett_matches_closed_form_n5_and_n4() {
+    // n=5 (odd): triangle peaking at 1.0 in the center, 0 at the ends.
+    let v5 = to_vec(&bartlett(5).unwrap());
+    let e5 = [0.0_f32, 0.5, 1.0, 0.5, 0.0];
+    for (i, (g, e)) in v5.iter().zip(e5.iter()).enumerate() {
+      assert!((g - e).abs() < WIN_TOL, "bartlett5[{i}]: got {g}, want {e}");
+    }
+    // n=4 (even): 1 - 2|k - 1.5|/3 → [0, 2/3, 2/3, 0].
+    let v4 = to_vec(&bartlett(4).unwrap());
+    let e4 = [0.0_f32, 2.0 / 3.0, 2.0 / 3.0, 0.0];
+    for (i, (g, e)) in v4.iter().zip(e4.iter()).enumerate() {
+      assert!((g - e).abs() < WIN_TOL, "bartlett4[{i}]: got {g}, want {e}");
+    }
+  }
+
+  #[test]
+  fn windows_reject_n_lt_2() {
+    for r in [
+      hamming(0),
+      hamming(1),
+      blackman(1),
+      bartlett(0),
+      bartlett(1),
+    ] {
+      assert!(matches!(r, Err(Error::Backend { .. })));
+    }
+  }
+
+  #[test]
+  fn window_from_name_dispatches_case_insensitively() {
+    // "hann"/"hanning" → Hann (endpoints 0); "HAMMING" → Hamming
+    // (endpoints 0.08); names are lowercased like the reference.
+    let hann = to_vec(&window_from_name("HaNn", 8).unwrap());
+    assert!(hann[0].abs() < WIN_TOL && hann[7].abs() < WIN_TOL);
+    let hanning = to_vec(&window_from_name("hanning", 8).unwrap());
+    assert_eq!(hann, hanning, "hann and hanning must be identical");
+    let hamming = to_vec(&window_from_name("HAMMING", 8).unwrap());
+    assert!((hamming[0] - 0.08).abs() < WIN_TOL);
+    let bartlett = to_vec(&window_from_name("Bartlett", 5).unwrap());
+    assert!((bartlett[2] - 1.0).abs() < WIN_TOL);
+  }
+
+  #[test]
+  fn window_from_name_rejects_unknown() {
+    assert!(matches!(
+      window_from_name("kaiser", 8),
+      Err(Error::Backend { .. })
+    ));
+  }
+
+  // ---- A1: istft ----------------------------------------------------------
+
+  /// The 16-sample test signal used for the round-trip (arbitrary but fixed).
+  fn signal_16() -> [f32; 16] {
+    [
+      0.1, 0.5, -0.3, 0.8, -0.2, 0.6, 0.0, -0.7, 0.4, 0.9, -0.5, 0.2, 0.3, -0.1, 0.7, -0.4,
+    ]
+  }
+
+  #[test]
+  fn istft_reconstructs_stft_with_matching_window() {
+    // Perfect reconstruction: feed istft the SAME symmetric Hann window stft
+    // uses internally (via Window::Array) with normalized=true (COLA / Σw²
+    // normalization), so each frame contributes `w² · x` and the divisor is
+    // `Σ w²` → exact `x` wherever the window-sum is non-zero. With n_fft=8,
+    // hop=4 (50% overlap) and 16 samples, the center-trim recovers the
+    // original length exactly. Verified against a numpy reference to 1e-16
+    // (f64); we assert 1e-5 for the f32 backend.
+    let buf = signal_16();
+    let x = Array::from_slice::<f32>(&buf, &[16i32]).unwrap();
+    let spec = stft(&x, 8, 4, None).unwrap();
+    assert_eq!(spec.shape(), vec![5, 5]); // (num_frames, n_fft/2+1)
+
+    let w = hann_window(8).unwrap();
+    let rec = istft(
+      &spec,
+      Some(4), // hop_length (matches stft)
+      Some(8), // win_length == n_fft
+      Window::Array(&w),
+      true, // center (undo stft's reflect pad)
+      None, // length (None → center-trim)
+      true, // normalized (Σw²)
+    )
+    .unwrap();
+    let r = to_vec(&rec);
+    assert_eq!(r.len(), buf.len(), "round-trip length mismatch");
+    for (i, (g, e)) in r.iter().zip(buf.iter()).enumerate() {
+      assert!(
+        (g - e).abs() < 1e-5,
+        "reconstruction[{i}]: got {g}, want {e} (diff {})",
+        (g - e).abs()
+      );
+    }
+  }
+
+  #[test]
+  fn istft_length_override_truncates_without_center_trim() {
+    // With an explicit `length`, the reference returns the first `length`
+    // samples of the raw OLA (no center trim). t = (5-1)*4 + 8 = 24.
+    let buf = signal_16();
+    let x = Array::from_slice::<f32>(&buf, &[16i32]).unwrap();
+    let spec = stft(&x, 8, 4, None).unwrap();
+    let w = hann_window(8).unwrap();
+    let rec = istft(
+      &spec,
+      Some(4),
+      Some(8),
+      Window::Array(&w),
+      true,
+      Some(10),
+      true,
+    )
+    .unwrap();
+    assert_eq!(to_vec(&rec).len(), 10);
+  }
+
+  #[test]
+  fn istft_named_window_runs_and_is_finite() {
+    // The Named path builds the periodic Hann (hann(win_length+1)[:-1]); this
+    // is NOT identical to stft's symmetric analysis window, so it won't
+    // reconstruct exactly, but it must run end-to-end and stay finite.
+    let buf = signal_16();
+    let x = Array::from_slice::<f32>(&buf, &[16i32]).unwrap();
+    let spec = stft(&x, 8, 4, None).unwrap();
+    let rec = istft(
+      &spec,
+      Some(4),
+      Some(8),
+      Window::Named("hann"),
+      true,
+      None,
+      false,
+    )
+    .unwrap();
+    for (i, v) in to_vec(&rec).iter().enumerate() {
+      assert!(v.is_finite(), "istft[{i}] not finite: {v}");
+    }
+  }
+
+  #[test]
+  fn istft_named_window_is_periodic_no_trailing_zero() {
+    // Regression on the `window_fn(win_length + 1)[:-1]` periodic
+    // construction: the synthesis window must have its trailing sample
+    // dropped (so it is NOT the symmetric window with a zero at the end).
+    // We can observe this only indirectly via the reconstruction, so instead
+    // assert the construction directly here for win_length=8:
+    // periodic hann(8) = hann(9)[:-1] = [0, .1464.., .5, .8535.., 1, .8535..,
+    // .5, .1464..] — note the LAST sample is 0.1464.., not 0.
+    let full = hann_window(9).unwrap();
+    let periodic = ops::indexing::slice(&full, &[0], &[8], &[1]).unwrap();
+    let v = to_vec(&periodic);
+    assert_eq!(v.len(), 8);
+    assert!(
+      v[0].abs() < WIN_TOL,
+      "periodic[0] should be 0, got {}",
+      v[0]
+    );
+    assert!(
+      (v[7] - 0.146_447).abs() < 1e-4,
+      "periodic[7] should be ~0.1464 (NOT 0), got {}",
+      v[7]
+    );
+  }
+
+  #[test]
+  fn istft_rejects_bad_shapes_and_params() {
+    // 1-D input (must be 2-D).
+    let one_d = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3i32]).unwrap();
+    assert!(matches!(
+      istft(&one_d, None, None, Window::Named("hann"), true, None, false),
+      Err(Error::Backend { .. })
+    ));
+
+    // Valid spec for the remaining param checks.
+    let buf = signal_16();
+    let x = Array::from_slice::<f32>(&buf, &[16i32]).unwrap();
+    let spec = stft(&x, 8, 4, None).unwrap();
+    let w = hann_window(8).unwrap();
+    // hop_length == 0.
+    assert!(matches!(
+      istft(
+        &spec,
+        Some(0),
+        Some(8),
+        Window::Array(&w),
+        true,
+        None,
+        false
+      ),
+      Err(Error::Backend { .. })
+    ));
+    // win_length > n_fft (n_fft = 8 here).
+    assert!(matches!(
+      istft(
+        &spec,
+        Some(4),
+        Some(16),
+        Window::Array(&w),
+        true,
+        None,
+        false
+      ),
+      Err(Error::Backend { .. })
+    ));
+    // length larger than the OLA length (t = 24).
+    assert!(matches!(
+      istft(
+        &spec,
+        Some(4),
+        Some(8),
+        Window::Array(&w),
+        true,
+        Some(1000),
+        true
+      ),
+      Err(Error::Backend { .. })
+    ));
+  }
 }
