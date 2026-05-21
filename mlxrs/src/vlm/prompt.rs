@@ -515,10 +515,19 @@ pub fn build_multimodal_mask_with_past(
 
   // block_id[i] = 1-indexed chunk-local image span index for chunk position
   // i; 0 = not in any image. Length seq_len (chunk-local). Allocated
-  // fallibly for the same reason as `buf` below — a large valid `seq_len`
-  // would otherwise abort the process in `vec![0u32; seq_len]` BEFORE the
-  // recoverable `buf.try_reserve_exact` could report OOM (Codex VLM-8
-  // R4F1: every allocation in this public mask helper must be recoverable).
+  // fallibly for the same reason as `buf` below: these are the TWO
+  // sequence-scaled buffers (`block_id` is O(seq_len); `buf` is
+  // O(seq_len · total_keys) — the dominant allocation, up to MBs), so a
+  // large valid chunk would otherwise abort in `vec![0u32; seq_len]`
+  // before the recoverable `buf.try_reserve_exact` could report OOM
+  // (Codex VLM-8 R4F1). The small auxiliaries here (`sorted`, a clone of
+  // `image_spans` — O(num_images), a handful of `(usize,usize)` pairs)
+  // follow the crate's standard infallible-`Vec` idiom: they cannot
+  // realistically OOM (model image counts are small constants), and a
+  // blanket try_reserve on every Vec would diverge from the rest of
+  // mlxrs + the python/swift references without a real threat-model gain
+  // (see VLM-9 in docs/rust-golden-standard-followups.md for the
+  // coordinated allocation-policy deferral).
   let mut block_id: Vec<u32> = Vec::new();
   block_id
     .try_reserve_exact(seq_len)
