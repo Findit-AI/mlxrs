@@ -1,0 +1,1414 @@
+//! Local VLM **load factory** + a (`model_type`, `processor_class`) →
+//! constructor registry pair, ported from the local-path slice of
+//! [`mlx_vlm.utils`](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/utils.py)
+//! (`load` / `load_model` / `load_processor` / `load_image_processor` /
+//! `load_config` / `get_model_and_args`) and `mlx-swift-lm`'s
+//! [`VLMModelFactory`](https://github.com/ml-explore/mlx-swift-lm/blob/main/Libraries/MLXVLM/VLMModelFactory.swift)
+//! (`VLMTypeRegistry` + `VLMProcessorTypeRegistry` + `VLMModelFactory._load`
+//! + `BaseProcessorConfiguration` + `loadProcessorConfig`'s
+//!   `preprocessor_config.json`-over-`processor_config.json` preference).
+//!
+//! This is the VLM analog of [`crate::lm::factory`] — same orchestration
+//! shape (parse config ONCE → validate registries EARLY → select tokenizer
+//! dir → load weights → load tokenizer → construct), reusing
+//! [`crate::lm::load::load_config`] / [`crate::lm::load::load_weights`] /
+//! [`crate::lm::load::load_tokenizer`] verbatim, and adding the two
+//! VLM-specific concerns the LM loader does not have:
+//!
+//! - the **processor config** read (mlx-vlm `load_processor` /
+//!   `load_image_processor`; mlx-swift-lm `loadProcessorConfig`), which
+//!   reads `<dir>/preprocessor_config.json` **preferring it over**
+//!   `<dir>/processor_config.json` (mirroring
+//!   `VLMModelFactory.swift:438-454`) and decodes its `processor_class`
+//!   field (mirroring `BaseProcessorConfiguration` at lines 45-51) to look
+//!   up the processor constructor — exactly how the swift registry
+//!   dispatches a per-model processor;
+//! - the **processor type registry** ([`VlmProcessorTypeRegistry`]) — a
+//!   `processor_class: String` → `ProcessorConstructor` table mirroring
+//!   `VLMProcessorTypeRegistry.shared` at `VLMModelFactory.swift:104-135`.
+//!   Per-model processors are **out of scope** (the project's no-model-arch
+//!   rule), so the registry is the seam every per-usecase processor PR
+//!   registers into.
+//!
+//! Per-model architectures (Qwen-VL / LLaVA / Pixtral / etc.) and per-model
+//! processors are out of scope — this PR ships the seam, not the
+//! architectures. The mock-driven test suite proves the end-to-end path
+//! against a hand-traced mock model + mock processor.
+//!
+//! Conventions match [`crate::lm::factory`] (and the rest of the crate):
+//! every fallible step returns [`Result`], recoverable failures
+//! (missing/invalid config, no weights, unknown `model_type` /
+//! `processor_class`, tokenizer load, processor-config parse) are
+//! [`Error::Backend`] with a message naming the cause, borrows are
+//! preferred over clones, and there is no implicit eval (the weight
+//! `Array`s are handed to the constructor lazily, exactly as
+//! [`crate::lm::load::load_weights`] returns them).
+//!
+//! [`Error::Backend`]: crate::Error::Backend
+
+use std::{collections::HashMap, path::Path};
+
+use crate::{
+  error::{Error, Result},
+  lm::{
+    factory::{Identifier, ModelConfiguration},
+    load::{self, Config, Weights},
+  },
+  tokenizer::Tokenizer,
+  vlm::{image::ImageProcessorConfig, model::Model as VlmModel},
+};
+
+/// Re-export of [`crate::lm::factory::ModelConfiguration`] under the VLM
+/// alias so the VLM factory matches the LM factory's public shape exactly
+/// without duplicating the local-path-only `Identifier` + `tokenizer_source`
+/// scaffolding. Mirrors how mlx-swift-lm's `VLMModelFactory` shares the
+/// same `ModelConfiguration` type as `LLMModelFactory` (both go through
+/// `ResolvedModelConfiguration`) — the source-location semantics are
+/// identical across LM and VLM.
+pub type VlmModelConfiguration = ModelConfiguration;
+
+/// Re-export the [`Identifier`] enum for callers that match on the VLM
+/// configuration's `id` field — same rationale as
+/// [`VlmModelConfiguration`].
+pub type VlmIdentifier = Identifier;
+
+/// Architecture-id remapping, mirroring `mlx_vlm.utils.MODEL_REMAPPING`
+/// (lines 30-46 of `mlx_vlm/utils.py`): some VLM checkpoints declare a
+/// `model_type` that is an alias for another architecture's
+/// implementation (e.g. `"lfm2-vl"` is served by `"lfm2_vl"`).
+/// [`remap_vlm_model_type`] applies this before a [`VlmTypeRegistry`]
+/// lookup so a registry only needs to register the *canonical* id.
+///
+/// Kept verbatim from `mlx_vlm.utils` (the authoritative spec) so a
+/// checkpoint that loads in mlx-vlm dispatches to the same constructor
+/// here. Sorted by key for a deterministic, reviewable table. This is
+/// the VLM-specific remap table; the LM table at
+/// [`crate::lm::factory::remap_model_type`] is independent (and an LM
+/// alias like `"mistral" → "llama"` does NOT apply to VLM checkpoints).
+const VLM_MODEL_REMAPPING: &[(&str, &str)] = &[
+  ("bunny-llama", "llava_bunny"),
+  ("cohere2_vision", "aya_vision"),
+  ("falcon-perception", "falcon_perception"),
+  ("granite-vision", "granite_vision"),
+  ("granite4-vision", "granite4_vision"),
+  ("granite4_vision", "granite4_vision"),
+  ("jvlm", "jina_vlm"),
+  ("lfm2-vl", "lfm2_vl"),
+  ("llava-qwen2", "llava_bunny"),
+  ("llava_qwen2", "fastvlm"),
+  ("nemotronh_nano_omni_reasoning_v3", "nemotron_h_nano_omni"),
+  ("phi4-siglip", "phi4_siglip"),
+  ("rf-detr", "rfdetr"),
+  ("sam3.1_video", "sam3_1"),
+  ("sam3_video", "sam3"),
+];
+
+/// Canonicalize a VLM checkpoint's `model_type` via the
+/// `VLM_MODEL_REMAPPING` table, mirroring `mlx_vlm.utils.get_model_and_args`'s
+/// `model_type = MODEL_REMAPPING.get(model_type, model_type)` (lines
+/// 115-117). An id with no alias is returned unchanged.
+pub fn remap_vlm_model_type(model_type: &str) -> &str {
+  VLM_MODEL_REMAPPING
+    .iter()
+    .find_map(|&(from, to)| (from == model_type).then_some(to))
+    .unwrap_or(model_type)
+}
+
+/// Per-`model_type` processor override, mirroring
+/// `VLMModelFactory.swift:399-403`'s `processorTypeOverrides` map:
+/// some checkpoints declare a `processor_class` in their
+/// `(pre)processor_config.json` that is wrong for the model
+/// architecture and must be overridden — currently only Mistral3
+/// models, which ship `"PixtralProcessor"` but need `"Mistral3Processor"`
+/// to handle spatial merging correctly. Returns the override class name
+/// for `model_type` (already canonicalized via [`remap_vlm_model_type`]),
+/// or `None` if no override applies.
+fn processor_class_override(model_type: &str) -> Option<&'static str> {
+  match model_type {
+    "mistral3" => Some("Mistral3Processor"),
+    _ => None,
+  }
+}
+
+/// The raw `processor_class` field of a VLM's processor config,
+/// mirroring mlx-swift-lm's `BaseProcessorConfiguration` at
+/// `VLMModelFactory.swift:45-51`:
+/// ```swift
+/// public struct BaseProcessorConfiguration: Codable, Sendable {
+///     public let processorClass: String
+///     enum CodingKeys: String, CodingKey {
+///         case processorClass = "processor_class"
+///     }
+/// }
+/// ```
+///
+/// Read from `<dir>/preprocessor_config.json` (preferred) or
+/// `<dir>/processor_config.json` (fallback) by [`load_processor_config`].
+/// The processor-config JSON is otherwise opaque to this layer; the
+/// processor constructor receives the verbatim JSON body so a per-model
+/// processor can decode its own model-specific fields (mirroring how
+/// `BaseProcessorConfiguration` is JUST the registry-lookup key and the
+/// per-model `Codable` init reads the rest of the file).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ProcessorConfig {
+  /// The processor class id (the registry lookup key) — e.g.
+  /// `"PixtralProcessor"`, `"Qwen2VLProcessor"`. Required.
+  pub processor_class: String,
+}
+
+/// Read the processor config from `dir`, preferring
+/// `preprocessor_config.json` over `processor_config.json` (mirroring
+/// mlx-swift-lm's `loadProcessorConfig` at `VLMModelFactory.swift:438-454`
+/// — that helper checks for `preprocessor_config.json` first, falls back
+/// to `processor_config.json`, then decodes `BaseProcessorConfiguration`).
+///
+/// Returns the parsed [`ProcessorConfig`] (the registry-lookup key) plus
+/// the verbatim JSON body — the same single-read pattern
+/// [`crate::lm::load::load_config`] uses for `config.json`, so a
+/// processor constructor consuming both the typed key and the raw JSON
+/// (for model-specific fields outside the typed subset, mirroring the
+/// swift per-processor `Codable` init that decodes the full
+/// `processorConfigData`) can never get them from two different on-disk
+/// versions of the file. Also returns the source filename (one of
+/// `"preprocessor_config.json"` / `"processor_config.json"`) so error
+/// messages and the [`LoadedProcessor`] hand-off can name the file the
+/// constructor saw.
+///
+/// The read is bounded by the same `MAX_CONFIG_BYTES` cap
+/// [`crate::lm::load::load_config`] uses for `config.json` and shares the
+/// same TOCTOU-closed `O_NONBLOCK`-on-unix open (a planted FIFO is
+/// rejected immediately, an oversized file is rejected before unbounded
+/// allocation). Every failure path (both files absent, non-regular,
+/// oversized, unreadable, invalid JSON, missing `processor_class`) is a
+/// recoverable [`Error::Backend`] naming the offending path.
+pub fn load_processor_config(dir: &Path) -> Result<(ProcessorConfig, String, &'static str)> {
+  // Preference order matches swift `loadProcessorConfig`:
+  // `preprocessor_config.json` first, then `processor_config.json`.
+  // (Python `load_image_processor` reads `config.json` not these; its
+  // per-model `ImageProcessor` decides what to look at. The swift behavior
+  // is the cross-model convention we follow because it matches what HF
+  // VLM checkpoints actually ship: `preprocessor_config.json` is the HF-
+  // standard image-processor config name, `processor_config.json` is the
+  // newer combined `AutoProcessor` config; either can be present.)
+  const PREFERRED: &str = "preprocessor_config.json";
+  const FALLBACK: &str = "processor_config.json";
+
+  // The two candidate paths. We do NOT just `fs::metadata().is_file()`
+  // gate then read — that's a TOCTOU on every check — instead we try to
+  // open each in order with the same hardened open as `load_config`,
+  // accepting `ENOENT` (and on unix `ENOTDIR`/symlink-to-missing) as the
+  // "absent" signal that falls through to the next candidate.
+  let preferred_path = dir.join(PREFERRED);
+  let fallback_path = dir.join(FALLBACK);
+
+  let (filename, path, body) = match read_optional_config_file(&preferred_path)? {
+    Some(text) => (PREFERRED, preferred_path, text),
+    None => match read_optional_config_file(&fallback_path)? {
+      Some(text) => (FALLBACK, fallback_path, text),
+      None => {
+        return Err(Error::Backend {
+          message: format!(
+            "no processor config found in {}: expected {PREFERRED} (preferred) or {FALLBACK}",
+            dir.display()
+          ),
+        });
+      }
+    },
+  };
+
+  let parsed: ProcessorConfig = serde_json::from_str(&body).map_err(|e| Error::Backend {
+    message: format!(
+      "invalid processor config JSON in {}: {e} (expected a `processor_class` string field)",
+      path.display()
+    ),
+  })?;
+
+  Ok((parsed, body, filename))
+}
+
+/// Bounded, TOCTOU-closed read of an OPTIONAL config file at `path`.
+///
+/// - Returns `Ok(Some(body))` on a successful, bounded, valid-UTF-8 read.
+/// - Returns `Ok(None)` if the file is absent (`ENOENT`) — the caller's
+///   "try the next candidate" signal.
+/// - Returns `Err(Error::Backend)` on every other failure (not a regular
+///   file, oversized, unreadable, non-UTF-8) — these are real defects
+///   the caller cannot recover from by trying a different filename.
+///
+/// Same hardened open as [`crate::lm::load::load_config`]: `O_NONBLOCK |
+/// O_CLOEXEC` on unix so a planted FIFO returns immediately instead of
+/// hanging, post-open `is_file()` fstat rejects FIFO/device/directory
+/// targets even when reached via a symlink, bounded by
+/// [`crate::lm::load::MAX_CONFIG_BYTES`].
+fn read_optional_config_file(path: &Path) -> Result<Option<String>> {
+  use std::io::Read;
+
+  #[cfg(unix)]
+  let open_result = {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+      .read(true)
+      .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+      .open(path)
+  };
+  #[cfg(not(unix))]
+  let open_result = std::fs::File::open(path);
+
+  let file = match open_result {
+    Ok(f) => f,
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    Err(e) => {
+      return Err(Error::Backend {
+        message: format!("cannot open processor config {}: {e}", path.display()),
+      });
+    }
+  };
+
+  let meta = file.metadata().map_err(|e| Error::Backend {
+    message: format!(
+      "cannot stat opened processor config {}: {e}",
+      path.display()
+    ),
+  })?;
+  if !meta.is_file() {
+    return Err(Error::Backend {
+      message: format!(
+        "processor config {} is not a regular file; refusing to read",
+        path.display()
+      ),
+    });
+  }
+
+  let mut bytes = Vec::new();
+  file
+    .take(load::MAX_CONFIG_BYTES + 1)
+    .read_to_end(&mut bytes)
+    .map_err(|e| Error::Backend {
+      message: format!("cannot read processor config {}: {e}", path.display()),
+    })?;
+  if bytes.len() as u64 > load::MAX_CONFIG_BYTES {
+    return Err(Error::Backend {
+      message: format!(
+        "processor config {} exceeds the {}-byte cap; refusing to read",
+        path.display(),
+        load::MAX_CONFIG_BYTES
+      ),
+    });
+  }
+
+  let text = String::from_utf8(bytes).map_err(|e| Error::Backend {
+    message: format!(
+      "processor config {} is not valid UTF-8: {e}",
+      path.display()
+    ),
+  })?;
+  Ok(Some(text))
+}
+
+/// Everything [`load()`] resolved from a VLM model directory's *model*
+/// inputs, handed to a [`VlmModelConstructor`] so it can assemble (and,
+/// if [`Config::quantization`] is set, quantize) a concrete VLM
+/// architecture without re-reading the directory.
+///
+/// Borrowing — the constructor gets `&LoadedVlmModel`; it reads the typed
+/// [`Config`] (and, for keys outside that typed subset, the verbatim
+/// [`config_json`](Self::config_json) text — the analogue of mlx-swift-lm
+/// passing the raw `config.json` `Data` to each model's `Codable` init at
+/// `VLMModelFactory.swift:341-348`) and takes the weight
+/// [`Array`](crate::array::Array)s it needs out of
+/// [`weights`](Self::weights) **by reference** (no implicit eval; mlx
+/// `Array` is a cheap refcounted handle, so an arch clones only the
+/// handles it keeps). Same shape as [`crate::lm::factory::LoadedModel`].
+#[non_exhaustive]
+pub struct LoadedVlmModel {
+  /// The typed `config.json` subset (mlx-vlm's `config` dict / mlx-swift-lm's
+  /// `BaseConfiguration`), with the generation-config eos override already
+  /// applied (see [`crate::lm::load::load_config`]).
+  pub config: Config,
+  /// The verbatim `config.json` body, for model-specific keys outside the
+  /// typed [`Config`] subset (the analogue of mlx-swift-lm handing each
+  /// model's `Codable` init the raw config `Data` at
+  /// `VLMModelFactory.swift:343-344`). Always the bytes the typed
+  /// [`config`](Self::config) was parsed from.
+  pub config_json: String,
+  /// The merged, name → [`Array`](crate::array::Array) weight map
+  /// (mlx-vlm's `weights` dict). Keys are verbatim — the constructor
+  /// applies any `sanitize`/remap itself, exactly as
+  /// [`crate::lm::load::load_weights`] documents.
+  pub weights: Weights,
+}
+
+/// Everything [`load()`] resolved for the *processor* side, handed to a
+/// [`ProcessorConstructor`] so it can assemble a concrete VLM processor
+/// (image processor + tokenizer pairing) without re-reading the
+/// directory.
+///
+/// Mirrors mlx-swift-lm's `processorRegistry.createModel(configuration:
+/// processorType:tokenizer:)` call shape at
+/// `VLMModelFactory.swift:405-407`: the constructor receives the
+/// verbatim processor-config JSON (for its per-model `Codable` init) AND
+/// the already-built [`Tokenizer`] (so the processor can splice the
+/// tokenizer's special-token ids into its preprocessing). The
+/// [`config`](Self::config) is the LM-style typed config (so a processor
+/// that needs the model's hidden dim / num_attention_heads / vocab_size
+/// can read it without re-parsing); the
+/// [`processor_class`](Self::processor_class) is the registry key the
+/// constructor was dispatched on (after any
+/// `processor_class_override`); the
+/// [`processor_config_filename`](Self::processor_config_filename) names
+/// the file the JSON came from (one of `"preprocessor_config.json"` /
+/// `"processor_config.json"`) for diagnostic / round-trip purposes.
+///
+/// The trait the constructor returns is intentionally an opaque
+/// `Box<dyn ProcessorTrait>` ([`Processor`]) rather than the concrete
+/// [`ImageProcessorConfig`] — per-model processors carry per-model state
+/// beyond just the ImageNet pipeline (custom crop modes, grid-aware
+/// patchifiers, tokenizer-aware multimodal chat templates, etc.) and the
+/// trait surfaces only the cross-model entry points
+/// ([`Processor::image_processor_config`] for the
+/// [`crate::vlm::image::preprocess`] pipeline). Per-model concrete impls
+/// are out of scope and are added per-usecase, mirroring the
+/// no-per-model-arch rule.
+#[non_exhaustive]
+pub struct LoadedProcessor<'a> {
+  /// The typed `config.json` subset — same instance the
+  /// [`VlmModelConstructor`] received (the model and processor share the
+  /// SAME parsed config, mirroring `VLMModelFactory.swift:333-339`'s
+  /// single `baseConfig` decode shared by both creator calls).
+  pub config: &'a Config,
+  /// The registry key this processor was looked up under (after any
+  /// `processor_class_override`) — useful for diagnostics and for a
+  /// constructor that wants to assert it was dispatched correctly.
+  pub processor_class: &'a str,
+  /// The verbatim processor-config JSON body — the
+  /// `processor_config_filename` file's bytes. The per-model constructor
+  /// decodes its own model-specific fields (`patch_size`, `crop_size`,
+  /// per-channel mean/std overrides, …) off this string.
+  pub processor_config_json: &'a str,
+  /// Name of the file the [`processor_config_json`](Self::processor_config_json)
+  /// came from (one of `"preprocessor_config.json"` / `"processor_config.json"`).
+  pub processor_config_filename: &'static str,
+  /// The fully-built [`Tokenizer`] — mlx-swift-lm passes the tokenizer
+  /// into the processor constructor at `VLMModelFactory.swift:405-407`
+  /// so a processor like Qwen2VLProcessor can splice the tokenizer's
+  /// `<|image_pad|>` / `<|video_pad|>` / `<|vision_start|>` ids into its
+  /// multimodal prompt assembly. By reference so the processor doesn't
+  /// take ownership.
+  pub tokenizer: &'a Tokenizer,
+}
+
+/// A registered VLM model constructor: assemble a [`VlmModel`] from the
+/// already-resolved [`LoadedVlmModel`] (parsed config + raw config JSON +
+/// weights).
+///
+/// Mirrors mlx-swift-lm's `VLMTypeRegistry` creator
+/// `(Data) throws -> LanguageModel` at `VLMModelFactory.swift:80-102` —
+/// but receives the *already-loaded* weights too (so a per-usecase
+/// architecture never re-globs/re-reads the directory) and returns a
+/// [`Result`] (Rust's `throws`). `Send + Sync` so a registry can be
+/// shared across threads (e.g. a `static` shared registry, as
+/// mlx-swift-lm's `VLMTypeRegistry.shared` is). The constructor itself
+/// does **no** I/O; the directory was already read by [`load()`].
+pub type VlmModelConstructor =
+  Box<dyn Fn(&LoadedVlmModel) -> Result<Box<dyn VlmModel>> + Send + Sync + 'static>;
+
+/// A `model_type: String` → [`VlmModelConstructor`] table, the VLM load
+/// factory's architecture **extension point**.
+///
+/// Mirrors mlx-swift-lm's `VLMTypeRegistry.shared` at
+/// `VLMModelFactory.swift:80-102` (and replaces `mlx_vlm.utils.
+/// get_model_and_args`' `importlib.import_module(f"mlx_vlm.models.
+/// {model_type}")` dynamic dispatch with an explicit registration
+/// table). Per-model VLM architectures are out of scope for this PR, so
+/// the registry starts [`empty`](Self::new); future per-usecase model
+/// PRs call [`register`](Self::register) (or build one with
+/// [`with`](Self::with)) to plug their architecture in. A `model_type`
+/// is canonicalized via [`remap_vlm_model_type`] on both registration
+/// and lookup, so callers register the *canonical* id and any alias
+/// resolves to it.
+#[derive(Default)]
+pub struct VlmTypeRegistry {
+  creators: HashMap<String, VlmModelConstructor>,
+}
+
+impl VlmTypeRegistry {
+  /// An empty registry (mlx-swift-lm's `VLMTypeRegistry()` — no creators).
+  pub fn new() -> Self {
+    Self {
+      creators: HashMap::new(),
+    }
+  }
+
+  /// Register `constructor` for `model_type` (canonicalized via
+  /// [`remap_vlm_model_type`]), mirroring mlx-swift-lm's
+  /// `ModelTypeRegistry.registerModelType(_:creator:)`. A re-registration
+  /// of the same (canonical) id replaces the previous constructor
+  /// (last-writer-wins, as the Swift dictionary assignment does) and
+  /// returns the displaced one.
+  pub fn register(
+    &mut self,
+    model_type: &str,
+    constructor: VlmModelConstructor,
+  ) -> Option<VlmModelConstructor> {
+    self
+      .creators
+      .insert(remap_vlm_model_type(model_type).to_owned(), constructor)
+  }
+
+  /// Builder form of [`register`](Self::register) for assembling a
+  /// registry in one expression (the analogue of mlx-swift-lm's
+  /// `ModelTypeRegistry(creators:)` init).
+  #[must_use]
+  pub fn with(mut self, model_type: &str, constructor: VlmModelConstructor) -> Self {
+    self.register(model_type, constructor);
+    self
+  }
+
+  /// `true` if a constructor is registered for `model_type` (after
+  /// [`remap_vlm_model_type`]).
+  pub fn contains(&self, model_type: &str) -> bool {
+    self.creators.contains_key(remap_vlm_model_type(model_type))
+  }
+
+  /// Construct a [`VlmModel`] for `loaded`'s [`Config::model_type`],
+  /// mirroring mlx-swift-lm's `VLMTypeRegistry.createModel(configuration:
+  /// modelType:)` call at `VLMModelFactory.swift:343-344`. The id is
+  /// canonicalized via [`remap_vlm_model_type`]; an unregistered id is a
+  /// recoverable [`Error::Backend`] (mlx-swift-lm's
+  /// `ModelFactoryError.unsupportedModelType`, mlx-vlm's
+  /// `ValueError("Model type … not supported.")`).
+  pub fn create(&self, loaded: &LoadedVlmModel) -> Result<Box<dyn VlmModel>> {
+    let model_type = remap_vlm_model_type(&loaded.config.model_type);
+    let constructor = self
+      .creators
+      .get(model_type)
+      .ok_or_else(|| Error::Backend {
+        message: format!(
+          "unsupported VLM model type {:?}: no constructor registered (register one via \
+           VlmTypeRegistry::register)",
+          loaded.config.model_type
+        ),
+      })?;
+    constructor(loaded)
+  }
+}
+
+/// The cross-model VLM processor trait the per-model processors implement,
+/// mirroring the per-model processor protocols in mlx-vlm
+/// (e.g. `Qwen2VLProcessor`, `PixtralProcessor` — each carries its own
+/// state and exposes the cross-model preprocessing entry point) and
+/// mlx-swift-lm's per-model `UserInputProcessor` conformers at
+/// `VLMModelFactory.swift:108-134`.
+///
+/// **Scope here:** only the **cross-model** entry point — the
+/// [`ImageProcessorConfig`] the per-model encoder expects for its
+/// [`crate::vlm::image::preprocess`] pipeline. Per-model multimodal
+/// prompt assembly / video frame handling / tool-augmented chat
+/// formatting are per-usecase per the no-per-model-arch rule and are
+/// owned by the per-model processor's own (concrete-type) methods —
+/// downcast off this trait via the concrete type's
+/// `&dyn std::any::Any` upcast as needed by the caller. (Future per-model
+/// processor PRs may add more cross-model methods to this trait if a
+/// pattern shared by every VLM emerges.)
+///
+/// `Send + Sync` for the same reason [`VlmModelConstructor`] is: a
+/// registry can be shared across threads.
+pub trait Processor: Send + Sync {
+  /// The [`ImageProcessorConfig`] this processor's per-model encoder
+  /// expects for [`crate::vlm::image::preprocess`] (mean / std / size /
+  /// resize-filter / channel order). Mirrors how
+  /// [`crate::vlm::model::Model::image_processor_config`] surfaces the
+  /// per-model config off the *model* — but exposed off the
+  /// [`Processor`] too so a caller that already has the processor
+  /// constructed (via the factory) does not have to also reach into
+  /// the model for the preprocessing pipeline's parameters.
+  fn image_processor_config(&self) -> ImageProcessorConfig;
+}
+
+/// A registered VLM processor constructor: assemble a
+/// [`Box<dyn Processor>`] from the already-resolved
+/// [`LoadedProcessor`] (parsed processor config + raw processor JSON +
+/// shared [`Config`] + already-built [`Tokenizer`]).
+///
+/// Mirrors mlx-swift-lm's `ProcessorTypeRegistry` creator
+/// `(Data, Tokenizer) throws -> UserInputProcessor` at
+/// `VLMModelFactory.swift:63-75`. `Send + Sync` so a `static` shared
+/// registry can be used from multiple threads.
+pub type ProcessorConstructor =
+  Box<dyn Fn(&LoadedProcessor<'_>) -> Result<Box<dyn Processor>> + Send + Sync + 'static>;
+
+/// A `processor_class: String` → [`ProcessorConstructor`] table, the VLM
+/// load factory's processor **extension point**.
+///
+/// Mirrors mlx-swift-lm's `VLMProcessorTypeRegistry.shared` at
+/// `VLMModelFactory.swift:104-135` (and replaces mlx-vlm's
+/// `AutoProcessor.from_pretrained(model_path, use_fast=True)` `transformers`
+/// dynamic dispatch with an explicit registration table). Per-model VLM
+/// processors are out of scope for this PR; the registry starts
+/// [`empty`](Self::new) and future per-usecase processor PRs register
+/// their constructors into it. Registration keys are the raw
+/// `processor_class` strings (no canonicalization — the
+/// `processor_class_override` applies on lookup only, mirroring the
+/// swift `processorTypeOverrides` lookup at lines 399-403).
+#[derive(Default)]
+pub struct VlmProcessorTypeRegistry {
+  creators: HashMap<String, ProcessorConstructor>,
+}
+
+impl VlmProcessorTypeRegistry {
+  /// An empty registry (mlx-swift-lm's `ProcessorTypeRegistry()`).
+  pub fn new() -> Self {
+    Self {
+      creators: HashMap::new(),
+    }
+  }
+
+  /// Register `constructor` for `processor_class`, mirroring
+  /// mlx-swift-lm's `ProcessorTypeRegistry.registerProcessorType(_:creator:)`.
+  /// A re-registration of the same id returns the displaced constructor
+  /// (last-writer-wins, as the Swift dictionary assignment does).
+  pub fn register(
+    &mut self,
+    processor_class: &str,
+    constructor: ProcessorConstructor,
+  ) -> Option<ProcessorConstructor> {
+    self
+      .creators
+      .insert(processor_class.to_owned(), constructor)
+  }
+
+  /// Builder form of [`register`](Self::register).
+  #[must_use]
+  pub fn with(mut self, processor_class: &str, constructor: ProcessorConstructor) -> Self {
+    self.register(processor_class, constructor);
+    self
+  }
+
+  /// `true` if a constructor is registered for `processor_class` (raw —
+  /// no override applied; the override is consulted only on the lookup
+  /// performed by [`load()`]).
+  pub fn contains(&self, processor_class: &str) -> bool {
+    self.creators.contains_key(processor_class)
+  }
+
+  /// Construct a [`Processor`] for `loaded`'s
+  /// [`processor_class`](LoadedProcessor::processor_class), mirroring
+  /// mlx-swift-lm's `ProcessorTypeRegistry.createModel(configuration:
+  /// processorType:tokenizer:)` at `VLMModelFactory.swift:405-407`. The
+  /// caller in [`load()`] is responsible for having already applied any
+  /// `processor_class_override` to the lookup key. An unregistered id
+  /// is a recoverable [`Error::Backend`].
+  pub fn create(&self, loaded: &LoadedProcessor<'_>) -> Result<Box<dyn Processor>> {
+    let constructor = self
+      .creators
+      .get(loaded.processor_class)
+      .ok_or_else(|| Error::Backend {
+        message: format!(
+          "unsupported VLM processor class {:?}: no constructor registered (register one via \
+           VlmProcessorTypeRegistry::register)",
+          loaded.processor_class
+        ),
+      })?;
+    constructor(loaded)
+  }
+}
+
+/// The product of [`load()`]: a constructed [`VlmModel`] plus the
+/// [`Tokenizer`], the constructed [`Processor`], and the parsed
+/// [`Config`].
+///
+/// Analogue of mlx-swift-lm's `ModelContext` (constructed at
+/// `VLMModelFactory.swift:422-425` — the `(configuration, model, processor,
+/// tokenizer)` tuple every VLM caller receives). Restricted to the
+/// already-modeled fields here; `defaultPrompt` / `extraEOSTokens` /
+/// `toolCallFormat` are intentionally not modeled (the eos set is
+/// already resolved on the [`Tokenizer`] / [`Config`]; prompt and
+/// tool-format are chat-pipeline concerns above this loader, same
+/// boundary [`crate::lm::factory::LoadedModelContext`] holds).
+#[non_exhaustive]
+pub struct LoadedVlmContext {
+  /// The constructed VLM model (from the [`VlmTypeRegistry`] constructor).
+  pub model: Box<dyn VlmModel>,
+  /// The model's tokenizer, built from the (optionally separate)
+  /// tokenizer directory with the resolved eos set.
+  pub tokenizer: Tokenizer,
+  /// The constructed VLM processor (from the
+  /// [`VlmProcessorTypeRegistry`] constructor).
+  pub processor: Box<dyn Processor>,
+  /// The parsed `config.json` subset, returned for callers that need
+  /// the architecture metadata (mlx-vlm's `model.config` access).
+  pub config: Config,
+}
+
+/// Load a VLM model + tokenizer + processor from a local
+/// [`VlmModelConfiguration`], dispatching to `model_registry` on the
+/// checkpoint's `model_type` and to `processor_registry` on the
+/// `(pre)processor_config.json`'s `processor_class` (after applying any
+/// per-model-type `processor_class_override`).
+///
+/// The end-to-end port of `mlx_vlm.utils.load` restricted to the
+/// local-path, no-network surface (and mlx-swift-lm's
+/// `VLMModelFactory._load` at `VLMModelFactory.swift:318-425`). The
+/// orchestration order is chosen so the *cheap, recoverable* failures
+/// come first — nothing heavy (weights, tokenizer, vision processor) is
+/// touched until both registries are known to be able to handle the
+/// checkpoint:
+///
+/// 1. Resolve the model directory ([`VlmModelConfiguration::model_directory`]
+///    — local, no Hub download) and read `config.json` **once** via
+///    [`crate::lm::load::load_config`], yielding both the typed
+///    [`Config`] (with the `generation_config.json` eos override applied)
+///    and the verbatim JSON body — exactly as the LM factory does.
+/// 2. **Validate the `model_type` is registered** (after
+///    [`remap_vlm_model_type`]) *before* loading anything heavy: an
+///    unsupported checkpoint is a cheap, recoverable [`Error::Backend`]
+///    here, with no weight/tokenizer/processor I/O — mlx-vlm's
+///    `ValueError("Model type … not supported.")` /
+///    mlx-swift-lm's `unsupportedModelType`.
+/// 3. Read the processor config (`preprocessor_config.json` preferred,
+///    `processor_config.json` fallback) ONCE via
+///    [`load_processor_config`], get both the typed `processor_class`
+///    and the verbatim JSON body, apply any
+///    `processor_class_override` for the canonical model type, and
+///    **validate the resulting processor class is registered** —
+///    same early-fail discipline as step 2, so an unsupported processor
+///    class is a cheap, recoverable error before any weight/tokenizer
+///    I/O.
+/// 4. Select the tokenizer directory
+///    ([`tokenizer_source`](VlmModelConfiguration::tokenizer_source) if set,
+///    else the model directory — mlx-swift-lm's `tokenizerDirectory`).
+/// 5. Discover and merge the weights from the model directory via
+///    [`crate::lm::load::load_weights`].
+/// 6. Build the [`Tokenizer`] EXACTLY ONCE from the selected directory
+///    via [`crate::lm::load::load_tokenizer`] (with the eos set resolved
+///    on the [`Config`] from step 1).
+/// 7. Construct the model via `model_registry` on the [`LoadedVlmModel`]
+///    (parsed config + raw JSON + weights).
+/// 8. Construct the processor via `processor_registry` on the
+///    [`LoadedProcessor`] (parsed processor config + raw processor JSON +
+///    shared config + tokenizer reference) and return a
+///    [`LoadedVlmContext`].
+///
+/// Per-model construction is the registries' job (this PR ships no
+/// architectures, no processors). No implicit eval — the weights reach
+/// the constructor lazily.
+pub fn load(
+  configuration: &VlmModelConfiguration,
+  model_registry: &VlmTypeRegistry,
+  processor_registry: &VlmProcessorTypeRegistry,
+) -> Result<LoadedVlmContext> {
+  let model_dir = configuration.model_directory();
+
+  // (1) Read config.json ONCE: typed Config (+ generation_config eos
+  // override) AND the verbatim JSON body, from the same bytes. Mirrors
+  // VLMModelFactory.swift:325-339 (single `Data` read shared by both
+  // BaseConfiguration decode and the per-model creator). The constructor
+  // may need model-specific keys outside the typed subset
+  // (mlx-swift-lm hands each model the raw config `Data`); reading once
+  // means they can never come from two different on-disk versions.
+  let (config, config_json) = load::load_config(model_dir)?;
+
+  // (2) Validate the (remapped) model_type is registered BEFORE any
+  // weights / tokenizer / processor I/O. An unsupported checkpoint —
+  // the common case, since per-model architectures are out of scope and
+  // the registry is normally empty — is a cheap, recoverable error
+  // here, never paying for the rest of the load pipeline.
+  if !model_registry.contains(&config.model_type) {
+    return Err(Error::Backend {
+      message: format!(
+        "unsupported VLM model type {:?}: no constructor registered (register one via \
+         VlmTypeRegistry::register)",
+        config.model_type
+      ),
+    });
+  }
+
+  // (3) Read the processor config (preprocessor_config.json preferred,
+  // processor_config.json fallback) ONCE, then apply any per-model-type
+  // override and validate the processor registry can handle it. Order:
+  // we run this BEFORE loading weights/tokenizer for the same
+  // early-fail-cheap reason as step (2) — a checkpoint whose processor
+  // class is registered nowhere should not pay for weight I/O. Some
+  // per-model overrides (Mistral3) mean the on-disk
+  // `processor_class` is NOT the registry key we look up against:
+  // resolve the override on the canonical model_type (the same key we
+  // dispatched the model constructor on), exactly mirroring
+  // VLMModelFactory.swift:399-403.
+  let (proc_config, proc_config_json, proc_filename) = load_processor_config(model_dir)?;
+  let canonical_model_type = remap_vlm_model_type(&config.model_type);
+  let processor_class = processor_class_override(canonical_model_type)
+    .unwrap_or(&proc_config.processor_class)
+    .to_owned();
+  if !processor_registry.contains(&processor_class) {
+    return Err(Error::Backend {
+      message: format!(
+        "unsupported VLM processor class {processor_class:?} (from {proc_filename} in {}{}): \
+         no constructor registered (register one via VlmProcessorTypeRegistry::register)",
+        model_dir.display(),
+        if processor_class != proc_config.processor_class {
+          format!(
+            ", overridden from on-disk {:?} for model_type {:?}",
+            proc_config.processor_class, canonical_model_type,
+          )
+        } else {
+          String::new()
+        },
+      ),
+    });
+  }
+
+  // (4) Select the tokenizer directory FIRST: the separate
+  // `tokenizer_source` if set (a real split layout where the model dir
+  // has NO `tokenizer.json`), else the model directory (mlx-swift-lm's
+  // `tokenizerDirectory`).
+  let tokenizer_dir = configuration.tokenizer_directory();
+
+  // (5) Discover/merge the weights from the model directory.
+  let weights = load::load_weights(model_dir)?;
+
+  // (6) Build the tokenizer EXACTLY ONCE from the selected directory,
+  // through the shared eos-resolution path (the eos set already resolved
+  // on `config`).
+  let tokenizer = load::load_tokenizer(tokenizer_dir, &config)?;
+
+  // (7) Construct the model via the registry (already validated as
+  // registered in step 2). The model receives the parsed `config`
+  // (still owned here) by reference inside `LoadedVlmModel`.
+  let loaded = LoadedVlmModel {
+    config,
+    config_json,
+    weights,
+  };
+  let model = model_registry.create(&loaded)?;
+
+  // (8) Construct the processor via its registry. The processor receives
+  // the SAME parsed config the model received (the `loaded.config`
+  // reference) and the already-built tokenizer — exactly the
+  // `(configuration, processorType, tokenizer)` triple mlx-swift-lm
+  // passes at VLMModelFactory.swift:405-407.
+  let processor = {
+    let loaded_proc = LoadedProcessor {
+      config: &loaded.config,
+      processor_class: &processor_class,
+      processor_config_json: &proc_config_json,
+      processor_config_filename: proc_filename,
+      tokenizer: &tokenizer,
+    };
+    processor_registry.create(&loaded_proc)?
+  };
+
+  Ok(LoadedVlmContext {
+    model,
+    tokenizer,
+    processor,
+    config: loaded.config,
+  })
+}
+
+#[cfg(test)]
+mod tests {
+  //! End-to-end VLM load-factory tests, driven by mock model + mock
+  //! processor types registered into fresh registries (per the
+  //! no-model-arch rule, this PR ships the seam, not architectures or
+  //! processors — so the end-to-end path is proven against hand-traced
+  //! mocks over a temp model directory).
+
+  use std::{
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+  };
+
+  use super::*;
+  use crate::{
+    array::Array,
+    lm::{cache::KvCache, model::Model as LmModel},
+    vlm::image::{ColorOrder, ImageProcessorConfig, ResizeFilter},
+  };
+
+  /// A minimal `config.json` for the mock VLM architecture. `model_type`
+  /// is the registry key; the remaining fields are exactly the required
+  /// keys of the typed [`Config`] (so the reused
+  /// [`crate::lm::load::load_config`] parse succeeds). `mock_extra` is a
+  /// model-specific key OUTSIDE the typed subset, used to prove the
+  /// constructor can read [`LoadedVlmModel::config_json`].
+  fn mock_config_json(model_type: &str) -> String {
+    format!(
+      r#"{{
+        "model_type": "{model_type}",
+        "hidden_size": 8,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 2,
+        "rope_theta": 10000.0,
+        "vocab_size": 5,
+        "tie_word_embeddings": false,
+        "mock_extra": 11
+      }}"#
+    )
+  }
+
+  /// A minimal `preprocessor_config.json` for the mock VLM processor.
+  /// `processor_class` is the registry key; `mock_image_size` is a
+  /// model-specific key OUTSIDE the typed subset, used to prove the
+  /// processor constructor reads [`LoadedProcessor::processor_config_json`].
+  fn mock_preprocessor_config_json(processor_class: &str, image_size: u32) -> String {
+    format!(
+      r#"{{
+        "processor_class": "{processor_class}",
+        "mock_image_size": {image_size}
+      }}"#
+    )
+  }
+
+  /// A trivial VLM [`Model`] returned by the mock constructor. Implements
+  /// the LM-side [`crate::lm::model::Model`] (vocab-aware zero logits) and
+  /// the VLM-side [`crate::vlm::model::Model`]'s required entry points
+  /// (text-embed lookup, image-encode passthrough); records the typed-
+  /// config `vocab_size` and the raw-config `mock_extra` for assertions.
+  struct MockVlmModel {
+    vocab: i32,
+    #[allow(dead_code)]
+    mock_extra: i64,
+  }
+
+  impl LmModel for MockVlmModel {
+    fn forward(&self, tokens: &Array, _cache: &mut [Box<dyn KvCache>]) -> Result<Array> {
+      let (batch, seq) = match tokens.shape().as_slice() {
+        [b, s] => (*b, *s),
+        [s] => (1, *s),
+        other => {
+          return Err(Error::ShapeMismatch {
+            message: format!("MockVlmModel::forward expects [B, S], got {other:?}"),
+          });
+        }
+      };
+      let vocab = self.vocab as usize;
+      Array::from_slice::<f32>(&vec![0.0_f32; batch * seq * vocab], &(batch, seq, vocab))
+    }
+  }
+
+  impl crate::vlm::model::Model for MockVlmModel {
+    fn embed_tokens(&self, tokens: &Array) -> Result<Array> {
+      // [1, T] tokens → [1, T, hidden=8] zero embeds. Matches the typed
+      // Config.hidden_size = 8 from `mock_config_json` so a chained
+      // forward_embeddings would line up.
+      let shape = tokens.shape();
+      let (b, t) = match shape.as_slice() {
+        [b, t] => (*b, *t),
+        other => {
+          return Err(Error::ShapeMismatch {
+            message: format!("MockVlmModel::embed_tokens expects [B, T], got {other:?}"),
+          });
+        }
+      };
+      Array::from_slice::<f32>(&vec![0.0_f32; b * t * 8], &(b, t, 8usize))
+    }
+
+    fn encode_image(&self, _image: &Array) -> Result<Array> {
+      // [1, 8] zero features — single placeholder per image into the
+      // hidden_size = 8 space.
+      Array::from_slice::<f32>(&[0.0_f32; 8], &(1usize, 8usize))
+    }
+  }
+
+  /// A trivial [`Processor`] returned by the mock processor constructor.
+  /// Records the typed `processor_class` it was dispatched on AND the
+  /// model-specific `mock_image_size` it read off the raw processor
+  /// JSON, so a test can assert both pieces of dispatch state arrived.
+  struct MockVlmProcessor {
+    #[allow(dead_code)]
+    processor_class: String,
+    image_size: u32,
+  }
+
+  impl Processor for MockVlmProcessor {
+    fn image_processor_config(&self) -> ImageProcessorConfig {
+      // Honor the image-size the processor decoded off the raw JSON, so
+      // a test can assert the cross-model preprocessing parameters
+      // round-trip through the registry.
+      ImageProcessorConfig {
+        size: (self.image_size, self.image_size),
+        mean: [0.5, 0.5, 0.5],
+        std: [0.5, 0.5, 0.5],
+        rescale_factor: 1.0 / 255.0,
+        do_resize: true,
+        do_rescale: true,
+        do_normalize: true,
+        resample: ResizeFilter::Bilinear,
+        color_order: ColorOrder::Rgb,
+      }
+    }
+  }
+
+  /// Build a [`VlmModelConstructor`] for the mock VLM architecture:
+  /// read the typed `vocab_size` off [`LoadedVlmModel::config`], parse
+  /// the model-specific `mock_extra` off [`LoadedVlmModel::config_json`],
+  /// and assert at least one weight tensor arrived.
+  fn mock_vlm_constructor() -> VlmModelConstructor {
+    Box::new(|loaded: &LoadedVlmModel| -> Result<Box<dyn VlmModel>> {
+      assert!(
+        !loaded.weights.is_empty(),
+        "constructor should receive the loaded weights"
+      );
+      let raw: serde_json::Value =
+        serde_json::from_str(&loaded.config_json).map_err(|e| Error::Backend {
+          message: format!("mock vlm ctor: bad config json: {e}"),
+        })?;
+      let mock_extra = raw
+        .get("mock_extra")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| Error::Backend {
+          message: "mock vlm ctor: missing mock_extra".into(),
+        })?;
+      Ok(Box::new(MockVlmModel {
+        vocab: loaded.config.vocab_size,
+        mock_extra,
+      }))
+    })
+  }
+
+  /// Build a [`ProcessorConstructor`] for the mock processor: read the
+  /// processor class off [`LoadedProcessor::processor_class`] and the
+  /// model-specific `mock_image_size` off
+  /// [`LoadedProcessor::processor_config_json`].
+  fn mock_processor_constructor() -> ProcessorConstructor {
+    Box::new(
+      |loaded: &LoadedProcessor<'_>| -> Result<Box<dyn Processor>> {
+        let raw: serde_json::Value =
+          serde_json::from_str(loaded.processor_config_json).map_err(|e| Error::Backend {
+            message: format!("mock vlm processor ctor: bad processor config json: {e}"),
+          })?;
+        let image_size = raw
+          .get("mock_image_size")
+          .and_then(serde_json::Value::as_u64)
+          .and_then(|x| u32::try_from(x).ok())
+          .ok_or_else(|| Error::Backend {
+            message: "mock vlm processor ctor: missing mock_image_size".into(),
+          })?;
+        // Sanity-touch the tokenizer the swift `(Data, Tokenizer) ->
+        // Processor` shape hands in — assert it can encode something so a
+        // future change that hands the wrong (uninitialized / wrong-dir)
+        // tokenizer surfaces here.
+        let _ = loaded
+          .tokenizer
+          .encode("a", false)
+          .expect("processor constructor must receive a working tokenizer");
+        Ok(Box::new(MockVlmProcessor {
+          processor_class: loaded.processor_class.to_owned(),
+          image_size,
+        }))
+      },
+    )
+  }
+
+  /// A fresh, writable per-test temp directory (the crate's
+  /// no-`tempfile`-crate convention: `temp_dir()` + pid + a
+  /// process-unique counter so parallel tests never collide). Created
+  /// empty; the caller populates it.
+  fn fresh_dir(tag: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+      "mlxrs-vlm-factory-{tag}-{}-{n}",
+      std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+  }
+
+  /// Serialize a minimal but loadable `tokenizer.json` (a 3-token
+  /// WordLevel model with a Whitespace pre-tokenizer) into `dir` via
+  /// the `tokenizers` crate — the same fixture style as the LM
+  /// factory's tests, so the reused [`Tokenizer::from_path`] loads it.
+  fn write_tokenizer(dir: &Path) {
+    use tokenizers::{
+      Tokenizer as HfTokenizer, models::wordlevel::WordLevel,
+      pre_tokenizers::whitespace::Whitespace,
+    };
+    let vocab = [("a", 0u32), ("b", 1), ("c", 2)]
+      .iter()
+      .map(|(w, i)| ((*w).to_string(), *i))
+      .collect();
+    let wl = WordLevel::builder()
+      .vocab(vocab)
+      .unk_token("a".to_string())
+      .build()
+      .unwrap();
+    let mut hf = HfTokenizer::new(wl);
+    hf.with_pre_tokenizer(Some(Whitespace {}));
+    hf.save(dir.join("tokenizer.json"), false).unwrap();
+  }
+
+  /// Populate `dir` with the VLM `config.json` + a tiny single-tensor
+  /// `model.safetensors` + the named processor config (one of
+  /// `"preprocessor_config.json"` / `"processor_config.json"`) — but
+  /// **no** `tokenizer.json`. Basis for [`write_vlm_dir`] (which adds
+  /// the tokenizer) and the split-layout test.
+  fn write_vlm_dir_no_tokenizer(
+    dir: &Path,
+    model_type: &str,
+    processor_filename: &str,
+    processor_class: &str,
+    image_size: u32,
+  ) {
+    std::fs::write(dir.join("config.json"), mock_config_json(model_type)).unwrap();
+    std::fs::write(
+      dir.join(processor_filename),
+      mock_preprocessor_config_json(processor_class, image_size),
+    )
+    .unwrap();
+
+    // A tiny one-tensor safetensors so `load_weights` finds non-empty
+    // weights. `save_safetensors` writes the on-disk format the loader
+    // reads.
+    let mut weights: Weights = HashMap::new();
+    weights.insert(
+      "mock.weight".to_owned(),
+      Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(2usize, 2)).unwrap(),
+    );
+    crate::io::save_safetensors(&dir.join("model.safetensors"), &weights).unwrap();
+  }
+
+  /// Populate `dir` as a minimal but *loadable* VLM model directory:
+  /// `config.json`, a tiny single-tensor `model.safetensors`, the named
+  /// processor config, and a `tokenizer.json`.
+  fn write_vlm_dir(
+    dir: &Path,
+    model_type: &str,
+    processor_filename: &str,
+    processor_class: &str,
+    image_size: u32,
+  ) {
+    write_vlm_dir_no_tokenizer(
+      dir,
+      model_type,
+      processor_filename,
+      processor_class,
+      image_size,
+    );
+    write_tokenizer(dir);
+  }
+
+  #[test]
+  fn load_dispatches_to_registered_mocks_and_returns_full_bundle() {
+    let dir = fresh_dir("dispatch");
+    write_vlm_dir(&dir, "mockvlm", "preprocessor_config.json", "MockProc", 64);
+    let model_registry = VlmTypeRegistry::new().with("mockvlm", mock_vlm_constructor());
+    let processor_registry =
+      VlmProcessorTypeRegistry::new().with("MockProc", mock_processor_constructor());
+    let config = VlmModelConfiguration::from_directory(&dir);
+
+    let ctx = load(&config, &model_registry, &processor_registry).expect("load should succeed");
+
+    // The returned config carries the parsed model_type + vocab.
+    assert_eq!(ctx.config.model_type, "mockvlm");
+    assert_eq!(ctx.config.vocab_size, 5);
+
+    // The constructed model is the mock: drive one forward to confirm
+    // it is wired and saw the right vocab.
+    let mut cache: Vec<Box<dyn KvCache>> = Vec::new();
+    let tokens = Array::from_slice::<i32>(&[0, 1, 2], &(1usize, 3)).unwrap();
+    let logits = LmModel::forward(ctx.model.as_ref(), &tokens, &mut cache).unwrap();
+    assert_eq!(logits.shape(), vec![1, 3, 5]);
+
+    // The constructed processor surfaces the image-size it decoded off
+    // the raw processor JSON (64 from `write_vlm_dir`) — round-trip
+    // proof that the processor constructor saw the right JSON body.
+    let proc_cfg = ctx.processor.image_processor_config();
+    assert_eq!(proc_cfg.size, (64, 64));
+
+    // The tokenizer loaded from the same directory.
+    let ids = ctx.tokenizer.encode("a b c", false).unwrap();
+    assert_eq!(ids.len(), 3);
+  }
+
+  #[test]
+  fn preprocessor_config_is_preferred_over_processor_config() {
+    // Both files present, with DIFFERENT processor_class values. The
+    // `preprocessor_config.json` MUST win (per
+    // VLMModelFactory.swift:438-454's preference order); the registry
+    // is set up so only the "Preferred" class can construct — the
+    // "Fallback" class would resolve to a missing constructor.
+    let dir = fresh_dir("prefer-preprocessor");
+    std::fs::write(dir.join("config.json"), mock_config_json("mockvlm")).unwrap();
+    std::fs::write(
+      dir.join("preprocessor_config.json"),
+      mock_preprocessor_config_json("Preferred", 32),
+    )
+    .unwrap();
+    std::fs::write(
+      dir.join("processor_config.json"),
+      mock_preprocessor_config_json("Fallback", 999),
+    )
+    .unwrap();
+    let mut weights: Weights = HashMap::new();
+    weights.insert(
+      "mock.weight".to_owned(),
+      Array::from_slice::<f32>(&[1.0], &(1usize,)).unwrap(),
+    );
+    crate::io::save_safetensors(&dir.join("model.safetensors"), &weights).unwrap();
+    write_tokenizer(&dir);
+
+    let model_registry = VlmTypeRegistry::new().with("mockvlm", mock_vlm_constructor());
+    let processor_registry =
+      VlmProcessorTypeRegistry::new().with("Preferred", mock_processor_constructor());
+    let config = VlmModelConfiguration::from_directory(&dir);
+
+    let ctx = load(&config, &model_registry, &processor_registry)
+      .expect("load should succeed using the preferred preprocessor_config.json");
+    // The mock processor records the image_size off the raw JSON — `32`
+    // proves the preferred file was used (would be `999` from the
+    // fallback otherwise).
+    assert_eq!(ctx.processor.image_processor_config().size, (32, 32));
+  }
+
+  #[test]
+  fn processor_config_is_used_when_only_fallback_present() {
+    // No preprocessor_config.json → fall back to processor_config.json.
+    let dir = fresh_dir("fallback-processor-config");
+    write_vlm_dir(&dir, "mockvlm", "processor_config.json", "MockProc", 48);
+    assert!(!dir.join("preprocessor_config.json").exists());
+    let model_registry = VlmTypeRegistry::new().with("mockvlm", mock_vlm_constructor());
+    let processor_registry =
+      VlmProcessorTypeRegistry::new().with("MockProc", mock_processor_constructor());
+    let config = VlmModelConfiguration::from_directory(&dir);
+
+    let ctx =
+      load(&config, &model_registry, &processor_registry).expect("fallback processor_config load");
+    assert_eq!(ctx.processor.image_processor_config().size, (48, 48));
+  }
+
+  #[test]
+  fn from_id_resolves_as_local_path() {
+    // An `Identifier::Id` is treated as a LOCAL path (no network): pointing
+    // it at the temp dir loads exactly as `from_directory` would.
+    let dir = fresh_dir("idpath");
+    write_vlm_dir(&dir, "mockvlm", "preprocessor_config.json", "MockProc", 24);
+    let model_registry = VlmTypeRegistry::new().with("mockvlm", mock_vlm_constructor());
+    let processor_registry =
+      VlmProcessorTypeRegistry::new().with("MockProc", mock_processor_constructor());
+    let config = VlmModelConfiguration::from_id(dir.to_str().unwrap());
+    assert_eq!(config.model_directory(), dir.as_path());
+
+    let ctx = load(&config, &model_registry, &processor_registry)
+      .expect("id-as-local-path load should succeed");
+    assert_eq!(ctx.config.model_type, "mockvlm");
+  }
+
+  #[test]
+  fn tokenizer_source_loads_from_separate_directory() {
+    // Split layout: the model dir has config + processor config +
+    // weights but NO tokenizer.json; a separate dir holds the tokenizer.
+    // `tokenizer_source` points the load there, mirroring the LM
+    // factory's analogous test.
+    let model_dir = fresh_dir("split-model");
+    write_vlm_dir_no_tokenizer(
+      &model_dir,
+      "mockvlm",
+      "preprocessor_config.json",
+      "MockProc",
+      16,
+    );
+    assert!(!model_dir.join("tokenizer.json").exists());
+    let tok_dir = fresh_dir("split-tok");
+    write_tokenizer(&tok_dir);
+
+    let model_registry = VlmTypeRegistry::new().with("mockvlm", mock_vlm_constructor());
+    let processor_registry =
+      VlmProcessorTypeRegistry::new().with("MockProc", mock_processor_constructor());
+    let config = VlmModelConfiguration::from_directory(&model_dir).with_tokenizer_source(&tok_dir);
+    assert_eq!(config.tokenizer_directory(), tok_dir.as_path());
+
+    let ctx = load(&config, &model_registry, &processor_registry).expect("split-tokenizer load");
+    let ids = ctx.tokenizer.encode("a b c", false).unwrap();
+    assert_eq!(ids.len(), 3);
+  }
+
+  #[test]
+  fn unknown_model_type_is_recoverable_error_with_no_io_beyond_config() {
+    // config.json says "nope" but only "mockvlm" is registered →
+    // unsupported-model-type Error (NOT a panic), naming the type. The
+    // weights file is deliberately INVALID, the tokenizer is absent,
+    // and the processor config is absent: any load attempt would
+    // surface a different error. We must see the unsupported-model
+    // error first (faithful to step (2) of the orchestration order).
+    let dir = fresh_dir("unknown-model-cheap");
+    std::fs::write(dir.join("config.json"), mock_config_json("nope")).unwrap();
+    std::fs::write(
+      dir.join("model.safetensors"),
+      b"this is not a safetensors file",
+    )
+    .unwrap();
+    assert!(!dir.join("tokenizer.json").exists());
+    assert!(!dir.join("preprocessor_config.json").exists());
+
+    let model_registry = VlmTypeRegistry::new().with("mockvlm", mock_vlm_constructor());
+    let processor_registry =
+      VlmProcessorTypeRegistry::new().with("MockProc", mock_processor_constructor());
+    let config = VlmModelConfiguration::from_directory(&dir);
+
+    let Err(err) = load(&config, &model_registry, &processor_registry) else {
+      panic!("unknown VLM model_type must error");
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("unsupported VLM model type"), "got: {msg}");
+    assert!(msg.contains("nope"), "error should name the type: {msg}");
+    // The processor-config / weights / tokenizer paths must NOT have
+    // run: their files are intentionally absent/invalid here, and a
+    // failure on any of them surfaces a different error message.
+    assert!(
+      !msg.contains("safetensors") && !msg.contains("processor") && !msg.contains("tokenizer.json"),
+      "weights/processor/tokenizer must not have been loaded, got: {msg}"
+    );
+  }
+
+  #[test]
+  fn unknown_processor_class_is_recoverable_error_with_no_weight_io() {
+    // Model type IS registered, but the processor class on disk is
+    // not. The unsupported-processor-class error must fire BEFORE any
+    // weight load: weights file is deliberately invalid here.
+    let dir = fresh_dir("unknown-processor-cheap");
+    std::fs::write(dir.join("config.json"), mock_config_json("mockvlm")).unwrap();
+    std::fs::write(
+      dir.join("preprocessor_config.json"),
+      mock_preprocessor_config_json("WrongProc", 16),
+    )
+    .unwrap();
+    std::fs::write(
+      dir.join("model.safetensors"),
+      b"this is not a safetensors file",
+    )
+    .unwrap();
+    assert!(!dir.join("tokenizer.json").exists());
+
+    let model_registry = VlmTypeRegistry::new().with("mockvlm", mock_vlm_constructor());
+    let processor_registry =
+      VlmProcessorTypeRegistry::new().with("MockProc", mock_processor_constructor());
+    let config = VlmModelConfiguration::from_directory(&dir);
+
+    let Err(err) = load(&config, &model_registry, &processor_registry) else {
+      panic!("unknown processor class must error");
+    };
+    let msg = err.to_string();
+    assert!(
+      msg.contains("unsupported VLM processor class"),
+      "got: {msg}"
+    );
+    assert!(
+      msg.contains("WrongProc"),
+      "error should name the class: {msg}"
+    );
+    assert!(
+      msg.contains("preprocessor_config.json"),
+      "error should name the source file: {msg}"
+    );
+    assert!(
+      !msg.contains("safetensors") && !msg.contains("tokenizer.json"),
+      "weights/tokenizer must not have been loaded, got: {msg}"
+    );
+  }
+
+  #[test]
+  fn missing_processor_config_is_recoverable_error() {
+    // No preprocessor_config.json AND no processor_config.json present.
+    let dir = fresh_dir("no-proc-config");
+    std::fs::write(dir.join("config.json"), mock_config_json("mockvlm")).unwrap();
+    let model_registry = VlmTypeRegistry::new().with("mockvlm", mock_vlm_constructor());
+    let processor_registry =
+      VlmProcessorTypeRegistry::new().with("MockProc", mock_processor_constructor());
+    let config = VlmModelConfiguration::from_directory(&dir);
+
+    let Err(err) = load(&config, &model_registry, &processor_registry) else {
+      panic!("missing processor config must error");
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("no processor config found"), "got: {msg}");
+    assert!(
+      msg.contains("preprocessor_config.json") && msg.contains("processor_config.json"),
+      "error should name both candidate filenames: {msg}"
+    );
+  }
+
+  #[test]
+  fn processor_class_override_applies_for_mistral3() {
+    // Mistral3 ships processor_class = "PixtralProcessor" on disk but
+    // VLMModelFactory.swift:399-403 overrides it to "Mistral3Processor"
+    // because spatial-merge handling is different. The registry is set
+    // up so only "Mistral3Processor" can construct; "PixtralProcessor"
+    // would resolve to a missing constructor.
+    let dir = fresh_dir("mistral3-override");
+    write_vlm_dir(
+      &dir,
+      "mistral3",
+      "preprocessor_config.json",
+      "PixtralProcessor",
+      40,
+    );
+    let model_registry = VlmTypeRegistry::new().with("mistral3", mock_vlm_constructor());
+    let processor_registry =
+      VlmProcessorTypeRegistry::new().with("Mistral3Processor", mock_processor_constructor());
+    let config = VlmModelConfiguration::from_directory(&dir);
+
+    let ctx = load(&config, &model_registry, &processor_registry)
+      .expect("mistral3 override should dispatch to Mistral3Processor");
+    assert_eq!(ctx.processor.image_processor_config().size, (40, 40));
+  }
+
+  #[test]
+  fn vlm_remap_applies_on_registration_and_lookup() {
+    // "lfm2-vl" canonicalizes to "lfm2_vl" (verbatim from
+    // mlx_vlm.utils.MODEL_REMAPPING line 34). Registering under either
+    // form, the registry finds it under both.
+    let registry = VlmTypeRegistry::new().with("lfm2-vl", mock_vlm_constructor());
+    assert!(registry.contains("lfm2-vl"));
+    assert!(registry.contains("lfm2_vl"));
+    assert!(!registry.contains("qwen3_vl"));
+    assert_eq!(remap_vlm_model_type("lfm2-vl"), "lfm2_vl");
+    assert_eq!(remap_vlm_model_type("qwen3_vl"), "qwen3_vl");
+  }
+
+  #[test]
+  fn register_replaces_and_returns_previous() {
+    let mut registry = VlmTypeRegistry::new();
+    assert!(
+      registry
+        .register("mockvlm", mock_vlm_constructor())
+        .is_none()
+    );
+    assert!(
+      registry
+        .register("mockvlm", mock_vlm_constructor())
+        .is_some()
+    );
+    let mut proc_registry = VlmProcessorTypeRegistry::new();
+    assert!(
+      proc_registry
+        .register("MockProc", mock_processor_constructor())
+        .is_none()
+    );
+    assert!(
+      proc_registry
+        .register("MockProc", mock_processor_constructor())
+        .is_some()
+    );
+  }
+
+  #[test]
+  fn raw_config_and_processor_json_reach_constructors() {
+    // The constructors stash what they SAW; assert both pieces of
+    // raw-JSON dispatch state arrived correctly (the model's
+    // `mock_extra = 11` from `mock_config_json`, the processor's
+    // `mock_image_size = 24` from `mock_preprocessor_config_json`).
+    let dir = fresh_dir("raw-dispatch");
+    write_vlm_dir(&dir, "mockvlm", "preprocessor_config.json", "MockProc", 24);
+    let model_registry = VlmTypeRegistry::new().with("mockvlm", mock_vlm_constructor());
+    let processor_registry =
+      VlmProcessorTypeRegistry::new().with("MockProc", mock_processor_constructor());
+    let config = VlmModelConfiguration::from_directory(&dir);
+
+    let ctx = load(&config, &model_registry, &processor_registry).expect("load");
+    assert_eq!(ctx.processor.image_processor_config().size, (24, 24));
+  }
+}
