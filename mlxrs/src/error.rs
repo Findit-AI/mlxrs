@@ -109,11 +109,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// `Vec::with_capacity` remains fine — this is for input-proportional
 /// buffers.
 ///
-/// Currently consumed only by the `vlm` module (the VLM-8 allocation-
-/// hardening pass); the gate widens as the lm/audio/embeddings follow-up
-/// adopts these helpers (tracked as VLM-9 / the coordinated
-/// allocation-policy PR).
-#[cfg(feature = "vlm")]
+/// Consumed by the `lm`, `vlm`, `audio`, and `embeddings` modules for
+/// request-scaled host-side buffers (the VLM-9 allocation-hardening pass,
+/// now extended across lm/audio/embeddings). Gated to exactly the features
+/// that use it so `cargo hack --each-feature` sees no dead code (`vlm` and
+/// `audio` both enable `lm`).
+#[cfg(any(feature = "lm", feature = "embeddings"))]
 pub(crate) fn try_with_capacity<T>(cap: usize) -> Result<Vec<T>> {
   let mut v = Vec::new();
   v.try_reserve_exact(cap).map_err(|_| Error::OutOfMemory)?;
@@ -123,7 +124,9 @@ pub(crate) fn try_with_capacity<T>(cap: usize) -> Result<Vec<T>> {
 /// Fallible [`slice::to_vec`]: clone `slice` into a freshly-reserved
 /// `Vec`, returning [`Error::OutOfMemory`] instead of aborting on
 /// allocation failure. The recoverable analogue of `slice.to_vec()` for
-/// request-scaled slices.
+/// request-scaled slices. (Only the `vlm` module needs the owned-clone
+/// form; lm/audio/embeddings use `try_with_capacity` + `extend` or
+/// `try_extend_from_slice` directly, hence the narrower gate.)
 #[cfg(feature = "vlm")]
 pub(crate) fn try_to_vec<T: Clone>(slice: &[T]) -> Result<Vec<T>> {
   let mut v = try_with_capacity(slice.len())?;
@@ -138,7 +141,7 @@ pub(crate) fn try_to_vec<T: Clone>(slice: &[T]) -> Result<Vec<T>> {
 /// prefill prompt, then one token per decode step), so exact reservation
 /// would reallocate on every append and turn an O(n) accumulation into
 /// O(n²). The recoverable analogue of `vec.extend_from_slice(slice)`.
-#[cfg(feature = "vlm")]
+#[cfg(feature = "lm")]
 pub(crate) fn try_extend_from_slice<T: Clone>(v: &mut Vec<T>, slice: &[T]) -> Result<()> {
   v.try_reserve(slice.len()).map_err(|_| Error::OutOfMemory)?;
   v.extend_from_slice(slice);
