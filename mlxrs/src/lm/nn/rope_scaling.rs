@@ -87,14 +87,24 @@ fn freqs_array(freqs: &[f64]) -> Result<Array> {
 /// the entire array in one broadcast multiply. When `head_dim > dims`, the
 /// leading `dims` slice is scaled and concatenated back with the untouched
 /// tail, matching the references' partial-features semantics.
+///
+/// The mscale scalar is built in `x`'s own dtype so the multiply introduces no
+/// dtype promotion: MLX would otherwise upcast a `float16`/`bfloat16` `x` times
+/// an `f32` scalar to `float32`. The references store the scaled value back into
+/// an `x[..., :dims]` slice (`x[..., :dims] = scale * x[..., :dims]`), whose
+/// dtype is the original activation dtype — so the output must keep `x`'s dtype.
+/// The untouched tail in the partial-dims path is already in `x`'s dtype, so the
+/// concat stays uniform.
 fn scale_leading_dims(x: &Array, dims: i32, mscale: f32) -> Result<Array> {
-  let scalar = Array::from_slice::<f32>(&[mscale], &(1usize,))?;
   let ndim = x.ndim();
   if ndim == 0 {
     return Err(Error::ShapeMismatch {
       message: "scaled RoPE input must have at least one axis".to_string(),
     });
   }
+  // Build the scalar in `x`'s dtype so `multiply` does not promote half-precision
+  // inputs to f32 (mirrors the references' in-place-into-`x` store).
+  let scalar = Array::from_slice::<f32>(&[mscale], &(1usize,))?.astype(x.dtype()?)?;
   let last = ndim - 1;
   let head_dim = x.shape()[last] as i32;
   if head_dim == dims {
@@ -508,7 +518,7 @@ impl YarnRope {
 #[allow(clippy::excessive_precision)]
 mod tests {
   use super::*;
-  use crate::lm::nn::rope::rope_with_freqs;
+  use crate::{dtype::Dtype, lm::nn::rope::rope_with_freqs};
 
   const TOL: f32 = 1e-5;
 
@@ -897,5 +907,93 @@ mod tests {
       &via_apply.to_vec::<f32>().unwrap(),
       &manual.to_vec::<f32>().unwrap(),
     );
+  }
+
+  // ───────── dtype preservation (no half-precision upcast) ─────────
+  //
+  // The mscale multiply must not promote a float16/bfloat16 input to float32:
+  // MLX promotes `half * f32 -> f32`, so building the mscale in f32 would silently
+  // upcast Q/K. The references store the scaled value back into an `x[..., :dims]`
+  // slice (`x[..., :dims] = scale * x[..., :dims]`) whose dtype is the original
+  // activation dtype, so the output dtype must equal the input dtype. These cover
+  // both the whole-axis (`head_dim == dims`) and partial-dims (`head_dim > dims`)
+  // paths; the f32 numerical-parity tests above stay as the value checks.
+
+  /// `x` of `dtype`, shape `[1, 1, 2, head_dim]`, ascending features — the f16/
+  /// bf16 counterpart of [`input`]. Built by casting the f32 input so no `half`
+  /// scalar import is needed and the exact production code path is exercised.
+  fn input_dtype(head_dim: usize, dtype: Dtype) -> Array {
+    input(head_dim).astype(dtype).unwrap()
+  }
+
+  #[test]
+  fn scale_leading_dims_preserves_half_dtype() {
+    for dtype in [Dtype::F16, Dtype::BF16] {
+      // head_dim == dims: whole-axis multiply.
+      let whole = scale_leading_dims(&input_dtype(8, dtype), 8, 2.0).unwrap();
+      assert_eq!(whole.dtype().unwrap(), dtype, "whole-axis dtype, {dtype:?}");
+      // head_dim > dims: scaled head concatenated with the untouched tail.
+      let partial = scale_leading_dims(&input_dtype(8, dtype), 4, 2.0).unwrap();
+      assert_eq!(
+        partial.dtype().unwrap(),
+        dtype,
+        "partial-dims dtype, {dtype:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn su_scaled_apply_preserves_half_dtype() {
+    // factor = max_pos/orig_max = 4 > 1 ⇒ non-unit scale ⇒ the mscale multiply
+    // runs; output dtype must match the half-precision input for both paths.
+    for dtype in [Dtype::F16, Dtype::BF16] {
+      // head_dim == dims = 8.
+      let r = SuScaledRope::new(8, DEFAULT_BASE, 16384, 4096, &[1.0; 4], None).unwrap();
+      assert!((r.scale() - 1.0).abs() > TOL, "expected non-unit scale");
+      let out = r.apply(&input_dtype(8, dtype), 3).unwrap();
+      assert_eq!(
+        out.dtype().unwrap(),
+        dtype,
+        "Su head_dim==dims dtype, {dtype:?}"
+      );
+      // head_dim = 8 > dims = 4 (partial-dims): long_factor is dims/2 = 2.
+      let r_partial = SuScaledRope::new(4, DEFAULT_BASE, 16384, 4096, &[1.0, 2.0], None).unwrap();
+      let out_partial = r_partial.apply(&input_dtype(8, dtype), 3).unwrap();
+      assert_eq!(
+        out_partial.dtype().unwrap(),
+        dtype,
+        "Su head_dim>dims dtype, {dtype:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn yarn_apply_preserves_half_dtype() {
+    // scaling_factor = 4 ⇒ mscale != 1 ⇒ the mscale multiply runs; output dtype
+    // must match the half-precision input for both paths.
+    for dtype in [Dtype::F16, Dtype::BF16] {
+      let cfg = YarnConfig::new(4.0);
+      let r = YarnRope::new(8, DEFAULT_BASE, false, cfg).unwrap();
+      assert!((r.mscale() - 1.0).abs() > TOL, "expected non-unit mscale");
+      // head_dim == dims = 8.
+      let out = r.apply(&input_dtype(8, dtype), 6).unwrap();
+      assert_eq!(
+        out.dtype().unwrap(),
+        dtype,
+        "YaRN head_dim==dims dtype, {dtype:?}"
+      );
+      // head_dim = 8 > dims = 4 (partial-dims).
+      let r_partial = YarnRope::new(4, DEFAULT_BASE, false, cfg).unwrap();
+      assert!(
+        (r_partial.mscale() - 1.0).abs() > TOL,
+        "expected non-unit mscale"
+      );
+      let out_partial = r_partial.apply(&input_dtype(8, dtype), 6).unwrap();
+      assert_eq!(
+        out_partial.dtype().unwrap(),
+        dtype,
+        "YaRN head_dim>dims dtype, {dtype:?}"
+      );
+    }
   }
 }
