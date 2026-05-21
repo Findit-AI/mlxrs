@@ -499,7 +499,7 @@ pub fn load(dir: &Path) -> Result<(Config, Weights, crate::tokenizer::Tokenizer)
 /// (optionally separate) tokenizer directory through the *same* eos-resolution
 /// path. A tokenizer-load failure is a recoverable [`Error::Backend`] naming
 /// the directory.
-pub(crate) fn load_tokenizer(dir: &Path, config: &Config) -> Result<crate::tokenizer::Tokenizer> {
+pub fn load_tokenizer(dir: &Path, config: &Config) -> Result<crate::tokenizer::Tokenizer> {
   let resolved_eos = config.eos_token_id.clone().map(EosTokenId::into_ids);
   crate::tokenizer::Tokenizer::from_path(dir, resolved_eos.as_deref()).map_err(|e| Error::Backend {
     message: format!("cannot load tokenizer from {}: {e}", dir.display()),
