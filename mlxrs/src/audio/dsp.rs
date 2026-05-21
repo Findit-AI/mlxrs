@@ -1892,6 +1892,20 @@ pub fn lfilter(b: &[f64], a: &[f64], data: &Array) -> Result<Array> {
   let n_samples_i32 = i32::try_from(n_samples).map_err(|_| Error::Backend {
     message: format!("lfilter: n_samples {n_samples} exceeds i32::MAX"),
   })?;
+  // Enforce the bounded-memory contract on the SHAPE before any
+  // materialization: `data` may be a lazy oversized array
+  // (e.g. `Array::zeros(MAX_LFILTER_SAMPLES + 1)`), in which case the
+  // subsequent `to_vec::<f32>()` would eval-and-allocate the full f32
+  // buffer (and then promote to a second f64 Vec) BEFORE the kernel's
+  // post-promotion cap check ever fired. Reject up-front so the public
+  // wrapper allocates nothing for oversized inputs. `lfilter_f64` still
+  // re-checks the same cap for direct callers (K-weighting path) — this
+  // is the shape-side guard for the f32 boundary.
+  if n_samples > MAX_LFILTER_SAMPLES {
+    return Err(Error::Backend {
+      message: format!("lfilter: sample count {n_samples} exceeds the {MAX_LFILTER_SAMPLES} cap"),
+    });
+  }
 
   // f32 boundary wrapper: read the input via `try_clone().to_vec::<f32>()`
   // (no `&mut` on the caller's borrow), promote to f64, run the shared
@@ -2054,6 +2068,129 @@ fn lfilter_f64(b: &[f64], a: &[f64], x: &[f64]) -> Result<Vec<f64>> {
   Ok(y)
 }
 
+/// In-place variant of [`lfilter_f64`]: runs the same direct-form II
+/// transposed IIR recurrence directly on the caller-provided `x` buffer,
+/// overwriting `x[n]` with `y[n]`. The numerical result is bit-identical
+/// to `lfilter_f64(b, a, x)` (same formula, same f64 precision, same
+/// `state[i] = ...` updates) — the only difference is allocation: this
+/// kernel only allocates the SMALL coefficient + state buffers
+/// (`max(len(a), len(b))` f64s total, typically 3 for a biquad), NOT a
+/// fresh `n_samples`-long output `Vec`.
+///
+/// Used by [`k_weight_channel`] to keep the peak working set at ONE f64
+/// channel buffer instead of TWO (the old chain `after_shelf =
+/// lfilter_f64(&hs, &chan); lfilter_f64(&hp, &after_shelf)` momentarily
+/// held both the first-stage output AND the second-stage allocation while
+/// `chan_f64` was still in scope — peak `~3 * channel_bytes` at the
+/// chain-call boundary).
+///
+/// # Errors
+/// - [`Error::Backend`] when:
+///   - `a` is empty,
+///   - `a[0] == 0` (the denominator's leading coefficient cannot be zero),
+///   - `x.len()` exceeds the shared
+///     [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES) cap
+///     (mirrors [`lfilter_f64`]'s element budget).
+///
+/// `b` empty mirrors [`lfilter_f64`]'s "zero-output" semantics by writing
+/// zeros into `x` (the in-place equivalent of returning `np.zeros_like`).
+fn lfilter_f64_in_place(b: &[f64], a: &[f64], x: &mut [f64]) -> Result<()> {
+  if a.is_empty() {
+    return Err(Error::Backend {
+      message: "lfilter: filter denominator must be non-empty".into(),
+    });
+  }
+  if a[0] == 0.0 {
+    return Err(Error::Backend {
+      message: "lfilter: filter denominator must have a non-zero leading term (a[0] != 0)".into(),
+    });
+  }
+  let n_samples = x.len();
+  if n_samples > MAX_LFILTER_SAMPLES {
+    return Err(Error::Backend {
+      message: format!("lfilter: sample count {n_samples} exceeds the {MAX_LFILTER_SAMPLES} cap"),
+    });
+  }
+
+  // Mirror `lfilter_f64`'s `b.is_empty()` early-return semantics in place:
+  // overwrite `x` with zeros (the in-place equivalent of the out-of-place
+  // kernel's `Vec::with_capacity` + `resize` of zeros).
+  if b.is_empty() {
+    for v in x.iter_mut() {
+      *v = 0.0;
+    }
+    return Ok(());
+  }
+
+  // Normalize `b` and `a` by `a[0]` — same arithmetic as `lfilter_f64`.
+  let a0 = a[0];
+  let mut b_norm: Vec<f64> = Vec::new();
+  b_norm
+    .try_reserve_exact(b.len())
+    .map_err(|e| Error::Backend {
+      message: format!("lfilter: reservation for b ({} taps) failed: {e}", b.len()),
+    })?;
+  for &bv in b {
+    b_norm.push(bv / a0);
+  }
+  let mut a_norm: Vec<f64> = Vec::new();
+  a_norm
+    .try_reserve_exact(a.len())
+    .map_err(|e| Error::Backend {
+      message: format!("lfilter: reservation for a ({} taps) failed: {e}", a.len()),
+    })?;
+  for &av in a {
+    a_norm.push(av / a0);
+  }
+
+  // `state_len = max(len(a), len(b)) - 1`. `a.len() >= 1` checked above
+  // and `b.len() >= 1` (the `b.is_empty()` branch returns earlier), so
+  // the `max` is >= 1 and the subtraction is safe.
+  let state_len = a_norm.len().max(b_norm.len()) - 1;
+
+  // `state_len == 0` fast path: `y[n] = b[0] * x[n]`. Read each sample
+  // BEFORE writing — both source and destination are the same slot, so
+  // the multiplication is order-safe regardless (single-pass, no
+  // dependency on neighboring slots).
+  if state_len == 0 {
+    let b0 = b_norm[0];
+    for v in x.iter_mut() {
+      *v *= b0;
+    }
+    return Ok(());
+  }
+
+  // General direct-form II transposed recurrence — same body as
+  // `lfilter_f64` but writes the output back into `x`. The critical
+  // ordering invariant: read `sample = x[n]` into a local BEFORE
+  // overwriting `x[n]` with `output`, since the per-sample feedforward
+  // (`b[i] * sample`) and feedback (`a[i] * output`) both use the SAME
+  // `sample` value that lived in `x[n]` on entry to this iteration.
+  let mut state: Vec<f64> = Vec::new();
+  state
+    .try_reserve_exact(state_len)
+    .map_err(|e| Error::Backend {
+      message: format!("lfilter: state reservation for {state_len} taps failed: {e}"),
+    })?;
+  state.resize(state_len, 0.0);
+
+  for slot in x.iter_mut() {
+    let sample = *slot;
+    let output = b_norm[0] * sample + state[0];
+    for i in 1..state_len {
+      let feedforward = b_norm.get(i).copied().unwrap_or(0.0) * sample;
+      let feedback = a_norm.get(i).copied().unwrap_or(0.0) * output;
+      state[i - 1] = state[i] + feedforward - feedback;
+    }
+    let feedforward_last = b_norm.get(state_len).copied().unwrap_or(0.0) * sample;
+    let feedback_last = a_norm.get(state_len).copied().unwrap_or(0.0) * output;
+    state[state_len - 1] = feedforward_last - feedback_last;
+    *slot = output;
+  }
+
+  Ok(())
+}
+
 /// Compute a BS.1770 biquad's `(b, a)` coefficients (both length 3, both
 /// normalized by `a[0]`) for either the K-weighting high-shelf or the
 /// high-pass stage.
@@ -2130,10 +2267,23 @@ enum BiquadKind {
 /// reference's `_k_weight_audio` (Python `np.float64` throughout —
 /// `np.result_type` promotes the input to f64 in BOTH biquad stages and
 /// the second stage receives an f64 input from the first). Drives the
-/// private [`lfilter_f64`] kernel directly: convert the f32 channel to f64
-/// ONCE, then chain TWO `lfilter_f64` calls (no intermediate f32 cast
-/// between stages, no `Array` round-trip per stage), then return the f64
-/// result for the per-block mean-square reduction.
+/// private [`lfilter_f64_in_place`] kernel directly: convert the f32
+/// channel to f64 ONCE into a single `chan_f64` buffer, then run TWO
+/// in-place `lfilter_f64_in_place` stages (no intermediate f32 cast
+/// between stages, no `Array` round-trip per stage, no second f64 channel
+/// buffer), then return that one buffer for the per-block mean-square
+/// reduction.
+///
+/// # Memory
+/// Peak working set per channel is ONE f64 channel buffer
+/// (`n_samples * 8 bytes`) plus the two biquads' small (length 3)
+/// coefficient + state buffers. The previous implementation chained
+/// out-of-place `lfilter_f64` calls (`after_shelf = lfilter_f64(...)`)
+/// which momentarily held TWO full f64 channel buffers across the second
+/// stage's allocation — for a max-allowed mono input
+/// (`MAX_DECODED_SAMPLES = 64 Mi samples`) that was an extra ~512 MiB
+/// beyond the documented bound. Switching to the in-place kernel
+/// eliminates the second buffer entirely.
 fn k_weight_channel(channel: &[f32], rate: u32) -> Result<Vec<f64>> {
   let rate_f64 = f64::from(rate);
   // High-shelf: +4 dB at 1500 Hz, Q = 1/sqrt(2). Matches
@@ -2152,12 +2302,14 @@ fn k_weight_channel(channel: &[f32], rate: u32) -> Result<Vec<f64>> {
   let (hp_b, hp_a) = bs1770_biquad_coefficients(0.0, 0.5, 38.0, rate_f64, BiquadKind::HighPass);
 
   // Promote the channel to f64 ONCE (the reference's
-  // `np.array(data, dtype=np.float64, copy=True)`). Then chain TWO
-  // `lfilter_f64` stages in f64 end-to-end. The first stage's f64 output
-  // becomes the second stage's input WITHOUT an intermediate f32 cast (the
-  // historical f32 boundary inside `lfilter` previously dropped ~16 bits
-  // of precision between the high-shelf and high-pass stages, biasing
-  // gate decisions near the absolute/relative LUFS thresholds).
+  // `np.array(data, dtype=np.float64, copy=True)`). The high-shelf and
+  // high-pass biquads then run in-place on `chan_f64`, so the peak
+  // working set is exactly ONE f64 channel buffer (no
+  // `after_shelf`-then-`hp_output` overlap). The f64 precision is still
+  // preserved end-to-end across both stages: same `f64`-typed buffer,
+  // same f64 coefficients, same f64 state — no intermediate f32 cast
+  // between stages (which historically dropped ~16 bits of precision and
+  // biased gate decisions near the absolute/relative LUFS thresholds).
   let n = channel.len();
   let mut chan_f64: Vec<f64> = Vec::new();
   chan_f64.try_reserve_exact(n).map_err(|e| Error::Backend {
@@ -2166,12 +2318,9 @@ fn k_weight_channel(channel: &[f32], rate: u32) -> Result<Vec<f64>> {
   for &v in channel {
     chan_f64.push(f64::from(v));
   }
-  let after_shelf = lfilter_f64(&hs_b, &hs_a, &chan_f64)?;
-  // `chan_f64` is no longer needed once `after_shelf` holds the first
-  // stage's output — drop early so the peak working set is one (not two)
-  // f64 channel buffers across the second-stage call.
-  drop(chan_f64);
-  lfilter_f64(&hp_b, &hp_a, &after_shelf)
+  lfilter_f64_in_place(&hs_b, &hs_a, &mut chan_f64)?;
+  lfilter_f64_in_place(&hp_b, &hp_a, &mut chan_f64)?;
+  Ok(chan_f64)
 }
 
 /// Measure ITU-R BS.1770 integrated loudness (LUFS) of an audio signal.
@@ -2224,8 +2373,12 @@ fn k_weight_channel(channel: &[f32], rate: u32) -> Result<Vec<f64>> {
 /// The streaming per-channel path keeps peak working memory bounded to:
 /// - the input clone `raw_f32` (`n_samples * n_channels * 4 bytes`,
 ///   bounded by the total-element cap above),
-/// - ONE channel's f64 K-weighted buffer (`n_samples * 8 bytes`,
-///   reused/dropped per channel), and
+/// - ONE channel's f64 K-weighted buffer (`n_samples * 8 bytes`, fully
+///   in-place — the high-shelf and high-pass biquads both write back into
+///   the SAME buffer via the private in-place lfilter kernel, so there
+///   is no second `after_shelf` channel buffer outstanding at the stage
+///   boundary; dropped per channel before the next channel's promotion),
+///   and
 /// - the per-channel mean-square matrix
 ///   (`num_blocks * n_channels * 8 bytes`, bounded by the block-work cap
 ///   above).
@@ -2235,7 +2388,11 @@ fn k_weight_channel(channel: &[f32], rate: u32) -> Result<Vec<f64>> {
 /// `3 * n_samples * n_channels`-worth of channel data simultaneously,
 /// which the [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES)
 /// cap could not bound (the cap is per-element, and the multiplier on the
-/// peak working set was hidden).
+/// peak working set was hidden). The chained out-of-place
+/// `lfilter_f64(&hs, ...) → lfilter_f64(&hp, ...)` form similarly held
+/// TWO f64 channel buffers across the stage-boundary call (~+512 MiB for
+/// the max-allowed mono input); the in-place kernel eliminates that
+/// overlap.
 pub fn integrated_loudness(data: &Array, rate: u32, block_size: f64, overlap: f64) -> Result<f64> {
   // Input validation mirrors `_validate_loudness_audio` + the loudness
   // parameter ranges.
@@ -3492,6 +3649,124 @@ mod tests {
     let x_2d = Array::from_slice::<f32>(&[1.0_f32, 2.0, 3.0, 4.0], &[2i32, 2i32]).unwrap();
     assert!(matches!(
       lfilter(&[0.5_f64], &[1.0_f64, -0.5], &x_2d),
+      Err(Error::Backend { .. })
+    ));
+  }
+
+  /// Public [`lfilter`]'s sample cap must fire on the input SHAPE BEFORE
+  /// any `to_vec` materialization. We construct a lazy `Array::zeros` of
+  /// `(MAX_LFILTER_SAMPLES + 1,)` f32 — which mlx does not eval until a
+  /// data accessor runs — and assert `lfilter` rejects it with
+  /// `Error::Backend`. If the cap check still lived behind the `to_vec`
+  /// (the pre-fix behavior), the rejected call would have first
+  /// materialized `(MAX_LFILTER_SAMPLES + 1) * 4 bytes` (≈256 MiB) of f32
+  /// plus a second `(MAX_LFILTER_SAMPLES + 1) * 8 bytes` (≈512 MiB) f64
+  /// promotion before erroring — a ~768 MiB allocation for a call that
+  /// the bounded-memory contract says must allocate nothing. The lazy
+  /// `Array::zeros` is the regression handle: with the up-front cap
+  /// check this test runs effectively for free.
+  #[test]
+  fn lfilter_rejects_lazy_oversized_input_without_allocating() {
+    let lazy_huge =
+      Array::zeros::<f32>(&[(MAX_LFILTER_SAMPLES + 1) as i32]).expect("lazy zeros must succeed");
+    let res = lfilter(&[0.5_f64], &[1.0_f64, -0.5], &lazy_huge);
+    assert!(
+      matches!(res, Err(Error::Backend { .. })),
+      "lfilter must reject a lazy ({} samples) input via the up-front \
+       sample cap, BEFORE the to_vec materializes f32 / promotes to f64 \
+       (got {res:?})",
+      MAX_LFILTER_SAMPLES + 1
+    );
+  }
+
+  /// [`lfilter_f64_in_place`] is the in-place variant the K-weighting path
+  /// uses to keep the peak working set at ONE f64 channel buffer (the
+  /// pre-fix chained out-of-place form held TWO across the high-shelf →
+  /// high-pass stage boundary). Numerically the two kernels must produce
+  /// BIT-IDENTICAL output (same direct-form II transposed math, same f64
+  /// precision, same state updates) — only the allocation strategy
+  /// differs. Pin this with the same biquad hand-traced impulse from
+  /// `lfilter_biquad_hand_traced_impulse`, comparing the in-place output
+  /// against the out-of-place `lfilter_f64`'s output sample-for-sample
+  /// (zero tolerance — these MUST agree exactly in f64).
+  #[test]
+  fn lfilter_f64_in_place_matches_out_of_place() {
+    let b: [f64; 2] = [0.25, 0.5];
+    let a: [f64; 3] = [1.0, -0.3, 0.1];
+    let x_in: [f64; 4] = [1.0, 0.0, 0.0, 0.0];
+
+    // Out-of-place reference output.
+    let y_out = lfilter_f64(&b, &a, &x_in).expect("out-of-place must succeed");
+
+    // In-place run on a mutable copy.
+    let mut x_buf = x_in;
+    lfilter_f64_in_place(&b, &a, &mut x_buf).expect("in-place must succeed");
+
+    assert_eq!(
+      x_buf.len(),
+      y_out.len(),
+      "in-place output length must match out-of-place"
+    );
+    for (i, (g, e)) in x_buf.iter().zip(y_out.iter()).enumerate() {
+      // Bit-identical: same arithmetic in f64, no tolerance.
+      assert_eq!(
+        g, e,
+        "in-place[{i}] = {g} must equal out-of-place[{i}] = {e} \
+         (bit-identical f64)"
+      );
+    }
+  }
+
+  /// In-place `state_len == 0` fast path (`b = [2.0], a = [1.0]` →
+  /// `y[n] = 2 * x[n]`) must overwrite the buffer correctly. The
+  /// in-place kernel's per-slot ordering (read `sample` before writing
+  /// `output`) is trivial in this branch but the parity guarantee with
+  /// `lfilter_f64` still applies — assert both kernels produce the same
+  /// output on the same input.
+  #[test]
+  fn lfilter_f64_in_place_state_len_zero_doubles() {
+    let b: [f64; 1] = [2.0];
+    let a: [f64; 1] = [1.0];
+    let x_in: [f64; 4] = [0.1, -0.5, 0.7, 1.0];
+
+    let y_out = lfilter_f64(&b, &a, &x_in).expect("out-of-place must succeed");
+    let mut x_buf = x_in;
+    lfilter_f64_in_place(&b, &a, &mut x_buf).expect("in-place must succeed");
+
+    for (i, (g, e)) in x_buf.iter().zip(y_out.iter()).enumerate() {
+      assert_eq!(g, e, "in-place fir[{i}] = {g} must equal out-of-place {e}");
+    }
+  }
+
+  /// In-place `b.is_empty()` semantics: mirror [`lfilter_f64`]'s
+  /// `np.zeros_like`-equivalent by overwriting the input buffer with
+  /// zeros (the in-place equivalent of returning a fresh zero `Vec`).
+  #[test]
+  fn lfilter_f64_in_place_empty_b_zeros_buffer() {
+    let b: [f64; 0] = [];
+    let a: [f64; 1] = [1.0];
+    let mut x_buf: [f64; 4] = [1.0, 2.0, 3.0, 4.0];
+    lfilter_f64_in_place(&b, &a, &mut x_buf).expect("empty-b must succeed");
+    for (i, &v) in x_buf.iter().enumerate() {
+      assert_eq!(v, 0.0, "empty-b in-place must zero x_buf[{i}], got {v}");
+    }
+  }
+
+  /// In-place kernel must reject the same invalid inputs as
+  /// [`lfilter_f64`]: empty `a`, `a[0] == 0`. The sample-cap branch is
+  /// not exercised here (would require a multi-GB buffer) but its
+  /// presence in the kernel is verified by the existing
+  /// `integrated_loudness_rejects_oversized_total_elements` cap test
+  /// upstream.
+  #[test]
+  fn lfilter_f64_in_place_rejects_invalid_inputs() {
+    let mut x_buf: [f64; 2] = [1.0, 2.0];
+    assert!(matches!(
+      lfilter_f64_in_place(&[1.0_f64], &[], &mut x_buf),
+      Err(Error::Backend { .. })
+    ));
+    assert!(matches!(
+      lfilter_f64_in_place(&[1.0_f64], &[0.0_f64, 1.0], &mut x_buf),
       Err(Error::Backend { .. })
     ));
   }
