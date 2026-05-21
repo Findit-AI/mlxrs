@@ -211,6 +211,18 @@ impl LayerNorm {
 /// dimensions between the first (batch) and last (features) are treated
 /// as spatial.
 ///
+/// `num_groups` and `dims` are private fields exposed via the
+/// [`num_groups`](Self::num_groups) / [`dims`](Self::dims) read-only
+/// accessors. They carry the strict modulo invariant
+/// `dims % num_groups == 0` that `Self::new` enforces; allowing external
+/// `&mut` mutation would let a caller drop `num_groups` to 0 (panicking
+/// in the private `validate_input_shape`'s `dims_i32 % self.num_groups`
+/// step) or break the divisibility (silent activation corruption). This
+/// mirrors swift's `public let groupCount` / `public let dimensions`
+/// immutability without giving up the constructor's validation.
+/// `weight`/`bias`/`eps`/`pytorch_compatible` stay `pub` — they don't
+/// carry the modulo invariant.
+///
 /// Two grouping orders, matching the references:
 ///
 /// - **default** (`pytorch_compatible = false`): reshape `[B, ...rest,
@@ -235,14 +247,19 @@ impl LayerNorm {
 pub struct GroupNorm {
   /// Number of feature groups (must divide `dims` evenly; the references
   /// rely on the same `dims / num_groups` integer division and would
-  /// produce a malformed reshape otherwise).
-  pub num_groups: i32,
+  /// produce a malformed reshape otherwise). PRIVATE so it can't be
+  /// post-construction mutated to 0 / negative / a value that breaks the
+  /// modulo invariant `Self::new` enforces; read via
+  /// [`Self::num_groups`].
+  num_groups: i32,
   /// Configured feature width (last axis of the expected input). Stored
   /// so [`forward`](Self::forward) can reject a checkpoint/config mismatch
   /// up-front instead of silently normalizing whatever last-axis width
   /// happens to be divisible by `num_groups`. The references store it on
-  /// the module unconditionally; we mirror that here.
-  pub dims: i32,
+  /// the module unconditionally; we mirror that here. PRIVATE for the
+  /// same modulo-invariant reason as [`Self::num_groups`]; read via
+  /// [`Self::dims`].
+  dims: i32,
   /// Optional per-feature affine scale of shape `(dims,)`. `None` ⇒
   /// `affine=False` in the references.
   pub weight: Option<Array>,
@@ -316,6 +333,29 @@ impl GroupNorm {
       eps,
       pytorch_compatible,
     })
+  }
+
+  /// Configured number of feature groups (`> 0`, divides
+  /// [`Self::dims`] evenly — guaranteed by [`Self::new`]).
+  ///
+  /// Read-only accessor for the private `num_groups` field; the field is
+  /// private specifically so it can't be post-construction mutated to a
+  /// value that would break the private `validate_input_shape`'s
+  /// `dims_i32 % self.num_groups` step (e.g. setting it to `0` would
+  /// panic on the modulo).
+  pub fn num_groups(&self) -> i32 {
+    self.num_groups
+  }
+
+  /// Configured feature width (`> 0`, evenly divisible by
+  /// [`Self::num_groups`] — guaranteed by [`Self::new`]).
+  ///
+  /// Read-only accessor for the private `dims` field; the field is
+  /// private to preserve the constructor's modulo invariant against
+  /// post-construction `&mut` mutation. See [`Self::num_groups`] for the
+  /// same rationale.
+  pub fn dims(&self) -> i32 {
+    self.dims
   }
 
   /// Apply GroupNorm to `x`. Dispatches to the default or pytorch path
@@ -843,7 +883,7 @@ mod tests {
     assert!(gn.weight.is_none());
     assert!(gn.bias.is_none());
     assert!(!gn.pytorch_compatible);
-    assert_eq!(gn.num_groups, 2);
+    assert_eq!(gn.num_groups(), 2);
   }
 
   #[test]
@@ -1011,8 +1051,8 @@ mod tests {
   #[test]
   fn group_norm_constructor_accepts_valid_non_affine() {
     let gn = GroupNorm::new(2, 4, 1e-5, false, false).unwrap();
-    assert_eq!(gn.dims, 4);
-    assert_eq!(gn.num_groups, 2);
+    assert_eq!(gn.dims(), 4);
+    assert_eq!(gn.num_groups(), 2);
     assert!(gn.weight.is_none());
     assert!(gn.bias.is_none());
   }
@@ -1039,6 +1079,28 @@ mod tests {
       }
       other => panic!("expected ShapeMismatch, got {other:?}"),
     }
+  }
+
+  // ─── GroupNorm field-visibility regressions (Codex R3) ───
+
+  /// `num_groups` and `dims` are PRIVATE fields with read-only public
+  /// accessors. This test demonstrates the accessors return the
+  /// constructor-validated values and — by virtue of compiling without
+  /// reaching for the field — confirms the read path goes through the
+  /// accessor. Direct field access from outside `super::` would fail to
+  /// compile (the field's visibility is module-private). External code
+  /// previously could write `gn.num_groups = 0` and then `gn.forward(_)`
+  /// would PANIC inside `validate_input_shape`'s `dims_i32 % 0`; with
+  /// the field private, that mutation path is statically impossible.
+  #[test]
+  fn group_norm_num_groups_dims_are_read_only_via_accessors() {
+    let gn = GroupNorm::new(4, 16, 1e-5, false, false).unwrap();
+    assert_eq!(gn.num_groups(), 4);
+    assert_eq!(gn.dims(), 16);
+    // (compile-fail) external `gn.num_groups = 0` and `gn.dims = 0` are
+    // both private-field errors; trying them here from inside `super::`
+    // would compile (same module), so we don't try — the visibility
+    // guarantee is what the regression turns on, not a runtime check.
   }
 
   // ─── inferred_dim overflow regression (Codex review) ───
