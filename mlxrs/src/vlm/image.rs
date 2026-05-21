@@ -106,7 +106,7 @@
 //! | Site                                          | Scale         | Caller fn                | Bounded-memory | Recoverable-OOM | Notes                                       |
 //! |-----------------------------------------------|---------------|--------------------------|----------------|-----------------|---------------------------------------------|
 //! | `apply_orientation_fallible` u8 variants (Rotate90/270/+FlipH on Luma8/LumaA8/Rgb8/Rgba8) | source pixels | `load_image` →`Result` | Y (`MAX_DECODED_IMAGE_BYTES`) | **Y** | **FIXED (R5):** manual rotate over `try_reserve_exact`-backed buffer — no second alloc, no probe race |
-//! | `apply_orientation_fallible` non-u8 variants (Luma16/LumaA16/Rgb16/Rgba16/Rgb32F/Rgba32F + rotates) | source pixels | `load_image` →`Result` | Y (`MAX_DECODED_IMAGE_BYTES`) | N (delegates to image-rs `apply_orientation`) | Cannot occur from `load_image` (PNG/JPEG decoders only emit u8 variants); reachable only via caller-supplied `DynamicImage`. Exhaustive `match` makes a future variant addition a compile error. |
+//! | `apply_orientation_fallible` non-u8 variants (Luma16/LumaA16/Rgb16/Rgba16/Rgb32F/Rgba32F + rotates) | source pixels | `load_image` →`Result` | Y (`MAX_DECODED_IMAGE_BYTES`) | **Y** | **FIXED (R6):** covered by manual generic rotate via `try_reserve_exact` over `T: Copy` — 16-bit PNGs (`Luma16`/`LumaA16`/`Rgb16`/`Rgba16` per image-rs PNG decoder) and 32-bit-float `DynamicImage` inputs (`Rgb32F`/`Rgba32F`) now route through the same fallible per-element-type buffer path as u8 |
 //! | `apply_orientation_fallible` (NoTransforms/Flip/Rot180, all variants) | in-place      | `load_image` →`Result`   | Y (in-place)   | Y (no alloc)    | Upstream `*_in_place` path — zero allocation |
 //! | `img.to_rgba8()` (in `resize`)                | source pixels | `resize` →`DynamicImage` | Y (`MAX_DECODED_IMAGE_BYTES` via `load_image`) | N (image-rs infallible clone) | OUT-OF-SCOPE: `-> DynamicImage` by reference parity (swift `resampleBicubic` / python `Image.resize`); see [`resize`] doc for the bounded-not-recoverable contract |
 //! | `fast_image_resize::images::Image::new` (in `resize`) | target pixels (trusted config) | `resize` →`DynamicImage` | Y (trusted `ImageProcessorConfig::size`) | N (fast_image_resize infallible alloc) | OUT-OF-SCOPE: matches reference signatures; bounded by trusted JSON config |
@@ -117,19 +117,24 @@
 //! | `dynamic_image_rgb_pixel` per-pixel `get_pixel` | none (stack `Rgba<u8>` only) | shared helper | Y (zero alloc) | Y (no alloc) | OK — no full-image intermediate alloc |
 //! | mlx `Array` ops (rescale/normalize/patchify/preprocess) | output array | each `-> Result<Array>` | Y (output-shape) | Y (mlx backend `Result`) | OK — mlx backend allocator errors surface via `Array::*` `Result` |
 //!
-//! **Class closure invariant (round-5).** This module guarantees
+//! **Class closure invariant (round-6).** This module guarantees
 //! **bounded-memory** end-to-end — every source-scale allocation is
 //! capped by [`MAX_DECODED_IMAGE_BYTES`] (512 MiB) or trusted
 //! [`ImageProcessorConfig::size`]; no quadratic or unbounded growth is
 //! possible from hostile input. **Recoverable-OOM** is guaranteed for
 //! every allocation under our direct control: [`pad_to_square`]'s
-//! canvas, [`image_to_array`]'s f32 buffer, and the u8-variant rotate
-//! buffer in `apply_orientation_fallible` (private helper called by
-//! [`load_image`]). The remaining sites
-//! (image-crate-internal `to_rgba8` / `Vec::clone` and
-//! `fast_image_resize::Image::new`) are bounded-but-not-recoverable
-//! because changing their signatures would diverge from the swift /
-//! python reference contracts (`-> DynamicImage`, infallible) per
+//! canvas, [`image_to_array`]'s f32 buffer, and the rotate buffer for
+//! every `DynamicImage` element type (u8 / u16 / f32) in
+//! `apply_orientation_fallible` (private helper called by
+//! [`load_image`]) — the round-6 generic-rotate path covers
+//! 16-bit-PNG-derived `Luma16`/`LumaA16`/`Rgb16`/`Rgba16` (image-rs
+//! 0.25's PNG decoder emits 16-bit variants for `BitDepth::Sixteen`
+//! PNG inputs) and caller-supplied `Rgb32F`/`Rgba32F` inputs. The
+//! remaining sites (image-crate-internal `to_rgba8` / `Vec::clone`
+//! and `fast_image_resize::Image::new`) are
+//! bounded-but-not-recoverable because changing their signatures
+//! would diverge from the swift / python reference contracts
+//! (`-> DynamicImage`, infallible) per
 //! `feedback_match_official_binding_design`. Under extreme allocator
 //! pressure those calls may abort the process; this is documented in
 //! each function's public docstring so callers see the contract
@@ -392,44 +397,39 @@ pub fn load_image(path: &std::path::Path) -> Result<::image::DynamicImage> {
 }
 
 /// Apply EXIF `orientation` to `img` with a *truly recoverable*
-/// allocator gate on the rotate variants for u8 pixel types
-/// (Luma8 / LumaA8 / Rgb8 / Rgba8) — the only variants any
-/// PNG / JPEG decoder ever produces, i.e. the only inputs
-/// [`load_image`] can hand us in practice.
+/// allocator gate on the four allocating rotate variants
+/// (`Rotate90` / `Rotate270` / `Rotate90FlipH` / `Rotate270FlipH`),
+/// for **every** `DynamicImage` element type — `u8`
+/// (Luma8 / LumaA8 / Rgb8 / Rgba8), `u16`
+/// (Luma16 / LumaA16 / Rgb16 / Rgba16), and `f32`
+/// (Rgb32F / Rgba32F).
 ///
-/// **The defect class this closes (Codex round-5 finding).**
-/// The round-4 implementation used a "probe-then-delegate" pattern:
-/// reserve a throwaway `Vec<u8>`, drop it, then call image-rs's
-/// `apply_orientation`. That pattern is race-prone — allocator
-/// pressure between the probe drop and the real `rotate90` /
-/// `rotate270` alloc can flip the result from "would succeed" to
-/// "aborts" — so it is NOT a strict no-abort guarantee. Round 5
-/// replaces the u8 hot path with a *manual* rotation that builds
-/// the rotated buffer INSIDE a `try_reserve_exact`-backed `Vec<u8>`
-/// (no second alloc, no probe drop, no race window). Allocator
-/// failure surfaces as [`Error::OutOfMemory`] exactly once, before
-/// the pixel-copy loop runs.
+/// **The defect class this closes (Codex round-5 → round-6 finding).**
+/// Round 4 used a "probe-then-delegate" pattern (reserve a throwaway
+/// `Vec<u8>`, drop it, then call image-rs's `apply_orientation`) which
+/// is race-prone — allocator pressure between the probe drop and the
+/// real `rotate90` / `rotate270` alloc can flip the result from "would
+/// succeed" to "aborts". Round 5 replaced the u8 hot path with a
+/// *manual* rotation that builds the rotated buffer INSIDE a
+/// `try_reserve_exact`-backed `Vec<u8>` (no second alloc, no probe
+/// drop, no race window). Round 5 left the non-u8 variants on the
+/// infallible image-rs delegate, claiming they could not occur via
+/// [`load_image`]; that claim was wrong — image-rs 0.25's PNG decoder
+/// emits `Luma16` / `LumaA16` / `Rgb16` / `Rgba16` for 16-bit PNG
+/// inputs (`codecs/png.rs:64-71`), so a 16-bit PNG carrying an EXIF
+/// `Rotate90` / `Rotate270` orientation could reach the infallible
+/// fallback from [`load_image`] and abort on allocator pressure.
+/// Round 6 generalizes the manual rotate over the element type
+/// `T: Copy` (see [`rotate_buf`]) so the u16 and f32 variants share
+/// the same `try_reserve_exact` gate as u8. Allocator failure now
+/// surfaces as [`Error::OutOfMemory`] exactly once for every
+/// `DynamicImage` variant, before the pixel-copy loop runs.
 ///
 /// **Dispatch.**
-/// - **u8 variants × rotate orientations:** manual per-pixel
-///   rotation into a `Vec<u8>` whose backing buffer was reserved
-///   via `try_reserve_exact`. Rebuild a `DynamicImage` via
-///   `ImageBuffer::from_raw`. Recoverable-OOM guaranteed.
-/// - **non-u8 variants × rotate orientations** (Luma16 / LumaA16 /
-///   Rgb16 / Rgba16 / Rgb32F / Rgba32F): NOT reachable from
-///   [`load_image`] under the current `image` Cargo feature set
-///   (only `png` + `jpeg` are enabled — PNG decoders emit Luma8 /
-///   LumaA8 / Rgb8 / Rgba8 / Luma16 / LumaA16 / Rgb16 / Rgba16;
-///   JPEG decoders only u8). For the caller-supplied
-///   `DynamicImage` path (third-party decoder, raw `image::open`)
-///   these fall back to image-rs's infallible `apply_orientation` —
-///   **bounded-memory** by [`MAX_DECODED_IMAGE_BYTES`] (we check
-///   the byte budget before delegating) but **not recoverable-OOM**.
-///   This is acceptable because (a) the variant set is exhaustively
-///   matched so adding a new `DynamicImage` variant upstream is a
-///   compile error here, and (b) the byte-count gate still rejects
-///   hostile dimensions cleanly. See the module-level audit table
-///   for the contract summary.
+/// - **All rotate orientations × all element types** (u8 / u16 / f32):
+///   manual per-pixel rotation into a `Vec<T>` whose backing buffer
+///   was reserved via `try_reserve_exact`. Rebuild a `DynamicImage`
+///   via `ImageBuffer::from_raw`. Recoverable-OOM guaranteed.
 /// - **No-op / in-place variants** (NoTransforms, FlipHorizontal,
 ///   FlipVertical, Rotate180) on any variant: zero source-sized
 ///   alloc — upstream `apply_orientation` dispatches to
@@ -470,10 +470,9 @@ fn apply_orientation_fallible(
       img.apply_orientation(orientation);
       Ok(img)
     }
-    // Allocating variants — dispatch on pixel-type. u8 variants get
-    // the truly-fallible manual-rotation path; non-u8 variants
-    // (unreachable from PNG/JPEG `load_image`) get the documented
-    // bounded-but-not-recoverable fallback to image-rs.
+    // Allocating variants — every `DynamicImage` element type
+    // (u8 / u16 / f32) routes through the generic-rotate path in
+    // `apply_rotate_fallible`. No infallible fallback remains.
     Orientation::Rotate90
     | Orientation::Rotate270
     | Orientation::Rotate90FlipH
@@ -506,33 +505,42 @@ enum RotateKind {
   Rotate270FlipH,
 }
 
-/// Manual fallible rotation for u8 [`DynamicImage`] variants
-/// (Luma8 / LumaA8 / Rgb8 / Rgba8) — the variant set every PNG /
-/// JPEG decoder produces. The rotated buffer is built INSIDE a
-/// `try_reserve_exact`-backed `Vec<u8>` so an allocator failure
-/// surfaces as [`Error::OutOfMemory`] exactly once, before the
-/// pixel-copy loop runs (no race window like the round-4 probe).
+/// Manual fallible rotation for every [`DynamicImage`] element type
+/// (u8: Luma8 / LumaA8 / Rgb8 / Rgba8; u16: Luma16 / LumaA16 / Rgb16
+/// / Rgba16; f32: Rgb32F / Rgba32F). The rotated buffer is built
+/// INSIDE a `try_reserve_exact`-backed `Vec<T>` (via [`rotate_buf`])
+/// so an allocator failure surfaces as [`Error::OutOfMemory`]
+/// exactly once, before the pixel-copy loop runs (no race window
+/// like the round-4 probe, no infallible fallback to image-rs).
 ///
-/// **Non-u8 fallback (Luma16 / LumaA16 / Rgb16 / Rgba16 / Rgb32F /
-/// Rgba32F):** the byte-count gate against [`MAX_DECODED_IMAGE_BYTES`]
-/// still runs, so the function is **bounded-memory** for these
-/// variants too. We then delegate to image-rs's `apply_orientation`
-/// (which calls `rotate90` / `rotate270`'s infallible `ImageBuffer
-/// ::new` backing alloc). This fallback path is **not recoverable-OOM**;
-/// the module-level audit table documents this and the helper's
-/// public docstring above flags it as the only non-fallible site.
-/// These variants cannot occur via [`load_image`] (PNG + JPEG decoders
-/// only — see `mlxrs/Cargo.toml`'s `image` features).
+/// **Round-6 closure.** Round 5 left non-u8 variants on an infallible
+/// `apply_orientation` fallback under the assumption they could not
+/// be reached from [`load_image`]; that was wrong (image-rs 0.25's
+/// PNG decoder emits 16-bit variants for `BitDepth::Sixteen` PNG
+/// inputs — `codecs/png.rs:64-71`). Round 6 generalizes the rotate
+/// over `T: Copy` so the same fallible path covers u16 and f32.
+/// `DynamicImage` is `#[non_exhaustive]` upstream, so a wildcard
+/// arm is required by the compiler; we surface any future-added
+/// variant as a typed [`Error::Backend`] rather than silently
+/// falling back to image-rs's infallible `apply_orientation` — the
+/// "no abort on allocator pressure" contract holds for every
+/// variant the helper handles today (the ten listed above), and a
+/// new variant produces a recoverable `Err` until its rotate arm
+/// is wired in.
 fn apply_rotate_fallible(
-  mut img: ::image::DynamicImage,
+  img: ::image::DynamicImage,
   rotation: RotateKind,
 ) -> Result<::image::DynamicImage> {
+  use ::image::{DynamicImage, ImageBuffer, Luma, LumaA, Rgb, Rgba};
   let w = u64::from(img.width());
   let h = u64::from(img.height());
   let bytes_per_pixel = u64::from(img.color().bytes_per_pixel());
   // `width * height * bytes_per_pixel`. u64 to keep the overflow
   // check host-arch-independent; `u32::MAX^2 * 16 ≈ 2.95e20` fits
   // in u64, so the `checked_mul` only fires for hostile dimensions.
+  // The byte budget is `bytes_per_pixel`-based (not subpixel-count)
+  // so 16-bit and f32 variants are bounded by their true memory
+  // footprint, not by the channel count alone.
   let bytes = w
     .checked_mul(h)
     .and_then(|wh| wh.checked_mul(bytes_per_pixel))
@@ -554,54 +562,104 @@ fn apply_rotate_fallible(
   }
   let src_w = img.width();
   let src_h = img.height();
-  // Pixel-type dispatch. u8 variants → manual rotate into a
-  // `try_reserve_exact`-backed buffer (truly recoverable OOM).
-  // Non-u8 → bounded fallback (the byte gate above still ran;
-  // see helper doc for the bounded-vs-recoverable contract).
-  if let Some(buf) = img.as_luma8() {
-    let dst = rotate_u8_buf(buf.as_raw(), src_w, src_h, 1, rotation)?;
-    let (out_w, out_h) = rotated_dims(src_w, src_h, rotation);
-    let out: ::image::GrayImage = ::image::ImageBuffer::from_raw(out_w, out_h, dst).expect(
-      "ImageBuffer::from_raw: dst buffer length matches w*h*1 by construction in rotate_u8_buf",
-    );
-    Ok(::image::DynamicImage::ImageLuma8(out))
-  } else if let Some(buf) = img.as_luma_alpha8() {
-    let dst = rotate_u8_buf(buf.as_raw(), src_w, src_h, 2, rotation)?;
-    let (out_w, out_h) = rotated_dims(src_w, src_h, rotation);
-    let out: ::image::GrayAlphaImage = ::image::ImageBuffer::from_raw(out_w, out_h, dst).expect(
-      "ImageBuffer::from_raw: dst buffer length matches w*h*2 by construction in rotate_u8_buf",
-    );
-    Ok(::image::DynamicImage::ImageLumaA8(out))
-  } else if let Some(buf) = img.as_rgb8() {
-    let dst = rotate_u8_buf(buf.as_raw(), src_w, src_h, 3, rotation)?;
-    let (out_w, out_h) = rotated_dims(src_w, src_h, rotation);
-    let out: ::image::RgbImage = ::image::ImageBuffer::from_raw(out_w, out_h, dst).expect(
-      "ImageBuffer::from_raw: dst buffer length matches w*h*3 by construction in rotate_u8_buf",
-    );
-    Ok(::image::DynamicImage::ImageRgb8(out))
-  } else if let Some(buf) = img.as_rgba8() {
-    let dst = rotate_u8_buf(buf.as_raw(), src_w, src_h, 4, rotation)?;
-    let (out_w, out_h) = rotated_dims(src_w, src_h, rotation);
-    let out: ::image::RgbaImage = ::image::ImageBuffer::from_raw(out_w, out_h, dst).expect(
-      "ImageBuffer::from_raw: dst buffer length matches w*h*4 by construction in rotate_u8_buf",
-    );
-    Ok(::image::DynamicImage::ImageRgba8(out))
-  } else {
-    // Non-u8 variant. Bounded-memory (the byte-budget check above
-    // already ran), NOT recoverable-OOM (image-rs's `rotate90` /
-    // `rotate270` use infallible `ImageBuffer::new`). Unreachable
-    // from `load_image` under the current `image` feature set
-    // (PNG + JPEG only emit u8 variants). Future addition of a
-    // `tiff` / `webp` feature, or caller-constructed non-u8 input,
-    // would land here.
-    let orientation = match rotation {
-      RotateKind::Rotate90 => ::image::metadata::Orientation::Rotate90,
-      RotateKind::Rotate270 => ::image::metadata::Orientation::Rotate270,
-      RotateKind::Rotate90FlipH => ::image::metadata::Orientation::Rotate90FlipH,
-      RotateKind::Rotate270FlipH => ::image::metadata::Orientation::Rotate270FlipH,
-    };
-    img.apply_orientation(orientation);
-    Ok(img)
+  let (out_w, out_h) = rotated_dims(src_w, src_h, rotation);
+  // Exhaustive per-variant dispatch into the generic
+  // `rotate_buf<T: Copy>` helper. `channels` is the per-pixel
+  // *subpixel count* (number of `T` elements per pixel), NOT a
+  // byte count — so `Rgb<u16>` is 3 (three u16 subpixels per
+  // pixel), `Rgba<f32>` is 4 (four f32 subpixels per pixel), etc.
+  // `ImageBuffer::from_raw` validates the container length is
+  // `width * height * CHANNEL_COUNT` in subpixel units, which
+  // exactly matches the buffer we hand it.
+  match img {
+    DynamicImage::ImageLuma8(buf) => {
+      let dst = rotate_buf::<u8>(buf.as_raw(), src_w, src_h, 1, rotation)?;
+      let out: ::image::GrayImage = ImageBuffer::from_raw(out_w, out_h, dst).expect(
+        "ImageBuffer::from_raw: dst buffer length matches w*h*1 by construction in rotate_buf",
+      );
+      Ok(DynamicImage::ImageLuma8(out))
+    }
+    DynamicImage::ImageLumaA8(buf) => {
+      let dst = rotate_buf::<u8>(buf.as_raw(), src_w, src_h, 2, rotation)?;
+      let out: ::image::GrayAlphaImage = ImageBuffer::from_raw(out_w, out_h, dst).expect(
+        "ImageBuffer::from_raw: dst buffer length matches w*h*2 by construction in rotate_buf",
+      );
+      Ok(DynamicImage::ImageLumaA8(out))
+    }
+    DynamicImage::ImageRgb8(buf) => {
+      let dst = rotate_buf::<u8>(buf.as_raw(), src_w, src_h, 3, rotation)?;
+      let out: ::image::RgbImage = ImageBuffer::from_raw(out_w, out_h, dst).expect(
+        "ImageBuffer::from_raw: dst buffer length matches w*h*3 by construction in rotate_buf",
+      );
+      Ok(DynamicImage::ImageRgb8(out))
+    }
+    DynamicImage::ImageRgba8(buf) => {
+      let dst = rotate_buf::<u8>(buf.as_raw(), src_w, src_h, 4, rotation)?;
+      let out: ::image::RgbaImage = ImageBuffer::from_raw(out_w, out_h, dst).expect(
+        "ImageBuffer::from_raw: dst buffer length matches w*h*4 by construction in rotate_buf",
+      );
+      Ok(DynamicImage::ImageRgba8(out))
+    }
+    DynamicImage::ImageLuma16(buf) => {
+      let dst = rotate_buf::<u16>(buf.as_raw(), src_w, src_h, 1, rotation)?;
+      let out: ImageBuffer<Luma<u16>, Vec<u16>> = ImageBuffer::from_raw(out_w, out_h, dst).expect(
+        "ImageBuffer::from_raw: Luma16 dst length matches w*h*1 u16 subpixels by construction",
+      );
+      Ok(DynamicImage::ImageLuma16(out))
+    }
+    DynamicImage::ImageLumaA16(buf) => {
+      let dst = rotate_buf::<u16>(buf.as_raw(), src_w, src_h, 2, rotation)?;
+      let out: ImageBuffer<LumaA<u16>, Vec<u16>> = ImageBuffer::from_raw(out_w, out_h, dst).expect(
+        "ImageBuffer::from_raw: LumaA16 dst length matches w*h*2 u16 subpixels by construction",
+      );
+      Ok(DynamicImage::ImageLumaA16(out))
+    }
+    DynamicImage::ImageRgb16(buf) => {
+      let dst = rotate_buf::<u16>(buf.as_raw(), src_w, src_h, 3, rotation)?;
+      let out: ImageBuffer<Rgb<u16>, Vec<u16>> = ImageBuffer::from_raw(out_w, out_h, dst).expect(
+        "ImageBuffer::from_raw: Rgb16 dst length matches w*h*3 u16 subpixels by construction",
+      );
+      Ok(DynamicImage::ImageRgb16(out))
+    }
+    DynamicImage::ImageRgba16(buf) => {
+      let dst = rotate_buf::<u16>(buf.as_raw(), src_w, src_h, 4, rotation)?;
+      let out: ImageBuffer<Rgba<u16>, Vec<u16>> = ImageBuffer::from_raw(out_w, out_h, dst).expect(
+        "ImageBuffer::from_raw: Rgba16 dst length matches w*h*4 u16 subpixels by construction",
+      );
+      Ok(DynamicImage::ImageRgba16(out))
+    }
+    DynamicImage::ImageRgb32F(buf) => {
+      let dst = rotate_buf::<f32>(buf.as_raw(), src_w, src_h, 3, rotation)?;
+      let out: ImageBuffer<Rgb<f32>, Vec<f32>> = ImageBuffer::from_raw(out_w, out_h, dst).expect(
+        "ImageBuffer::from_raw: Rgb32F dst length matches w*h*3 f32 subpixels by construction",
+      );
+      Ok(DynamicImage::ImageRgb32F(out))
+    }
+    DynamicImage::ImageRgba32F(buf) => {
+      let dst = rotate_buf::<f32>(buf.as_raw(), src_w, src_h, 4, rotation)?;
+      let out: ImageBuffer<Rgba<f32>, Vec<f32>> = ImageBuffer::from_raw(out_w, out_h, dst).expect(
+        "ImageBuffer::from_raw: Rgba32F dst length matches w*h*4 f32 subpixels by construction",
+      );
+      Ok(DynamicImage::ImageRgba32F(out))
+    }
+    // `DynamicImage` is `#[non_exhaustive]` upstream — a wildcard
+    // arm is required by the compiler even though the ten arms
+    // above cover every variant defined in image-rs 0.25. Surface
+    // any future addition as a typed `Backend` error rather than
+    // silently calling the infallible `apply_orientation` (which
+    // reintroduces the abort-on-OOM behavior round 5/6 closes).
+    // Recoverable by definition (it's an `Err`, not a panic), and
+    // upgrading to a proper rotate arm becomes a localized edit
+    // here the day a new variant ships.
+    other => Err(Error::Backend {
+      message: format!(
+        "apply_rotate_fallible: unsupported DynamicImage variant {:?}; \
+         image-rs added a new pixel type that mlxrs has not yet wired \
+         into the fallible rotate path — please file an issue and \
+         extend the match arms above",
+        other.color()
+      ),
+    }),
   }
 }
 
@@ -613,9 +671,23 @@ fn rotated_dims(src_w: u32, src_h: u32, _rotation: RotateKind) -> (u32, u32) {
   (src_h, src_w)
 }
 
-/// Manual rotation of a u8 pixel buffer for the four EXIF rotate
-/// orientations, into a `Vec<u8>` whose backing storage is reserved
-/// via `try_reserve_exact` (recoverable-OOM).
+/// Manual rotation of a `T`-typed pixel buffer for the four EXIF
+/// rotate orientations, into a `Vec<T>` whose backing storage is
+/// reserved via `try_reserve_exact` (recoverable-OOM).
+///
+/// **Generic over the element type** (`T: Copy + Default`) so the
+/// same body covers every `DynamicImage` element width:
+/// - u8: Luma8 / LumaA8 / Rgb8 / Rgba8
+/// - u16: Luma16 / LumaA16 / Rgb16 / Rgba16
+/// - f32: Rgb32F / Rgba32F
+///
+/// Rotation is a *permutation of pixel positions*, not a per-channel
+/// projection — the index math is identical for every element type;
+/// only the per-pixel memcpy length (`channels` subpixels of `T`)
+/// scales with the variant. `Copy` is required for the per-pixel
+/// `copy_from_slice`; `Default` is required to zero-init the
+/// reservation before the permutation writes land (cheap: u8/u16
+/// default to 0, f32 to 0.0).
 ///
 /// **Pixel conventions** (cross-checked against image-rs
 /// `imageops/affine.rs` in `image-0.25.10`):
@@ -635,67 +707,68 @@ fn rotated_dims(src_w: u32, src_h: u32, _rotation: RotateKind) -> (u32, u32) {
 ///   Output: `dst.put_pixel(h-1-y, w-1-x, src.get_pixel(x, y))`
 ///   with dims `(h, w)`.
 ///
-/// `channels` is the per-pixel byte count (1 for Luma8, 2 for
-/// LumaA8, 3 for Rgb8, 4 for Rgba8). The function is generic in
-/// the byte-stride only — the rotation math is the same for all
-/// u8 pixel types because rotation is a permutation of pixel
-/// positions, not a per-channel projection.
+/// `channels` is the per-pixel *subpixel count* (1 for Luma, 2 for
+/// LumaA, 3 for Rgb, 4 for Rgba) — NOT a byte count. The element
+/// stride per pixel is `channels * size_of::<T>()` bytes, but the
+/// allocator and copy operate in `T`-element units, so `bytes` here
+/// is the subpixel-element count for `Vec::try_reserve_exact::<T>`.
 ///
-/// `src.len()` MUST equal `src_w * src_h * channels`; the caller
-/// (the four `as_*` paths in [`apply_rotate_fallible`]) guarantees
-/// this via the `ImageBuffer::as_raw()` contract. The byte budget
-/// has already been validated by the caller against
-/// [`MAX_DECODED_IMAGE_BYTES`], so `bytes` is well under `usize::MAX`.
-fn rotate_u8_buf(
-  src: &[u8],
+/// `src.len()` MUST equal `src_w * src_h * channels` (in `T` units);
+/// the caller (the ten per-variant arms in [`apply_rotate_fallible`])
+/// guarantees this via the `ImageBuffer::as_raw()` contract. The
+/// byte budget has already been validated by the caller against
+/// [`MAX_DECODED_IMAGE_BYTES`] (using true `bytes_per_pixel`), so
+/// the subpixel-element count is well under `usize::MAX`.
+fn rotate_buf<T: Copy + Default>(
+  src: &[T],
   src_w: u32,
   src_h: u32,
   channels: usize,
   rotation: RotateKind,
-) -> Result<Vec<u8>> {
+) -> Result<Vec<T>> {
   let w_usize = src_w as usize;
   let h_usize = src_h as usize;
-  // `bytes = w * h * channels` already validated <= MAX_DECODED_IMAGE_BYTES
-  // by the caller; recompute here in usize (the cast is lossless on any
-  // 64-bit host) so the buffer reservation has a precise length. Defend
-  // against an unexpected overflow regardless — `try_reserve_exact` on a
-  // pathologically large `usize` would still return Err, but the explicit
-  // overflow check yields a typed `ShapeMismatch` rather than the less
+  // `elements = w * h * channels` (in `T` subpixel units; total
+  // bytes = elements * size_of::<T>() is already validated <=
+  // MAX_DECODED_IMAGE_BYTES by the caller). Recompute here in
+  // usize (the cast is lossless on any 64-bit host) so the buffer
+  // reservation has a precise length. Defend against an unexpected
+  // overflow regardless — `try_reserve_exact` on a pathologically
+  // large `usize` would still return Err, but the explicit overflow
+  // check yields a typed `ShapeMismatch` rather than the less
   // specific `OutOfMemory`.
-  let bytes = w_usize
+  let elements = w_usize
     .checked_mul(h_usize)
     .and_then(|wh| wh.checked_mul(channels))
     .ok_or_else(|| Error::ShapeMismatch {
-      message: format!(
-        "rotate_u8_buf: w*h*channels overflows usize for {src_w}x{src_h}x{channels}"
-      ),
+      message: format!("rotate_buf: w*h*channels overflows usize for {src_w}x{src_h}x{channels}"),
     })?;
   debug_assert_eq!(
     src.len(),
-    bytes,
-    "rotate_u8_buf: src.len() must equal w*h*channels by ImageBuffer::as_raw() contract"
+    elements,
+    "rotate_buf: src.len() must equal w*h*channels by ImageBuffer::as_raw() contract"
   );
   // Allocate the destination buffer fallibly. `try_reserve_exact`
   // returns Err on allocator failure rather than aborting; convert
-  // to `Error::OutOfMemory`. We then `resize(bytes, 0)` so the
-  // length matches and the slice indices below are valid. No second
-  // allocation occurs: `resize` of a zero-init `u8` slice on a
-  // freshly-reserved `Vec` is an in-place memset (`Vec::resize`
-  // for `T: Copy` zero-init is `ptr::write_bytes` of the reserved
-  // capacity; no realloc when `len + n <= capacity`).
-  let mut dst: Vec<u8> = Vec::new();
+  // to `Error::OutOfMemory`. We then `resize(elements, T::default())`
+  // so the length matches and the slice indices below are valid. No
+  // second allocation occurs (`Vec::resize` does not reallocate when
+  // `len + n <= capacity`, which is the case immediately after a
+  // `try_reserve_exact(elements)` from `len == 0`).
+  let mut dst: Vec<T> = Vec::new();
   dst
-    .try_reserve_exact(bytes)
+    .try_reserve_exact(elements)
     .map_err(|_| Error::OutOfMemory)?;
-  dst.resize(bytes, 0);
-  let (out_w, out_h) = rotated_dims(src_w, src_h, rotation);
+  dst.resize(elements, T::default());
+  let (out_w, _out_h) = rotated_dims(src_w, src_h, rotation);
   let out_w_usize = out_w as usize;
-  let _out_h_usize = out_h as usize;
   // Iterate the source once. For each source pixel at (x, y), copy
-  // its `channels` bytes into the destination position implied by
-  // `rotation`. The inner per-pixel byte copy is a contiguous
-  // memcpy of `channels` bytes (1/2/3/4 — LLVM unrolls / converts
-  // to a single load+store for small fixed sizes).
+  // its `channels` `T` elements into the destination position
+  // implied by `rotation`. The inner per-pixel `copy_from_slice` is
+  // a contiguous memcpy of `channels * size_of::<T>()` bytes (LLVM
+  // unrolls / converts to single loads/stores for small fixed sizes
+  // — same code shape as the u8-only round-5 path, just parameterized
+  // by `T`).
   //
   // Index math (verified against `imageops/affine.rs` upstream):
   //   Rotate90       : (x, y) -> (h_usize - 1 - y, x)        out dims (h, w)
@@ -1926,6 +1999,170 @@ mod apply_orientation_tests {
       reference.as_raw(),
       "manual LumaA8 rotate90 must match image::imageops::rotate90 byte-identical"
     );
+  }
+
+  // -- Round-6 16-bit-PNG / float-pixel rotate parity ------------------
+  //
+  // image-rs 0.25's PNG decoder emits `Luma16`/`LumaA16`/`Rgb16`/
+  // `Rgba16` for `BitDepth::Sixteen` PNG inputs (`codecs/png.rs:64-71`),
+  // and caller-supplied `DynamicImage::ImageRgb32F`/`ImageRgba32F`
+  // round-trip through the same fallible rotate path. Round 5
+  // missed these and left them on an infallible image-rs delegate
+  // that could abort on allocator pressure for a 16-bit PNG with
+  // EXIF Rotate90/270 (the load_image entry-point closure was
+  // broken). Round 6 generalizes the manual rotate over `T: Copy`
+  // so the same `try_reserve_exact` gate covers u16 and f32 — the
+  // tests below verify byte-identical parity with `image::imageops`
+  // for the new element widths.
+
+  /// Build a non-square `Rgb16` image whose subpixels encode pixel
+  /// position so any rotation is checkable byte-for-byte against
+  /// `image::imageops::rotate*`. Uses the high byte of each u16 so
+  /// the values survive any accidental u8-truncation regression and
+  /// remain unique-per-pixel for small sizes.
+  fn xy_encoded_rgb16(width: u32, height: u32) -> DynamicImage {
+    let mut buf: ImageBuffer<Rgb<u16>, Vec<u16>> = ImageBuffer::new(width, height);
+    for y in 0..height {
+      for x in 0..width {
+        // (256 * (10*x + 1), 256 * (10*y + 1), 0xBEEF) — three
+        // independent u16 channels with non-zero high bytes so a
+        // hypothetical truncation to u8 would zero out the channel
+        // distinctly.
+        buf.put_pixel(
+          x,
+          y,
+          Rgb([
+            (((x * 10) as u16) + 1) << 8,
+            (((y * 10) as u16) + 1) << 8,
+            0xBEEF,
+          ]),
+        );
+      }
+    }
+    DynamicImage::ImageRgb16(buf)
+  }
+
+  /// `Luma16` (single-channel u16) test image: encodes the
+  /// row-major pixel index in the high byte plus a fixed low-byte
+  /// pattern so any rotation is byte-traceable.
+  fn xy_encoded_luma16(width: u32, height: u32) -> DynamicImage {
+    let mut buf: ImageBuffer<Luma<u16>, Vec<u16>> = ImageBuffer::new(width, height);
+    for y in 0..height {
+      for x in 0..width {
+        let idx = (y * width + x) as u16;
+        // (idx << 8) | 0x5A — high byte = row-major index, low byte
+        // = constant 0x5A so a stride-1 u8-truncation would lose
+        // identity.
+        buf.put_pixel(x, y, Luma([(idx << 8) | 0x005A]));
+      }
+    }
+    DynamicImage::ImageLuma16(buf)
+  }
+
+  /// `Rgb32F` test image: encodes pixel position in three f32
+  /// channels with deliberately fractional values so any 4-byte
+  /// stride bug surfaces as a visible bit-pattern shift.
+  fn xy_encoded_rgb32f(width: u32, height: u32) -> DynamicImage {
+    let mut buf: ImageBuffer<Rgb<f32>, Vec<f32>> = ImageBuffer::new(width, height);
+    for y in 0..height {
+      for x in 0..width {
+        // (x + 0.25, y + 0.5, 0.875) — distinct fractions in each
+        // channel; 0.875 is exactly representable so equality
+        // comparison against the rotated buffer is exact.
+        buf.put_pixel(x, y, Rgb([(x as f32) + 0.25, (y as f32) + 0.5, 0.875]));
+      }
+    }
+    DynamicImage::ImageRgb32F(buf)
+  }
+
+  #[test]
+  fn rotate90_rgb16_manual_matches_reference() {
+    // ROUND-6: Rotate90 on Rgb16 now routes through the same
+    // truly-fallible `rotate_buf<u16>` path the u8 variants use.
+    // A non-square 4x3 image must rotate to 3x4 with byte-identical
+    // pixels to `image::imageops::rotate90`. This is the regression
+    // test for the 16-bit-PNG-EXIF-rotate `load_image` gap the audit
+    // missed in round 5.
+    let img = xy_encoded_rgb16(4, 3);
+    let reference = ::image::imageops::rotate90(img.as_rgb16().expect("rgb16 source"));
+    let out = apply_orientation_fallible(img, Orientation::Rotate90)
+      .expect("manual Rgb16 rotate90 should succeed under MAX_DECODED_IMAGE_BYTES");
+    assert_eq!(out.width(), 3, "Rotate90 swaps width <- height");
+    assert_eq!(out.height(), 4, "Rotate90 swaps height <- width");
+    assert_eq!(
+      out.as_rgb16().expect("rgb16 output").as_raw(),
+      reference.as_raw(),
+      "manual Rgb16 rotate90 must yield byte-identical u16 subpixels to image::imageops::rotate90"
+    );
+  }
+
+  #[test]
+  fn rotate270_luma16_manual_matches_reference() {
+    // Rotate270 on Luma16 — single-channel u16 path. Verifies the
+    // 1-subpixel-per-pixel stride is honored for the u16 element
+    // type. Non-square 4x3 → 3x4.
+    let img = xy_encoded_luma16(4, 3);
+    let reference = ::image::imageops::rotate270(img.as_luma16().expect("luma16 source"));
+    let out =
+      apply_orientation_fallible(img, Orientation::Rotate270).expect("manual Luma16 rotate270 ok");
+    assert_eq!(out.width(), 3);
+    assert_eq!(out.height(), 4);
+    assert_eq!(
+      out.as_luma16().expect("luma16 output").as_raw(),
+      reference.as_raw(),
+      "manual Luma16 rotate270 must yield byte-identical u16 subpixels to image::imageops::rotate270"
+    );
+  }
+
+  #[test]
+  fn rotate90_rgb32f_manual_matches_reference() {
+    // Rotate90 on Rgb32F — verifies the `rotate_buf<f32>` arm.
+    // Comparison is bit-exact via `Vec<f32>` equality because the
+    // operation is a pure permutation (no arithmetic, no FP drift).
+    let img = xy_encoded_rgb32f(4, 3);
+    let reference = ::image::imageops::rotate90(img.as_rgb32f().expect("rgb32f source"));
+    let out =
+      apply_orientation_fallible(img, Orientation::Rotate90).expect("manual Rgb32F rotate90 ok");
+    assert_eq!(out.width(), 3);
+    assert_eq!(out.height(), 4);
+    assert_eq!(
+      out.as_rgb32f().expect("rgb32f output").as_raw(),
+      reference.as_raw(),
+      "manual Rgb32F rotate90 must yield bit-identical f32 subpixels to image::imageops::rotate90 \
+       (permutation only — no FP arithmetic)"
+    );
+  }
+
+  #[test]
+  fn synthetic_16bit_rotate_succeeds_via_orientation_entry_point() {
+    // End-to-end check that mimics the broken-by-round-5 load_image
+    // closure: build a 16-bit `DynamicImage` directly (no on-disk
+    // PNG needed; a unit test does not need a real decoder to
+    // exercise the post-decode rotate path) and hand it to
+    // `apply_orientation_fallible` with EXIF Rotate90 / Rotate270 /
+    // composite orientations. All four allocating-rotate
+    // orientations must now succeed via the generic `rotate_buf`
+    // path — round 5 would have hit the infallible fallback for
+    // these. (The "real 16-bit PNG decode" path is exercised
+    // implicitly through `load_image` once a 16-bit PNG with EXIF
+    // orientation is supplied; we test the rotate-shaped subgoal
+    // here without coupling to disk I/O.)
+    for rotation in [
+      Orientation::Rotate90,
+      Orientation::Rotate270,
+      Orientation::Rotate90FlipH,
+      Orientation::Rotate270FlipH,
+    ] {
+      let img = xy_encoded_rgb16(4, 3);
+      let out = apply_orientation_fallible(img, rotation)
+        .expect("16-bit Rgb16 rotate must succeed via the round-6 fallible u16 path");
+      assert_eq!(out.width(), 3, "all four rotate orientations swap w<->h");
+      assert_eq!(out.height(), 4);
+      assert!(
+        matches!(out, DynamicImage::ImageRgb16(_)),
+        "output must preserve the source DynamicImage variant (Rgb16 in, Rgb16 out)"
+      );
+    }
   }
 
   // -- Byte-budget gate -----------------------------------------------
