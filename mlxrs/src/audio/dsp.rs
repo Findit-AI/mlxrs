@@ -580,26 +580,25 @@ pub enum Window<'a> {
 /// the irfft output, which is the only self-consistent behavior.
 /// `hop_length` defaults to `win_length / 4`.
 ///
-/// When `win_length < n_fft`, the synthesis window is zero-padded up to the
-/// full `n_fft` width exactly as [`stft`] pads its analysis window
-/// (`[window(win_length), zeros(n_fft - win_length)]`), and the overlap-add
-/// operates on full `n_fft`-wide irfft frames. This makes `istft` a
-/// mathematically exact inverse of `stft` for `win_length < n_fft` (within
-/// the COLA-covered region). The upstream reference instead slices each frame
-/// down to `win_length` and trims `win_length / 2`, which is NOT a valid
-/// inverse for `win_length < n_fft` (wrong center offset, dropped tail
-/// energy); we deliberately implement the correct inverse here.
+/// **Only `win_length == n_fft` is supported** (the default). The short-window
+/// `win_length < n_fft` inverse is intentionally rejected: upstream
+/// `mlx_audio.dsp.istft`'s own short-window inverse is non-reconstructing — it
+/// slices each irfft frame down to `win_length` and trims `win_length / 2`,
+/// which leaves boundary samples uncovered and shifts the center offset — so
+/// there is no faithful reference to mirror, and a corrected short-window OLA
+/// kept leaving a tail sample unreconstructed across earlier review rounds.
+/// Passing `win_length != n_fft` therefore returns a recoverable
+/// [`Error::Backend`]; a reconstructing short-window inverse is tracked as a
+/// follow-up. With `win_length == n_fft` the synthesis window is exactly
+/// `n_fft` wide and the overlap-add is an exact inverse of [`stft`] over the
+/// COLA-covered region.
 ///
 /// Normalization mirrors the reference: each output sample is divided by the
 /// overlap-add sum of the (optionally squared) window. With `normalized =
 /// false` the divisor is `Σ w` (simple window normalization); with
 /// `normalized = true` it is `Σ w²` (COLA / `torch.istft` convention).
 /// Positions whose window-sum is `<= 1e-10` are left unnormalized (matching
-/// the reference's `mx.where(window_sum > 1e-10, ...)` guard). Samples outside
-/// the window's COLA-covered span (e.g. the very last samples when
-/// `win_length < n_fft` and the zero-padded window tail leaves them
-/// uncovered) therefore stay un-normalized — this is intrinsic to the
-/// windowing, not a defect.
+/// the reference's `mx.where(window_sum > 1e-10, ...)` guard).
 ///
 /// Center / `length` ordering matches librosa / mlx-audio center semantics:
 /// when `center = true` (the default), the `n_fft / 2` reflect-pad [`stft`]
@@ -620,8 +619,9 @@ pub enum Window<'a> {
 ///     `n_fft = (n_freqs - 1) * 2`),
 ///   - `num_frames == 0`,
 ///   - `hop_length == 0` or `win_length == 0`,
-///   - `win_length > n_fft` (the synthesis window cannot be longer than the
-///     irfft frame — the reference would broadcast-fail),
+///   - `win_length != n_fft` (only `win_length == n_fft` is supported; the
+///     short-window `win_length < n_fft` inverse is non-reconstructing
+///     upstream and is rejected, tracked as a follow-up),
 ///   - an explicit [`Window::Array`] is not 1-D,
 ///   - any derived size overflows `usize`/`i32`, the OLA output length `t`
 ///     exceeds the
@@ -673,9 +673,24 @@ pub fn istft(
       message: "istft: win_length must be > 0".into(),
     });
   }
-  if win_length > n_fft {
+  // `istft` currently supports only `win_length == n_fft` (the default). The
+  // short-window (`win_length < n_fft`) inverse is intentionally unsupported:
+  // upstream `mlx_audio.dsp.istft`'s own short-window inverse is
+  // non-reconstructing (it slices each frame down to `win_length` and trims
+  // `win_length / 2`, leaving boundary samples uncovered / shifted), so there
+  // is no faithful reference to mirror. Earlier rounds attempted a corrected
+  // short-window OLA but every variant left a tail sample unreconstructed.
+  // Rejecting up front kills that defect class; a reconstructing short-window
+  // inverse is tracked as a follow-up. `win_length > n_fft` is likewise
+  // rejected (the synthesis window cannot exceed the irfft frame width).
+  if win_length != n_fft {
     return Err(Error::Backend {
-      message: format!("istft: win_length {win_length} > n_fft {n_fft} (unsupported)"),
+      message: format!(
+        "istft: win_length {win_length} != n_fft {n_fft} is unsupported; \
+         istft currently requires win_length == n_fft (the short-window \
+         win_length < n_fft inverse is non-reconstructing upstream and is \
+         tracked as a follow-up)"
+      ),
     });
   }
   let hop_length = hop_length.unwrap_or(win_length / 4);
@@ -684,89 +699,11 @@ pub fn istft(
       message: "istft: hop_length must be > 0".into(),
     });
   }
-  let win_length_i32 = i32::try_from(win_length).map_err(|_| Error::Backend {
-    message: format!("istft: win_length {win_length} exceeds i32::MAX"),
-  })?;
-
-  // Synthesis window. Named → periodic form (symmetric of `win_length + 1`,
-  // trailing sample dropped); Array → used verbatim. Either way, zero-pad up
-  // to `win_length` if shorter (matches the reference).
-  let window = match window {
-    Window::Named(name) => {
-      let win_len_p1 = win_length.checked_add(1).ok_or_else(|| Error::Backend {
-        message: format!("istft: win_length {win_length} + 1 overflows usize"),
-      })?;
-      let full = window_from_name(name, win_len_p1)?;
-      // Drop the trailing duplicate sample: full[0 .. win_length].
-      ops::indexing::slice(&full, &[0], &[win_length_i32], &[1])?
-    }
-    Window::Array(w) => {
-      if w.ndim() != 1 {
-        return Err(Error::Backend {
-          message: format!("istft: explicit window must be 1-D, got {}-D", w.ndim()),
-        });
-      }
-      w.try_clone()?
-    }
-  };
-  // Synthesis window must be padded to the **full `n_fft`** width exactly as
-  // [`stft`] pads its analysis window (zeros appended at the END): `stft`
-  // builds `w = [window(win_length), zeros(n_fft - win_length)]` and applies
-  // it to every `n_fft`-wide frame, so a mathematically exact inverse must
-  // overlap-add `n_fft`-wide frames against the *same* `n_fft`-wide window.
-  // The previous code instead sliced each irfft frame down to `win_length`
-  // and trimmed by `win_length / 2`, which is NOT the inverse of `stft` for
-  // `win_length < n_fft` (wrong offset / dropped energy) — see the Codex
-  // review note. We pad in two steps to keep the diagnostics specific:
-  //   1. up to `win_length` (no-op for the Named path; pads a short explicit
-  //      `Window::Array` — mirrors the reference's `w` zero-pad), then
-  //   2. up to `n_fft` (the `stft` analysis-window pad).
-  let w_len = window.shape()[0];
-  let window = if w_len < win_length {
-    let pad_value = Array::zeros::<f32>(&[0i32; 0])?;
-    let pad_high = [
-      i32::try_from(win_length - w_len).map_err(|_| Error::Backend {
-        message: format!("istft: window pad {} exceeds i32::MAX", win_length - w_len),
-      })?,
-    ];
-    ops::shape::pad(
-      &window,
-      &[0_i32],
-      &[0_i32],
-      &pad_high,
-      &pad_value,
-      c"constant",
-    )?
-  } else {
-    window
-  };
-  // Pad the (win_length-wide) synthesis window up to n_fft with trailing
-  // zeros, matching `stft`'s `[window, zeros(n_fft - win_length)]`. No-op
-  // when win_length == n_fft (the default).
-  let window = if win_length < n_fft {
-    let pad_value = Array::zeros::<f32>(&[0i32; 0])?;
-    let pad_high = [
-      i32::try_from(n_fft - win_length).map_err(|_| Error::Backend {
-        message: format!(
-          "istft: window pad-to-n_fft {} exceeds i32::MAX",
-          n_fft - win_length
-        ),
-      })?,
-    ];
-    ops::shape::pad(
-      &window,
-      &[0_i32],
-      &[0_i32],
-      &pad_high,
-      &pad_value,
-      c"constant",
-    )?
-  } else {
-    window
-  };
-
-  // Every frame is `n_fft` wide (the irfft output width and the padded
-  // synthesis-window width), so the overlap-add stride/frame width is `n_fft`.
+  // Every frame is `n_fft` wide (the irfft output width and the synthesis
+  // window width — `win_length == n_fft` is enforced above), so the
+  // overlap-add stride / frame width is `n_fft`. Computed here, before any
+  // window construction, so the OOM cap below precedes the (potentially large)
+  // named-window allocation.
   let frame_width = n_fft;
 
   // Output / window-sum buffer length: `t = (num_frames - 1) * hop + n_fft`.
@@ -822,11 +759,60 @@ pub fn istft(
     message: format!("istft: n_fft {n_fft} exceeds i32::MAX"),
   })?;
 
+  // Synthesis window construction — placed AFTER the OOM cap above so a
+  // pathological lazy huge-`n_fft` spectrum is rejected before the named
+  // window (`window_from_name(n_fft)`, a CPU `Vec` up to the work cap) is
+  // ever allocated. Named → periodic form (symmetric window of `n_fft + 1`
+  // with its trailing duplicate sample dropped, the COLA-friendly periodic
+  // window the reference uses); Array → used verbatim, then zero-padded up to
+  // `n_fft` if shorter (mirrors the reference's `w` zero-pad). `win_length ==
+  // n_fft` is enforced above, so the window is exactly `n_fft` wide and no
+  // pad-to-`n_fft`-from-`win_length` step (the source of the prior round's
+  // uncovered-tail bug) is needed.
+  let n_fft_p1 = n_fft.checked_add(1).ok_or_else(|| Error::Backend {
+    message: format!("istft: n_fft {n_fft} + 1 overflows usize"),
+  })?;
+  let window = match window {
+    Window::Named(name) => {
+      let full = window_from_name(name, n_fft_p1)?;
+      // Drop the trailing duplicate sample: full[0 .. n_fft].
+      ops::indexing::slice(&full, &[0], &[n_fft_i32], &[1])?
+    }
+    Window::Array(w) => {
+      if w.ndim() != 1 {
+        return Err(Error::Backend {
+          message: format!("istft: explicit window must be 1-D, got {}-D", w.ndim()),
+        });
+      }
+      w.try_clone()?
+    }
+  };
+  // Zero-pad an explicit `Window::Array` shorter than `n_fft` up to `n_fft`
+  // (mirrors the reference's `w` zero-pad). No-op for the Named path and for a
+  // full-width array.
+  let w_len = window.shape()[0];
+  let window = if w_len < n_fft {
+    let pad_value = Array::zeros::<f32>(&[0i32; 0])?;
+    let pad_high = [i32::try_from(n_fft - w_len).map_err(|_| Error::Backend {
+      message: format!("istft: window pad {} exceeds i32::MAX", n_fft - w_len),
+    })?];
+    ops::shape::pad(
+      &window,
+      &[0_i32],
+      &[0_i32],
+      &pad_high,
+      &pad_value,
+      c"constant",
+    )?
+  } else {
+    window
+  };
+
   // Inverse FFT of every frame along the frequency axis (axis 1):
-  // (num_frames, n_freqs) complex → (num_frames, n_fft) real. Frames stay
-  // full `n_fft` wide — they are NOT sliced to `win_length` (that was the
-  // pre-fix bug); the trailing-zero region of the padded synthesis window
-  // zeroes out the unused tail during the multiply below.
+  // (num_frames, n_freqs) complex → (num_frames, n_fft) real. Frames are full
+  // `n_fft` wide and the synthesis window is `n_fft` wide (`win_length ==
+  // n_fft`), so the overlap-add multiply below is a straight element-wise
+  // product with no slicing.
   let frames_time = fft::irfft(x, n_fft_i32, 1, FftNorm::Backward)?;
 
   // updates_reconstructed = (frames_time * w).flatten() — shape
@@ -885,10 +871,9 @@ pub fn istft(
 
   // Final trimming. The center reflect-pad `stft` added is `n_fft / 2` on
   // EACH side (`reflect_pad_1d(samples, n_fft / 2)`), so the centered signal
-  // begins at raw OLA index `pad = n_fft / 2` — NOT `win_length / 2` (the
-  // old, wrong offset for `win_length < n_fft`) and the center pad must be
-  // removed BEFORE `length` is applied (librosa / mlx-audio center
-  // semantics):
+  // begins at raw OLA index `pad = n_fft / 2` (with `win_length == n_fft` this
+  // equals `win_length / 2`), and the center pad must be removed BEFORE
+  // `length` is applied (librosa / mlx-audio center semantics):
   //   * `center == true,  length = Some(n)` → `reconstructed[pad .. pad + n]`
   //     (drop the reflected prefix, then keep `n` real samples). The pre-fix
   //     code returned `reconstructed[0 .. n]`, i.e. the reflected prefix plus
@@ -1492,7 +1477,8 @@ mod tests {
       ),
       Err(Error::Backend { .. })
     ));
-    // win_length > n_fft (n_fft = 8 here).
+    // win_length != n_fft (n_fft = 8 here; 16 > 8 is one side of the rejection,
+    // the short-window < side is covered by `istft_rejects_win_length_lt_n_fft`).
     assert!(matches!(
       istft(
         &spec,
@@ -1578,125 +1564,91 @@ mod tests {
   }
 
   #[test]
-  fn istft_roundtrip_win_length_lt_n_fft_asserts_values() {
-    // Codex `win_length < n_fft` finding: the FAITHFUL inverse overlap-adds
-    // full `n_fft`-wide frames against the synthesis window padded to `n_fft`
-    // exactly as `stft` pads its analysis window, and trims by `n_fft/2`. We
-    // pass the SAME base window `stft` uses (symmetric Hann of `win_length`)
-    // via Window::Array + normalized=true, so each frame contributes `w²·x`
-    // and the divisor is `Σ w²` → exact `x` over the COLA-covered span.
-    //
-    // n_fft=16, win_length=8, hop=4 on a 16-sample signal: padded=32,
-    // num_frames=5, n_freqs=9, t=(5-1)*4+16=32, centered region [8 .. 24] = 16
-    // samples. The analysis window is only nonzero in its first 8 of 16
-    // samples, so the LAST centered sample (index 15) has window-sum 0 and is
-    // left un-normalized (intrinsic to the zero-padded window, NOT a defect);
-    // every covered sample [0 .. 15) reconstructs to the original. Verified
-    // against an f64 numpy mirror (covered-region max error 1.1e-16). The
-    // pre-fix code (slice frames to win_length, trim win_length/2) produced a
-    // SHIFTED/corrupt signal here (error ~0.4 across the board).
+  fn istft_rejects_win_length_lt_n_fft() {
+    // Scope reduction (Codex round 3): the short-window `win_length < n_fft`
+    // inverse is non-reconstructing upstream (it slices each frame to
+    // `win_length` and trims `win_length / 2`, leaving a tail sample
+    // uncovered), and every corrected OLA attempt in prior rounds still left a
+    // boundary sample unreconstructed. We therefore REJECT `win_length != n_fft`
+    // outright rather than ship a masked-tail roundtrip. Here n_fft=16
+    // (n_freqs=9 → (9-1)*2) and win_length=8 < n_fft must return Err, for both
+    // an explicit Window::Array and a Window::Named.
     let buf = signal_16();
     let x = Array::from_slice::<f32>(&buf, &[16i32]).unwrap();
     let spec = stft(&x, 16, 4, Some(8)).unwrap();
-    assert_eq!(spec.shape(), vec![5, 9]); // (num_frames, n_fft/2+1)
-    let w = hann_window(8).unwrap(); // same base window stft uses (win_length=8)
-    let rec = istft(
-      &spec,
-      Some(4), // hop_length (matches stft)
-      Some(8), // win_length < n_fft
-      Window::Array(&w),
-      true,     // center → trim n_fft/2 = 8
-      Some(16), // length → keep all 16 (covered region is [0..15))
-      true,     // normalized (Σw²)
-    )
-    .unwrap();
-    let r = to_vec(&rec);
-    assert_eq!(r.len(), 16, "win<n_fft round-trip length mismatch");
-    // Assert VALUES over the COLA-covered span [0 .. 15). The last sample is
-    // outside the window's coverage (window-sum 0) and is intentionally not
-    // asserted here.
-    for (i, (g, e)) in r.iter().zip(buf.iter()).take(15).enumerate() {
-      assert!(
-        (g - e).abs() < 1e-5,
-        "win<n_fft reconstruction[{i}]: got {g}, want {e} (diff {})",
-        (g - e).abs()
-      );
-    }
-  }
-
-  #[test]
-  fn istft_roundtrip_win_length_lt_n_fft_full_coverage_exact() {
-    // Companion to the above: with a wider window (win_length=12 < n_fft=16,
-    // hop=4) the zero-padded synthesis window DOES satisfy COLA across the
-    // whole centered region, so ALL 16 samples reconstruct exactly. This pins
-    // the faithful `win_length < n_fft` inverse end-to-end with no
-    // boundary-coverage caveat (f64 numpy mirror: max error 2.2e-16).
-    let buf = signal_16();
-    let x = Array::from_slice::<f32>(&buf, &[16i32]).unwrap();
-    let spec = stft(&x, 16, 4, Some(12)).unwrap();
-    assert_eq!(spec.shape(), vec![5, 9]);
-    let w = hann_window(12).unwrap();
-    let rec = istft(
+    assert_eq!(spec.shape(), vec![5, 9]); // (num_frames, n_fft/2+1), n_fft=16
+    let w = hann_window(8).unwrap();
+    let res_array = istft(
       &spec,
       Some(4),
-      Some(12),
+      Some(8), // win_length=8 < n_fft=16 → unsupported
       Window::Array(&w),
       true,
       Some(16),
       true,
-    )
-    .unwrap();
-    let r = to_vec(&rec);
-    assert_eq!(r.len(), 16);
-    for (i, (g, e)) in r.iter().zip(buf.iter()).enumerate() {
-      assert!(
-        (g - e).abs() < 1e-5,
-        "win12<n_fft16 reconstruction[{i}]: got {g}, want {e} (diff {})",
-        (g - e).abs()
-      );
-    }
+    );
+    assert!(
+      matches!(res_array, Err(Error::Backend { .. })),
+      "win_length=8 < n_fft=16 (Window::Array) must be rejected, got {res_array:?}"
+    );
+    let res_named = istft(
+      &spec,
+      Some(4),
+      Some(8), // win_length=8 < n_fft=16 → unsupported
+      Window::Named("hann"),
+      true,
+      None,
+      false,
+    );
+    assert!(
+      matches!(res_named, Err(Error::Backend { .. })),
+      "win_length=8 < n_fft=16 (Window::Named) must be rejected, got {res_named:?}"
+    );
   }
 
   #[test]
-  fn istft_rejects_pathological_scatter_work_before_alloc() {
-    // Codex OOM finding: the real scatter/update workload is
-    // `num_frames * n_fft`, which can dwarf the OLA *output* length `t` for
-    // small hops. The `t <= MAX_DECODED_SAMPLES` cap does NOT catch this; the
-    // dedicated MAX_OLA_WORK guard must reject it BEFORE any
-    // broadcast/flatten/`try_reserve` (and before the irfft).
+  fn istft_rejects_pathological_scatter_work_before_window_alloc() {
+    // Codex OOM finding (+ the medium "work cap runs after named-window alloc"
+    // finding): the real scatter/update workload is `num_frames * n_fft`, which
+    // can dwarf the OLA *output* length `t` for small hops. The
+    // `t <= MAX_DECODED_SAMPLES` cap does NOT catch this; the dedicated
+    // MAX_OLA_WORK guard must reject it BEFORE any window construction
+    // (`window_from_name(n_fft + 1)`, a CPU Vec up to the cap) and before any
+    // broadcast/flatten/`try_reserve`/irfft.
     //
-    // We pick a shape where `t` is small but the work explodes, using a LAZY
-    // mlx spectrum (`zeros(...).astype(Complex64)`) so nothing is materialized
-    // — exactly the "shaped/lazy input" the finding describes. The cap fires
-    // off `x.shape()` alone, so the (logically ~600 MiB) spectrum is never
-    // allocated, the synthesis-window pads stay lazy, and the irfft never
-    // runs.
+    // We use a LAZY mlx spectrum (`zeros(...).astype(Complex64)`) — nothing is
+    // materialized — and crucially `Window::Named("hann")` with the DEFAULT
+    // `win_length` (= n_fft). If the cap ran after window construction, the
+    // Named path would first allocate `hann_window(n_fft + 1)` ≈ 18 Mi f32s.
+    // Because the cap precedes window construction, that allocation never
+    // happens. (`win_length` must equal `n_fft` to pass the supported-window
+    // check, so we cannot use a tiny window to dodge the allocation here — the
+    // ordering is what protects the common Named path.)
     //
-    // num_frames=4, n_freqs=9 Mi+1 → n_fft=(n_freqs-1)*2=18 Mi.
+    // num_frames=4, n_freqs=9 Mi+1 → n_fft=(n_freqs-1)*2=18 Mi, win_length=18 Mi.
     //   work = num_frames * n_fft = 4 * 18 Mi = 72 Mi  > MAX_OLA_WORK (64 Mi) ✓
     //   t    = (4-1)*hop + n_fft  = 6 + 18 Mi ≈ 18 Mi  < MAX_DECODED  (64 Mi)
-    // so ONLY the work cap can reject this — proving it is the work cap, not
-    // the output-length cap, doing the job. `win_length=Some(8)` +
-    // Window::Array keeps window construction trivial (no huge Vec).
+    // so ONLY the work cap can reject this — proving it is the work cap, not the
+    // output-length cap, doing the job.
     let n_freqs: i32 = 9 * 1024 * 1024 + 1;
     let num_frames: i32 = 4;
     let spec = Array::zeros::<f32>(&[num_frames, n_freqs])
       .unwrap()
       .astype(crate::Dtype::Complex64)
       .unwrap();
-    let w = hann_window(8).unwrap();
     let res = istft(
       &spec,
-      Some(2), // small hop → t stays under the decoded cap
-      Some(8), // tiny win_length → cheap window, padded lazily to n_fft
-      Window::Array(&w),
+      Some(2),               // small hop → t stays under the decoded cap
+      None,                  // win_length defaults to n_fft (the supported case)
+      Window::Named("hann"), // would alloc hann(n_fft+1) AFTER the cap — never reached
       true,
       None,
       false,
     );
     assert!(
       matches!(res, Err(Error::Backend { .. })),
-      "pathological num_frames*n_fft must be rejected by the MAX_OLA_WORK cap"
+      "pathological num_frames*n_fft must be rejected by the MAX_OLA_WORK cap \
+       before the named-window allocation"
     );
   }
 }
