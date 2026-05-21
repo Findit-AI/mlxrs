@@ -74,9 +74,11 @@ impl EmbeddingModelOutput {
 ///   `&mut` on the model (matching the references, where the module is frozen
 ///   for inference). One model can therefore back many concurrent encode
 ///   calls.
-/// - `input_ids` — an integer `(batch, seq_len)` array of token ids, padded to
+/// - `input_ids` — an `I32` `(batch, seq_len)` array of token ids, padded to
 ///   the batch's max length by the caller ([`encode`](super::encode::encode)
-///   builds it).
+///   builds it). `I32` is MLX's default index dtype for the embedding
+///   `take` / gather (matching `lm/generate.rs::token_window`), so a model's
+///   lookup can index with it directly without casting.
 /// - `attention_mask` — a `(batch, seq_len)` array, `1` for real tokens and
 ///   `0` for padding. Passed through to the pooling stage so padded positions
 ///   are excluded. Models that build internal additive attention biases derive

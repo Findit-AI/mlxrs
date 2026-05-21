@@ -138,7 +138,13 @@ impl EncodeConfig {
 /// (`1` for real tokens, `0` for padding).
 ///
 /// Returns `(input_ids, attention_mask, seq_len)`:
-/// - `input_ids` — `(batch, seq_len)` `u32` array (right-padded);
+/// - `input_ids` — `(batch, seq_len)` `i32` array (right-padded). `I32` is
+///   MLX's default index dtype for the embedding `take` / gather an
+///   [`EmbeddingModel`] performs (matching `lm/generate.rs::token_window`),
+///   so the lookup never has to cast. Each `u32` id is converted with a
+///   CHECKED `i32::try_from` (a token id `> i32::MAX` — realistically never —
+///   yields a recoverable [`Error::ShapeMismatch`] rather than silently
+///   wrapping negative);
 /// - `attention_mask` — `(batch, seq_len)` `f32` array (`1.0` / `0.0`);
 /// - `seq_len` — the batch max length (after per-text truncation).
 ///
@@ -195,24 +201,40 @@ fn tokenize_and_pad(
 
   // Flatten into right-padded (batch, seq_len) id + mask buffers. Each row's
   // own mask is all-`1` (pad-stripped above); the only `0` cells come from
-  // the manual padding appended here to reach the batch max length.
+  // the manual padding appended here to reach the batch max length. Ids are
+  // emitted as `i32` (MLX's index dtype) via a CHECKED `u32 -> i32`
+  // conversion so a token id `> i32::MAX` is a recoverable error, not a
+  // silent wrap to a negative index.
   let total = batch
     .checked_mul(seq_len)
     .ok_or_else(|| Error::ShapeMismatch {
       message: format!("encode: batch {batch} * seq_len {seq_len} overflows usize"),
     })?;
-  let mut id_data: Vec<u32> = try_with_capacity(total)?;
+  // The padding id is written into every padded cell, so range-check it once
+  // up front rather than per cell.
+  let pad_id = i32::try_from(pad_token_id).map_err(|_| Error::ShapeMismatch {
+    message: format!(
+      "encode: pad_token_id {pad_token_id} exceeds i32::MAX ({})",
+      i32::MAX
+    ),
+  })?;
+  let mut id_data: Vec<i32> = try_with_capacity(total)?;
   let mut mask_data: Vec<f32> = try_with_capacity(total)?;
   for (ids, mask) in &rows {
     let real = ids.len();
-    id_data.extend_from_slice(ids);
+    for &id in ids {
+      let id = i32::try_from(id).map_err(|_| Error::ShapeMismatch {
+        message: format!("encode: token id {id} exceeds i32::MAX ({})", i32::MAX),
+      })?;
+      id_data.push(id);
+    }
     mask_data.extend(mask.iter().map(|&m| f32::from(m)));
     let pad = seq_len - real;
-    id_data.extend(std::iter::repeat_n(pad_token_id, pad));
+    id_data.extend(std::iter::repeat_n(pad_id, pad));
     mask_data.extend(std::iter::repeat_n(0.0_f32, pad));
   }
 
-  let input_ids = Array::from_slice::<u32>(&id_data, &(batch, seq_len))?;
+  let input_ids = Array::from_slice::<i32>(&id_data, &(batch, seq_len))?;
   let attention_mask = Array::from_slice::<f32>(&mask_data, &(batch, seq_len))?;
   Ok((input_ids, attention_mask, seq_len))
 }
@@ -299,6 +321,32 @@ pub fn encode(
           pooled_shape[0],
           texts.len(),
           pooled_shape
+        ),
+      });
+    }
+    // The pooler's hidden width must match the hidden states' (`(batch,
+    // seq_len, hidden)`): a pooler emitting a different width than the model's
+    // hidden dim would otherwise be normalized / truncated and returned as
+    // embeddings of an unexpected dimension. This fast-path bypasses the
+    // hidden-state poolers' rank-3 guard, so confirm `last_hidden_state` is
+    // rank-3 before indexing its hidden axis (same panic→`Err` discipline).
+    let hidden_shape = output.last_hidden_state.shape();
+    if hidden_shape.len() != 3 {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "encode: model last_hidden_state must be rank-3 (batch, seq_len, hidden), \
+           got rank {} shape {:?}",
+          hidden_shape.len(),
+          hidden_shape
+        ),
+      });
+    }
+    if pooled_shape[1] != hidden_shape[2] {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "encode: model pooled_output hidden width {} must match last_hidden_state hidden {}, \
+           got pooled shape {:?} vs hidden {:?}",
+          pooled_shape[1], hidden_shape[2], pooled_shape, hidden_shape
         ),
       });
     }
@@ -463,7 +511,8 @@ mod tests {
     assert_eq!(ids.shape(), vec![2, 3]);
     assert_eq!(mask.shape(), vec![2, 3]);
     // Row 1 is right-padded with pad_token_id = 7 and mask 0 in the tail.
-    assert_eq!(ids.to_vec::<u32>().unwrap(), vec![0, 1, 2, 3, 4, 7]);
+    // `input_ids` is `I32` (MLX's index dtype), so read it as `i32`.
+    assert_eq!(ids.to_vec::<i32>().unwrap(), vec![0, 1, 2, 3, 4, 7]);
     assert_eq!(
       mask.to_vec::<f32>().unwrap(),
       vec![1.0, 1.0, 1.0, 1.0, 1.0, 0.0]
@@ -477,7 +526,7 @@ mod tests {
     let (mut ids, mut mask, seq_len) =
       tokenize_and_pad(&tok, &["a b c", "d e"], false, Some(2), 0).unwrap();
     assert_eq!(seq_len, 2);
-    assert_eq!(ids.to_vec::<u32>().unwrap(), vec![0, 1, 3, 4]);
+    assert_eq!(ids.to_vec::<i32>().unwrap(), vec![0, 1, 3, 4]);
     assert_eq!(mask.to_vec::<f32>().unwrap(), vec![1.0, 1.0, 1.0, 1.0]);
   }
 
@@ -555,7 +604,7 @@ mod tests {
     let (mut ids, mut mask, seq_len) = tokenize_and_pad(&tok, &["a b c"], false, None, 0).unwrap();
     assert_eq!(seq_len, 3, "pad cells must be stripped, not counted");
     assert_eq!(ids.shape(), vec![1, 3]);
-    assert_eq!(ids.to_vec::<u32>().unwrap(), vec![0, 1, 2]);
+    assert_eq!(ids.to_vec::<i32>().unwrap(), vec![0, 1, 2]);
     assert_eq!(mask.to_vec::<f32>().unwrap(), vec![1.0, 1.0, 1.0]);
   }
 
@@ -573,8 +622,8 @@ mod tests {
       tokenize_and_pad(&padded, &["a b c", "d e"], false, None, 7).unwrap();
     assert_eq!(u_seq, p_seq);
     assert_eq!(
-      u_ids.to_vec::<u32>().unwrap(),
-      p_ids.to_vec::<u32>().unwrap()
+      u_ids.to_vec::<i32>().unwrap(),
+      p_ids.to_vec::<i32>().unwrap()
     );
     assert_eq!(
       u_mask.to_vec::<f32>().unwrap(),
@@ -753,6 +802,45 @@ mod tests {
   fn encode_none_rejects_wrong_batch_pooled_output() {
     let tok = word_tokenizer();
     let model = raw_pooled_model(vec![7.0, 5.0], vec![1, 2]);
+    let cfg = EncodeConfig::new()
+      .add_special_tokens(false)
+      .strategy(PoolingStrategy::None)
+      .normalize(false);
+    let err = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap_err();
+    assert!(
+      matches!(err, Error::ShapeMismatch { .. }),
+      "expected ShapeMismatch, got {err:?}"
+    );
+  }
+
+  /// A correctly-ranked, correctly-batched `pooled_output` whose hidden width
+  /// differs from `last_hidden_state`'s hidden dim must be rejected with
+  /// [`Error::ShapeMismatch`] for `Cls` — otherwise it would be normalized /
+  /// truncated and returned as embeddings of an unexpected dimension. The
+  /// canned hidden states are `(.., .., 2)`, so a `(2, 3)` pooler is wrong-width
+  /// while still passing the rank-2 and batch checks.
+  #[test]
+  fn encode_cls_rejects_wrong_hidden_width_pooled_output() {
+    let tok = word_tokenizer();
+    // (batch=2, hidden=3) pooler, but the model's hidden dim is 2.
+    let model = raw_pooled_model(vec![7.0, 5.0, 1.0, 6.0, 4.0, 2.0], vec![2, 3]);
+    let cfg = EncodeConfig::new()
+      .add_special_tokens(false)
+      .strategy(PoolingStrategy::Cls)
+      .normalize(false);
+    let err = encode(&model, &tok, &["a b c", "d e"], &cfg).unwrap_err();
+    assert!(
+      matches!(err, Error::ShapeMismatch { .. }),
+      "expected ShapeMismatch, got {err:?}"
+    );
+  }
+
+  /// Same wrong-hidden-width guard for the `None` strategy's `pooled_output`
+  /// bypass.
+  #[test]
+  fn encode_none_rejects_wrong_hidden_width_pooled_output() {
+    let tok = word_tokenizer();
+    let model = raw_pooled_model(vec![7.0, 5.0, 1.0, 6.0, 4.0, 2.0], vec![2, 3]);
     let cfg = EncodeConfig::new()
       .add_special_tokens(false)
       .strategy(PoolingStrategy::None)
