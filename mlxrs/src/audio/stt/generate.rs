@@ -234,9 +234,12 @@ fn audio_path_to_mel<M: super::model::Model>(
 
   // 6. log-mel spectrogram. Output shape `(n_mels, T)` per the
   //    mlx-audio / Whisper canonical layout — fed straight into
-  //    `model.encode_audio`.
+  //    `model.encode_audio`. Threads `mc.log_floor` through the
+  //    `_with` variant so a Kaldi/Custom-floor model (AUDIO-5 LogFloor)
+  //    is encoded with its own floor instead of the hard-coded Whisper
+  //    `1e-10` (Codex bundle-#64 finding).
   let mc = model.mel_config();
-  dsp::log_mel_spectrogram(
+  dsp::log_mel_spectrogram_with(
     &samples_arr,
     mc.n_fft,
     mc.hop_length,
@@ -245,6 +248,7 @@ fn audio_path_to_mel<M: super::model::Model>(
     mc.sample_rate,
     mc.f_min,
     mc.f_max,
+    mc.log_floor,
   )
 }
 

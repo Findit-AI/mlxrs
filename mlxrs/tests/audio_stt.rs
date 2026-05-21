@@ -66,6 +66,12 @@ struct MockSttModel {
   /// Records every `encode_audio` mel shape so tests can assert the
   /// auto-resample / mel-config-override paths drove a different mel size.
   last_mel_shape: std::cell::RefCell<Option<Vec<usize>>>,
+  /// Records the MIN value of every `encode_audio` mel — the log-floor
+  /// choice (`LogFloor::Whisper` 1e-10 ⇒ log10 floor ≈ -10 vs
+  /// `LogFloor::Kaldi` 1e-8 ⇒ ≈ -8) is observable as a shift in the
+  /// floor of silence/low-energy bins, so a test can prove the floor
+  /// was actually threaded through `audio_path_to_mel`.
+  last_mel_min: std::cell::RefCell<Option<f32>>,
   /// Counts `decode_step` invocations — distinguishes "iterator empty for
   /// 0-second audio" from "iterator yielded 0 tokens by some other path".
   decode_calls: std::cell::RefCell<usize>,
@@ -81,6 +87,7 @@ impl MockSttModel {
       eos: vocab as u32,
       mel_cfg: MelConfig::whisper_default(),
       last_mel_shape: std::cell::RefCell::new(None),
+      last_mel_min: std::cell::RefCell::new(None),
       decode_calls: std::cell::RefCell::new(0),
     }
   }
@@ -100,6 +107,15 @@ impl LmModel for MockSttModel {
 impl SttModel for MockSttModel {
   fn encode_audio(&self, mel: &Array) -> mlxrs::Result<Array> {
     *self.last_mel_shape.borrow_mut() = Some(mel.shape());
+    // Record the mel's MIN so a test can observe which log-floor was
+    // applied (Whisper 1e-10 ⇒ floor ≈ -10; Kaldi 1e-8 ⇒ ≈ -8). `mel`
+    // is a fresh owned Array; `to_vec` needs `&mut`, so clone-then-eval
+    // into a local (the clone is the test mock's cost, not production).
+    let mut mel_local = mel.try_clone()?;
+    if let Ok(vals) = mel_local.to_vec::<f32>() {
+      let min = vals.iter().copied().fold(f32::INFINITY, f32::min);
+      *self.last_mel_min.borrow_mut() = Some(min);
+    }
     // Trivial encoder states; the loop forwards this unchanged to
     // `decode_step` without inspecting it.
     Array::from_slice::<f32>(&[0.0_f32], &[1, 1, 1])
@@ -469,6 +485,63 @@ fn stt_generate_uses_mel_config_override() {
   assert_eq!(
     mel_shape[0], 128,
     "n_mels override = 128 (canary-style), not 80 (whisper default)"
+  );
+  let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn stt_generate_threads_mel_config_log_floor() {
+  // **Bundle #64 Codex finding fix**: `MelConfig::log_floor` (AUDIO-5
+  // `LogFloor`) MUST be threaded through `audio_path_to_mel` so a
+  // Kaldi-style model gets the 1e-8 floor instead of the hard-coded
+  // Whisper 1e-10. Run the SAME audio through two models differing only
+  // in `log_floor` and assert the resulting mel's MIN differs by the
+  // expected ~2 log10-units (log10(1e-8) = -8 vs log10(1e-10) = -10):
+  // the Kaldi floor clamps low-energy bins HIGHER, so its mel min is
+  // strictly greater than the Whisper floor's.
+  let path = make_wav("log_floor", 16_000, ONE_SECOND_16K);
+
+  let cfg = || SttGenConfig {
+    lm: mlxrs::lm::generate::GenConfig {
+      max_tokens: 1,
+      ..mlxrs::lm::generate::GenConfig::default()
+    },
+    ..SttGenConfig::default()
+  };
+
+  let whisper_model = MockSttModel::new(3); // whisper_default ⇒ LogFloor::Whisper
+  let _ = stt_generate(&whisper_model, &path, cache(1), cfg())
+    .unwrap()
+    .map(|r| r.unwrap().token)
+    .collect::<Vec<_>>();
+  let whisper_min = whisper_model
+    .last_mel_min
+    .borrow()
+    .expect("whisper mel min recorded");
+
+  let mut kaldi_model = MockSttModel::new(3);
+  kaldi_model.mel_cfg = MelConfig {
+    log_floor: mlxrs::audio::dsp::LogFloor::Kaldi,
+    ..MelConfig::whisper_default()
+  };
+  let _ = stt_generate(&kaldi_model, &path, cache(1), cfg())
+    .unwrap()
+    .map(|r| r.unwrap().token)
+    .collect::<Vec<_>>();
+  let kaldi_min = kaldi_model
+    .last_mel_min
+    .borrow()
+    .expect("kaldi mel min recorded");
+
+  // The Kaldi floor (1e-8) clamps low-energy bins higher than the
+  // Whisper floor (1e-10): the per-bin floor differs by log10(1e-8) -
+  // log10(1e-10) = 2 units. The observed mel min must reflect the
+  // higher Kaldi floor (strictly greater) — proving the floor was
+  // actually threaded, not silently defaulted to Whisper.
+  assert!(
+    kaldi_min > whisper_min,
+    "Kaldi floor (1e-8) must lift the mel min above the Whisper floor (1e-10): \
+     kaldi_min={kaldi_min} whisper_min={whisper_min}"
   );
   let _ = fs::remove_file(&path);
 }
