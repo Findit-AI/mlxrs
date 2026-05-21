@@ -1344,6 +1344,27 @@ impl<M: Model> Iterator for BatchGenerator<'_, M> {
       self.last.clone()
     };
 
+    // Snapshot which rows were unfinished BEFORE this step. Rows already
+    // finished pre-step must NOT be re-emitted to streaming callers — the
+    // per-row finish is a one-shot event (mlx-lm's `_step` removes finished
+    // rows from the batch entirely; our batch shape can't shrink, but the
+    // surfaced contract matches: each row yields at most one terminal
+    // `finish_reason` and nothing thereafter). `batch_generate`'s aggregator
+    // happens to drop repeated `stop` emits, but raw streaming users
+    // (`batch_stream_generate` / `batch_generate_step`) would otherwise see
+    // the leak.
+    let b = self.batch_size();
+    let mut was_unfinished: Vec<bool> = match try_with_capacity(b) {
+      Ok(v) => v,
+      Err(e) => {
+        self.done = true;
+        return Some(Err(e));
+      }
+    };
+    for f in &self.finished {
+      was_unfinished.push(f.is_none());
+    }
+
     let steps = match self.step(&input) {
       Ok(s) => s,
       Err(e) => {
@@ -1381,9 +1402,15 @@ impl<M: Model> Iterator for BatchGenerator<'_, M> {
       }
     }
 
-    // Queue per-row emits and stop if every row finished.
+    // Queue per-row emits and stop if every row finished. Only emit rows
+    // that were unfinished BEFORE this step — rows that just transitioned
+    // (their terminal `finish_reason` carries the EOS / length signal) and
+    // rows still active. Rows already-finished pre-step are filtered out
+    // here so the iterator never re-emits them.
     for step in steps {
-      self.pending_emit.push_back(step);
+      if was_unfinished[step.row] {
+        self.pending_emit.push_back(step);
+      }
     }
     if self.finished.iter().all(|r| r.is_some()) {
       self.done = true;
@@ -1996,5 +2023,79 @@ mod batch_tests {
       }
     }
     assert_eq!(results, vec![Vec::<u32>::new(); b]);
+  }
+
+  /// Streaming-count regression: a row that finishes EARLY must NOT be
+  /// re-emitted on later steps. Without the pre-step `was_unfinished`
+  /// snapshot in `Iterator::next`, the already-finished row's per-step
+  /// (carried-`finish_reason="stop"`, dummy token) `BatchGenStep` would
+  /// leak to `batch_stream_generate` callers on every later forward.
+  /// `batch_generate`'s aggregator happens to drop repeated `stop` rows,
+  /// but raw-streaming users see the bug. This test pins the contract by
+  /// counting per-row emits.
+  ///
+  /// 2-row batch:
+  /// - row 0 hits EOS on decode step 1 ⇒ exactly ONE emit (the terminal
+  ///   `stop` step) — NEVER one emit per subsequent step.
+  /// - row 1 continues until `max_tokens` ⇒ `max_tokens` emits (one per
+  ///   step, the final one carrying `Some("length")`).
+  #[test]
+  fn batch_stream_generate_finished_row_not_re_emitted() {
+    // Equal-length prompts so left_pad is `[0, 0]` and prefill is trivial.
+    let prompts: Vec<&[u32]> = vec![&[1u32, 2], &[3u32, 4]];
+    let left_pad = batch_left_padding(&prompts);
+    assert_eq!(left_pad, vec![0, 0]);
+    let max_len = 2;
+    let max_tokens = 5;
+    // row 0: EOS (5) at decode step 0 (first generated token) ⇒ should
+    //        produce exactly ONE emit (the terminal stop step).
+    // row 1: runs to `max_tokens=5` ⇒ tokens [20, 21, 22, 23, 24], last
+    //        of which carries `Some("length")`. 5 emits total.
+    let scripts = vec![
+      vec![5u32, 99, 99, 99, 99], // EOS on first decode token
+      vec![20u32, 21, 22, 23, 24],
+    ];
+    let model = MockBatchModel::new(64, max_len, scripts);
+    let cache: Vec<Box<dyn crate::lm::cache::KvCache>> =
+      vec![Box::new(BatchKvCache::new(&left_pad))];
+    let cfg = GenConfig {
+      max_tokens,
+      eos: vec![5],
+      ..Default::default()
+    };
+
+    let mut emits_per_row: Vec<usize> = vec![0; 2];
+    let mut finish_per_row: Vec<Option<String>> = vec![None; 2];
+    for item in batch_generate_step(&model, &prompts, 0, cache, cfg) {
+      let step = item.expect("step error");
+      emits_per_row[step.row] += 1;
+      if let Some(r) = step.finish_reason {
+        // A row should never transition twice — its terminal `finish_reason`
+        // is the LAST thing the iterator says about that row.
+        assert!(
+          finish_per_row[step.row].is_none(),
+          "row {} got a second finish_reason emit: prior={:?}, new={:?}",
+          step.row,
+          finish_per_row[step.row],
+          r,
+        );
+        finish_per_row[step.row] = Some(r);
+      }
+    }
+
+    // Row 0: exactly ONE emit — the terminal `stop` step.
+    assert_eq!(
+      emits_per_row[0], 1,
+      "row 0 finished on step 1 but was re-emitted on later steps (got {} emits, expected 1)",
+      emits_per_row[0]
+    );
+    assert_eq!(finish_per_row[0].as_deref(), Some("stop"));
+    // Row 1: full `max_tokens` emits, last carries `Some("length")`.
+    assert_eq!(
+      emits_per_row[1], max_tokens,
+      "row 1 expected {max_tokens} emits, got {}",
+      emits_per_row[1]
+    );
+    assert_eq!(finish_per_row[1].as_deref(), Some("length"));
   }
 }
