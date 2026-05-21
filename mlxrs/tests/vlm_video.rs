@@ -103,6 +103,66 @@ fn smart_resize_rejects_overflow_dimension() {
 }
 
 #[test]
+fn smart_resize_min_cell_guard_exact_i128_no_f64_bypass_no_overflow() {
+  // Regression for the Codex "inexact/overflowing factor-square validation"
+  // finding (3rd round on the min-cell guard). The guard now compares
+  // `factor*factor` to `max_pixels` in EXACT i128, never f64 (precision
+  // bypass) or unchecked i64 (debug overflow panic in the error message).
+
+  // (1) f64-precision bypass: factor = 3_037_000_499 has
+  //     factor^2 = 9_223_372_030_926_249_001 (just under i64::MAX). With
+  //     max_pixels = factor^2 - 1, the EXACT min cell (factor^2) is strictly
+  //     greater than the budget, so the guard MUST fire (Err). The old f64
+  //     code rounded both factor^2 and factor^2-1 to the same f64, bypassed
+  //     the guard, and returned an over-budget (factor, factor).
+  let factor = 3_037_000_499_i64;
+  let f2 = (factor as i128) * (factor as i128);
+  assert_eq!(
+    f2, 9_223_372_030_926_249_001_i128,
+    "sanity: factor^2 is one below the i64::MAX neighborhood"
+  );
+  let max_just_under = (f2 - 1) as i64; // factor^2 - 1, still a valid positive i64
+  let r = smart_resize(1, 1, factor, 1, max_just_under);
+  assert!(
+    r.is_err(),
+    "exact factor^2 > max_pixels must Err (no f64 collapse bypass), got {r:?}"
+  );
+
+  // (2) format-overflow / debug panic: factor = 3_037_000_500 has
+  //     factor^2 = 9_223_372_037_000_250_000 > i64::MAX. The guard fires, and
+  //     the error message must format the EXACT i128 product WITHOUT computing
+  //     `factor * factor` in i64 (which panics in debug). Must Err, never panic.
+  let factor_ovf = 3_037_000_500_i64;
+  assert!(
+    (factor_ovf as i128) * (factor_ovf as i128) > i64::MAX as i128,
+    "sanity: factor^2 overflows i64"
+  );
+  let r2 = smart_resize(1, 1, factor_ovf, 1, i64::MAX);
+  assert!(
+    r2.is_err(),
+    "factor^2 overflowing i64 must Err WITHOUT a debug panic, got {r2:?}"
+  );
+
+  // (3) boundary still works: a near-sqrt(i64::MAX) factor with
+  //     max_pixels = factor^2 EXACTLY must succeed. height=width=factor so the
+  //     bars stay at `factor` (no rescale) and the area == factor^2 == budget.
+  //     Confirms the exact i128 guard does not over-reject the in-budget edge.
+  let exact_max = f2 as i64; // factor^2 fits i64 (one below the MAX neighborhood)
+  let (h, w) = smart_resize(factor, factor, factor, 1, exact_max)
+    .expect("max_pixels == factor^2 exactly must succeed");
+  assert_eq!(
+    (h, w),
+    (factor, factor),
+    "factor x factor square exactly fills the factor^2 budget"
+  );
+  assert_eq!(
+    (h as i128) * (w as i128),
+    f2,
+    "area equals the exact factor^2 budget"
+  );
+}
+
+#[test]
 fn smart_nframes_rejects_overflow() {
   // Fixed{i64::MAX}: round_by_factor(i64::MAX, FRAME_FACTOR=2) overflows the
   // `quotient * 2` product -> must Err (not panic/wrap into a small count

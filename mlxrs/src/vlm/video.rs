@@ -350,16 +350,21 @@ pub fn smart_resize(
   // pinned to at least `factor` by the `max(factor, ...)` guards below).
   // If even that minimal cell overflows `max_pixels`, no positive
   // factor-aligned size fits the budget; the python reference would scale
-  // down to `(0, 0)`. Reject up front, naming the budget. (`factor` and
-  // `max_pixels` are both validated-positive here, so `factor * factor`
-  // cannot overflow at any realistic frame size.)
-  let min_cell = (factor as f64) * (factor as f64);
-  if min_cell > max_pixels as f64 {
+  // down to `(0, 0)`. Reject up front, naming the budget.
+  //
+  // EXACT i128 arithmetic — NOT f64. `factor` can be any positive `i64`, so
+  // `factor * factor` can overflow `i64` (debug panic / release wrap) and is
+  // *inexact* in f64 (the 53-bit mantissa collapses adjacent values: e.g.
+  // `factor=3_037_000_499` and `max_pixels=factor*factor-1` both round to the
+  // same f64, silently bypassing the guard and returning an over-budget size).
+  // `i128` represents every `i64²` product exactly and overflow-free, so the
+  // comparison and the error message are both exact for any positive `i64`.
+  let min_cell = (factor as i128) * (factor as i128);
+  if min_cell > max_pixels as i128 {
     return Err(Error::ShapeMismatch {
       message: format!(
         "smart_resize: budget max_pixels ({max_pixels}) cannot contain the smallest \
-         factor-aligned size ({factor}x{factor} = {})",
-        factor * factor
+         factor-aligned size ({factor}x{factor} = {min_cell})"
       ),
     });
   }
@@ -386,19 +391,28 @@ pub fn smart_resize(
   let mut h_bar = factor.max(round_by_factor(height, factor)?);
   let mut w_bar = factor.max(round_by_factor(width, factor)?);
 
-  // `h*w` and `h_bar*w_bar` are products of (validated-positive) frame
-  // dimensions; compute the pixel-budget comparison in f64 to mirror the
-  // python float arithmetic exactly and to keep the `sqrt` domain in floats
-  // throughout (the bars themselves are already overflow-checked above).
+  // python branches on `h_bar * w_bar > max_pixels` / `< min_pixels` with
+  // arbitrary-precision ints — i.e. EXACT integer comparisons. Mirror that
+  // with `i128` (NOT f64): both bars are positive multiples of `factor` here,
+  // so their product can exceed `i64` and is inexact in f64 (the 53-bit
+  // mantissa collapses adjacent integers, which could pick the wrong branch
+  // or skip a needed rescale on an adversarial budget). `i128` holds every
+  // `i64 * i64` exactly and overflow-free.
+  let bar_area = (h_bar as i128) * (w_bar as i128);
+  // `beta` is the only float math, matching python's `math.sqrt(...)`. Its
+  // `height * width` argument is exact in f64 here: any dimension large enough
+  // to lose precision (> ±2^53) was already rejected by `round_by_factor`'s
+  // input guard above, so this branch only runs on faithfully-representable
+  // dims. Keep the sqrt/`beta` in f64 to reproduce the reference bit-for-bit.
   let hw = height as f64 * width as f64;
-  if (h_bar as f64) * (w_bar as f64) > max_pixels as f64 {
+  if bar_area > max_pixels as i128 {
     let beta = (hw / max_pixels as f64).sqrt();
     // python: floor_by_factor(height / beta, factor) where the argument is
     // the FLOAT `height / beta` — use the float-input helper so we don't
     // truncate before the `floor(_ / factor)` (a double-floor would diverge).
     h_bar = floor_by_factor_f(height as f64 / beta, factor)?;
     w_bar = floor_by_factor_f(width as f64 / beta, factor)?;
-  } else if (h_bar as f64) * (w_bar as f64) < min_pixels as f64 {
+  } else if bar_area < min_pixels as i128 {
     let beta = (min_pixels as f64 / hw).sqrt();
     h_bar = ceil_by_factor_f(height as f64 * beta, factor)?;
     w_bar = ceil_by_factor_f(width as f64 * beta, factor)?;
