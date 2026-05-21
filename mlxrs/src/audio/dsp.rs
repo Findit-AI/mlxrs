@@ -16,20 +16,21 @@
 //!   `STR_TO_WINDOW_FN` table (`"hann"`/`"hanning"`/`"hamming"`/`"blackman"`/
 //!   `"bartlett"`).
 //! - STFT mirrors `mlx_audio.dsp.stft` defaults: `center=True`,
-//!   `pad_mode="reflect"`. Output layout is **`(num_frames, n_fft / 2 + 1)`
-//!   complex** (mlx-c `rfft` yields `Complex64` natively), as in the
-//!   reference.
-//! - [`istft`] inverts **even-`n_fft`** [`stft`] output **in that same
-//!   `(num_frames, n_fft / 2 + 1)` layout** (so `istft(&stft(x, ..)?, ..)`
-//!   composes directly). This is a deliberate, semantics-preserving adaptation
-//!   of `mlx_audio.dsp.istft`, which documents a frequency-major
-//!   `(n_fft / 2 + 1, num_frames)` input and irffts along axis 0; see [`istft`]
-//!   for the full rationale (the reference's `win_length`/`n_fft` defaults are
-//!   also derived from the frequency dimension here, fixing an axis bug in the
-//!   upstream default formula). [`istft`] infers `n_fft = (n_freqs - 1) * 2`
-//!   (the universal even case) and does not expose an explicit `n_fft`: a
-//!   one-sided spectrum cannot disambiguate odd `n_fft` from the adjacent even
-//!   length, so odd `n_fft` is unsupported (see [`istft`]).
+//!   `pad_mode="reflect"`. [`stft`] returns a typed [`Spectrum`] carrying the
+//!   **`(num_frames, n_fft / 2 + 1)` complex** transform (mlx-c `rfft` yields
+//!   `Complex64` natively, as in the reference) **plus the analysis metadata**
+//!   (`n_fft`, `hop_length`, `win_length`, `window_pad`, `center`).
+//! - [`istft`] inverts **even-`n_fft`** [`stft`] output by reading every
+//!   parameter FROM the [`Spectrum`] (so `istft(&stft(x, ..)?, ..)` composes
+//!   directly) — it **infers nothing**. This is a deliberate,
+//!   semantics-preserving adaptation of `mlx_audio.dsp.istft`, which documents
+//!   a frequency-major `(n_fft / 2 + 1, num_frames)` input and irffts along
+//!   axis 0; here the frames are on axis 0 so we irfft along axis 1 (see
+//!   [`istft`]). Carrying `n_fft` in the [`Spectrum`] makes the
+//!   odd-vs-even-`n_fft` ambiguity structurally impossible: a one-sided
+//!   spectrum cannot disambiguate odd `n_fft` from the adjacent even length
+//!   from the bin count alone, so both [`stft`] and [`Spectrum::from_parts`]
+//!   reject odd `n_fft` and a [`Spectrum`] can never carry it.
 //! - Mel filterbank uses the HTK formula
 //!   (`mel = 2595 * log10(1 + hz / 700)`) and returns shape
 //!   **`(n_mels, n_fft / 2 + 1)`**.
@@ -85,6 +86,24 @@ const LOG_FLOOR_KALDI: f32 = 1e-8;
 /// shaped inputs that would otherwise drive multi-GB allocation.
 const MAX_OLA_WORK: usize = 64 * 1024 * 1024;
 
+/// Hard ceiling on [`stft`]'s forward *work* — applied (with checked
+/// arithmetic) to BOTH the strided-frame element count `num_frames * n_fft`
+/// (the windowed-frame matrix the rfft consumes) AND the one-sided output
+/// element count `num_frames * (n_fft / 2 + 1)`, BEFORE any frame view,
+/// window multiply, or rfft is built. Mirrors [`MAX_OLA_WORK`] on the inverse
+/// side: the public-input *sample* length is already capped at
+/// [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES), but a
+/// *lazily-shaped* huge input (e.g. a 64 Mi-sample array with `n_fft = 1024,
+/// hop = 1`) produces `num_frames ≈ 64 Mi` frames whose strided view is
+/// `num_frames * n_fft ≈ 64 Gi` elements — orders of magnitude past the
+/// sample count. We reject any `(num_frames, n_fft, hop)` combination whose
+/// frame work or output element count overflows `usize` or exceeds this cap
+/// *before* allocating, so a pathological / lazily-shaped input can never
+/// drive a multi-GB framing/FFT allocation. 64 Mi-elements (256 MiB of f32
+/// frames + matching Complex64 output) is a generous ceiling that still
+/// admits every realistic STFT.
+const MAX_STFT_WORK: usize = 64 * 1024 * 1024;
+
 /// Coverage threshold for the overlap-add window-sum, shared by [`istft`]'s
 /// normalization guard and its mandatory coverage check. A sample whose
 /// window-sum is `<= COVERAGE_EPS` received negligible window energy in the
@@ -121,8 +140,9 @@ const COVERAGE_EPS: f32 = 1e-10;
 ///
 /// The default is [`WindowPad::Right`] so the forward [`stft`] (and the
 /// mel/log-mel front-ends built on it) stay byte-identical to `mlx_audio.dsp`
-/// for short windows. Pass [`WindowPad::Center`] explicitly when you need
-/// `istft(&stft(x, .., Center)?, .., Center)?` to invert a short window.
+/// for short windows. Pass [`WindowPad::Center`] to [`stft`] when you need
+/// `istft(&stft(x, .., Center)?, ..)?` to invert a short window — the
+/// resulting [`Spectrum`] carries the placement, so [`istft`] re-applies it.
 ///
 /// `mlx-audio-swift` has no `win_length` (the window is always `n_fft`), so
 /// it corresponds to `win_length == n_fft`, which both variants handle the
@@ -141,6 +161,218 @@ pub enum WindowPad {
   /// coverage, exactly invertible by [`istft`] for every `win_length <=
   /// n_fft`. Opt in to this for invertible short-window round-trips.
   Center,
+}
+
+/// A typed short-time spectrum: the `(num_frames, n_fft / 2 + 1)`
+/// `Dtype::Complex64` transform data **plus all the metadata
+/// [`istft`] needs to invert it exactly**.
+///
+/// This is the structural fix for the odd-vs-even-`n_fft` ambiguity that a
+/// bare-array spectrum could not close. A one-sided real spectrum has
+/// `n_freqs == n_fft / 2 + 1` for BOTH `n_fft = 2k` and `n_fft = 2k + 1`, so
+/// the bin count alone cannot tell an odd `n_fft` from the adjacent even
+/// length — any inverse that *infers* `n_fft` from a raw array can be made to
+/// misdecode (an odd-`n_fft` external spectrum, in particular). By carrying
+/// `n_fft` (and the rest of the analysis parameters) in the type, [`istft`]
+/// reads them directly and **infers nothing**, and a `Spectrum` simply
+/// *cannot exist* with inconsistent or odd metadata: every `Spectrum` is
+/// produced either by [`stft`] (which rejects odd `n_fft`) or by the
+/// validated [`Spectrum::from_parts`] constructor (which rejects odd `n_fft`,
+/// a wrong bin count, `win_length > n_fft`, etc.). There is no way to hand
+/// [`istft`] a raw array.
+///
+/// The fields are exactly the analysis parameters [`stft`] used, so the
+/// inverse needs no inference:
+/// - `data`: the `(num_frames, n_fft / 2 + 1)` `Complex64` transform.
+/// - `n_fft`: the (even) FFT length — the irfft target width.
+/// - `hop_length`: the analysis hop (overlap-add stride on the inverse).
+/// - `win_length`: the analysis window length (`<= n_fft`).
+/// - `window_pad`: the [`WindowPad`] placement of the `win_length` window in
+///   the `n_fft` frame (so synthesis re-places it identically).
+/// - `center`: whether [`stft`] reflect-padded the SIGNAL by `n_fft / 2` on
+///   each side (`center = true, pad_mode = "reflect"`, the `mlx_audio.dsp`
+///   default), which [`istft`] must undo before applying `length`.
+///
+/// (Not `Clone`: [`Array`] has only a fallible `try_clone`, so cloning a
+/// [`Spectrum`] would have to be fallible too. Clone the `data` via
+/// [`Array::try_clone`] and rebuild through [`Spectrum::from_parts`] if a copy
+/// is needed.)
+#[derive(Debug)]
+pub struct Spectrum {
+  /// `(num_frames, n_fft / 2 + 1)` `Dtype::Complex64` transform data.
+  data: Array,
+  /// The (even) FFT length used by [`stft`]; the irfft target width.
+  n_fft: usize,
+  /// The analysis hop length (the inverse overlap-add stride).
+  hop_length: usize,
+  /// The analysis window length (`win_length <= n_fft`).
+  win_length: usize,
+  /// Placement of the `win_length` window inside the `n_fft` frame.
+  window_pad: WindowPad,
+  /// Whether [`stft`] reflect-padded the signal by `n_fft / 2` on each side.
+  center: bool,
+}
+
+impl Spectrum {
+  /// The `(num_frames, n_fft / 2 + 1)` `Dtype::Complex64` transform data.
+  pub fn data(&self) -> &Array {
+    &self.data
+  }
+
+  /// The (even) FFT length used to produce this spectrum (the irfft target
+  /// width on the inverse).
+  pub fn n_fft(&self) -> usize {
+    self.n_fft
+  }
+
+  /// The analysis hop length (the overlap-add stride [`istft`] uses).
+  pub fn hop_length(&self) -> usize {
+    self.hop_length
+  }
+
+  /// The analysis window length (`win_length <= n_fft`).
+  pub fn win_length(&self) -> usize {
+    self.win_length
+  }
+
+  /// The [`WindowPad`] placement of the `win_length` window in the `n_fft`
+  /// frame ([`istft`] re-places the synthesis window identically).
+  pub fn window_pad(&self) -> WindowPad {
+    self.window_pad
+  }
+
+  /// Whether [`stft`] reflect-padded the signal by `n_fft / 2` on each side
+  /// (`center = true`). [`istft`] undoes this before applying `length`.
+  pub fn center(&self) -> bool {
+    self.center
+  }
+
+  /// The number of frames (`data`'s first dimension).
+  pub fn num_frames(&self) -> usize {
+    // `data` is validated 2-D at every construction site, so `shape()[0]`
+    // is always present.
+    self.data.shape()[0]
+  }
+
+  /// The number of one-sided frequency bins (`data`'s last dimension,
+  /// `== n_fft / 2 + 1`).
+  pub fn n_freqs(&self) -> usize {
+    self.data.shape()[1]
+  }
+
+  /// Build a [`Spectrum`] from a raw `(num_frames, n_fft / 2 + 1)`
+  /// `Complex64` array plus its analysis metadata, **validating that the
+  /// metadata is self-consistent and invertible**.
+  ///
+  /// This is the only way to wrap an *external* / hand-built spectrum (one
+  /// not produced by [`stft`]) for [`istft`], and it closes the
+  /// external-odd-spectrum hole: the validation below makes it impossible to
+  /// construct a `Spectrum` whose metadata [`istft`] would misdecode. Every
+  /// check that [`stft`] enforces on the producer side is re-enforced here.
+  ///
+  /// # Errors
+  /// Returns a recoverable [`Error::Backend`] when:
+  /// - `data` is not 2-D (must be `(num_frames, n_freqs)`),
+  /// - `n_fft == 0` or `n_fft` is **odd** (the one-sided spectrum cannot be
+  ///   inverted unambiguously — see [`Spectrum`] / [`stft`]),
+  /// - `data`'s last dimension `!= n_fft / 2 + 1` (the bin count does not
+  ///   match the declared `n_fft`),
+  /// - `hop_length == 0` or `win_length == 0`,
+  /// - `win_length > n_fft` (the window cannot exceed the irfft frame),
+  /// - `num_frames == 0`,
+  /// - `data`'s dtype is not [`Dtype::Complex64`](crate::Dtype::Complex64).
+  ///
+  /// Note this does **not** itself reject [`WindowPad::Right`] with
+  /// `win_length < n_fft`: such a spectrum is a perfectly valid forward
+  /// transform (it is what [`stft`] emits for the mel front-end); it is only
+  /// the *inverse* that is non-faithful, so [`istft`] rejects that
+  /// combination when asked to invert (see [`istft`]).
+  pub fn from_parts(
+    data: Array,
+    n_fft: usize,
+    hop_length: usize,
+    win_length: usize,
+    window_pad: WindowPad,
+    center: bool,
+  ) -> Result<Spectrum> {
+    let shape = data.shape();
+    if shape.len() != 2 {
+      return Err(Error::Backend {
+        message: format!(
+          "Spectrum::from_parts: data must be 2-D (num_frames, n_freqs), got {}-D",
+          shape.len()
+        ),
+      });
+    }
+    if n_fft == 0 {
+      return Err(Error::Backend {
+        message: "Spectrum::from_parts: n_fft must be > 0".into(),
+      });
+    }
+    // Reject odd `n_fft`: a one-sided spectrum has `n_freqs == n_fft / 2 + 1`
+    // for both `n_fft = 2k` and `2k + 1`, so an odd-`n_fft` spectrum cannot be
+    // inverted unambiguously. Closing it here means a `Spectrum` can never
+    // carry odd metadata regardless of how it was constructed.
+    if !n_fft.is_multiple_of(2) {
+      return Err(Error::Backend {
+        message: format!(
+          "Spectrum::from_parts: n_fft must be even (got {n_fft}); odd n_fft is \
+           unsupported because the one-sided spectrum cannot be inverted unambiguously"
+        ),
+      });
+    }
+    if hop_length == 0 {
+      return Err(Error::Backend {
+        message: "Spectrum::from_parts: hop_length must be > 0".into(),
+      });
+    }
+    if win_length == 0 {
+      return Err(Error::Backend {
+        message: "Spectrum::from_parts: win_length must be > 0".into(),
+      });
+    }
+    if win_length > n_fft {
+      return Err(Error::Backend {
+        message: format!(
+          "Spectrum::from_parts: win_length {win_length} > n_fft {n_fft} \
+           (the window cannot exceed the irfft frame)"
+        ),
+      });
+    }
+    let num_frames = shape[0];
+    if num_frames == 0 {
+      return Err(Error::Backend {
+        message: "Spectrum::from_parts: num_frames must be > 0".into(),
+      });
+    }
+    let n_freqs = shape[1];
+    // `n_fft` is even, so `n_fft / 2 + 1` is the exact one-sided bin count.
+    let expected_n_freqs = n_fft / 2 + 1;
+    if n_freqs != expected_n_freqs {
+      return Err(Error::Backend {
+        message: format!(
+          "Spectrum::from_parts: data last dim {n_freqs} != n_fft/2 + 1 = {expected_n_freqs} \
+           (n_fft={n_fft}); the bin count does not match the declared n_fft"
+        ),
+      });
+    }
+    if data.dtype()? != crate::Dtype::Complex64 {
+      return Err(Error::Backend {
+        message: format!(
+          "Spectrum::from_parts: data must be Dtype::Complex64, got {:?}",
+          data.dtype()?
+        ),
+      });
+    }
+    Ok(Spectrum {
+      data,
+      n_fft,
+      hop_length,
+      win_length,
+      window_pad,
+      center,
+    })
+  }
 }
 
 /// Place a `win_length`-wide window `w` into an `n_fft`-wide frame per
@@ -561,17 +793,31 @@ fn reflect_pad_1d(samples: &Array, padding: usize) -> Result<Array> {
 /// [`istft`] rejects it (use [`WindowPad::Center`] for `win_length < n_fft`).
 /// This forward `stft` itself supports Right padding for any `win_length`.
 ///
-/// Output: `(num_frames, n_fft / 2 + 1)` `Dtype::Complex64`, where
-/// `num_frames = 1 + (padded_len - n_fft) / hop_length`. Matches the
-/// reference layout.
+/// Returns a typed [`Spectrum`] carrying the `(num_frames, n_fft / 2 + 1)`
+/// `Dtype::Complex64` transform (`num_frames = 1 + (padded_len - n_fft) /
+/// hop_length`, the reference layout) **plus all the metadata [`istft`] needs
+/// to invert it** — `n_fft`, `hop_length`, `win_length`, `window_pad`, and the
+/// signal-centering flag (always `center = true` here: `stft` hardcodes
+/// `center = true, pad_mode = "reflect"`, the `mlx_audio.dsp` default). Because
+/// the metadata travels in the type, [`istft`] reads it directly and infers
+/// nothing — the odd-vs-even-`n_fft` ambiguity is structurally gone.
+///
+/// **Work cap.** Before building the strided frame view, the window multiply,
+/// or the rfft, `stft` computes `num_frames`, the frame element count
+/// `num_frames * n_fft`, and the output element count `num_frames * (n_fft/2 +
+/// 1)` with checked arithmetic and rejects (recoverable [`Error::Backend`]) any
+/// combination that overflows or exceeds `MAX_STFT_WORK`. A lazily-shaped huge
+/// input (e.g. 64 Mi samples with `n_fft = 1024, hop = 1`) is rejected before
+/// any allocation, so it cannot drive a multi-GB framing/FFT allocation.
 ///
 /// **`n_fft` must be even.** The one-sided spectrum has
 /// `n_freqs == n_fft / 2 + 1` for BOTH `n_fft = 2k` and `n_fft = 2k + 1`, so
-/// the bin count cannot disambiguate an odd `n_fft` from the adjacent even
-/// length and [`istft`] (which infers `n_fft = (n_freqs - 1) * 2`, the even
-/// case) would silently misdecode an odd-`n_fft` spectrum. To keep the
-/// `stft`/`istft` pair consistently even-only, this forward `stft` rejects odd
-/// `n_fft` up front rather than emitting an un-invertible spectrum.
+/// the bin count alone cannot disambiguate an odd `n_fft` from the adjacent
+/// even length. Although [`istft`] now reads `n_fft` from the [`Spectrum`]
+/// (rather than inferring it), keeping the producer even-only means a
+/// [`Spectrum`] can never carry an odd `n_fft` at all, so this forward `stft`
+/// rejects odd `n_fft` up front rather than emitting an un-invertible spectrum
+/// ([`Spectrum::from_parts`] enforces the same on external spectra).
 ///
 /// # Errors
 /// - [`Error::Backend`] when:
@@ -582,6 +828,10 @@ fn reflect_pad_1d(samples: &Array, padding: usize) -> Result<Array> {
 ///   - `win_length > n_fft`,
 ///   - the post-pad sample count is too short to fit a single frame
 ///     (matches the reference's `Input is too short` raise),
+///   - the frame work `num_frames * n_fft` or output element count
+///     `num_frames * (n_fft / 2 + 1)` overflows `usize` or exceeds
+///     `MAX_STFT_WORK` (a lazily-shaped huge input is rejected before any
+///     allocation),
 ///   - any size exceeds `i32::MAX`.
 pub fn stft(
   samples: &Array,
@@ -589,7 +839,7 @@ pub fn stft(
   hop_length: usize,
   win_length: Option<usize>,
   window_pad: WindowPad,
-) -> Result<Array> {
+) -> Result<Spectrum> {
   if n_fft == 0 {
     return Err(Error::Backend {
       message: "stft: n_fft must be > 0".into(),
@@ -597,9 +847,9 @@ pub fn stft(
   }
   // Reject odd `n_fft` up front (before any framing/FFT work): a one-sided
   // real-FFT spectrum has `n_freqs == n_fft / 2 + 1` for both `n_fft = 2k` and
-  // `2k + 1`, so `istft` (which infers `n_fft = (n_freqs - 1) * 2`, the even
-  // case) cannot disambiguate odd from the adjacent even length and would
-  // silently misdecode. Keeping the producer even-only closes that path.
+  // `2k + 1`, so the bin count alone cannot disambiguate odd from the adjacent
+  // even length. Keeping the producer even-only means the `Spectrum` this
+  // returns can never carry an odd `n_fft`, so its inverse is unambiguous.
   if !n_fft.is_multiple_of(2) {
     return Err(Error::Backend {
       message: format!(
@@ -633,11 +883,14 @@ pub fn stft(
 
   // Analysis window via the SHARED `frame_window` (symmetric hann of
   // `win_length`, placed into the `n_fft` frame per `window_pad`; no-op when
-  // `win_length == n_fft`). `istft` rebuilds its synthesis window through the
+  // `win_length == n_fft`). Built AFTER the work cap below so a lazily-shaped
+  // huge input is rejected before this CPU `Vec` (up to `win_length <= n_fft`
+  // elements) is allocated. `istft` rebuilds its synthesis window through the
   // exact same call, so analysis and synthesis windows always match.
-  let window = frame_window(win_length, n_fft, window_pad)?;
 
-  // `center=True, pad_mode="reflect"` (reference default).
+  // `center=True, pad_mode="reflect"` (reference default). The reflect pad is
+  // a lazy slice+concatenate (no large host allocation), so it precedes the
+  // work cap; the cap then gates the strided view / window / rfft.
   let padded = reflect_pad_1d(samples, n_fft / 2)?;
   let padded_len = padded.shape()[0];
 
@@ -681,6 +934,63 @@ pub fn stft(
       ),
     });
   }
+
+  // WORK CAP (Codex finding). Mirror `istft`'s `MAX_OLA_WORK` guard on the
+  // forward side: BEFORE building the strided frame view, the window, or the
+  // rfft, reject any `(num_frames, n_fft, hop)` whose framing work or output
+  // size is pathological. The public-input *sample* length is already capped
+  // (`MAX_DECODED_SAMPLES`), but a LAZILY-shaped huge input (e.g. 64 Mi
+  // samples, n_fft=1024, hop=1) yields `num_frames ≈ 64 Mi` frames and a
+  // strided view of `num_frames * n_fft ≈ 64 Gi` elements — far past the
+  // sample count. Both the frame element count `num_frames * n_fft` (the
+  // windowed matrix the rfft consumes) and the one-sided output element count
+  // `num_frames * (n_fft / 2 + 1)` are checked here so neither the framing
+  // intermediate nor the FFT output can balloon past `MAX_STFT_WORK`. Checked
+  // arithmetic + the cap precede every allocation below (including the
+  // `frame_window` CPU `Vec`), so a shaped/lazy input never reaches them.
+  let frame_work = num_frames
+    .checked_mul(n_fft)
+    .ok_or_else(|| Error::Backend {
+      message: format!(
+        "stft: frame work count num_frames * n_fft overflows usize \
+         (num_frames={num_frames}, n_fft={n_fft})"
+      ),
+    })?;
+  if frame_work > MAX_STFT_WORK {
+    return Err(Error::Backend {
+      message: format!(
+        "stft: frame work count {frame_work} (num_frames={num_frames} * n_fft={n_fft}) \
+         exceeds the {MAX_STFT_WORK} work cap"
+      ),
+    });
+  }
+  // `n_fft` is even (checked above), so `n_fft / 2 + 1` cannot overflow.
+  let out_elems = num_frames
+    .checked_mul(n_fft / 2 + 1)
+    .ok_or_else(|| Error::Backend {
+      message: format!(
+        "stft: output element count num_frames * (n_fft/2 + 1) overflows usize \
+         (num_frames={num_frames}, n_fft={n_fft})"
+      ),
+    })?;
+  if out_elems > MAX_STFT_WORK {
+    return Err(Error::Backend {
+      message: format!(
+        "stft: output element count {out_elems} (num_frames={num_frames} * \
+         (n_fft/2 + 1)={}) exceeds the {MAX_STFT_WORK} work cap",
+        n_fft / 2 + 1
+      ),
+    });
+  }
+
+  // Analysis window via the SHARED `frame_window` (symmetric hann of
+  // `win_length`, placed into the `n_fft` frame per `window_pad`; no-op when
+  // `win_length == n_fft`). Built AFTER the work cap so a lazily-shaped huge
+  // input is rejected before this CPU `Vec` is allocated. `istft` rebuilds its
+  // synthesis window through the EXACT same call, so analysis and synthesis
+  // windows always match by construction.
+  let window = frame_window(win_length, n_fft, window_pad)?;
+
   let num_frames_i32 = i32::try_from(num_frames).map_err(|_| Error::Backend {
     message: format!("stft: num_frames {num_frames} exceeds i32::MAX"),
   })?;
@@ -709,7 +1019,22 @@ pub fn stft(
   // `frames * window` broadcasts the `(n_fft,)` window across each frame.
   let windowed = ops::arithmetic::multiply(&frames, &window)?;
   // rfft over the last axis (axis 1) with explicit length n_fft.
-  fft::rfft(&windowed, n_fft_i32, 1, FftNorm::Backward)
+  let data = fft::rfft(&windowed, n_fft_i32, 1, FftNorm::Backward)?;
+
+  // Wrap the `(num_frames, n_fft / 2 + 1)` Complex64 transform together with
+  // the analysis metadata `istft` needs to invert it exactly. `center` is
+  // always `true` here (`stft` hardcodes `center = true, pad_mode = "reflect"`,
+  // the `mlx_audio.dsp` default). All invariants `Spectrum::from_parts` would
+  // re-check (even n_fft, `n_freqs == n_fft / 2 + 1`, `win_length <= n_fft`,
+  // non-empty) hold by construction, so the data is wrapped directly.
+  Ok(Spectrum {
+    data,
+    n_fft,
+    hop_length,
+    win_length,
+    window_pad,
+    center: true,
+  })
 }
 
 /// Inverse Short-Time Fourier Transform — overlap-add reconstruction, the
@@ -717,55 +1042,49 @@ pub fn stft(
 ///
 /// Faithful port of `mlx_audio.dsp.istft(x, hop_length, win_length, window,
 /// center=True, length=None)`, adapted to mlxrs's STFT layout and restricted
-/// to **even `n_fft`** (the universal case). **`x` is
-/// `(num_frames, n_fft / 2 + 1)` `Dtype::Complex64`** — i.e. exactly what
-/// [`stft`] returns — so `istft(&stft(s, ..)?, ..)` composes directly.
+/// to **even `n_fft`** (the universal case). The input is a typed [`Spectrum`]
+/// — exactly what [`stft`] returns (or a validated [`Spectrum::from_parts`]) —
+/// so `istft(&stft(s, ..)?, ..)` composes directly.
 ///
-/// **Even-`n_fft` only.** `n_fft` is inferred as `(n_freqs - 1) * 2` and is
-/// **not** an explicit parameter. A one-sided spectrum has
-/// `n_freqs == n_fft / 2 + 1` for BOTH `n_fft = 2k` and `n_fft = 2k + 1`, so
-/// the bin count cannot tell an odd `n_fft` from the adjacent even length;
-/// inferring (or even being told) an odd `n_fft` would silently misdecode the
-/// transform. [`istft`] therefore inverts the even-`n_fft` STFT output (what
-/// every documented `mlx-audio` config produces) and odd `n_fft` is
-/// unsupported.
+/// **All transform parameters are read FROM the [`Spectrum`] — nothing is
+/// inferred.** `n_fft`, `hop_length`, `win_length`, `window_pad`, and the
+/// signal-centering flag (`center`) all come straight off the [`Spectrum`]
+/// (`spectrum.n_fft()`, …). There is **no** `n_fft`/`hop`/`win`/`pad`/`center`
+/// parameter to mis-state, and crucially **no `n_fft` inference**: a
+/// one-sided spectrum has `n_freqs == n_fft / 2 + 1` for BOTH `n_fft = 2k` and
+/// `2k + 1`, so inferring `n_fft` from the bin count could misdecode an odd
+/// transform — but [`Spectrum`] carries the exact even `n_fft` its producer
+/// used, and a `Spectrum` cannot exist with odd `n_fft` (both [`stft`] and
+/// [`Spectrum::from_parts`] reject it). The odd-vs-even ambiguity is therefore
+/// **structurally impossible**, not merely guarded.
 ///
 /// **There is no custom-window parameter.** The synthesis window is rebuilt
-/// internally from `(win_length, n_fft, window_pad)` through the very same
-/// `frame_window` the forward [`stft`] used for its analysis window, so the
-/// synthesis window is **identical to the analysis window by construction** —
-/// the historical synthesis/analysis mismatch (a separately-specified
-/// periodic synthesis window silently differing from `stft`'s symmetric
-/// analysis window) is structurally impossible. Pass the SAME `win_length` /
-/// `window_pad` you gave [`stft`] and `istft(&stft(x, ..)?, ..)?` reconstructs
-/// every sample. The reference instead documents a frequency-major
-/// `(n_fft / 2 + 1, num_frames)` input and irffts along axis 0 then
-/// transposes; here the frames are already on axis 0, so we irfft along
-/// axis 1 and skip the transpose. This is a semantics-preserving adaptation,
-/// not a behavior change (every sample of the reconstruction is identical to
-/// the reference fed the transpose of `x`).
+/// internally from the [`Spectrum`]'s `(win_length, n_fft, window_pad)`
+/// through the very same `frame_window` the forward [`stft`] used for its
+/// analysis window, so the synthesis window is **identical to the analysis
+/// window by construction** — the historical synthesis/analysis mismatch (a
+/// separately-specified periodic synthesis window silently differing from
+/// `stft`'s symmetric analysis window) is structurally impossible. The
+/// reference instead documents a frequency-major `(n_fft / 2 + 1, num_frames)`
+/// input and irffts along axis 0 then transposes; here the frames are already
+/// on axis 0, so we irfft along axis 1 and skip the transpose. This is a
+/// semantics-preserving adaptation, not a behavior change (every sample of the
+/// reconstruction is identical to the reference fed the transpose of the data).
 ///
-/// `win_length` defaults to `n_fft`. The reference's documented default
-/// (`(n_fft - 1) * 2`) is computed as `(x.shape[1] - 1) * 2`, which under its
-/// own documented frequency-major layout reads the `num_frames` axis — an
-/// upstream axis bug; we derive `n_fft` (and hence the default `win_length`)
-/// from `n_freqs` (`x.shape[1]` in our layout). `hop_length` defaults to
-/// `win_length / 4`.
-///
-/// Both window-padding conventions are accepted via `window_pad`
-/// ([`WindowPad`]). The synthesis window is the symmetric Hann of `win_length`
-/// placed into the `n_fft` frame with the SAME `window_pad` as the forward
-/// [`stft`]'s analysis window (both via `frame_window`), then overlap-added
-/// full `n_fft` wide.
+/// The synthesis window is the symmetric Hann of the [`Spectrum`]'s
+/// `win_length` placed into the `n_fft` frame with its `window_pad` (both via
+/// `frame_window`), then overlap-added full `n_fft` wide.
 /// - [`WindowPad::Center`] is exactly invertible for every `win_length <=
-///   n_fft` — full short-window support. Use it for invertible short windows.
+///   n_fft` — full short-window support.
 /// - [`WindowPad::Right`] (the [`WindowPad`] default) is supported **only for
 ///   `win_length == n_fft`**. Right-pad short-window inversion (`win_length <
 ///   n_fft`) is not a faithful inverse: the forward transform discards /
 ///   distorts boundary information, so the reconstruction is wrong even where
-///   the window-sum is nonzero. [`istft`] therefore **rejects** Right with
-///   `win_length != n_fft` up front with a recoverable [`Error::Backend`]. Use
-///   [`WindowPad::Center`] for short-window inversion.
+///   the window-sum is nonzero. [`istft`] therefore **rejects** a [`Spectrum`]
+///   whose `window_pad` is Right with `win_length != n_fft` up front with a
+///   recoverable [`Error::Backend`] (such a [`Spectrum`] is a valid forward
+///   transform — it is what the mel front-end produces — only its *inverse* is
+///   non-faithful). Use [`WindowPad::Center`] for short-window inversion.
 ///
 /// **Overlap-add normalization is always `Σ w²`** (the window-sum of
 /// *squares*). [`stft`] emits FFTs of already-windowed frames, and [`istft`]
@@ -791,10 +1110,13 @@ pub fn stft(
 /// converts into an error. Right-pad short-window configs, where the guard is
 /// insufficient to catch covered-but-wrong samples, are rejected up front.)
 ///
-/// Center / `length` ordering matches librosa / mlx-audio center semantics:
-/// when `center = true` (the default), the `n_fft / 2` reflect-pad [`stft`]
-/// added is removed FIRST (the centered signal begins at raw OLA index
-/// `n_fft / 2`), and only then is `length` applied:
+/// Center / `length` ordering matches librosa / mlx-audio center semantics.
+/// `center` is read from the [`Spectrum`] (always `true` for an [`stft`]
+/// output, since `stft` hardcodes `center = true`). When `center = true`, the
+/// `n_fft / 2` reflect-pad [`stft`] added is removed FIRST (the centered
+/// signal begins at raw OLA index `n_fft / 2`), and only then is `length`
+/// applied. `length` (the desired output length) is the **only** inverse-side
+/// parameter:
 /// - `center = true,  length = None`    → the centered signal
 ///   `reconstructed[n_fft/2 .. t - n_fft/2]`.
 /// - `center = true,  length = Some(n)` → `reconstructed[n_fft/2 .. n_fft/2 + n]`
@@ -806,13 +1128,9 @@ pub fn stft(
 ///
 /// # Errors
 /// - [`Error::Backend`] when:
-///   - `x` is not 2-D, or `n_freqs < 2` (need at least 2 bins to define
-///     `n_fft`),
-///   - `num_frames == 0`,
-///   - `hop_length == 0`, `win_length == 0`, or `win_length > n_fft`,
-///   - `window_pad` is [`WindowPad::Right`] and `win_length != n_fft`
-///     (short-window right-pad inversion is not a faithful inverse — rejected
-///     up front; use [`WindowPad::Center`]),
+///   - the [`Spectrum`]'s `window_pad` is [`WindowPad::Right`] and
+///     `win_length != n_fft` (short-window right-pad inversion is not a
+///     faithful inverse — rejected up front; use [`WindowPad::Center`]),
 ///   - **the coverage guard fires** — some requested output sample has a
 ///     window-sum `<= COVERAGE_EPS` (a supported config should never trigger
 ///     this; if it does it is a real reconstruction bug),
@@ -827,62 +1145,42 @@ pub fn stft(
 ///     `n_fft/2 + length > t`; with `center = false`, `length > t`).
 /// - Propagates window-construction errors from `frame_window` (the shared
 ///   symmetric-Hann builder).
-pub fn istft(
-  x: &Array,
-  hop_length: Option<usize>,
-  win_length: Option<usize>,
-  window_pad: WindowPad,
-  center: bool,
-  length: Option<usize>,
-) -> Result<Array> {
+///
+/// (The [`Spectrum`]'s structural invariants — 2-D `Complex64` data, even
+/// `n_fft`, `n_freqs == n_fft / 2 + 1`, `1 <= win_length <= n_fft`,
+/// `hop_length >= 1`, `num_frames >= 1` — are guaranteed at construction by
+/// [`stft`] / [`Spectrum::from_parts`], so [`istft`] does not re-validate
+/// them.)
+pub fn istft(spectrum: &Spectrum, length: Option<usize>) -> Result<Array> {
+  // Every transform parameter is read straight off the typed `Spectrum` — no
+  // inference, no ambiguity. The `Spectrum`'s invariants (even n_fft,
+  // n_freqs == n_fft/2 + 1, 1 <= win_length <= n_fft, hop >= 1, num_frames >=
+  // 1, Complex64 data) were enforced at construction by `stft` /
+  // `Spectrum::from_parts`.
+  let x = spectrum.data();
+  let n_fft = spectrum.n_fft();
+  let hop_length = spectrum.hop_length();
+  let win_length = spectrum.win_length();
+  let window_pad = spectrum.window_pad();
+  let center = spectrum.center();
   let shape = x.shape();
   if shape.len() != 2 {
     return Err(Error::Backend {
       message: format!(
-        "istft: expected 2-D (num_frames, n_freqs) input, got {}-D",
+        "istft: expected 2-D (num_frames, n_freqs) spectrum data, got {}-D",
         shape.len()
       ),
     });
   }
   let num_frames = shape[0];
-  let n_freqs = shape[1];
-  if n_freqs < 2 {
-    return Err(Error::Backend {
-      message: format!("istft: n_freqs {n_freqs} < 2 (need >= 2 bins for irfft)"),
-    });
-  }
-  if num_frames == 0 {
-    return Err(Error::Backend {
-      message: "istft: num_frames must be > 0".into(),
-    });
-  }
-  // The irfft target length, ALWAYS the even inference `n_fft = (n_freqs - 1)
-  // * 2`. This is unambiguous: a one-sided spectrum has `n_freqs == n_fft / 2
-  // + 1` for both `n_fft = 2k` and `2k + 1`, so the bin count cannot
-  // distinguish odd from the adjacent even length — `istft` therefore inverts
-  // the even-`n_fft` STFT output (the universal `mlx-audio` case) and odd
-  // `n_fft` is unsupported (there is no `n_fft` parameter to mis-state).
-  let n_fft = (n_freqs - 1).checked_mul(2).ok_or_else(|| Error::Backend {
-    message: format!("istft: n_fft = (n_freqs - 1) * 2 overflows usize (n_freqs={n_freqs})"),
-  })?;
-  let win_length = win_length.unwrap_or(n_fft);
-  if win_length == 0 {
-    return Err(Error::Backend {
-      message: "istft: win_length must be > 0".into(),
-    });
-  }
-  // The synthesis window (placed into the `n_fft` frame per `window_pad`)
-  // cannot be wider than the irfft frame. `win_length < n_fft` IS supported
-  // under `WindowPad::Center` (the librosa `pad_center` placement gives full
-  // COLA coverage of the centered output region and a faithful inverse); it is
-  // rejected under `WindowPad::Right` just below.
-  if win_length > n_fft {
-    return Err(Error::Backend {
-      message: format!(
-        "istft: win_length {win_length} > n_fft {n_fft} (window cannot exceed the irfft frame)"
-      ),
-    });
-  }
+  // The irfft target length is the `Spectrum`'s OWN even `n_fft` — read from
+  // the type, NOT inferred from the bin count. A `Spectrum` is guaranteed
+  // (by `stft` / `Spectrum::from_parts`) to satisfy `n_freqs == n_fft / 2 + 1`
+  // with `n_fft` even, `1 <= win_length <= n_fft`, `hop >= 1`, `num_frames >=
+  // 1`, so there is no odd-vs-even ambiguity and no per-call re-derivation —
+  // the historical `n_fft = (n_freqs - 1) * 2` inference (which could
+  // misdecode an odd transform) is gone.
+
   // Right-pad short-window inversion is fundamentally NOT a faithful inverse.
   // For `WindowPad::Right` with `win_length < n_fft`, the right-pad geometry
   // combined with the `n_fft / 2` reflect-pad centering places the (symmetric
@@ -904,12 +1202,6 @@ pub fn istft(
          inversion is not a faithful inverse — use WindowPad::Center for \
          short-window (win_length < n_fft) inversion"
       ),
-    });
-  }
-  let hop_length = hop_length.unwrap_or(win_length / 4);
-  if hop_length == 0 {
-    return Err(Error::Backend {
-      message: "istft: hop_length must be > 0".into(),
     });
   }
   // Every frame is `n_fft` wide: the irfft output width AND the synthesis
@@ -1329,8 +1621,11 @@ pub fn mel_spectrogram(
   // (rather than relying on `WindowPad::default()`) so the mel placement is
   // pinned regardless of any future change to the enum default.
   let spec = stft(samples, n_fft, hop_length, win_length, WindowPad::Right)?;
-  // `|stft|^2` — `abs` of Complex64 yields F32 magnitudes, then square.
-  let mag = spec.abs()?;
+  // `|stft|^2` — `abs` of the Complex64 spectrum data yields F32 magnitudes,
+  // then square. `mel_spectrogram` only needs the magnitudes, so it reads the
+  // transform array off the typed `Spectrum` (the metadata is irrelevant to
+  // the forward magnitude path here).
+  let mag = spec.data().abs()?;
   let power = mag.square()?;
   // `power` is `(num_frames, n_freqs)`; mel is `(n_mels, n_freqs)`.
   // Mel-spec layout in mlx-audio / Whisper is `(n_mels, num_frames)` =
@@ -1417,6 +1712,7 @@ pub fn log_mel_spectrogram_with(
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::Dtype;
 
   /// Absolute tolerance for the closed-form window value checks. The
   /// formulas are evaluated in f32 here and in `mlx-audio` in f64 then cast
@@ -1575,15 +1871,10 @@ mod tests {
   ) {
     let x = Array::from_slice::<f32>(signal, &[signal.len() as i32]).unwrap();
     let spec = stft(&x, n_fft, hop, Some(win_length), window_pad).unwrap();
-    let rec = istft(
-      &spec,
-      Some(hop),
-      Some(win_length),
-      window_pad,
-      true, // center (undo stft's reflect pad)
-      len_override,
-    )
-    .unwrap();
+    // `istft` reads n_fft / hop / win / pad / center FROM the typed `Spectrum`
+    // (which `stft` built) — `length` is the ONLY inverse-side parameter, so
+    // a synthesis/analysis mismatch is structurally impossible.
+    let rec = istft(&spec, len_override).unwrap();
     let r = to_vec(&rec);
     let expected_len = len_override.unwrap_or(signal.len());
     assert_eq!(
@@ -1613,10 +1904,16 @@ mod tests {
     // Spectra are byte-identical across the two modes (no window padding).
     let spec_c = stft(&x, 8, 4, Some(8), WindowPad::Center).unwrap();
     let spec_r = stft(&x, 8, 4, Some(8), WindowPad::Right).unwrap();
-    assert_eq!(spec_c.shape(), vec![5, 5]); // (num_frames, n_fft/2+1)
-    for (c, r) in to_vec(&spec_c.abs().unwrap())
+    assert_eq!(spec_c.data().shape(), vec![5, 5]); // (num_frames, n_fft/2+1)
+    // Metadata is carried on the typed Spectrum (no inference downstream).
+    assert_eq!(spec_c.n_fft(), 8);
+    assert_eq!(spec_c.win_length(), 8);
+    assert_eq!(spec_c.hop_length(), 4);
+    assert_eq!(spec_c.window_pad(), WindowPad::Center);
+    assert!(spec_c.center());
+    for (c, r) in to_vec(&spec_c.data().abs().unwrap())
       .iter()
-      .zip(to_vec(&spec_r.abs().unwrap()).iter())
+      .zip(to_vec(&spec_r.data().abs().unwrap()).iter())
     {
       assert!(
         (c - r).abs() < 1e-6,
@@ -1683,10 +1980,15 @@ mod tests {
     let buf = signal_16();
     let x = Array::from_slice::<f32>(&buf, &[16i32]).unwrap();
     for &win in &[8usize, 12usize] {
+      // The REAL public stft produces a valid Right short-window Spectrum
+      // (carrying window_pad=Right, win<n_fft); it is the INVERSE that rejects
+      // it, reading the placement off the typed Spectrum (no params passed).
       let spec = stft(&x, 16, 4, Some(win), WindowPad::Right).unwrap();
-      assert_eq!(spec.shape(), vec![5, 9]); // (num_frames, n_fft/2+1), n_fft=16
+      assert_eq!(spec.data().shape(), vec![5, 9]); // (num_frames, n_fft/2+1), n_fft=16
+      assert_eq!(spec.window_pad(), WindowPad::Right);
+      assert_eq!(spec.win_length(), win);
       for len in [None, Some(16usize)] {
-        let res = istft(&spec, Some(4), Some(win), WindowPad::Right, true, len);
+        let res = istft(&spec, len);
         assert!(
           matches!(res, Err(Error::Backend { .. })),
           "Right + win={win} < n_fft=16 (length={len:?}) must be rejected up front \
@@ -1726,18 +2028,25 @@ mod tests {
     // un-centered head (which includes index 0) must therefore error rather
     // than return a corrupt sample — for both length=None (full raw OLA) and an
     // explicit length. (n_fft=8, hop=4, win=8 symmetric Hann.)
+    //
+    // `center` is now carried on the Spectrum, so we build a `center = false`
+    // Spectrum from the REAL stft's transform data via the validated
+    // `Spectrum::from_parts` (stft itself always sets center = true). The
+    // transform data is unchanged — only the carried `center` flag differs.
     let buf = signal_16();
     let x = Array::from_slice::<f32>(&buf, &[16i32]).unwrap();
     let spec = stft(&x, 8, 4, Some(8), WindowPad::Center).unwrap();
+    let spec_no_center = Spectrum::from_parts(
+      spec.data().try_clone().unwrap(),
+      8, // n_fft
+      4, // hop_length
+      8, // win_length
+      WindowPad::Center,
+      false, // center=false: requested region starts at the uncovered index 0
+    )
+    .unwrap();
     for len in [None, Some(10usize)] {
-      let res = istft(
-        &spec,
-        Some(4),
-        Some(8),
-        WindowPad::Center,
-        false, // center=false: requested region starts at the uncovered index 0
-        len,
-      );
+      let res = istft(&spec_no_center, len);
       assert!(
         matches!(res, Err(Error::Backend { .. })),
         "center=false head (length={len:?}) includes the zero-coverage OLA \
@@ -1769,34 +2078,139 @@ mod tests {
   }
 
   #[test]
-  fn istft_rejects_bad_shapes_and_params() {
-    // 1-D input (must be 2-D).
-    let one_d = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3i32]).unwrap();
-    assert!(matches!(
-      istft(&one_d, None, None, WindowPad::Center, true, None),
-      Err(Error::Backend { .. })
-    ));
-
-    // Valid spec for the remaining param checks.
+  fn istft_rejects_length_out_of_range() {
+    // `length` (the desired output length) is the ONLY inverse-side parameter
+    // now (n_fft/hop/win/pad/center are read off the Spectrum), so the only
+    // istft-side numeric rejection is an out-of-range `length`. The structural
+    // metadata rejections (bad shape, hop==0, win>n_fft, odd n_fft, wrong bin
+    // count) are enforced at construction by `Spectrum::from_parts` — see
+    // `spectrum_from_parts_rejects_inconsistent_metadata`.
     let buf = signal_16();
     let x = Array::from_slice::<f32>(&buf, &[16i32]).unwrap();
     let spec = stft(&x, 8, 4, Some(8), WindowPad::Center).unwrap();
-    // hop_length == 0.
+    // length larger than the OLA length (t = (5-1)*4 + 8 = 24): center=true so
+    // n_fft/2 + length = 4 + 1000 > 24 is out of range.
     assert!(matches!(
-      istft(&spec, Some(0), Some(8), WindowPad::Center, true, None),
+      istft(&spec, Some(1000)),
       Err(Error::Backend { .. })
     ));
-    // win_length > n_fft (n_fft = 8 here; 16 > 8 → the window cannot exceed the
-    // irfft frame width).
+  }
+
+  #[test]
+  fn spectrum_from_parts_rejects_inconsistent_metadata() {
+    // `Spectrum::from_parts` is the validated constructor for EXTERNAL/raw
+    // spectra: it must make it impossible to build a Spectrum whose metadata
+    // istft would misdecode. This closes the external-odd-spectrum hole (the
+    // bare-array path that allowed istft misdecodes for 11 review rounds) — a
+    // Spectrum cannot exist with odd/inconsistent metadata.
+    //
+    // A valid `(num_frames=5, n_freqs=5)` Complex64 array for n_fft=8.
+    let valid = Array::zeros::<f32>(&[5i32, 5i32])
+      .unwrap()
+      .astype(Dtype::Complex64)
+      .unwrap();
+
+    // Sanity: the consistent case constructs fine.
+    assert!(
+      Spectrum::from_parts(valid.try_clone().unwrap(), 8, 4, 8, WindowPad::Center, true).is_ok()
+    );
+
+    // Odd n_fft — THE external-odd-spectrum hole. (n_freqs=5 would match BOTH
+    // n_fft=8 and the odd n_fft=9; the constructor must reject odd up front so
+    // no Spectrum can ever carry it.)
     assert!(matches!(
-      istft(&spec, Some(4), Some(16), WindowPad::Center, true, None),
+      Spectrum::from_parts(valid.try_clone().unwrap(), 9, 4, 8, WindowPad::Center, true),
       Err(Error::Backend { .. })
     ));
-    // length larger than the OLA length (t = 24).
+
+    // Wrong n_freqs for the declared n_fft: n_fft=16 ⇒ n_freqs must be 9, but
+    // the data has 5, so the bin count contradicts the metadata.
     assert!(matches!(
-      istft(&spec, Some(4), Some(8), WindowPad::Center, true, Some(1000)),
+      Spectrum::from_parts(
+        valid.try_clone().unwrap(),
+        16,
+        4,
+        8,
+        WindowPad::Center,
+        true
+      ),
       Err(Error::Backend { .. })
     ));
+
+    // win_length > n_fft.
+    assert!(matches!(
+      Spectrum::from_parts(
+        valid.try_clone().unwrap(),
+        8,
+        4,
+        16,
+        WindowPad::Center,
+        true
+      ),
+      Err(Error::Backend { .. })
+    ));
+
+    // hop_length == 0 and win_length == 0.
+    assert!(matches!(
+      Spectrum::from_parts(valid.try_clone().unwrap(), 8, 0, 8, WindowPad::Center, true),
+      Err(Error::Backend { .. })
+    ));
+    assert!(matches!(
+      Spectrum::from_parts(valid.try_clone().unwrap(), 8, 4, 0, WindowPad::Center, true),
+      Err(Error::Backend { .. })
+    ));
+
+    // n_fft == 0.
+    assert!(matches!(
+      Spectrum::from_parts(valid.try_clone().unwrap(), 0, 4, 0, WindowPad::Center, true),
+      Err(Error::Backend { .. })
+    ));
+
+    // Non-2-D data (1-D).
+    let one_d = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3i32])
+      .unwrap()
+      .astype(Dtype::Complex64)
+      .unwrap();
+    assert!(matches!(
+      Spectrum::from_parts(one_d, 8, 4, 8, WindowPad::Center, true),
+      Err(Error::Backend { .. })
+    ));
+
+    // Non-Complex64 data (F32) with otherwise-consistent metadata.
+    let real_data = Array::zeros::<f32>(&[5i32, 5i32]).unwrap();
+    assert!(matches!(
+      Spectrum::from_parts(real_data, 8, 4, 8, WindowPad::Center, true),
+      Err(Error::Backend { .. })
+    ));
+  }
+
+  #[test]
+  fn spectrum_from_parts_then_istft_round_trips() {
+    // An EXTERNAL Spectrum (rebuilt from raw stft data via `from_parts`, NOT
+    // the stft-returned Spectrum) must invert exactly — proving the validated
+    // constructor produces a faithfully-invertible Spectrum, not just a
+    // well-formed one. n_fft=8, hop=4, win=8, Center, center=true.
+    let buf = signal_16();
+    let x = Array::from_slice::<f32>(&buf, &[16i32]).unwrap();
+    let stft_spec = stft(&x, 8, 4, Some(8), WindowPad::Center).unwrap();
+    let external = Spectrum::from_parts(
+      stft_spec.data().try_clone().unwrap(),
+      8,
+      4,
+      8,
+      WindowPad::Center,
+      true,
+    )
+    .unwrap();
+    let rec = istft(&external, Some(16)).unwrap();
+    let r = to_vec(&rec);
+    assert_eq!(r.len(), 16);
+    for (i, (g, e)) in r.iter().zip(buf.iter()).enumerate() {
+      assert!(
+        (g - e).abs() < 1e-5,
+        "from_parts round-trip[{i}]: got {g}, want {e}"
+      );
+    }
   }
 
   #[test]
@@ -1821,22 +2235,56 @@ mod tests {
     // so ONLY the work cap can reject this.
     let n_freqs: i32 = 9 * 1024 * 1024 + 1;
     let num_frames: i32 = 4;
-    let spec = Array::zeros::<f32>(&[num_frames, n_freqs])
+    let n_fft = (n_freqs as usize - 1) * 2; // 18 Mi (even; n_freqs == n_fft/2+1)
+    let data = Array::zeros::<f32>(&[num_frames, n_freqs])
       .unwrap()
       .astype(crate::Dtype::Complex64)
       .unwrap();
-    let res = istft(
-      &spec,
-      Some(2), // small hop → t stays under the decoded cap
-      None,    // win_length defaults to the inferred n_fft
+    // `from_parts` accepts this (the shape/metadata are consistent: even n_fft,
+    // n_freqs == n_fft/2+1, win<=n_fft) — it is a well-formed Spectrum. The
+    // PATHOLOGY is the inverse work `num_frames * n_fft`, which only the
+    // MAX_OLA_WORK guard inside istft can reject (and must, before frame_window
+    // allocates `hann_window(n_fft)` ≈ 18 Mi f32s).
+    let spec = Spectrum::from_parts(
+      data,
+      n_fft,
+      2,     // small hop → t stays under the decoded cap
+      n_fft, // win_length == n_fft (Right would also be valid here)
       WindowPad::Center,
       true,
-      None,
-    );
+    )
+    .unwrap();
+    let res = istft(&spec, None);
     assert!(
       matches!(res, Err(Error::Backend { .. })),
       "pathological num_frames*n_fft must be rejected by the MAX_OLA_WORK cap \
        before the frame_window allocation"
+    );
+  }
+
+  #[test]
+  fn stft_rejects_pathological_work_before_alloc() {
+    // Codex finding: cap stft's forward work. A LAZILY-shaped huge input (no
+    // data materialized) with a small n_fft and hop=1 produces num_frames ≈
+    // input length and a strided frame view of `num_frames * n_fft` elements —
+    // orders of magnitude past the sample count. The MAX_STFT_WORK guard must
+    // reject it BEFORE building the frame view / window / rfft (i.e. before any
+    // allocation). The public sample cap (MAX_DECODED_SAMPLES = 64 Mi) does NOT
+    // catch this: the input length is AT the sample cap, but the frame work is
+    // ~64 Gi.
+    //
+    // We use a lazy `zeros` 1-D array of 64 Mi samples; with n_fft=1024, hop=1:
+    //   padded_len ≈ 64 Mi (+ 1024), num_frames ≈ 64 Mi
+    //   frame work = num_frames * n_fft ≈ 64 Mi * 1024 = 64 Gi  >> MAX_STFT_WORK
+    // Nothing is materialized, so if the cap did NOT run first this would try a
+    // multi-GB framing/FFT allocation. Asserting Err proves the cap fired early.
+    let n_samples = 64 * 1024 * 1024i32;
+    let lazy = Array::zeros::<f32>(&[n_samples]).unwrap();
+    let res = stft(&lazy, 1024, 1, None, WindowPad::Right);
+    assert!(
+      matches!(res, Err(Error::Backend { .. })),
+      "pathological lazy huge-shape stft input (num_frames * n_fft) must be \
+       rejected by the MAX_STFT_WORK cap before any framing/FFT allocation, got {res:?}"
     );
   }
 
@@ -1866,7 +2314,7 @@ mod tests {
     // Hand-built reference on the Right-padded stft.
     let expected_mel = {
       let spec = stft(&x, n_fft, hop, Some(win), WindowPad::Right).unwrap();
-      let power = spec.abs().unwrap().square().unwrap();
+      let power = spec.data().abs().unwrap().square().unwrap();
       let bank = mel_filter_bank(n_mels, n_fft, sr, 0.0, None).unwrap();
       let power_t = power.transpose().unwrap();
       to_vec(&ops::linalg_basic::matmul(&bank, &power_t).unwrap())
@@ -1884,7 +2332,7 @@ mod tests {
     // placed at a different offset, shifting the spectral energy).
     let center_mel = {
       let spec = stft(&x, n_fft, hop, Some(win), WindowPad::Center).unwrap();
-      let power = spec.abs().unwrap().square().unwrap();
+      let power = spec.data().abs().unwrap().square().unwrap();
       let bank = mel_filter_bank(n_mels, n_fft, sr, 0.0, None).unwrap();
       let power_t = power.transpose().unwrap();
       to_vec(&ops::linalg_basic::matmul(&bank, &power_t).unwrap())
