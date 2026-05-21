@@ -27,8 +27,18 @@
 //!   generation Iterator, ported from `mlx-vlm/mlx_vlm/generate.py::
 //!   generate_step` (preprocess images → vision encode → embed merge →
 //!   prefill via `forward_embeddings` → per-token decode via `forward`).
+//! - [`crate::vlm::video`] — model-agnostic video *preprocessing* math
+//!   ported from `mlx-vlm/mlx_vlm/video_generate.py` (`smart_resize`,
+//!   `smart_nframes`, frame-index sampling, and a `process_frames` that
+//!   reuses [`image::preprocess`](crate::vlm::image::preprocess) per
+//!   frame + stacks). **Container
+//!   decoding (mp4 → frames) is intentionally NOT here** — it needs a
+//!   codec dependency and is a documented follow-up; this module ports
+//!   the portable sampling + resize + prep arithmetic and takes
+//!   caller-decoded frames.
 
 pub mod generate;
 pub mod image;
 pub mod model;
 pub mod prompt;
+pub mod video;

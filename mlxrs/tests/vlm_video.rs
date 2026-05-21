@@ -1,0 +1,379 @@
+//! V1 VLM video-preprocessing math tests.
+//!
+//! Reference basis:
+//! - python `mlx-vlm/mlx_vlm/video_generate.py` (`round_by_factor`,
+//!   `ceil_by_factor`, `floor_by_factor`, `smart_resize`, `smart_nframes`,
+//!   the `np.linspace(0, total-1, n).round()` frame-index pick, and the
+//!   per-frame resize+`np.stack` body of `fetch_video`).
+//! - swift `MLXVLM/Models/QwenVL.swift` `QwenVL.targetSize` (the swift
+//!   mirror of `smart_resize`).
+//!
+//! All expectations are HAND-TRACED in the comments above each assert so a
+//! reviewer can re-derive them from the python math without running the
+//! reference.
+
+#![cfg(feature = "vlm")]
+
+use mlxrs::vlm::{
+  image::{ColorOrder, ImageProcessorConfig, ResizeFilter},
+  video::{
+    FrameSampling, MAX_PIXELS, MIN_PIXELS, ceil_by_factor, floor_by_factor, process_frames,
+    round_by_factor, sample_frame_indices, smart_nframes, smart_resize,
+  },
+};
+
+// ---------- *_by_factor (banker's rounding parity) ----------
+
+#[test]
+fn round_by_factor_banker_rounding_edges() {
+  // python `round_by_factor(n, f) = round(n / f) * f` with round-HALF-TO-
+  // EVEN (python built-in `round`). Half-quotient cases must pick the even
+  // neighbor, NOT round-away-from-zero.
+  assert_eq!(round_by_factor(14, 28), 0); // 0.5  -> 0 (even)
+  assert_eq!(round_by_factor(42, 28), 56); // 1.5 -> 2 (even) -> 56
+  assert_eq!(round_by_factor(70, 28), 56); // 2.5 -> 2 (even) -> 56
+  assert_eq!(round_by_factor(98, 28), 112); // 3.5 -> 4 (even) -> 112
+  assert_eq!(round_by_factor(800, 28), 812); // 28.571 -> 29 -> 812
+  assert_eq!(round_by_factor(1280, 28), 1288); // 45.714 -> 46 -> 1288
+}
+
+#[test]
+fn ceil_floor_by_factor_edges() {
+  // ceil_by_factor(n, f) = ceil(n / f) * f ; floor_by_factor = floor(...) * f
+  assert_eq!(ceil_by_factor(10, 2), 10); // ceil(5.0) * 2
+  assert_eq!(ceil_by_factor(9, 2), 10); // ceil(4.5) = 5 -> 10
+  assert_eq!(floor_by_factor(9, 2), 8); // floor(4.5) = 4 -> 8
+  assert_eq!(floor_by_factor(10, 2), 10); // floor(5.0) -> 10
+  assert_eq!(ceil_by_factor(4, 2), 4); // ceil(2.0) -> 4
+}
+
+// ---------- smart_resize ----------
+
+#[test]
+fn smart_resize_within_budget_rounds_to_factor() {
+  // height=800, width=1280, factor=28, default min/max pixels.
+  //   h_bar = max(28, round_by_factor(800, 28))  = max(28, 812)  = 812
+  //   w_bar = max(28, round_by_factor(1280, 28)) = max(28, 1288) = 1288
+  //   812 * 1288 = 1_045_856  (in [MIN_PIXELS, MAX_PIXELS]) -> no scaling
+  let (h, w) = smart_resize(800, 1280, 28, MIN_PIXELS, MAX_PIXELS).unwrap();
+  assert_eq!((h, w), (812, 1288));
+}
+
+#[test]
+fn smart_resize_scales_down_for_max_pixels() {
+  // height=420, width=420, factor=28, min=MIN_PIXELS, max=50_000.
+  //   h_bar = w_bar = round_by_factor(420, 28) = round(15.0) * 28 = 420
+  //   420 * 420 = 176_400 > 50_000  -> scale DOWN
+  //   beta = sqrt(176_400 / 50_000) = sqrt(3.528) = 1.878297...
+  //   height / beta = 420 / 1.878297 = 223.610...
+  //   floor_by_factor(223.610, 28) = floor(223.610 / 28) * 28
+  //                                = floor(7.986) * 28 = 7 * 28 = 196
+  let (h, w) = smart_resize(420, 420, 28, MIN_PIXELS, 50_000).unwrap();
+  assert_eq!((h, w), (196, 196));
+  assert!(h * w <= 50_000, "downscaled pixel count within max_pixels");
+}
+
+#[test]
+fn smart_resize_scales_up_for_min_pixels() {
+  // height=28, width=28, factor=28, min=MIN_PIXELS(=3136), max=MAX_PIXELS.
+  //   h_bar = w_bar = max(28, round_by_factor(28, 28)) = 28
+  //   28 * 28 = 784 < 3136  -> scale UP
+  //   beta = sqrt(3136 / (28*28)) = sqrt(4.0) = 2.0
+  //   height * beta = 56 ; ceil_by_factor(56, 28) = ceil(2.0) * 28 = 56
+  let (h, w) = smart_resize(28, 28, 28, MIN_PIXELS, MAX_PIXELS).unwrap();
+  assert_eq!((h, w), (56, 56));
+  assert_eq!(h * w, MIN_PIXELS, "upscaled to exactly min_pixels here");
+}
+
+#[test]
+fn smart_resize_factor_floor_via_max_guard() {
+  // height=width=14, factor=28: round_by_factor(14, 28) = round(0.5) = 0
+  // (banker's), so the `max(factor, 0)` guard pins both bars to 28.
+  //   28 * 28 = 784 < MIN_PIXELS -> scale up
+  //   beta = sqrt(3136 / 196) = sqrt(16) = 4.0 ; 14 * 4 = 56 -> (56, 56)
+  let (h, w) = smart_resize(14, 14, 28, MIN_PIXELS, MAX_PIXELS).unwrap();
+  assert_eq!((h, w), (56, 56));
+}
+
+#[test]
+fn smart_resize_rejects_extreme_aspect_ratio() {
+  // max/min = 1000/1 = 1000 > MAX_RATIO(200) -> Err.
+  assert!(smart_resize(1, 1000, 28, MIN_PIXELS, MAX_PIXELS).is_err());
+}
+
+#[test]
+fn smart_resize_rejects_nonpositive_and_bad_budget() {
+  assert!(smart_resize(0, 100, 28, MIN_PIXELS, MAX_PIXELS).is_err());
+  assert!(smart_resize(100, 0, 28, MIN_PIXELS, MAX_PIXELS).is_err());
+  assert!(smart_resize(100, 100, 0, MIN_PIXELS, MAX_PIXELS).is_err());
+  // min_pixels > max_pixels is an empty interval.
+  assert!(smart_resize(100, 100, 28, 5000, 4000).is_err());
+}
+
+// ---------- smart_nframes ----------
+
+#[test]
+fn smart_nframes_fixed_rounds_to_frame_factor() {
+  // Fixed{7}: round_by_factor(7, FRAME_FACTOR=2) = round(3.5) = 4 -> 8.
+  let n = smart_nframes(FrameSampling::Fixed { nframes: 7 }, 100, 30.0).unwrap();
+  assert_eq!(n, 8);
+}
+
+#[test]
+fn smart_nframes_fps_default_path() {
+  // Fps{fps=2, min=4, max=None}, total=100, video_fps=30.
+  //   min_frames = ceil_by_factor(4, 2) = 4
+  //   max_frames = floor_by_factor(min(768, 100), 2) = 100
+  //   raw = 100 / 30 * 2 = 6.6667
+  //   clamp: max(6.6667, 4)=6.6667; min(_,100)=6.6667; min(_,100)=6.6667
+  //   floor_by_factor(floor(6.6667)=6, 2) = 6
+  let n = smart_nframes(
+    FrameSampling::Fps {
+      fps: 2.0,
+      min_frames: 4,
+      max_frames: None,
+    },
+    100,
+    30.0,
+  )
+  .unwrap();
+  assert_eq!(n, 6);
+}
+
+#[test]
+fn smart_nframes_fps_clamps_to_min() {
+  // total=10, video_fps=30, fps=2 -> raw = 0.6667, clamped UP to min_frames.
+  //   min_frames = ceil_by_factor(4, 2) = 4 ; result = 4
+  let n = smart_nframes(
+    FrameSampling::Fps {
+      fps: 2.0,
+      min_frames: 4,
+      max_frames: None,
+    },
+    10,
+    30.0,
+  )
+  .unwrap();
+  assert_eq!(n, 4);
+}
+
+#[test]
+fn smart_nframes_fps_clamps_to_max_default() {
+  // total=1000, video_fps=1, fps=2 -> raw = 2000.
+  //   max_frames = floor_by_factor(min(768, 1000), 2) = 768
+  //   clamp: max(2000,4)=2000; min(2000,768)=768; min(768,1000)=768 -> 768
+  let n = smart_nframes(
+    FrameSampling::Fps {
+      fps: 2.0,
+      min_frames: 4,
+      max_frames: None,
+    },
+    1000,
+    1.0,
+  )
+  .unwrap();
+  assert_eq!(n, 768);
+}
+
+#[test]
+fn smart_nframes_fps_clamps_to_total() {
+  // total=10, video_fps=1, fps=2 -> raw = 20 > total.
+  //   max_frames = floor_by_factor(min(768,10),2)=10
+  //   clamp: max(20,4)=20; min(20,10)=10; min(10,10)=10 -> 10 (== total)
+  let n = smart_nframes(
+    FrameSampling::Fps {
+      fps: 2.0,
+      min_frames: 4,
+      max_frames: None,
+    },
+    10,
+    1.0,
+  )
+  .unwrap();
+  assert_eq!(n, 10);
+}
+
+#[test]
+fn smart_nframes_fps_custom_max_frames() {
+  // Fps{fps=2, min=4, max=Some(6)}, total=100, video_fps=10.
+  //   raw = 100 / 10 * 2 = 20 ; max_frames = floor_by_factor(6,2)=6
+  //   clamp: max(20,4)=20; min(20,6)=6; min(6,100)=6 -> 6
+  let n = smart_nframes(
+    FrameSampling::Fps {
+      fps: 2.0,
+      min_frames: 4,
+      max_frames: Some(6),
+    },
+    100,
+    10.0,
+  )
+  .unwrap();
+  assert_eq!(n, 6);
+}
+
+#[test]
+fn smart_nframes_default_sampling_matches_explicit() {
+  // FrameSampling::default() == Fps{FPS, FPS_MIN_FRAMES, None}.
+  let d = smart_nframes(FrameSampling::default(), 100, 30.0).unwrap();
+  let e = smart_nframes(
+    FrameSampling::Fps {
+      fps: 2.0,
+      min_frames: 4,
+      max_frames: None,
+    },
+    100,
+    30.0,
+  )
+  .unwrap();
+  assert_eq!(d, e);
+  assert_eq!(d, 6);
+}
+
+#[test]
+fn smart_nframes_rejects_bad_inputs() {
+  assert!(smart_nframes(FrameSampling::default(), 0, 30.0).is_err()); // total<=0
+  assert!(
+    smart_nframes(
+      FrameSampling::Fps {
+        fps: 2.0,
+        min_frames: 4,
+        max_frames: None
+      },
+      100,
+      0.0
+    )
+    .is_err()
+  ); // video_fps<=0
+  // Fixed{1} -> round_by_factor(1,2)=round(0.5)=0 < FRAME_FACTOR -> Err.
+  assert!(smart_nframes(FrameSampling::Fixed { nframes: 1 }, 100, 30.0).is_err());
+}
+
+// ---------- sample_frame_indices ----------
+
+#[test]
+fn sample_frame_indices_linspace_round_even() {
+  // linspace(0, 9, 5) = [0, 2.25, 4.5, 6.75, 9]
+  //   round-half-to-even -> [0, 2, 4 (4.5->even), 7 (6.75->7), 9]
+  assert_eq!(sample_frame_indices(10, 5).unwrap(), vec![0, 2, 4, 7, 9]);
+}
+
+#[test]
+fn sample_frame_indices_more_cases() {
+  // linspace(0, 7, 4) = [0, 2.333, 4.667, 7] -> [0, 2, 5, 7]
+  assert_eq!(sample_frame_indices(8, 4).unwrap(), vec![0, 2, 5, 7]);
+  // num=1 -> [start] = [0]
+  assert_eq!(sample_frame_indices(10, 1).unwrap(), vec![0]);
+  // linspace(0, 3, 2) = [0, 3]
+  assert_eq!(sample_frame_indices(4, 2).unwrap(), vec![0, 3]);
+  // Endpoints are exactly [0, total-1].
+  let idx = sample_frame_indices(100, 8).unwrap();
+  assert_eq!(idx.first(), Some(&0));
+  assert_eq!(idx.last(), Some(&99));
+  assert_eq!(idx.len(), 8);
+}
+
+#[test]
+fn sample_frame_indices_rejects_bad_inputs() {
+  assert!(sample_frame_indices(0, 4).is_err());
+  assert!(sample_frame_indices(10, 0).is_err());
+}
+
+// ---------- process_frames ----------
+
+/// Solid-color `width x height` RGB frame.
+fn solid_frame(width: u32, height: u32, rgb: [u8; 3]) -> ::image::DynamicImage {
+  let mut buf = ::image::RgbImage::new(width, height);
+  for y in 0..height {
+    for x in 0..width {
+      buf.put_pixel(x, y, ::image::Rgb(rgb));
+    }
+  }
+  ::image::DynamicImage::ImageRgb8(buf)
+}
+
+/// No-op-resize, no-rescale, no-normalize config: `process_frames` then
+/// equals "image_to_array per frame, stacked", which is fully
+/// deterministic (no interpolation) for hand-tracing.
+fn passthrough_cfg(size: (u32, u32)) -> ImageProcessorConfig {
+  ImageProcessorConfig {
+    size,
+    mean: [0.0, 0.0, 0.0],
+    std: [1.0, 1.0, 1.0],
+    rescale_factor: 1.0,
+    do_resize: false,
+    do_rescale: false,
+    do_normalize: false,
+    resample: ResizeFilter::Bicubic,
+    color_order: ColorOrder::Rgb,
+  }
+}
+
+#[test]
+fn process_frames_stacks_channel_last_t_h_w_3() {
+  // 3 solid 2x2 frames; do_resize=false so each frame -> image_to_array
+  // [2,2,3] of the solid color; stacked along a new leading T axis ->
+  // [3, 2, 2, 3].
+  let frames = [
+    solid_frame(2, 2, [10, 20, 30]),
+    solid_frame(2, 2, [40, 50, 60]),
+    solid_frame(2, 2, [70, 80, 90]),
+  ];
+  let cfg = passthrough_cfg((2, 2));
+  let mut out = process_frames(&frames, &cfg).unwrap();
+  assert_eq!(out.shape(), vec![3, 2, 2, 3], "stacked layout [T, H, W, 3]");
+
+  let v: Vec<f32> = out.to_vec().unwrap();
+  // Build the expected channel-last stack by hand: per frame, 4 pixels
+  // (row-major) each = the solid color.
+  let mut expected = Vec::new();
+  for color in [[10.0, 20.0, 30.0], [40.0, 50.0, 60.0], [70.0, 80.0, 90.0]] {
+    for _pixel in 0..4 {
+      expected.extend_from_slice(&color);
+    }
+  }
+  assert_eq!(v, expected);
+}
+
+#[test]
+fn process_frames_matches_per_frame_preprocess_with_rescale() {
+  // With do_rescale=true (1/255) the stacked output must equal the
+  // per-frame preprocess values. Single frame keeps the hand-trace tiny.
+  let frame = solid_frame(1, 1, [255, 0, 128]);
+  let cfg = ImageProcessorConfig {
+    size: (1, 1),
+    mean: [0.0, 0.0, 0.0],
+    std: [1.0, 1.0, 1.0],
+    rescale_factor: 1.0 / 255.0,
+    do_resize: false,
+    do_rescale: true,
+    do_normalize: false,
+    resample: ResizeFilter::Bicubic,
+    color_order: ColorOrder::Rgb,
+  };
+  let frames = [frame];
+  let mut out = process_frames(&frames, &cfg).unwrap();
+  assert_eq!(out.shape(), vec![1, 1, 1, 3]);
+  let v: Vec<f32> = out.to_vec().unwrap();
+  // 255/255=1.0, 0/255=0.0, 128/255=0.50196...
+  let expected = [1.0_f32, 0.0, 128.0 / 255.0];
+  assert!(
+    v.iter().zip(expected).all(|(a, b)| (a - b).abs() <= 1e-5),
+    "got {v:?}"
+  );
+}
+
+#[test]
+fn process_frames_single_frame_shape() {
+  let frames = [solid_frame(2, 3, [5, 5, 5])];
+  let cfg = passthrough_cfg((2, 3));
+  let out = process_frames(&frames, &cfg).unwrap();
+  // image_to_array yields [H=3, W=2, 3]; stacked -> [1, 3, 2, 3].
+  assert_eq!(out.shape(), vec![1, 3, 2, 3]);
+}
+
+#[test]
+fn process_frames_empty_is_err() {
+  let frames: [::image::DynamicImage; 0] = [];
+  let cfg = passthrough_cfg((2, 2));
+  assert!(process_frames(&frames, &cfg).is_err());
+}
