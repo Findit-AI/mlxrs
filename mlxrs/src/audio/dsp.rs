@@ -19,13 +19,17 @@
 //!   `pad_mode="reflect"`. Output layout is **`(num_frames, n_fft / 2 + 1)`
 //!   complex** (mlx-c `rfft` yields `Complex64` natively), as in the
 //!   reference.
-//! - [`istft`] inverts [`stft`] **in that same `(num_frames, n_fft / 2 + 1)`
-//!   layout** (so `istft(&stft(x, ..)?, ..)` composes directly). This is a
-//!   deliberate, semantics-preserving adaptation of `mlx_audio.dsp.istft`,
-//!   which documents a frequency-major `(n_fft / 2 + 1, num_frames)` input
-//!   and irffts along axis 0; see [`istft`] for the full rationale (the
-//!   reference's `win_length` default is also derived from the frequency
-//!   dimension here, fixing an axis bug in the upstream default formula).
+//! - [`istft`] inverts **even-`n_fft`** [`stft`] output **in that same
+//!   `(num_frames, n_fft / 2 + 1)` layout** (so `istft(&stft(x, ..)?, ..)`
+//!   composes directly). This is a deliberate, semantics-preserving adaptation
+//!   of `mlx_audio.dsp.istft`, which documents a frequency-major
+//!   `(n_fft / 2 + 1, num_frames)` input and irffts along axis 0; see [`istft`]
+//!   for the full rationale (the reference's `win_length`/`n_fft` defaults are
+//!   also derived from the frequency dimension here, fixing an axis bug in the
+//!   upstream default formula). [`istft`] infers `n_fft = (n_freqs - 1) * 2`
+//!   (the universal even case) and does not expose an explicit `n_fft`: a
+//!   one-sided spectrum cannot disambiguate odd `n_fft` from the adjacent even
+//!   length, so odd `n_fft` is unsupported (see [`istft`]).
 //! - Mel filterbank uses the HTK formula
 //!   (`mel = 2595 * log10(1 + hz / 700)`) and returns shape
 //!   **`(n_mels, n_fft / 2 + 1)`**.
@@ -689,10 +693,19 @@ pub fn stft(
 /// inverse of [`stft`].
 ///
 /// Faithful port of `mlx_audio.dsp.istft(x, hop_length, win_length, window,
-/// center=True, length=None, normalized=False)`, adapted to mlxrs's STFT
-/// layout. **`x` is `(num_frames, n_fft / 2 + 1)` `Dtype::Complex64`** — i.e.
-/// exactly what [`stft`] returns — so `istft(&stft(s, ..)?, ..)` composes
-/// directly.
+/// center=True, length=None)`, adapted to mlxrs's STFT layout and restricted
+/// to **even `n_fft`** (the universal case). **`x` is
+/// `(num_frames, n_fft / 2 + 1)` `Dtype::Complex64`** — i.e. exactly what
+/// [`stft`] returns — so `istft(&stft(s, ..)?, ..)` composes directly.
+///
+/// **Even-`n_fft` only.** `n_fft` is inferred as `(n_freqs - 1) * 2` and is
+/// **not** an explicit parameter. A one-sided spectrum has
+/// `n_freqs == n_fft / 2 + 1` for BOTH `n_fft = 2k` and `n_fft = 2k + 1`, so
+/// the bin count cannot tell an odd `n_fft` from the adjacent even length;
+/// inferring (or even being told) an odd `n_fft` would silently misdecode the
+/// transform. [`istft`] therefore inverts the even-`n_fft` STFT output (what
+/// every documented `mlx-audio` config produces) and odd `n_fft` is
+/// unsupported.
 ///
 /// **There is no custom-window parameter.** The synthesis window is rebuilt
 /// internally from `(win_length, n_fft, window_pad)` through the very same
@@ -701,25 +714,20 @@ pub fn stft(
 /// the historical synthesis/analysis mismatch (a separately-specified
 /// periodic synthesis window silently differing from `stft`'s symmetric
 /// analysis window) is structurally impossible. Pass the SAME `win_length` /
-/// `n_fft` / `window_pad` you gave [`stft`] (with `normalized = true` for the
-/// exact `Σw²` inverse) and `istft(&stft(x, ..)?, ..)?` reconstructs every
-/// sample. The reference instead documents a frequency-major
+/// `window_pad` you gave [`stft`] and `istft(&stft(x, ..)?, ..)?` reconstructs
+/// every sample. The reference instead documents a frequency-major
 /// `(n_fft / 2 + 1, num_frames)` input and irffts along axis 0 then
 /// transposes; here the frames are already on axis 0, so we irfft along
 /// axis 1 and skip the transpose. This is a semantics-preserving adaptation,
 /// not a behavior change (every sample of the reconstruction is identical to
 /// the reference fed the transpose of `x`).
 ///
-/// `n_fft` is an explicit `Option<usize>` defaulting to `(n_freqs - 1) * 2`
-/// (the even-length irfft target). Passing it explicitly lets **odd** `n_fft`
-/// round-trip (e.g. `n_fft = 9` ⇒ `n_freqs = 5`, where the default formula
-/// would otherwise infer `8`); it is validated against the frequency axis
-/// (`n_freqs == n_fft / 2 + 1`, a recoverable error otherwise) and used as
-/// the irfft length. `win_length` defaults to `n_fft`. The reference's
-/// documented default (`(n_fft - 1) * 2`) is computed as `(x.shape[1] - 1) *
-/// 2`, which under its own documented frequency-major layout reads the
-/// `num_frames` axis — an upstream axis bug; we derive from `n_freqs`
-/// (`x.shape[1]` in our layout). `hop_length` defaults to `win_length / 4`.
+/// `win_length` defaults to `n_fft`. The reference's documented default
+/// (`(n_fft - 1) * 2`) is computed as `(x.shape[1] - 1) * 2`, which under its
+/// own documented frequency-major layout reads the `num_frames` axis — an
+/// upstream axis bug; we derive `n_fft` (and hence the default `win_length`)
+/// from `n_freqs` (`x.shape[1]` in our layout). `hop_length` defaults to
+/// `win_length / 4`.
 ///
 /// Both window-padding conventions are accepted via `window_pad`
 /// ([`WindowPad`]). The synthesis window is the symmetric Hann of `win_length`
@@ -736,10 +744,14 @@ pub fn stft(
 ///   `win_length != n_fft` up front with a recoverable [`Error::Backend`]. Use
 ///   [`WindowPad::Center`] for short-window inversion.
 ///
-/// Normalization mirrors the reference: each output sample is divided by the
-/// overlap-add sum of the (optionally squared) synthesis window. With
-/// `normalized = false` the divisor is `Σ w` (simple window normalization);
-/// with `normalized = true` it is `Σ w²` (COLA / `torch.istft` convention).
+/// **Overlap-add normalization is always `Σ w²`** (the window-sum of
+/// *squares*). [`stft`] emits FFTs of already-windowed frames, and [`istft`]
+/// irffts and multiplies by the synthesis window *again*, so each output
+/// sample carries a `w²` weight and the faithful inverse divides by the
+/// overlap-add sum of `w²` (the COLA / `torch.istft` convention). There is no
+/// `normalized` toggle: dividing by `Σ w` (the upstream `normalized=False`
+/// branch) is a gain error against this windowed-twice forward transform, so
+/// that path is removed and `Σ w²` is always used.
 ///
 /// **Coverage guard (structural correctness invariant).** After the
 /// overlap-add, every sample in the *requested output region* (the region
@@ -773,8 +785,6 @@ pub fn stft(
 /// - [`Error::Backend`] when:
 ///   - `x` is not 2-D, or `n_freqs < 2` (need at least 2 bins to define
 ///     `n_fft`),
-///   - an explicit `n_fft` is inconsistent with the frequency axis
-///     (`n_freqs != n_fft / 2 + 1`),
 ///   - `num_frames == 0`,
 ///   - `hop_length == 0`, `win_length == 0`, or `win_length > n_fft`,
 ///   - `window_pad` is [`WindowPad::Right`] and `win_length != n_fft`
@@ -794,16 +804,13 @@ pub fn stft(
 ///     `n_fft/2 + length > t`; with `center = false`, `length > t`).
 /// - Propagates window-construction errors from `frame_window` (the shared
 ///   symmetric-Hann builder).
-#[allow(clippy::too_many_arguments)]
 pub fn istft(
   x: &Array,
-  n_fft: Option<usize>,
   hop_length: Option<usize>,
   win_length: Option<usize>,
   window_pad: WindowPad,
   center: bool,
   length: Option<usize>,
-  normalized: bool,
 ) -> Result<Array> {
   let shape = x.shape();
   if shape.len() != 2 {
@@ -826,37 +833,15 @@ pub fn istft(
       message: "istft: num_frames must be > 0".into(),
     });
   }
-  // The irfft target length. Defaults to `(n_freqs - 1) * 2` (the even
-  // round-trip length), but may be passed explicitly so an ODD `n_fft`
-  // round-trips (the default formula can only produce even values). Whichever
-  // we use, it MUST satisfy `n_freqs == n_fft / 2 + 1` — the rfft/irfft bin
-  // count for a length-`n_fft` real transform — else the irfft below would be
-  // fed an inconsistent length. Validate the explicit value against the
-  // frequency axis (recoverable error), and bound-check the default for
-  // overflow.
-  let n_fft = match n_fft {
-    Some(n) => {
-      if n == 0 {
-        return Err(Error::Backend {
-          message: "istft: n_fft must be > 0".into(),
-        });
-      }
-      // `n / 2 + 1` cannot overflow (`n / 2 <= usize::MAX / 2`).
-      if n_freqs != n / 2 + 1 {
-        return Err(Error::Backend {
-          message: format!(
-            "istft: explicit n_fft {n} is inconsistent with n_freqs {n_freqs} \
-             (require n_freqs == n_fft / 2 + 1 = {})",
-            n / 2 + 1
-          ),
-        });
-      }
-      n
-    }
-    None => (n_freqs - 1).checked_mul(2).ok_or_else(|| Error::Backend {
-      message: format!("istft: n_fft = (n_freqs - 1) * 2 overflows usize (n_freqs={n_freqs})"),
-    })?,
-  };
+  // The irfft target length, ALWAYS the even inference `n_fft = (n_freqs - 1)
+  // * 2`. This is unambiguous: a one-sided spectrum has `n_freqs == n_fft / 2
+  // + 1` for both `n_fft = 2k` and `2k + 1`, so the bin count cannot
+  // distinguish odd from the adjacent even length — `istft` therefore inverts
+  // the even-`n_fft` STFT output (the universal `mlx-audio` case) and odd
+  // `n_fft` is unsupported (there is no `n_fft` parameter to mis-state).
+  let n_fft = (n_freqs - 1).checked_mul(2).ok_or_else(|| Error::Backend {
+    message: format!("istft: n_fft = (n_freqs - 1) * 2 overflows usize (n_freqs={n_freqs})"),
+  })?;
   let win_length = win_length.unwrap_or(n_fft);
   if win_length == 0 {
     return Err(Error::Backend {
@@ -987,12 +972,13 @@ pub fn istft(
   let windowed = ops::arithmetic::multiply(&frames_time, &window)?;
   let updates_reconstructed = ops::shape::flatten(&windowed, 0, -1)?;
 
-  // window_norm = w*w if normalized else w; tiled across frames then flattened.
-  let window_norm = if normalized {
-    ops::arithmetic::multiply(&window, &window)?
-  } else {
-    window
-  };
+  // window_norm = w*w ALWAYS — the faithful OLA divisor. `stft` already
+  // windowed each frame and `istft` multiplies by the synthesis window again
+  // (in `windowed` above), so each sample carries a `w²` weight and the
+  // overlap-add must be normalized by `Σ w²` (COLA / `torch.istft`). Dividing
+  // by `Σ w` (the removed `normalized=false` branch) is a gain error against
+  // this windowed-twice forward transform. Tiled across frames then flattened.
+  let window_norm = ops::arithmetic::multiply(&window, &window)?;
   // tile(window_norm, num_frames): (n_fft,) → (num_frames, n_fft).
   let window_norm_row = ops::shape::reshape(&window_norm, &(1usize, frame_width))?;
   let window_norm_tiled = ops::shape::broadcast_to(&window_norm_row, &(num_frames, frame_width))?;
@@ -1116,15 +1102,15 @@ pub fn istft(
           "istft: requested output sample at index {global_idx} (region offset {local_idx}) \
            has window-sum {min_wsum:.3e} <= COVERAGE_EPS ({COVERAGE_EPS:.0e}) — it received \
            no window coverage in the overlap-add and is not recoverable \
-           (n_fft={n_fft}, win_length={win_length}, hop={hop_length}, window_pad={window_pad:?}, \
-           normalized={normalized}); the requested region (e.g. a center=false head/tail) \
+           (n_fft={n_fft}, win_length={win_length}, hop={hop_length}, window_pad={window_pad:?}); \
+           the requested region (e.g. a center=false head/tail) \
            includes a zero-coverage sample — adjust length/center or the window"
         ),
       });
     }
   }
 
-  // Normalize by the (squared) window-sum where it exceeds the coverage
+  // Normalize by the squared-window-sum (`Σ w²`) where it exceeds the coverage
   // threshold, else leave the raw overlap-add (matches the reference's
   // `mx.where` guard). The coverage guard above guarantees every REQUESTED
   // sample is on the normalized branch; the `where` only matters for the
@@ -1532,8 +1518,7 @@ mod tests {
     ]
   }
 
-  /// A 19-sample fixed test signal for the non-hop-aligned / odd-`n_fft`
-  /// round-trips.
+  /// A 19-sample fixed test signal for the non-hop-aligned round-trips.
   fn signal_19() -> [f32; 19] {
     [
       0.1, 0.5, -0.3, 0.8, -0.2, 0.6, 0.0, -0.7, 0.4, 0.9, -0.5, 0.2, 0.3, -0.1, 0.7, -0.4, 0.55,
@@ -1542,18 +1527,19 @@ mod tests {
   }
 
   /// Round-trip `signal` through the REAL public [`stft`] then [`istft`] with
-  /// the SAME `win_length` / `n_fft` / `window_pad` and `normalized = true`
-  /// (the exact `Σw²` inverse), and assert EVERY output sample equals the
-  /// original.
+  /// the SAME `win_length` / `window_pad` (`istft` infers the even `n_fft`
+  /// itself and always uses the `Σw²` inverse), and assert EVERY output sample
+  /// equals the original.
   ///
   /// This is the canary the previous review rounds were missing: it goes
   /// through `stft` itself (NOT a private periodic-forward helper), and the
   /// synthesis window `istft` rebuilds is the SAME symmetric Hann `stft`
   /// placed (both via `frame_window`) — so if the two ever drifted, this
-  /// would fail value-for-value. `len_override` is the `length` passed to
-  /// `istft` (pass `Some(signal.len())` to recover the full input even when
-  /// the centered region is shorter than the signal). Expected values were
-  /// cross-checked against a self-contained f64 numpy mirror
+  /// would fail value-for-value. `n_fft` is passed to `stft` only (even values
+  /// only; `istft` re-derives it from the bin count). `len_override` is the
+  /// `length` passed to `istft` (pass `Some(signal.len())` to recover the full
+  /// input even when the centered region is shorter than the signal). Expected
+  /// values were cross-checked against a self-contained f64 numpy mirror
   /// (`docs/istft_ref.py`, local-only) reporting max round-trip error
   /// <= 4.5e-16 for every covered case; the f32 backend is asserted at 1e-5.
   fn assert_roundtrips_all_samples(
@@ -1568,13 +1554,11 @@ mod tests {
     let spec = stft(&x, n_fft, hop, Some(win_length), window_pad).unwrap();
     let rec = istft(
       &spec,
-      Some(n_fft), // explicit n_fft (required for odd n_fft to round-trip)
       Some(hop),
       Some(win_length),
       window_pad,
       true, // center (undo stft's reflect pad)
       len_override,
-      true, // normalized (Σw²)
     )
     .unwrap();
     let r = to_vec(&rec);
@@ -1644,8 +1628,8 @@ mod tests {
     // WindowPad::Center, win_length < n_fft: full COLA coverage, exactly
     // invertible through the REAL public stft. `stft` places the symmetric Hann
     // of `win_length` center-padded into n_fft; `istft` rebuilds that EXACT
-    // window via the shared `frame_window` and overlap-adds with normalized=true
-    // (Σw²). (min window-sum 0.41 for win=8, 1.01 for win=12; max err 1.1e-16 vs
+    // window via the shared `frame_window` and overlap-adds with the always-on
+    // Σw² normalization. (min window-sum 0.41 for win=8, 1.01 for win=12; max err 1.1e-16 vs
     // the numpy mirror.) n_fft=16, hop=4, win=8 and win=12 — both cover the
     // centered 16-sample region. Asserts ALL 16 samples. This is the correctness
     // payoff of the Center convention (and of unifying the windows): the
@@ -1679,16 +1663,7 @@ mod tests {
       let spec = stft(&x, 16, 4, Some(win), WindowPad::Right).unwrap();
       assert_eq!(spec.shape(), vec![5, 9]); // (num_frames, n_fft/2+1), n_fft=16
       for len in [None, Some(16usize)] {
-        let res = istft(
-          &spec,
-          Some(16),
-          Some(4),
-          Some(win),
-          WindowPad::Right,
-          true,
-          len,
-          true,
-        );
+        let res = istft(&spec, Some(4), Some(win), WindowPad::Right, true, len);
         assert!(
           matches!(res, Err(Error::Backend { .. })),
           "Right + win={win} < n_fft=16 (length={len:?}) must be rejected up front \
@@ -1703,44 +1678,6 @@ mod tests {
     for &win in &[8usize, 12usize] {
       assert_roundtrips_all_samples(&buf, 16, win, 4, WindowPad::Center, None);
     }
-  }
-
-  #[test]
-  fn istft_odd_nfft_center_all_samples() {
-    // Odd n_fft must round-trip via the EXPLICIT `n_fft` argument (the default
-    // `(n_freqs - 1) * 2` can only produce EVEN values). n_fft=9 (n_freqs=5,
-    // hop=3) over signal_16 and n_fft=15 (n_freqs=8, hop=5) over signal_19,
-    // Center mode. length=Some(signal.len()) recovers every sample. Cross-
-    // checked vs numpy (max err 4.4e-16 / 2.2e-16).
-    let s16 = signal_16();
-    assert_roundtrips_all_samples(&s16, 9, 9, 3, WindowPad::Center, Some(16));
-    let s19 = signal_19();
-    assert_roundtrips_all_samples(&s19, 15, 15, 5, WindowPad::Center, Some(19));
-  }
-
-  #[test]
-  fn istft_odd_nfft_validates_against_freq_axis() {
-    // An explicit odd n_fft must satisfy `n_freqs == n_fft / 2 + 1`. A spec with
-    // n_freqs=5 is consistent with n_fft ∈ {8, 9} (8/2+1 == 9/2+1 == 5) but NOT
-    // with n_fft=11 (11/2+1 == 6) → must Err.
-    let buf = signal_16();
-    let x = Array::from_slice::<f32>(&buf, &[16i32]).unwrap();
-    let spec = stft(&x, 9, 3, Some(9), WindowPad::Center).unwrap();
-    assert_eq!(spec.shape()[1], 5); // n_freqs
-    let bad = istft(
-      &spec,
-      Some(11), // 11/2+1 = 6 != n_freqs (5)
-      Some(3),
-      Some(9),
-      WindowPad::Center,
-      true,
-      None,
-      true,
-    );
-    assert!(
-      matches!(bad, Err(Error::Backend { .. })),
-      "explicit n_fft inconsistent with n_freqs must Err, got {bad:?}"
-    );
   }
 
   #[test]
@@ -1772,13 +1709,11 @@ mod tests {
     for len in [None, Some(10usize)] {
       let res = istft(
         &spec,
-        Some(8),
         Some(4),
         Some(8),
         WindowPad::Center,
         false, // center=false: requested region starts at the uncovered index 0
         len,
-        true,
       );
       assert!(
         matches!(res, Err(Error::Backend { .. })),
@@ -1793,16 +1728,7 @@ mod tests {
     // 1-D input (must be 2-D).
     let one_d = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3i32]).unwrap();
     assert!(matches!(
-      istft(
-        &one_d,
-        None,
-        None,
-        None,
-        WindowPad::Center,
-        true,
-        None,
-        false
-      ),
+      istft(&one_d, None, None, WindowPad::Center, true, None),
       Err(Error::Backend { .. })
     ));
 
@@ -1812,45 +1738,18 @@ mod tests {
     let spec = stft(&x, 8, 4, Some(8), WindowPad::Center).unwrap();
     // hop_length == 0.
     assert!(matches!(
-      istft(
-        &spec,
-        None,
-        Some(0),
-        Some(8),
-        WindowPad::Center,
-        true,
-        None,
-        false
-      ),
+      istft(&spec, Some(0), Some(8), WindowPad::Center, true, None),
       Err(Error::Backend { .. })
     ));
     // win_length > n_fft (n_fft = 8 here; 16 > 8 → the window cannot exceed the
     // irfft frame width).
     assert!(matches!(
-      istft(
-        &spec,
-        None,
-        Some(4),
-        Some(16),
-        WindowPad::Center,
-        true,
-        None,
-        false
-      ),
+      istft(&spec, Some(4), Some(16), WindowPad::Center, true, None),
       Err(Error::Backend { .. })
     ));
     // length larger than the OLA length (t = 24).
     assert!(matches!(
-      istft(
-        &spec,
-        None,
-        Some(4),
-        Some(8),
-        WindowPad::Center,
-        true,
-        Some(1000),
-        true
-      ),
+      istft(&spec, Some(4), Some(8), WindowPad::Center, true, Some(1000)),
       Err(Error::Backend { .. })
     ));
   }
@@ -1883,13 +1782,11 @@ mod tests {
       .unwrap();
     let res = istft(
       &spec,
-      None,    // n_fft defaults to (n_freqs-1)*2
       Some(2), // small hop → t stays under the decoded cap
-      None,    // win_length defaults to n_fft
+      None,    // win_length defaults to the inferred n_fft
       WindowPad::Center,
       true,
       None,
-      false,
     );
     assert!(
       matches!(res, Err(Error::Backend { .. })),
