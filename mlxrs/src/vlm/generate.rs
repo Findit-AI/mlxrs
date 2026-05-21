@@ -98,7 +98,7 @@ use std::{cell::RefCell, path::PathBuf};
 
 use crate::{
   array::Array,
-  error::{Error, Result, try_with_capacity},
+  error::{Error, Result, try_extend_from_slice, try_with_capacity},
   lm::{
     cache::KvCache,
     generate::{
@@ -529,7 +529,7 @@ impl<M: Model> VlmDecode<'_, M> {
     let mut logits = logits;
     if !self.processors.is_empty() && !step_inputs.is_empty() {
       let mut history = self.history.borrow_mut();
-      history.extend_from_slice(step_inputs);
+      try_extend_from_slice(&mut history, step_inputs)?;
       for p in &self.processors {
         logits = p(&history, &logits)?;
       }

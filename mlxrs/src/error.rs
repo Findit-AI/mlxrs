@@ -131,6 +131,20 @@ pub(crate) fn try_to_vec<T: Clone>(slice: &[T]) -> Result<Vec<T>> {
   Ok(v)
 }
 
+/// Fallible [`Vec::extend_from_slice`]: reserve room for `slice` and append,
+/// returning [`Error::OutOfMemory`] instead of aborting on allocation
+/// failure. Uses the AMORTIZED `try_reserve` (NOT `try_reserve_exact`):
+/// callers grow the same `Vec` repeatedly (processor history accumulates the
+/// prefill prompt, then one token per decode step), so exact reservation
+/// would reallocate on every append and turn an O(n) accumulation into
+/// O(n²). The recoverable analogue of `vec.extend_from_slice(slice)`.
+#[cfg(feature = "vlm")]
+pub(crate) fn try_extend_from_slice<T: Clone>(v: &mut Vec<T>, slice: &[T]) -> Result<()> {
+  v.try_reserve(slice.len()).map_err(|_| Error::OutOfMemory)?;
+  v.extend_from_slice(slice);
+  Ok(())
+}
+
 thread_local! {
   pub(crate) static LAST: RefCell<Option<Error>> = const { RefCell::new(None) };
 }
