@@ -100,9 +100,11 @@ const MAX_OLA_WORK: usize = 64 * 1024 * 1024;
 /// sample count. We reject any `(num_frames, n_fft, hop)` combination whose
 /// frame work or output element count overflows `usize` or exceeds this cap
 /// *before* allocating, so a pathological / lazily-shaped input can never
-/// drive a multi-GB framing/FFT allocation. 64 Mi-elements (256 MiB of f32
-/// frames + matching Complex64 output) is a generous ceiling that still
-/// admits every realistic STFT.
+/// drive a multi-GB framing/FFT allocation. The cap is intentionally in
+/// elements, not bytes: at 64 Mi-elements the f32 frame matrix alone can be
+/// ~256 MiB, while a `Dtype::Complex64` one-sided output of that size can be
+/// ~512 MiB (plus any other intermediates). This is still a generous ceiling
+/// that admits every realistic STFT.
 const MAX_STFT_WORK: usize = 64 * 1024 * 1024;
 
 /// Coverage threshold for the overlap-add window-sum, shared by [`istft`]'s
@@ -869,7 +871,7 @@ pub fn stft(
   if !n_fft.is_multiple_of(2) {
     return Err(Error::Backend {
       message: format!(
-        "stft requires an even n_fft (got {n_fft}); odd n_fft is unsupported \
+        "stft: n_fft must be even (got {n_fft}); odd n_fft is unsupported \
          because the one-sided spectrum cannot be inverted unambiguously."
       ),
     });
