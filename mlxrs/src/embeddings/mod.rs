@@ -72,9 +72,14 @@
 //!   `EmbeddingModelOutput`) and the
 //!   [`encode`](crate::embeddings::encode()) entry +
 //!   [`EncodeConfig`](crate::embeddings::EncodeConfig) (tokenize → pad +
-//!   attention mask → `forward` → [`pool`](crate::embeddings::pool) →
-//!   optional L2-normalize → `(batch, dim)`; mirrors python
-//!   `utils.generate` + swift `EmbedderModelContainer.perform`).
+//!   attention mask → `forward` → optional
+//!   [`pool`](crate::embeddings::pool) / post-processing; typically
+//!   returns pooled rank-2 embeddings `(batch, dim)`, but
+//!   [`PoolingStrategy::None`](crate::embeddings::PoolingStrategy::None)
+//!   can preserve rank-3 hidden states `(batch, seq_len, dim)`, and the
+//!   `pooled_output` fast-path can also return rank-2 output; mirrors
+//!   python `utils.generate` + swift
+//!   `EmbedderModelContainer.perform`).
 
 pub mod config;
 pub mod encode;

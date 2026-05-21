@@ -257,10 +257,13 @@ fn tokenize_and_pad(
 ///    `inputs.pooledOutput ?? hiddenStates…`; otherwise the hidden-states
 ///    pooling path is taken as before.
 ///
-/// The returned array is `(batch, dim)` (or `(batch, seq_len, dim)` if
-/// `cfg.strategy` is [`PoolingStrategy::None`], which passes the hidden states
-/// through). **No implicit eval**: the result is a lazy graph node; the caller
-/// evaluates (or reads it) when ready.
+/// The returned array is usually `(batch, dim)`. If `cfg.strategy` is
+/// [`PoolingStrategy::None`] and the model does not provide a
+/// `pooled_output`, the hidden states are passed through and the result is
+/// `(batch, seq_len, dim)` instead; if a `pooled_output` is present, that
+/// fast-path still returns a rank-2 `(batch, dim)` array. **No implicit eval**:
+/// the result is a lazy graph node; the caller evaluates (or reads it) when
+/// ready.
 ///
 /// An empty `texts` slice returns a `(0, …)` array (zero-row batch). The
 /// pooling stage receives the model's hidden states unchanged from the
