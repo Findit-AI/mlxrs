@@ -890,11 +890,15 @@ fn rotate_buf<T: Copy + Default>(
 /// # Errors
 /// - [`Error::ShapeMismatch`] if either target dimension is `0`, if
 ///   `height * width * 4` overflows `u64`, if it exceeds
-///   [`MAX_DECODED_IMAGE_BYTES`], or if `source_width * source_height *
-///   4` overflows `usize` — the message carries the offending dims and
-///   the cap. (The over-cap case uses `ShapeMismatch` rather than
-///   [`Error::OutOfMemory`] so it can name the dims + ceiling, matching
-///   [`pad_to_square`]'s canvas gate.)
+///   [`MAX_DECODED_IMAGE_BYTES`], if `source_width * source_height * 4`
+///   overflows `usize`, or if that RGBA8-expanded source staging size
+///   itself exceeds [`MAX_DECODED_IMAGE_BYTES`] — the message carries the
+///   offending dims and the cap. (The over-cap cases use `ShapeMismatch`
+///   rather than [`Error::OutOfMemory`] so they can name the dims +
+///   ceiling, matching [`pad_to_square`]'s canvas gate.) The source guard
+///   matters because `load_image`'s cap is on the *source* pixel format:
+///   a `Luma8` (1 B/px) image accepted just under the cap would expand
+///   4x as RGBA8 staging.
 /// - [`Error::OutOfMemory`] if the allocator cannot satisfy the
 ///   `try_reserve_exact` for the source RGBA buffer or for any buffer the
 ///   resize kernel allocates (coefficient tables, inter-pass
@@ -976,6 +980,24 @@ pub fn resize(
     .ok_or_else(|| Error::ShapeMismatch {
       message: format!("resize: source width*height*4 overflows usize for {src_h}x{src_w}"),
     })?;
+  // Source-staging cap (Codex review): `load_image`'s 512 MiB ceiling is
+  // enforced on `decoder.total_bytes()` — the SOURCE pixel format. A
+  // low-bytes-per-pixel source (e.g. `Luma8`, 1 B/px) accepted just under
+  // that cap expands 4x when projected to the RGBA8 staging buffer below,
+  // so an under-cap Luma8 image could drive a ~2 GiB RGBA staging
+  // allocation and break the documented bounded-memory invariant. The
+  // destination already has this guard (`dst_bytes` above); apply the
+  // same `MAX_DECODED_IMAGE_BYTES` ceiling to the RGBA-expanded SOURCE
+  // staging before its `try_reserve_exact`. `u64` so the comparison is
+  // host-width-independent (matches the `dst_bytes` gate).
+  if src_bytes as u64 > MAX_DECODED_IMAGE_BYTES {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "resize: {src_h}x{src_w} source needs {src_bytes} bytes as RGBA8 staging, \
+         exceeds MAX_DECODED_IMAGE_BYTES={MAX_DECODED_IMAGE_BYTES}"
+      ),
+    });
+  }
   let mut src_buf = crate::error::try_with_capacity::<u8>(src_bytes)?;
   if let Some(rgba) = img.as_rgba8() {
     // Already RGBA8: borrow the backing `&[u8]` and copy exactly

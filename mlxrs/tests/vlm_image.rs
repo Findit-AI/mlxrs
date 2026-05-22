@@ -156,6 +156,60 @@ fn resize_rejects_overflowing_target_product() {
 }
 
 #[test]
+fn resize_rejects_source_rgba_staging_over_cap() {
+  // Regression for Codex Finding 2 (medium): `load_image`'s 512 MiB cap
+  // is enforced on `decoder.total_bytes()` — the SOURCE pixel format. A
+  // low-bytes-per-pixel source (Luma8, 1 B/px) can pass that cap yet
+  // expand 4x when projected to the RGBA8 staging buffer `resize`
+  // materializes. Before the fix, `resize` capped only the DESTINATION,
+  // so an under-cap Luma8 could drive a ~2 GiB RGBA staging allocation.
+  //
+  // 16384x8193 Luma8 = ~128 MiB (well under the 512 MiB source cap as
+  // Luma8), but `16384*8193*4 = 536_936_448 bytes > 512 MiB` as the RGBA8
+  // staging — so `resize` must reject it with a recoverable
+  // `ShapeMismatch` naming the RGBA-expanded byte count, BEFORE the
+  // `try_reserve_exact`. The target is tiny (8x8) so the destination
+  // guard does NOT fire — this isolates the SOURCE-staging guard.
+  let w = 16_384u32;
+  let h = 8_193u32;
+  assert!(
+    (w as u64 * h as u64) * 4 > 512 * 1024 * 1024,
+    "fixture must exceed the 512 MiB cap as RGBA8 staging"
+  );
+  let luma = ::image::DynamicImage::ImageLuma8(
+    ::image::ImageBuffer::from_raw(w, h, vec![0u8; (w as usize) * (h as usize)])
+      .expect("Luma8 from_raw for the over-cap source fixture"),
+  );
+  let err = resize(&luma, (8, 8), ResizeFilter::Bilinear)
+    .expect_err("Luma8 source whose RGBA8 staging exceeds the cap must be rejected");
+  match err {
+    Error::ShapeMismatch { message } => assert!(
+      message.contains("resize")
+        && message.contains("MAX_DECODED_IMAGE_BYTES")
+        && message.contains("staging"),
+      "expected ShapeMismatch naming the RGBA staging cap; got: {message}"
+    ),
+    other => panic!("expected ShapeMismatch for over-cap source staging, got {other:?}"),
+  }
+}
+
+#[test]
+fn resize_normal_luma8_source_still_resizes() {
+  // The source-staging guard must NOT regress ordinary Luma8 inputs: a
+  // small Luma8 image (whose RGBA8 staging is far under the cap) still
+  // resizes successfully via the per-pixel fallible projection path.
+  let mut luma = ::image::GrayImage::new(8, 6);
+  for (i, p) in luma.pixels_mut().enumerate() {
+    *p = ::image::Luma([(i * 5 % 256) as u8]);
+  }
+  let img = ::image::DynamicImage::ImageLuma8(luma);
+  let out = resize(&img, (4, 4), ResizeFilter::Bilinear)
+    .expect("a small Luma8 source must still resize (staging well under the cap)");
+  assert_eq!(out.width(), 4, "resized width");
+  assert_eq!(out.height(), 4, "resized height");
+}
+
+#[test]
 fn resize_accepted_target_uses_fallible_alloc_path_never_aborts() {
   // Regression for Codex Finding (high, round 2) + the own-resize
   // omnibus follow-up: an accepted target AT OR BELOW the 512 MiB cap
@@ -512,6 +566,196 @@ fn resize_pil_reference_width_straddle_5x1_to_2x1() {
     vec![43, 157, 10, 255, 157, 43, 10, 255],
     "Bicubic 5x1->2x1 must match PIL byte-for-byte"
   );
+}
+
+// ---------- resize: premultiplied-alpha (PIL parity) ----------
+//
+// PIL's `Image.resize` converts RGBA -> premultiplied `RGBa` before any
+// non-NEAREST resample and back after (`Image.py`:
+// `if self.mode in ["LA","RGBA"] and resample != NEAREST`). A
+// straight-channel convolution is NOT byte-exact for non-opaque alpha: it
+// bleeds the colour of fully-transparent pixels into their neighbours.
+// The expected values below are computed from PIL's exact integer
+// pipeline (`MULDIV255` premultiply -> `Resample.c` fixed-point
+// convolution -> `rgba2rgbA` `CLIP8(255*c/a)` unpremultiply) and were
+// cross-checked by hand-tracing the trivially separable 2x1->1x1 cases.
+
+/// Build a `DynamicImage::ImageRgba8` from a row-major RGBA8 byte slice.
+fn rgba8_image(w: u32, h: u32, bytes: &[u8]) -> ::image::DynamicImage {
+  assert_eq!(bytes.len(), (w * h * 4) as usize, "rgba8_image: byte count");
+  ::image::DynamicImage::ImageRgba8(
+    ::image::ImageBuffer::from_raw(w, h, bytes.to_vec()).expect("rgba8_image: from_raw"),
+  )
+}
+
+#[test]
+fn resize_premultiplied_alpha_transparent_red_opaque_blue_downscale() {
+  // The Codex example: a transparent-red pixel `(255,0,0,0)` next to an
+  // opaque-blue pixel `(0,0,255,255)`. PIL premultiplies before
+  // resampling, so the transparent red contributes ZERO colour — the
+  // downscaled pixel is pure blue with half alpha `(0,0,255,128)`. A
+  // straight-channel average would (wrongly) yield purple
+  // `(128,0,128,128)`. Hand-traced + PIL-pipeline-verified.
+  let transparent_red = [255u8, 0, 0, 0];
+  let opaque_blue = [0u8, 0, 255, 255];
+
+  // 2x1 -> 1x1: pure horizontal, the simplest case to hand-verify.
+  let src_2x1: Vec<u8> = [transparent_red, opaque_blue].concat();
+  let img_2x1 = rgba8_image(2, 1, &src_2x1);
+  for f in [
+    ResizeFilter::Bilinear,
+    ResizeFilter::Bicubic,
+    ResizeFilter::Lanczos3,
+  ] {
+    let out = resize(&img_2x1, (1, 1), f).unwrap().to_rgba8().into_raw();
+    assert_eq!(
+      out,
+      vec![0, 0, 255, 128],
+      "{f:?} 2x1->1x1: PIL premultiplied alpha must give pure blue \
+       (0,0,255,128), not straight-channel purple (128,0,128,128)"
+    );
+  }
+
+  // 2x2 -> 1x1 (both axes): columns transparent-red / opaque-blue.
+  let src_2x2: Vec<u8> = [transparent_red, opaque_blue, transparent_red, opaque_blue].concat();
+  let img_2x2 = rgba8_image(2, 2, &src_2x2);
+  for f in [
+    ResizeFilter::Bilinear,
+    ResizeFilter::Bicubic,
+    ResizeFilter::Lanczos3,
+  ] {
+    let out = resize(&img_2x2, (1, 1), f).unwrap().to_rgba8().into_raw();
+    assert_eq!(
+      out,
+      vec![0, 0, 255, 128],
+      "{f:?} 2x2->1x1: premultiplied-alpha downscale must give (0,0,255,128)"
+    );
+  }
+}
+
+#[test]
+fn resize_premultiplied_alpha_partial_alpha_both_sides() {
+  // Both pixels non-opaque: red at A=128 `(255,0,0,128)` + opaque blue
+  // `(0,0,255,255)`, 2x1 -> 1x1. PIL: premultiply red -> (128,0,0,128),
+  // blue -> (0,0,255,255); average -> (64,0,128,192); unpremultiply
+  // `CLIP8(255*c/192)` -> (85,0,170,192). Hand-traced.
+  let src: Vec<u8> = [[255u8, 0, 0, 128], [0u8, 0, 255, 255]].concat();
+  let img = rgba8_image(2, 1, &src);
+  for f in [
+    ResizeFilter::Bilinear,
+    ResizeFilter::Bicubic,
+    ResizeFilter::Lanczos3,
+  ] {
+    let out = resize(&img, (1, 1), f).unwrap().to_rgba8().into_raw();
+    assert_eq!(
+      out,
+      vec![85, 0, 170, 192],
+      "{f:?} partial-alpha 2x1->1x1 must match PIL premultiplied result"
+    );
+  }
+}
+
+#[test]
+fn resize_premultiplied_alpha_upscale() {
+  // Upscale 2x2 -> 4x4 (columns transparent-red / opaque-blue). The
+  // premultiplied path keeps the colour pure blue at every output column
+  // — only the alpha ramps — instead of bleeding red into the
+  // partially-transparent interpolated columns. Per-row layout is
+  // identical (the source is column-constant). PIL-pipeline-verified.
+  let transparent_red = [255u8, 0, 0, 0];
+  let opaque_blue = [0u8, 0, 255, 255];
+  let src: Vec<u8> = [transparent_red, opaque_blue, transparent_red, opaque_blue].concat();
+  let img = rgba8_image(2, 2, &src);
+
+  // Expected single row (4 RGBA pixels) per filter; all 4 output rows are
+  // identical because the source is constant down each column.
+  for (f, row) in [
+    (
+      ResizeFilter::Bilinear,
+      [0u8, 0, 0, 0, 0, 0, 255, 64, 0, 0, 255, 191, 0, 0, 255, 255],
+    ),
+    (
+      ResizeFilter::Bicubic,
+      [0u8, 0, 0, 0, 0, 0, 255, 53, 0, 0, 255, 202, 0, 0, 255, 255],
+    ),
+    (
+      ResizeFilter::Lanczos3,
+      [0u8, 0, 0, 0, 0, 0, 255, 59, 0, 0, 255, 196, 0, 0, 255, 255],
+    ),
+  ] {
+    let out = resize(&img, (4, 4), f).unwrap().to_rgba8().into_raw();
+    let mut expected = Vec::with_capacity(64);
+    for _ in 0..4 {
+      expected.extend_from_slice(&row);
+    }
+    assert_eq!(
+      out, expected,
+      "{f:?} 2x2->4x4 premultiplied upscale: colour stays pure blue, \
+       only alpha ramps (no red bleed into transparent columns)"
+    );
+    // Every interpolated column must have R == 0 (no transparent-red
+    // colour bleed) — the core premultiplied-alpha guarantee.
+    for px in out.chunks_exact(4) {
+      assert_eq!(
+        px[0], 0,
+        "{f:?} upscale: no red bleed — R must be 0 in every output pixel"
+      );
+    }
+  }
+}
+
+#[test]
+fn resize_nearest_does_not_premultiply() {
+  // PIL exempts NEAREST from premultiplication (it is a pure pixel
+  // gather). The transparent-red pixel must survive a NEAREST resize with
+  // its straight `(255,0,0,0)` channels intact — premultiplying it would
+  // (wrongly) zero the R channel.
+  let transparent_red = [255u8, 0, 0, 0];
+  let opaque_blue = [0u8, 0, 255, 255];
+  let src: Vec<u8> = [transparent_red, opaque_blue, transparent_red, opaque_blue].concat();
+  let img = rgba8_image(2, 2, &src);
+
+  // 2x2 -> 2x2 NEAREST is identity: every pixel gathered verbatim. The
+  // transparent-red R channel stays 255 (it would be 0 if premultiplied).
+  let out = resize(&img, (2, 2), ResizeFilter::Nearest)
+    .unwrap()
+    .to_rgba8()
+    .into_raw();
+  assert_eq!(
+    out, src,
+    "NEAREST must NOT premultiply: transparent-red keeps straight \
+     channels (255,0,0,0), not the premultiplied (0,0,0,0)"
+  );
+}
+
+#[test]
+fn resize_opaque_alpha_unaffected_by_premultiply() {
+  // Premultiply/unpremultiply are the identity for A == 255
+  // (`MULDIV255(c,255) == c`; unpremultiply special-cases alpha 255), so
+  // a fully-opaque image resizes bit-identically to a straight-channel
+  // resize — the existing alpha=255 PIL-reference tests are unaffected.
+  // Re-assert here on a non-trivial opaque RGBA gradient.
+  let mut src = Vec::with_capacity(4 * 4 * 4);
+  for y in 0..4u32 {
+    for x in 0..4u32 {
+      src.extend_from_slice(&[(x * 60) as u8, (y * 60) as u8, 100, 255]);
+    }
+  }
+  let img = rgba8_image(4, 4, &src);
+  for f in [
+    ResizeFilter::Bilinear,
+    ResizeFilter::Bicubic,
+    ResizeFilter::Lanczos3,
+  ] {
+    let out = resize(&img, (2, 3), f).unwrap().to_rgba8().into_raw();
+    // Alpha stays a solid 255 everywhere (premultiply identity on opaque).
+    for px in out.chunks_exact(4) {
+      assert_eq!(
+        px[3], 255,
+        "{f:?} opaque resize: alpha must remain 255 (premultiply identity)"
+      );
+    }
+  }
 }
 
 // ---------- image_to_array ----------

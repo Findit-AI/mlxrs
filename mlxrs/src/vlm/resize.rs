@@ -28,6 +28,21 @@
 //! of input pixels within the filter's support window, weights from the
 //! filter kernel normalized to sum to 1.
 //!
+//! ### Premultiplied alpha (matches `Image.resize`)
+//! PIL's `Image.resize` wrapper converts RGBA -> **premultiplied** `RGBa`
+//! *before* any non-NEAREST resample and converts back after
+//! (`Image.py`: `if self.mode in ["LA","RGBA"] and resample != NEAREST`).
+//! Convolving straight (non-premultiplied) channels is NOT byte-exact for
+//! an image with non-opaque alpha — it leaks the colour of
+//! fully-transparent pixels into their neighbours. This module mirrors
+//! that path exactly: it premultiplies the source colour channels
+//! (`MULDIV255`), runs the separable convolution over `RGBa`, then
+//! unpremultiplies the destination (`rgba2rgbA`'s `CLIP8(255*c/a)`). For
+//! an all-opaque (`A == 255`) image both conversions are the identity, so
+//! opaque inputs stay bit-identical to a straight-channel resize.
+//! **NEAREST is exempt** (PIL does not premultiply for it — a pure
+//! gather): `resize_nearest` keeps straight channels.
+//!
 //! ### Coordinate mapping + antialiasing (matches `precompute_coeffs`)
 //! For output index `xx` along an axis resampled from `in_size` to
 //! `out_size`:
@@ -361,8 +376,30 @@ pub(crate) fn resize_rgba8(
     })?;
 
   if filter == Filter::Nearest {
+    // PIL exempts `NEAREST` from premultiplication: it is a pure pixel
+    // gather, so straight RGBA channels are already byte-exact (see the
+    // `premultiply_rgba` doc + `Image.resize`'s `resample != NEAREST`
+    // guard).
     return resize_nearest(src, src_w, src_h, dst_w, dst_h, dst_len);
   }
+
+  // --- Premultiplied-alpha staging (PIL parity) ---
+  // PIL's `Image.resize` converts RGBA -> premultiplied `RGBa` BEFORE any
+  // non-NEAREST resample and converts back after (`Image.py`:
+  // `if self.mode in ["LA", "RGBA"] and resample != NEAREST: ...
+  // convert("RGBa") ... resize ... convert(self.mode)`). Straight-channel
+  // convolution is NOT byte-exact for non-opaque alpha — it bleeds the
+  // colour of fully-transparent pixels into their neighbours. We mirror
+  // that exact path: premultiply the colour channels into an owned
+  // fallible copy, run the existing separable convolution over the
+  // premultiplied buffer, then unpremultiply the destination in place.
+  // For an all-opaque (`A == 255`) image both passes are the identity
+  // (`MULDIV255(c, 255) == c`, and unpremultiply special-cases
+  // `alpha == 255`), so opaque inputs are bit-identical to the prior
+  // behaviour. (`resize_rgba8` only ever sees RGBA8 — `vlm::image::resize`
+  // projects every source variant, including `LumaA8`, to RGBA8 first —
+  // so the single RGBA premultiply path also covers PIL's `LA -> La`.)
+  let src_pm = premultiply_rgba(src)?;
 
   // --- Separable convolution ---
   // Horizontal pass: (src_h rows) x (dst_w cols) intermediate, RGBA8.
@@ -387,7 +424,8 @@ pub(crate) fn resize_rgba8(
   dst.resize(dst_len, 0u8);
 
   // Horizontal pass: for each src row, convolve along x into `inter`.
-  convolve_axis(src, src_w, src_h, &mut inter, dst_w, &hcoeffs);
+  // Operates on the PREMULTIPLIED source (`src_pm`).
+  convolve_axis(&src_pm, src_w, src_h, &mut inter, dst_w, &hcoeffs);
   // Vertical pass: convolve `inter` along y into `dst`. We transpose the
   // access by treating columns: for each output row `oy`, gather input
   // rows `[ymin, ymin+n)` from `inter`. To reuse `convolve_axis` (which
@@ -395,7 +433,98 @@ pub(crate) fn resize_rgba8(
   // separate routine because its taps stride by a full row.
   convolve_vertical(&inter, dst_w, src_h, &mut dst, dst_h, &vcoeffs);
 
+  // Convert the premultiplied `dst` back to straight RGBA8 in place (PIL's
+  // post-resize `convert(self.mode)`).
+  unpremultiply_rgba(&mut dst);
+
   Ok(dst)
+}
+
+/// PIL fixed-point `c * a / 255`, mirroring `libImaging`'s `MULDIV255`
+/// macro exactly: `tmp = c * a + 128; ((tmp >> 8) + tmp) >> 8`. The `+128`
+/// is PIL's rounding bias and the double-shift is its `/255`
+/// approximation (`SHIFTFORDIV255`). Bit-exact with Pillow's premultiply.
+#[inline]
+fn muldiv255(c: u8, a: u8) -> u8 {
+  // `c, a <= 255`, so `c * a + 128 <= 65153` — fits `u32` with room to
+  // spare; the result is provably `<= 255`.
+  let tmp = u32::from(c) * u32::from(a) + 128;
+  (((tmp >> 8) + tmp) >> 8) as u8
+}
+
+/// Premultiply an RGBA8 buffer (PIL `rgbA2rgba` — the `RGBA -> RGBa`
+/// mode conversion `Image.resize` applies before a non-NEAREST resample).
+/// Each colour channel becomes `MULDIV255(c, A)`; alpha is unchanged. The
+/// premultiplied buffer is an owned fallible copy (`src` is borrowed and
+/// must stay intact); allocator refusal surfaces as
+/// [`Error::OutOfMemory`].
+///
+/// `src.len()` must be a multiple of [`CHANNELS`] (guaranteed by
+/// [`resize_rgba8`]'s `src.len() == src_w * src_h * 4` check).
+fn premultiply_rgba(src: &[u8]) -> Result<Vec<u8>> {
+  let mut out: Vec<u8> = try_with_capacity(src.len())?;
+  for px in src.chunks_exact(CHANNELS) {
+    let a = px[3];
+    // PIL premultiplies the colour channels only; alpha passes through.
+    out.push(muldiv255(px[0], a));
+    out.push(muldiv255(px[1], a));
+    out.push(muldiv255(px[2], a));
+    out.push(a);
+  }
+  // `chunks_exact` drops a partial trailing chunk; the caller guarantees
+  // `src.len()` is a whole number of RGBA pixels, so `out.len()` equals
+  // `src.len()`. Assert it so a future caller violating that contract
+  // fails loudly rather than silently truncating.
+  debug_assert_eq!(
+    out.len(),
+    src.len(),
+    "premultiply_rgba: src length must be a multiple of CHANNELS"
+  );
+  Ok(out)
+}
+
+/// Unpremultiply an RGBA8 buffer in place (PIL `rgba2rgbA` — the
+/// `RGBa -> RGBA` conversion `Image.resize` applies after the resample).
+/// Mirrors `libImaging` exactly: when `alpha` is `255` or `0` the colour
+/// channels pass through unchanged, otherwise each is
+/// `CLIP8((255 * c) / alpha)` (truncating integer division, clamped to
+/// `[0, 255]`). Alpha is unchanged. No allocation — operates on the
+/// destination buffer the convolution already produced.
+///
+/// The `alpha == 0` passthrough matches PIL: after premultiplication a
+/// zero-alpha pixel already has colour channels `0` (`MULDIV255(c, 0)
+/// == 0`), and the convolution of all-zero contributors keeps them `0`,
+/// so the recovered straight colour is `0` regardless — PIL does not
+/// special-case it to anything else.
+///
+/// `buf.len()` must be a multiple of [`CHANNELS`].
+fn unpremultiply_rgba(buf: &mut [u8]) {
+  for px in buf.chunks_exact_mut(CHANNELS) {
+    let a = px[3];
+    if a == 0 || a == 255 {
+      // PIL passthrough: opaque needs no division, and a zero-alpha
+      // pixel's premultiplied colour is already 0.
+      continue;
+    }
+    // `CLIP8((255 * c) / a)`: `255 * c <= 65025` fits `u32`; integer
+    // division truncates (matches C). `a` is in `1..=254` here, so the
+    // quotient can exceed 255 (a premultiplied colour > alpha, possible
+    // after convolution rounding) — `CLIP8` clamps it.
+    let a32 = u32::from(a);
+    px[0] = clip8_div(u32::from(px[0]), a32);
+    px[1] = clip8_div(u32::from(px[1]), a32);
+    px[2] = clip8_div(u32::from(px[2]), a32);
+    // px[3] (alpha) unchanged.
+  }
+}
+
+/// PIL `CLIP8((255 * c) / a)` for unpremultiply. `a` must be non-zero
+/// (the caller special-cases `a == 0`). Truncating integer division then
+/// clamp to `[0, 255]`.
+#[inline]
+fn clip8_div(c: u32, a: u32) -> u8 {
+  let v = (255 * c) / a;
+  if v > 255 { 255 } else { v as u8 }
 }
 
 /// Nearest-neighbor resize (pure pixel gather, PIL `Image.NEAREST`).
@@ -753,7 +882,10 @@ mod tests {
 
   /// Force-scalar variant of [`resize_rgba8`] (calls the `*_scalar`
   /// kernels directly, bypassing the NEON dispatch). Used only by the
-  /// differential test to compare against the dispatched path.
+  /// differential test to compare against the dispatched path. Mirrors
+  /// [`resize_rgba8`]'s premultiplied-alpha staging exactly (premultiply
+  /// the source, convolve, unpremultiply) so the differential test stays
+  /// a faithful NEON-vs-scalar comparison of the WHOLE resize.
   fn resize_rgba8_scalar(
     src: &[u8],
     src_w: usize,
@@ -766,12 +898,14 @@ mod tests {
       let dst_len = dst_w * dst_h * CHANNELS;
       return resize_nearest(src, src_w, src_h, dst_w, dst_h, dst_len).unwrap();
     }
+    let src_pm = premultiply_rgba(src).unwrap();
     let hc = precompute_coeffs(src_w, dst_w, filter).unwrap();
     let vc = precompute_coeffs(src_h, dst_h, filter).unwrap();
     let mut inter = vec![0u8; src_h * dst_w * CHANNELS];
     let mut dst = vec![0u8; dst_w * dst_h * CHANNELS];
-    convolve_axis_scalar(src, src_w, src_h, &mut inter, dst_w, &hc);
+    convolve_axis_scalar(&src_pm, src_w, src_h, &mut inter, dst_w, &hc);
     convolve_vertical_scalar(&inter, dst_w, src_h, &mut dst, dst_h, &vc);
+    unpremultiply_rgba(&mut dst);
     dst
   }
 
@@ -900,6 +1034,111 @@ mod tests {
         }
       }
     }
+  }
+
+  #[test]
+  fn muldiv255_matches_pil_and_is_opaque_identity() {
+    // MULDIV255(c, 255) must be the identity for EVERY c (PIL relies on
+    // this so an opaque RGBA resize is bit-identical to a straight one).
+    for c in 0u8..=255 {
+      assert_eq!(
+        muldiv255(c, 255),
+        c,
+        "MULDIV255({c}, 255) must equal {c} (opaque identity)"
+      );
+      // MULDIV255(c, 0) == 0 for every c (zero-alpha kills the colour).
+      assert_eq!(muldiv255(c, 0), 0, "MULDIV255({c}, 0) must be 0");
+    }
+    // Spot-check PIL's exact rounding against a hand-computed value:
+    // MULDIV255(255, 128) = ((32768>>8)+32768)>>8 = (128+32768)>>8 = 128.
+    assert_eq!(muldiv255(255, 128), 128, "MULDIV255(255,128) hand-checked");
+    // MULDIV255(200, 100) = ((20128>>8)+20128)>>8 = (78+20128)>>8 = 78.
+    assert_eq!(muldiv255(200, 100), 78, "MULDIV255(200,100) hand-checked");
+  }
+
+  #[test]
+  fn premultiply_unpremultiply_opaque_is_identity() {
+    // For a fully-opaque buffer (A == 255) premultiply then unpremultiply
+    // must round-trip to the exact input — this is why the opaque
+    // PIL-reference resize tests are unaffected by the premultiply path.
+    let src: Vec<u8> = (0u8..=255).flat_map(|c| [c, 255 - c, c / 2, 255]).collect();
+    let pm = premultiply_rgba(&src).unwrap();
+    assert_eq!(pm, src, "premultiply must be identity for opaque alpha");
+    let mut round = pm;
+    unpremultiply_rgba(&mut round);
+    assert_eq!(
+      round, src,
+      "unpremultiply must be identity for opaque alpha"
+    );
+  }
+
+  #[test]
+  fn premultiply_transparent_pixel_zeros_colour() {
+    // A fully-transparent pixel (A == 0): premultiply zeros every colour
+    // channel (PIL `MULDIV255(c, 0) == 0`), and unpremultiply leaves the
+    // already-zero colour at zero (PIL passthrough for A == 0).
+    let src = vec![255u8, 128, 64, 0]; // transparent, arbitrary colour
+    let pm = premultiply_rgba(&src).unwrap();
+    assert_eq!(
+      pm,
+      vec![0, 0, 0, 0],
+      "premultiply of a transparent pixel must zero the colour channels"
+    );
+    let mut round = pm;
+    unpremultiply_rgba(&mut round);
+    assert_eq!(
+      round,
+      vec![0, 0, 0, 0],
+      "unpremultiply of a zero-alpha pixel keeps colour 0 (PIL passthrough)"
+    );
+  }
+
+  #[test]
+  fn unpremultiply_clips_and_divides_like_pil() {
+    // Partial alpha: unpremultiply does CLIP8(255*c/a) (truncating
+    // integer division, clamp [0,255]).
+    // a=128: CLIP8(255*64/128) = 16320/128 = 127.
+    let mut buf = vec![64u8, 0, 0, 128];
+    unpremultiply_rgba(&mut buf);
+    assert_eq!(
+      buf[0], 127,
+      "unpremultiply 64 over alpha 128: 255*64/128=127"
+    );
+    assert_eq!(buf[3], 128, "alpha unchanged");
+    // Premultiplied colour > alpha (possible after convolution rounding):
+    // CLIP8 must clamp to 255. c=200, a=100 -> 255*200/100=510 -> 255.
+    let mut buf2 = vec![200u8, 0, 0, 100];
+    unpremultiply_rgba(&mut buf2);
+    assert_eq!(
+      buf2[0], 255,
+      "unpremultiply must clamp an over-alpha colour to 255"
+    );
+  }
+
+  #[test]
+  fn resize_premultiplied_transparent_red_opaque_blue() {
+    // Codex example at the kernel level: transparent-red `(255,0,0,0)`
+    // next to opaque-blue `(0,0,255,255)`, 2x1 -> 1x1. The premultiplied
+    // path must yield pure blue with half alpha `(0,0,255,128)` for every
+    // non-NEAREST filter — NOT the straight-channel purple
+    // `(128,0,128,128)`. NEAREST is exempt (pure gather, no premultiply).
+    let src = [255u8, 0, 0, 0, 0, 0, 255, 255]; // 2x1: t-red, o-blue
+    for f in [Filter::Bilinear, Filter::Bicubic, Filter::Lanczos3] {
+      let out = resize_rgba8(&src, 2, 1, 1, 1, f).unwrap();
+      assert_eq!(
+        out,
+        vec![0, 0, 255, 128],
+        "{f:?}: premultiplied-alpha resize must give pure blue (0,0,255,128)"
+      );
+    }
+    // NEAREST gathers the rightmost pixel (out 0 -> floor(0.5*2/1)=1):
+    // straight opaque blue, no premultiply.
+    let nn = resize_rgba8(&src, 2, 1, 1, 1, Filter::Nearest).unwrap();
+    assert_eq!(
+      nn,
+      vec![0, 0, 255, 255],
+      "NEAREST must not premultiply — gathers the opaque-blue pixel verbatim"
+    );
   }
 
   #[test]
