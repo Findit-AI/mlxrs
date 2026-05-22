@@ -108,6 +108,8 @@ use std::{
   path::Path,
 };
 
+use regex::Regex;
+
 use crate::{
   array::Array,
   error::{Error, Result},
@@ -123,8 +125,16 @@ use crate::{
 /// neither `scale` nor `alpha` is present in `adapter_config.json`.
 pub const DEFAULT_LORA_SCALE: f32 = 20.0;
 
-/// mlx-lm's default LoRA rank (`tuner/lora.py:16,71`: `r: int = 8`).
+/// mlx-lm's default LoRA rank (`tuner/lora.py:16,71`: `r: int = 8`). Also the
+/// HuggingFace PEFT `LoraConfig.r` default (`peft` `lora/config.py`: `r: int =
+/// 8`) — the two coincide.
 pub const DEFAULT_LORA_RANK: i32 = 8;
+
+/// HuggingFace PEFT `LoraConfig.lora_alpha`'s default (`peft` `lora/config.py`:
+/// `lora_alpha: int = 8`). A PEFT adapter that omits `lora_alpha` is scaled by
+/// `8 / r` (or `8 / sqrt(r)` under rsLoRA) — NOT by the mlx-lm `20.0` literal
+/// (PEFT has no literal-scale concept). Used only on the PEFT-flat path.
+pub const DEFAULT_PEFT_LORA_ALPHA: f32 = 8.0;
 
 /// mlx-lm's default `num_layers` for a LoRA config — the number of trailing
 /// decoder blocks adapted (`mlx_lm` adapter configs commonly carry it
@@ -180,9 +190,10 @@ impl Default for FineTuneType {
   }
 }
 
-/// The in-memory low-rank parameter block — the normalized representation of
-/// `adapter_config.json`'s low-rank settings, regardless of which on-disk
-/// *shape* the config used.
+/// The in-memory low-rank *parameter* block — `rank` / `scale` / `alpha` /
+/// `dropout` plus (mlx-lm-native only) the `keys` allowlist. The normalized
+/// representation of an `adapter_config.json`'s low-rank scalars, regardless
+/// of which on-disk *shape* the config used.
 ///
 /// # Two on-disk shapes, one in-memory form
 ///
@@ -197,31 +208,26 @@ impl Default for FineTuneType {
 ///   `LoRAConfiguration.LoRAParameters`, `LoRAContainer.swift:34-45`). Its keys
 ///   are `rank` / `scale` / `alpha` / `keys` / `dropout`.
 /// - **PEFT / HuggingFace** — a real `peft` `LoraConfig` has **no**
-///   `lora_parameters` nesting; its fields are *flat at the top level*:
-///   `{ "peft_type": "LORA", "r": R, "lora_alpha": A, "target_modules": […],
-///   "lora_dropout": D, "bias": … }`. PEFT names the rank `r`, the alpha
-///   `lora_alpha`, the target allowlist `target_modules`, the dropout
-///   `lora_dropout`.
-///
-/// The two are detected and bridged in [`LoraConfig`]'s `Deserialize` (see its
-/// docs): a top-level `lora_parameters` object selects the mlx-lm-native read;
-/// top-level `r` / `lora_alpha` / `target_modules` (and/or `peft_type`) with no
-/// `lora_parameters` selects the PEFT read. The PEFT mapping is `r` → [`rank`],
-/// `lora_alpha` → [`alpha`], `target_modules` → [`keys`], `lora_dropout` →
-/// [`dropout`]. Either way the result is *this* struct — the rest of the
-/// module is shape-agnostic.
+///   `lora_parameters` nesting; its fields are *flat at the top level*. The
+///   PEFT scalar mapping into this block is `r` → [`rank`] (default
+///   [`DEFAULT_LORA_RANK`]), `lora_alpha` → [`alpha`] (default
+///   [`DEFAULT_PEFT_LORA_ALPHA`]), `lora_dropout` → [`dropout`]. PEFT has no
+///   literal-`scale` field, so [`scale`] is left `None`; PEFT's `target_modules`
+///   selection does **not** land in [`keys`] — it lives in [`PeftSelection`]
+///   ([`LoraConfig::selection`]), because PEFT's regex / `layers_to_transform`
+///   selection is richer than a `keys` suffix list.
 ///
 /// `scale` is the literal low-rank scale (mlx-lm `config["scale"]`). When
-/// `alpha` is present (the PEFT/HF convention `scale = alpha / rank`), it
-/// **takes precedence** over the literal `scale`
-/// ([`LoraParameters::resolved_scale`]). `keys` is the explicit
-/// target-projection allowlist (e.g. `["self_attn.q_proj",
-/// "self_attn.v_proj"]`); `None` means "every eligible linear" (mlx-lm's
-/// auto-discovery, `tuner/utils.py:85-101`). `dropout` is carried for config
-/// round-trip fidelity but **ignored at inference** (an inference adapter's
-/// dropout is the identity — see the [module docs](self)).
+/// `alpha` is present (the convention `scale = alpha / rank`), it **takes
+/// precedence** over the literal `scale` ([`LoraParameters::resolved_scale`]).
+/// `keys` is the mlx-lm-native explicit target-projection allowlist (e.g.
+/// `["self_attn.q_proj", "self_attn.v_proj"]`); `None` means "every eligible
+/// linear" (mlx-lm's auto-discovery, `tuner/utils.py:85-101`). `dropout` is
+/// carried for config round-trip fidelity but **ignored at inference** (an
+/// inference adapter's dropout is the identity — see the [module docs](self)).
 ///
 /// [`rank`]: LoraParameters::rank
+/// [`scale`]: LoraParameters::scale
 /// [`alpha`]: LoraParameters::alpha
 /// [`keys`]: LoraParameters::keys
 /// [`dropout`]: LoraParameters::dropout
@@ -230,7 +236,9 @@ pub struct LoraParameters {
   /// Low-rank dimension `r`. In the mlx-lm-native nested shape this is the
   /// `lora_parameters.rank` key; in the PEFT flat shape it is the top-level
   /// `r` key — [`LoraConfig`]'s `Deserialize` maps whichever applies into here.
-  /// Defaults to [`DEFAULT_LORA_RANK`] when neither shape supplies it.
+  /// Defaults to [`DEFAULT_LORA_RANK`] when neither shape supplies it. On a
+  /// PEFT config this is the config-wide default; per-module `rank_pattern`
+  /// overrides are in [`PeftSelection`].
   #[serde(default = "default_rank")]
   pub rank: i32,
   /// Literal low-rank scale (mlx-lm `config["scale"]`). Used when `alpha` is
@@ -241,17 +249,18 @@ pub struct LoraParameters {
   #[serde(default)]
   pub scale: Option<f32>,
   /// The alpha — if present, the effective scale is `alpha / rank` and this
-  /// **takes precedence** over a literal `scale` (PEFT's `scaling = lora_alpha
-  /// / r`). In the mlx-lm-native nested shape this is `lora_parameters.alpha`;
-  /// in the PEFT flat shape it is the top-level `lora_alpha` key.
+  /// **takes precedence** over a literal `scale`. In the mlx-lm-native nested
+  /// shape this is `lora_parameters.alpha`; in the PEFT flat shape it carries
+  /// `lora_alpha` (defaulting to [`DEFAULT_PEFT_LORA_ALPHA`] when PEFT omits
+  /// it). On a PEFT config this is the config-wide default; per-module
+  /// `alpha_pattern` overrides and the `use_rslora` scaling are in
+  /// [`PeftSelection`].
   #[serde(default)]
   pub alpha: Option<f32>,
-  /// Explicit target-projection allowlist (suffix paths like
-  /// `"self_attn.q_proj"`). `None` ⇒ adapt every eligible linear. In the
-  /// mlx-lm-native shape this is `lora_parameters.keys`; in the PEFT flat
-  /// shape it is the top-level `target_modules` list (PEFT's list-of-strings
-  /// "ends-with" match is exactly [`linear_to_lora_layers`]'s `keys` suffix
-  /// match — see [`LoraConfig`]'s `Deserialize`).
+  /// **mlx-lm-native** explicit target-projection allowlist (suffix paths like
+  /// `"self_attn.q_proj"`). `None` ⇒ adapt every eligible linear. This is the
+  /// `lora_parameters.keys` key. A PEFT config leaves this `None` — PEFT's
+  /// `target_modules` / `exclude_modules` selection lives in [`PeftSelection`].
   #[serde(default)]
   pub keys: Option<Vec<String>>,
   /// Training dropout — carried for round-trip fidelity, **ignored at
@@ -307,10 +316,206 @@ impl LoraParameters {
   }
 }
 
+/// PEFT's `target_modules` / `exclude_modules` selector — **either** a list of
+/// module-name suffixes **or** a single regex string (`peft`
+/// `LoraConfig.target_modules: Optional[Union[list[str], str]]`, same for
+/// `exclude_modules`).
+///
+/// Reproduces PEFT's `check_target_module_exists`
+/// (`peft/tuners/tuners_utils.py`) match semantics **faithfully**:
+///
+/// - **list** — a module key matches when it equals a list entry **or** ends
+///   with `".{entry}"` (PEFT: `key in target_modules or any(key.endswith(f".
+///   {t}") for t in target_modules)`).
+/// - **regex** — a *full* match against the whole module key (PEFT:
+///   `match_target_against_key` is `re.fullmatch(target_pattern, key)`).
+///
+/// Unlike the previous port — which rejected the regex form — this models PEFT
+/// exactly via the `regex` crate, so a real PEFT config with a regex
+/// `target_modules` loads.
+#[derive(Debug, Clone)]
+pub enum ModuleMatcher {
+  /// `["q_proj", "v_proj"]` — exact-or-`.endswith` suffix match.
+  List(Vec<String>),
+  /// `"...regex..."` — a full-match regex over the whole module key. Boxed
+  /// because a compiled [`Regex`] is large relative to the small `Vec` arm.
+  Regex(Box<Regex>),
+}
+
+impl ModuleMatcher {
+  /// Whether `module_key` matches — PEFT `check_target_module_exists` semantics
+  /// (`re.fullmatch` for the regex arm; exact-or-`.endswith(".{entry}")` for
+  /// the list arm).
+  pub fn matches(&self, module_key: &str) -> bool {
+    match self {
+      ModuleMatcher::List(names) => names
+        .iter()
+        .any(|n| module_key == n || module_key.ends_with(&format!(".{n}"))),
+      // PEFT `match_target_against_key` is `re.fullmatch` — `Regex::is_match`
+      // is a `search`, so anchor it to the whole string explicitly.
+      ModuleMatcher::Regex(re) => re
+        .find(module_key)
+        .is_some_and(|m| m.start() == 0 && m.end() == module_key.len()),
+    }
+  }
+}
+
+/// The selection / scale half of a PEFT `LoraConfig` — everything PEFT uses to
+/// decide *which* modules get a LoRA layer and *how strongly* each is scaled
+/// (`peft/tuners/lora/{config,layer,model}.py` +
+/// `peft/tuners/tuners_utils.py`). Built only on the PEFT-flat path; the
+/// mlx-lm-native path keeps its own `num_layers` + `LoraParameters::keys`
+/// selection (see [`AdapterSelection`]).
+///
+/// Faithful to PEFT, NOT to mlx-lm: PEFT has **no** `num_layers` trailing
+/// window — it adapts EVERY block whose modules match `target_modules`, unless
+/// `layers_to_transform` / `layers_pattern` restrict to explicit block indices.
+#[derive(Debug, Clone)]
+pub struct PeftSelection {
+  /// PEFT `target_modules` (`Optional[Union[list[str], str]]`) — the module
+  /// allowlist. `None` is represented as an empty [`ModuleMatcher::List`] (PEFT
+  /// `None` means "auto-detect linears"; mlxrs has no module tree, so an empty
+  /// allowlist with no restriction falls back to the rank-2 auto-discovery in
+  /// [`linear_to_lora_layers`] — see its docs).
+  pub target_modules: Option<ModuleMatcher>,
+  /// PEFT `exclude_modules` (`Optional[Union[list[str], str]]`) — modules to
+  /// remove from the target set. Checked *before* `target_modules` (PEFT's
+  /// early `_ExcludedModule` return).
+  pub exclude_modules: Option<ModuleMatcher>,
+  /// PEFT `layers_to_transform` (`Optional[Union[list[int], int]]`) — when set,
+  /// only these decoder-block indices are adapted. `None` ⇒ every block. An
+  /// `int` is normalized to a one-element list.
+  pub layers_to_transform: Option<Vec<i32>>,
+  /// PEFT `layers_pattern` (`Optional[Union[list[str], str]]`) — the
+  /// `ModuleList` attribute name(s) the block index sits under (e.g. `"layers"`
+  /// / `"h"`). Empty ⇒ PEFT's default index regex `.*\.[^.]*\.(\d+)\.`. Only
+  /// consulted when `layers_to_transform` is set.
+  pub layers_pattern: Vec<String>,
+  /// PEFT `rank_pattern` (`dict[str, int]`) — per-module rank overrides. Each
+  /// key is matched against a module path by PEFT's `get_pattern_key`
+  /// (`re.match(rf"(.*\.)?({key})$", module)`); a match overrides `r` for that
+  /// module. Empty ⇒ every module uses `r`.
+  pub rank_pattern: Vec<(String, i32)>,
+  /// PEFT `alpha_pattern` (`dict[str, int]`) — per-module alpha overrides, same
+  /// `get_pattern_key` matching as `rank_pattern`. Empty ⇒ every module uses
+  /// `lora_alpha`.
+  pub alpha_pattern: Vec<(String, f32)>,
+  /// PEFT `use_rslora` — rank-stabilized scaling. `true` ⇒ the per-module scale
+  /// is `alpha / sqrt(r)`; `false` ⇒ `alpha / r` (`peft/tuners/lora/layer.py`
+  /// `update_layer`).
+  pub use_rslora: bool,
+  /// PEFT `fan_in_fan_out` — `true` ⇒ the base weight is stored transposed,
+  /// `[in_features, out_features]` (Conv1D-style) rather than the standard
+  /// `[out_features, in_features]`. The forward / fuse math transposes it back
+  /// (`peft/tuners/lora/layer.py`'s `transpose(...)`).
+  pub fan_in_fan_out: bool,
+}
+
+impl PeftSelection {
+  /// The rank for `module_path` — `rank_pattern[key]` when a pattern key
+  /// matches (PEFT `get_pattern_key`), else the config-wide `default_rank`
+  /// (PEFT `r`). PEFT `_create_and_replace`:
+  /// `r = lora_config.rank_pattern.get(r_key, lora_config.r)`.
+  pub fn rank_for(&self, module_path: &str, default_rank: i32) -> i32 {
+    pattern_lookup(&self.rank_pattern, module_path).unwrap_or(default_rank)
+  }
+
+  /// The alpha for `module_path` — `alpha_pattern[key]` when a pattern key
+  /// matches, else the config-wide `default_alpha` (PEFT `lora_alpha`). PEFT
+  /// `_create_and_replace`:
+  /// `alpha = lora_config.alpha_pattern.get(alpha_key, lora_config.lora_alpha)`.
+  pub fn alpha_for(&self, module_path: &str, default_alpha: f32) -> f32 {
+    pattern_lookup(&self.alpha_pattern, module_path).unwrap_or(default_alpha)
+  }
+
+  /// The effective LoRA scale for `module_path` — PEFT `update_layer`'s
+  /// `scaling = lora_alpha / r` (or `lora_alpha / sqrt(r)` under `use_rslora`),
+  /// with the per-module `rank_pattern` / `alpha_pattern` overrides applied
+  /// first. A non-positive resolved rank yields `0.0` (degenerate; rejected
+  /// upstream before a layer is built).
+  pub fn scale_for(&self, module_path: &str, default_rank: i32, default_alpha: f32) -> f32 {
+    let r = self.rank_for(module_path, default_rank);
+    let alpha = self.alpha_for(module_path, default_alpha);
+    if r <= 0 {
+      return 0.0;
+    }
+    if self.use_rslora {
+      alpha / (r as f32).sqrt()
+    } else {
+      alpha / r as f32
+    }
+  }
+}
+
+/// PEFT `get_pattern_key` (`peft/utils/other.py`): match `module_path` against
+/// each `(pattern, value)` entry — a hit is `re.match(rf"(.*\.)?({pattern})$",
+/// module_path)`, i.e. an optional dotted prefix then the literal pattern key
+/// anchored at the end. Returns the first matching value, or `None`.
+///
+/// PEFT's pattern keys are themselves regex fragments; this reproduces the
+/// `re.match` anchoring by full-matching `(.*\.)?(pattern)` and requiring the
+/// match to reach the string end. A pattern that fails to compile is skipped
+/// (a malformed `rank_pattern` key cannot crash adapter loading — it simply
+/// never matches, exactly as a regex that matches nothing).
+fn pattern_lookup<T: Copy>(patterns: &[(String, T)], module_path: &str) -> Option<T> {
+  for (pattern, value) in patterns {
+    // `(.*\.)?(pattern)$` anchored at end — equivalent to PEFT's
+    // `re.match(rf"(.*\.)?({key})$", key_to_match)`.
+    let Ok(re) = Regex::new(&format!(r"(.*\.)?({pattern})$")) else {
+      continue;
+    };
+    if re
+      .find(module_path)
+      .is_some_and(|m| m.start() == 0 && m.end() == module_path.len())
+    {
+      return Some(*value);
+    }
+  }
+  None
+}
+
+/// Collect a PEFT `rank_pattern` / `alpha_pattern` JSON object into a
+/// **key-sorted** `Vec<(pattern, value)>`. PEFT iterates the dict in insertion
+/// order; mlxrs deserializes it into a [`HashMap`] (no order), so the `Vec` is
+/// sorted by pattern key to make [`pattern_lookup`]'s "first match wins"
+/// deterministic. For the realistic case — *disjoint* pattern keys, one match
+/// at most — the order is irrelevant; sorting only pins the (otherwise
+/// pathological) overlapping-pattern tie-break instead of leaving it to
+/// `HashMap` iteration randomness.
+fn sorted_pattern<T>(map: Option<HashMap<String, T>>) -> Vec<(String, T)> {
+  let mut v: Vec<(String, T)> = map.map(|m| m.into_iter().collect()).unwrap_or_default();
+  v.sort_by(|a, b| a.0.cmp(&b.0));
+  v
+}
+
+/// Which on-disk shape an `adapter_config.json` was — and therefore which
+/// layer-selection rule [`linear_to_lora_layers`] applies.
+///
+/// The two shapes select layers by **structurally different** rules, so the
+/// normalized config carries which one applies rather than flattening them:
+///
+/// - [`AdapterSelection::MlxLm`] — mlx-lm's *trailing-`num_layers`-block window*
+///   plus the `lora_parameters.keys` suffix allowlist.
+/// - [`AdapterSelection::Peft`] — PEFT's `target_modules` / `exclude_modules` /
+///   `layers_to_transform` / `layers_pattern` selection (NO trailing window —
+///   every matching block).
+#[derive(Debug, Clone)]
+pub enum AdapterSelection {
+  /// mlx-lm-native: the trailing-`num_layers`-block window. A **non-positive**
+  /// value selects ALL blocks (mlx-lm's `model.layers[-max(num_layers, 0):]`
+  /// reduces to `layers[0:]` via the Python `-0` slice quirk).
+  MlxLm {
+    /// Number of trailing decoder blocks adapted.
+    num_layers: i32,
+  },
+  /// PEFT-flat: target/exclude/layer-index selection (see [`PeftSelection`]).
+  Peft(PeftSelection),
+}
+
 /// The `adapter_config.json` schema — mlx-lm's adapter config
 /// (`tuner/utils.py:127-136`: `fine_tune_type`, `num_layers`,
 /// `lora_parameters`) and swift `LoRAConfiguration` (`LoRAContainer.swift:27-66`),
-/// **plus** the PEFT / HuggingFace `peft` `LoraConfig` shape.
+/// **plus** the full HuggingFace `peft` `LoraConfig` shape.
 ///
 /// # Two on-disk shapes
 ///
@@ -323,49 +528,67 @@ impl LoraParameters {
 ///   `{ "fine_tune_type": …, "num_layers": N, "lora_parameters": { "rank": R,
 ///   "scale": S, "dropout": D, "keys": […] } }`.
 /// - **PEFT / HuggingFace** — a real `peft` `LoraConfig` has **no**
-///   `lora_parameters` nesting; the same settings sit *flat at the top level*
-///   under PEFT's own names:
-///   `{ "peft_type": "LORA", "r": R, "lora_alpha": A, "target_modules": […],
-///   "lora_dropout": D, "bias": … }`.
+///   `lora_parameters` nesting; its fields sit *flat at the top level* under
+///   PEFT's own names: `{ "peft_type": "LORA", "r": R, "lora_alpha": A,
+///   "target_modules": …, "exclude_modules": …, "use_rslora": …, "use_dora":
+///   …, "rank_pattern": {…}, "alpha_pattern": {…}, "layers_to_transform": …,
+///   "layers_pattern": …, "fan_in_fan_out": …, "lora_dropout": D, "bias": … }`.
 ///
-/// `Deserialize` (see its own docs below) **detects** the shape and bridges it
-/// into the single in-memory representation here — a top-level `lora_parameters`
-/// object ⇒ the nested mlx-lm-native read; top-level `r` / `lora_alpha` /
-/// `target_modules` (and/or `peft_type`) with no `lora_parameters` ⇒ the PEFT
-/// read, mapping `r` → rank, `lora_alpha` → alpha, `target_modules` → keys,
-/// `lora_dropout` → dropout. Everything downstream ([`linear_to_lora_layers`],
-/// [`load_adapters`]) is shape-agnostic — it sees only the normalized
-/// [`LoraParameters`].
+/// `Deserialize` (see its own docs) **detects** the shape: a top-level
+/// `lora_parameters` object ⇒ the mlx-lm-native read; top-level `r` /
+/// `lora_alpha` / `target_modules` / `peft_type` (with no `lora_parameters`) ⇒
+/// the PEFT read. The resolved [`selection`](LoraConfig::selection) records
+/// which rule applies — PEFT has **no** `num_layers` trailing window (the
+/// round-4 bug a PEFT config wrongly inheriting `num_layers=16`); it selects by
+/// `target_modules` / `layers_to_transform` instead.
 ///
-/// Forward-compatible by design (no `deny_unknown_fields`): an adapter config
-/// carrying extra training-only keys (`optimizer`, `learning_rate`, `data`, …)
-/// or extra PEFT keys (`task_type`, `base_model_name_or_path`, `bias`, …)
-/// parses cleanly — exactly as mlx-lm reads it into a `SimpleNamespace` and
-/// ignores the unused keys.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+/// # PEFT scale — rsLoRA + rank/alpha patterns
+///
+/// On the PEFT path the scale is **per-module**: PEFT's
+/// `scaling = lora_alpha / r` (or `lora_alpha / sqrt(r)` when `use_rslora`),
+/// with `rank_pattern` / `alpha_pattern` overriding `r` / `lora_alpha` for
+/// modules whose path matches a pattern key. See [`PeftSelection::scale_for`].
+/// On the mlx-lm-native path the scale is the single `LoraParameters`-resolved
+/// value (`alpha / rank`, or the literal `scale`).
+///
+/// # Training-only PEFT fields — accept-and-ignore
+///
+/// A real PEFT `LoraConfig` carries training-only fields with **no** inference
+/// effect: `init_lora_weights`, `loftq_config`, `eva_config`, `corda_config`,
+/// `lora_ga_config`, `task_type`, `modules_to_save`, `layer_replication`,
+/// `target_parameters`, `megatron_config`, `megatron_core`, `runtime_config`,
+/// … The `Deserialize` does **not** `deny_unknown_fields`, so these parse
+/// cleanly and are dropped — they affect only how an adapter was *trained*,
+/// never how it runs.
+///
+/// # Rejected PEFT field — `lora_bias`
+///
+/// `lora_bias: true` ships a bias on the `lora_B` projection that PEFT adds
+/// (scaled) in the forward. mlxrs's [`LoRALinear`] is a faithful port of
+/// mlx-lm's `tuner/lora.py`, which has no `lora_B`-bias term — so a
+/// `lora_bias: true` config is a recoverable `Deserialize` error rather than
+/// a silent bias drop (which would give wrong inference). `lora_bias: false`
+/// — the default, carried by ~every adapter — is fine.
+#[derive(Debug, Clone)]
 pub struct LoraConfig {
   /// `lora` / `dora` / `full` (mlx-lm `fine_tune_type`). Defaults to
   /// [`FineTuneType::Lora`] (mlx-lm's `getattr(..., "lora")`). A PEFT config
   /// has no `fine_tune_type` key, so a PEFT-bridged config is always
   /// [`FineTuneType::Lora`] here (DoRA is signalled by PEFT's `use_dora`).
   pub fine_tune_type: FineTuneType,
-  /// Number of trailing decoder blocks adapted (mlx-lm `config.num_layers`).
-  /// Defaults to [`DEFAULT_NUM_LAYERS`]. A **non-positive** value selects ALL
-  /// blocks, not none — mlx-lm's `model.layers[-max(num_layers, 0):]`
-  /// (`tuner/utils.py:103`) reduces to `model.layers[-0:]` == `model.layers[0:]`
-  /// when `num_layers <= 0` (the Python `-0` slice quirk), so `num_layers: -1`
-  /// (and `0`) adapt every decoder block. A PEFT config has no `num_layers`
-  /// key (PEFT selects by `target_modules` regex/list alone), so a
-  /// PEFT-bridged config takes the [`DEFAULT_NUM_LAYERS`] default.
-  pub num_layers: i32,
   /// The normalized low-rank parameter block — built from `config.lora_parameters`
   /// (mlx-lm-native) **or** from the flat PEFT top-level fields (see the type
-  /// docs and [`LoraParameters`]).
+  /// docs and [`LoraParameters`]). On the PEFT path, `keys` is left `None`
+  /// (PEFT selection lives in [`selection`](Self::selection)) and `alpha`
+  /// carries `lora_alpha` (defaulting to [`DEFAULT_PEFT_LORA_ALPHA`]).
   pub lora_parameters: LoraParameters,
   /// PEFT/HF `use_dora` flag — some adapters carry the DoRA signal here
   /// instead of `fine_tune_type: "dora"`. Either signal selects DoRA (see
   /// [`LoraConfig::is_dora`]). Read from the top level in **both** shapes.
   pub use_dora: bool,
+  /// Which layer-selection rule applies — the mlx-lm trailing-`num_layers`
+  /// window, or the PEFT `target_modules` / `layers_to_transform` selection.
+  pub selection: AdapterSelection,
 }
 
 fn default_num_layers() -> i32 {
@@ -374,13 +597,16 @@ fn default_num_layers() -> i32 {
 
 /// The permissive deserialization target that captures the **union** of both
 /// `adapter_config.json` shapes — mlx-lm-native (nested `lora_parameters`) and
-/// PEFT-flat (top-level `r` / `lora_alpha` / `target_modules` / …). Every field
-/// is optional; [`LoraConfig`]'s [`Deserialize`](serde::Deserialize) reads this,
+/// PEFT-flat (the full top-level PEFT `LoraConfig` surface). Every field is
+/// optional; [`LoraConfig`]'s [`Deserialize`](serde::Deserialize) reads this,
 /// then normalizes it into the typed [`LoraConfig`].
 ///
 /// This is the "permissive deserialize then normalize" step: serde cannot
 /// branch on which keys are present from a `#[derive]`, so the raw form
 /// captures *all* keys non-fatally and the normalization picks the shape.
+/// Training-only PEFT fields (`init_lora_weights`, `loftq_config`, `task_type`,
+/// `modules_to_save`, `megatron_*`, …) are simply *not listed* here — with no
+/// `deny_unknown_fields` they parse and are dropped (accept-and-ignore).
 #[derive(serde::Deserialize)]
 struct RawLoraConfig {
   /// mlx-lm `fine_tune_type` (`"lora"` / `"dora"` / `"full"`). Absent in PEFT
@@ -408,32 +634,87 @@ struct RawLoraConfig {
   /// PEFT top-level `lora_alpha`.
   #[serde(default)]
   lora_alpha: Option<f32>,
-  /// PEFT top-level `target_modules` — either a list of module-name suffixes
-  /// (the common case, maps directly to `keys`) or a single regex string
-  /// (unsupported as a `keys` allowlist — see the `Deserialize` impl).
+  /// PEFT top-level `target_modules` — a list of module-name suffixes or a
+  /// single regex string.
   #[serde(default)]
-  target_modules: Option<TargetModules>,
-  /// PEFT top-level `lora_dropout`.
+  target_modules: Option<StrOrList>,
+  /// PEFT top-level `exclude_modules` — same list-or-regex shape.
+  #[serde(default)]
+  exclude_modules: Option<StrOrList>,
+  /// PEFT top-level `lora_dropout` (inference: ignored).
   #[serde(default)]
   lora_dropout: Option<f32>,
+  /// PEFT `use_rslora` — rank-stabilized scaling (`alpha / sqrt(r)`).
+  #[serde(default)]
+  use_rslora: bool,
+  /// PEFT `fan_in_fan_out` — base weight stored transposed.
+  #[serde(default)]
+  fan_in_fan_out: bool,
+  /// PEFT `lora_bias` — a bias on the `lora_B` projection
+  /// (`nn.Linear(r, out_features, bias=lora_bias)`). When `true` the adapter
+  /// ships a `lora_B.bias` tensor that PEFT adds (scaled) in the forward — a
+  /// surface mlxrs's mlx-lm-faithful `LoRALinear` does not carry, so a `true`
+  /// value is rejected by the `Deserialize` (a silent drop would give wrong
+  /// inference). Defaults `false` (the overwhelmingly common case).
+  #[serde(default)]
+  lora_bias: bool,
+  /// PEFT `layers_to_transform` — an int or a list of ints.
+  #[serde(default)]
+  layers_to_transform: Option<IntOrList>,
+  /// PEFT `layers_pattern` — a string or a list of strings.
+  #[serde(default)]
+  layers_pattern: Option<StrOrList>,
+  /// PEFT `rank_pattern` — `{module-pattern: rank}`.
+  #[serde(default)]
+  rank_pattern: Option<HashMap<String, i32>>,
+  /// PEFT `alpha_pattern` — `{module-pattern: alpha}`.
+  #[serde(default)]
+  alpha_pattern: Option<HashMap<String, f32>>,
 }
 
-/// PEFT's `target_modules`, which is **either** a list of module-name suffixes
-/// **or** a single regex string (`peft` `LoraConfig.target_modules:
-/// Optional[Union[list[str], str]]`).
-///
-/// The list form is PEFT's "exact / ends-with" match — semantically identical
-/// to [`linear_to_lora_layers`]'s `keys` suffix match — so it maps directly to
-/// [`LoraParameters::keys`]. The single-string form is a *regex*, which has no
-/// faithful `keys`-allowlist analogue; [`LoraConfig`]'s `Deserialize` rejects
-/// it with a clear recoverable error rather than silently mis-selecting layers.
+/// A PEFT field that is **either** a single string **or** a list of strings
+/// (`target_modules` / `exclude_modules` / `layers_pattern` —
+/// `Optional[Union[list[str], str]]`).
 #[derive(serde::Deserialize)]
 #[serde(untagged)]
-enum TargetModules {
-  /// `target_modules: ["q_proj", "v_proj"]` — a list of module-name suffixes.
+enum StrOrList {
+  /// `["q_proj", "v_proj"]`.
   List(Vec<String>),
-  /// `target_modules: "...regex..."` — a single regex string.
-  Regex(String),
+  /// `"...single string / regex..."`.
+  One(String),
+}
+
+/// A PEFT field that is **either** a single int **or** a list of ints
+/// (`layers_to_transform` — `Optional[Union[list[int], int]]`).
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum IntOrList {
+  /// `[0, 1, 5]`.
+  List(Vec<i32>),
+  /// `3`.
+  One(i32),
+}
+
+/// Build a [`ModuleMatcher`] from a PEFT `target_modules` / `exclude_modules`
+/// value: the list form is a [`ModuleMatcher::List`]; the single-string form is
+/// a *regex* — compiled here, and a compile failure is a recoverable
+/// deserialize error (a malformed regex must not silently match nothing).
+fn module_matcher_from<E: serde::de::Error>(
+  value: StrOrList,
+  field: &str,
+) -> std::result::Result<ModuleMatcher, E> {
+  match value {
+    StrOrList::List(names) => Ok(ModuleMatcher::List(names)),
+    StrOrList::One(pattern) => {
+      let re = Regex::new(&pattern).map_err(|e| {
+        E::custom(format!(
+          "adapter_config.json `{field}` is the regex string {pattern:?}, which failed to \
+           compile: {e}"
+        ))
+      })?;
+      Ok(ModuleMatcher::Regex(Box::new(re)))
+    }
+  }
 }
 
 impl<'de> serde::Deserialize<'de> for LoraConfig {
@@ -446,40 +727,35 @@ impl<'de> serde::Deserialize<'de> for LoraConfig {
   /// **shape-detection** normalization:
   ///
   /// - **mlx-lm-native** — when the raw form has a `lora_parameters` object,
-  ///   that object IS the [`LoraParameters`] (mlx-lm-native `rank` / `scale` /
-  ///   `alpha` / `keys` / `dropout`); `fine_tune_type` / `num_layers` /
-  ///   `use_dora` are read from the top level as before. The flat PEFT keys
-  ///   (`r`, `lora_alpha`, …) are ignored in this branch — a config carrying a
-  ///   `lora_parameters` object is unambiguously mlx-lm-native.
+  ///   that object IS the [`LoraParameters`]; `fine_tune_type` / `num_layers` /
+  ///   `use_dora` are read from the top level; [`selection`](LoraConfig::selection)
+  ///   is [`AdapterSelection::MlxLm`]. The flat PEFT keys are ignored — a
+  ///   config carrying `lora_parameters` is unambiguously mlx-lm-native.
   /// - **PEFT / HuggingFace** — when there is **no** `lora_parameters` object
-  ///   but the raw form carries top-level `r` / `lora_alpha` / `target_modules`
-  ///   (and/or `peft_type`), the flat PEFT fields are mapped into a
-  ///   [`LoraParameters`]: `r` → [`rank`](LoraParameters::rank), `lora_alpha`
-  ///   → [`alpha`](LoraParameters::alpha), `target_modules` →
-  ///   [`keys`](LoraParameters::keys), `lora_dropout` →
-  ///   [`dropout`](LoraParameters::dropout). PEFT has no `fine_tune_type` /
-  ///   `num_layers` / literal-`scale` keys, so those take their defaults
-  ///   ([`FineTuneType::Lora`] / [`DEFAULT_NUM_LAYERS`] / `None`); DoRA is
-  ///   carried only by PEFT's `use_dora`.
-  /// - **neither** — a config with no `lora_parameters` *and* no PEFT marker
-  ///   (e.g. `{}` or a config carrying only training-only keys) takes every
-  ///   default — same as the previous `#[derive(Deserialize)]` behavior.
+  ///   but the raw form carries top-level `r` / `lora_alpha` /
+  ///   `target_modules` / `peft_type`, the full PEFT surface is mapped: `r` →
+  ///   [`rank`](LoraParameters::rank) (default [`DEFAULT_LORA_RANK`]),
+  ///   `lora_alpha` → [`alpha`](LoraParameters::alpha) (default
+  ///   [`DEFAULT_PEFT_LORA_ALPHA`]), `lora_dropout` →
+  ///   [`dropout`](LoraParameters::dropout); `target_modules` /
+  ///   `exclude_modules` / `use_rslora` / `fan_in_fan_out` /
+  ///   `layers_to_transform` / `layers_pattern` / `rank_pattern` /
+  ///   `alpha_pattern` into a [`PeftSelection`]. [`selection`](LoraConfig::selection)
+  ///   is [`AdapterSelection::Peft`] — **no** `num_layers` window.
+  /// - **neither** — a bare / training-only-keys config takes every default
+  ///   ([`AdapterSelection::MlxLm`] with [`DEFAULT_NUM_LAYERS`]).
   ///
   /// # Errors
   ///
   /// - A `peft_type` other than `"LORA"` (case-insensitive) is a *different
-  ///   adapter kind* (`LOHA`, `LOKR`, `IA3`, a prompt-tuning method, …) — this
-  ///   module loads LoRA/DoRA adapters only, so a non-LoRA `peft_type` is a
-  ///   recoverable deserialize error (surfaced as [`Error::Backend`] by
-  ///   [`LoraConfig::from_json`]) rather than a silent mis-load.
-  /// - A PEFT `target_modules` given as a single **regex string** has no
-  ///   faithful `keys`-allowlist analogue (the `keys` selector is a
-  ///   suffix-match list, not a regex engine) — this is a recoverable
-  ///   deserialize error naming the limitation.
+  ///   adapter kind* (`LOHA`, `LOKR`, `IA3`, prompt-tuning, …) — this module
+  ///   loads LoRA/DoRA adapters only, so a non-LoRA `peft_type` is a
+  ///   recoverable deserialize error.
+  /// - A `target_modules` / `exclude_modules` regex string that fails to
+  ///   compile is a recoverable deserialize error.
   ///
   /// [`rank`]: LoraParameters::rank
   /// [`alpha`]: LoraParameters::alpha
-  /// [`keys`]: LoraParameters::keys
   /// [`dropout`]: LoraParameters::dropout
   fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
   where
@@ -496,12 +772,15 @@ impl<'de> serde::Deserialize<'de> for LoraConfig {
     // configs). Without it, top-level `r` / `lora_alpha` / `target_modules` /
     // `peft_type` marks the PEFT-flat shape.
     if let Some(lora_parameters) = raw.lora_parameters {
-      // mlx-lm-native: the nested object is the parameter block verbatim.
+      // mlx-lm-native: the nested object is the parameter block verbatim, and
+      // selection is the trailing-`num_layers` window.
       return Ok(LoraConfig {
         fine_tune_type: raw.fine_tune_type.unwrap_or_default(),
-        num_layers: raw.num_layers.unwrap_or_else(default_num_layers),
         lora_parameters,
         use_dora: raw.use_dora,
+        selection: AdapterSelection::MlxLm {
+          num_layers: raw.num_layers.unwrap_or_else(default_num_layers),
+        },
       });
     }
 
@@ -511,7 +790,7 @@ impl<'de> serde::Deserialize<'de> for LoraConfig {
       || raw.target_modules.is_some();
 
     if is_peft {
-      // PEFT-flat: validate `peft_type` (LoRA only) and map the flat fields.
+      // PEFT-flat: validate `peft_type` (LoRA only) and map the full surface.
       if let Some(peft_type) = &raw.peft_type
         && !peft_type.eq_ignore_ascii_case("LORA")
       {
@@ -521,46 +800,77 @@ impl<'de> serde::Deserialize<'de> for LoraConfig {
            IA3, prompt-tuning, …) is not supported"
         )));
       }
-      // `target_modules`: a list maps to `keys` directly (PEFT's list form is
-      // an exact/ends-with match — the same semantics as `keys`); a single
-      // regex string has no `keys`-allowlist analogue.
-      let keys = match raw.target_modules {
+      // `lora_bias: true` ships a `lora_B.bias` tensor PEFT adds in the
+      // forward — mlxrs's mlx-lm-faithful `LoRALinear` has no B-bias slot, so
+      // reject it (a silent drop would give wrong inference). `false` (the
+      // default, ~every adapter) is fine.
+      if raw.lora_bias {
+        return Err(D::Error::custom(
+          "adapter_config.json sets `lora_bias: true` (a bias on the lora_B projection); this \
+           loader's LoRALinear has no lora_B-bias term, so a `lora_bias` adapter is not \
+           supported (it would silently drop the bias)",
+        ));
+      }
+
+      let target_modules = match raw.target_modules {
         None => None,
-        Some(TargetModules::List(modules)) => Some(modules),
-        Some(TargetModules::Regex(re)) => {
-          return Err(D::Error::custom(format!(
-            "adapter_config.json `target_modules` is a regex string ({re:?}); only the \
-             list-of-module-names form is supported (it maps to the `keys` suffix-match \
-             allowlist — a regex has no faithful `keys` analogue)"
-          )));
-        }
+        Some(v) => Some(module_matcher_from::<D::Error>(v, "target_modules")?),
+      };
+      let exclude_modules = match raw.exclude_modules {
+        None => None,
+        Some(v) => Some(module_matcher_from::<D::Error>(v, "exclude_modules")?),
+      };
+      // `layers_to_transform`: an int normalizes to a one-element list (PEFT's
+      // `layer_index == layer_indexes` int case ≡ membership in `[idx]`).
+      let layers_to_transform = raw.layers_to_transform.map(|v| match v {
+        IntOrList::List(xs) => xs,
+        IntOrList::One(x) => vec![x],
+      });
+      // `layers_pattern`: a string normalizes to a one-element list.
+      let layers_pattern = match raw.layers_pattern {
+        None => Vec::new(),
+        Some(StrOrList::List(xs)) => xs,
+        Some(StrOrList::One(x)) => vec![x],
+      };
+      let peft = PeftSelection {
+        target_modules,
+        exclude_modules,
+        layers_to_transform,
+        layers_pattern,
+        rank_pattern: sorted_pattern(raw.rank_pattern),
+        alpha_pattern: sorted_pattern(raw.alpha_pattern),
+        use_rslora: raw.use_rslora,
+        fan_in_fan_out: raw.fan_in_fan_out,
       };
       let lora_parameters = LoraParameters {
         rank: raw.r.unwrap_or_else(default_rank),
-        // PEFT has no literal-`scale` field — the scale is always `lora_alpha
-        // / r` (resolved by `LoraParameters::resolved_scale`).
+        // PEFT has no literal-`scale` field — the scale is `lora_alpha / r`
+        // (or `/ sqrt(r)`), resolved per-module by `PeftSelection::scale_for`.
         scale: None,
-        alpha: raw.lora_alpha,
-        keys,
+        // PEFT `lora_alpha` defaults to 8 (NOT the mlx-lm `20.0` literal).
+        alpha: Some(raw.lora_alpha.unwrap_or(DEFAULT_PEFT_LORA_ALPHA)),
+        // PEFT selection lives in `PeftSelection`, not `keys`.
+        keys: None,
         dropout: raw.lora_dropout,
       };
       return Ok(LoraConfig {
         // PEFT configs have no `fine_tune_type` — LoRA by default; DoRA is
         // carried by `use_dora`.
         fine_tune_type: FineTuneType::Lora,
-        // PEFT has no `num_layers` — it selects via `target_modules` alone.
-        num_layers: default_num_layers(),
         lora_parameters,
         use_dora: raw.use_dora,
+        selection: AdapterSelection::Peft(peft),
       });
     }
 
     // Neither shape: a bare / training-only-keys config — every default.
     Ok(LoraConfig {
       fine_tune_type: raw.fine_tune_type.unwrap_or_default(),
-      num_layers: raw.num_layers.unwrap_or_else(default_num_layers),
       lora_parameters: LoraParameters::default(),
       use_dora: raw.use_dora,
+      selection: AdapterSelection::MlxLm {
+        num_layers: raw.num_layers.unwrap_or_else(default_num_layers),
+      },
     })
   }
 }
@@ -586,14 +896,70 @@ impl LoraConfig {
     self.fine_tune_type == FineTuneType::Dora || self.use_dora
   }
 
-  /// The resolved low-rank scale (see [`LoraParameters::resolved_scale`]).
+  /// The resolved low-rank scale **for the mlx-lm-native path**
+  /// (see [`LoraParameters::resolved_scale`]). On a PEFT config the scale is
+  /// per-module — use [`scale_for`](Self::scale_for) — so this returns the
+  /// `lora_parameters`-resolved value, which for a PEFT config is the
+  /// no-pattern, non-rsLoRA baseline (`lora_alpha / r`).
   pub fn scale(&self) -> f32 {
     self.lora_parameters.resolved_scale()
   }
 
-  /// The low-rank dimension `r`.
+  /// The effective low-rank scale **for one module path** — the value that
+  /// scales that module's low-rank term.
+  ///
+  /// - **mlx-lm-native** — the single config-wide scale (`alpha / rank`, or the
+  ///   literal `scale`); `module_path` is unused.
+  /// - **PEFT** — PEFT's per-module `update_layer` scaling: `lora_alpha / r`,
+  ///   or `lora_alpha / sqrt(r)` under `use_rslora`, with `rank_pattern` /
+  ///   `alpha_pattern` overriding `r` / `lora_alpha` for a matching module
+  ///   (see [`PeftSelection::scale_for`]).
+  pub fn scale_for(&self, module_path: &str) -> f32 {
+    match &self.selection {
+      AdapterSelection::MlxLm { .. } => self.lora_parameters.resolved_scale(),
+      AdapterSelection::Peft(peft) => peft.scale_for(
+        module_path,
+        self.lora_parameters.rank,
+        self
+          .lora_parameters
+          .alpha
+          .unwrap_or(DEFAULT_PEFT_LORA_ALPHA),
+      ),
+    }
+  }
+
+  /// The effective low-rank **rank** for one module path — the config-wide
+  /// `rank` for the mlx-lm-native path, or PEFT's `rank_pattern`-overridden
+  /// rank for a PEFT config (see [`PeftSelection::rank_for`]). This is the rank
+  /// the module's `lora_a` / `lora_b` factors must agree with (the
+  /// config-vs-tensor cross-check).
+  pub fn rank_for(&self, module_path: &str) -> i32 {
+    match &self.selection {
+      AdapterSelection::MlxLm { .. } => self.lora_parameters.rank,
+      AdapterSelection::Peft(peft) => peft.rank_for(module_path, self.lora_parameters.rank),
+    }
+  }
+
+  /// The config-wide low-rank dimension `r` (PEFT `r` / mlx-lm
+  /// `lora_parameters.rank`) — the default before any `rank_pattern` override.
   pub fn rank(&self) -> i32 {
     self.lora_parameters.rank
+  }
+
+  /// The PEFT selection block, when this config is PEFT-shaped; `None` for an
+  /// mlx-lm-native config.
+  pub fn peft(&self) -> Option<&PeftSelection> {
+    match &self.selection {
+      AdapterSelection::Peft(p) => Some(p),
+      AdapterSelection::MlxLm { .. } => None,
+    }
+  }
+
+  /// Whether the base weights this adapter targets are stored transposed
+  /// (`[in_features, out_features]`) — PEFT `fan_in_fan_out`. Always `false`
+  /// for an mlx-lm-native config (mlx-lm stores weights `[out, in]`).
+  pub fn fan_in_fan_out(&self) -> bool {
+    self.peft().is_some_and(|p| p.fan_in_fan_out)
   }
 }
 
@@ -1397,7 +1763,9 @@ fn validate_config_rank(params: &AdapterParams, config_rank: usize, who: &str) -
 
 /// Apply LoRA/DoRA wrapping to the targeted linear layers of a [`Weights`]
 /// map — mlx-lm `tuner/utils.py::linear_to_lora_layers` (`tuner/utils.py:38-110`)
-/// adapted to the weight-map model (see the [module docs](self)).
+/// **and** HuggingFace PEFT's `LoraModel._create_and_replace` /
+/// `check_target_module_exists`, adapted to the weight-map model (see the
+/// [module docs](self)).
 ///
 /// For each base-weight path the predicate selects, this builds a [`LoraLayer`]
 /// (LoRA or DoRA per `config`) over the path's [`BaseLinear`] — a dense base
@@ -1409,33 +1777,33 @@ fn validate_config_rank(params: &AdapterParams, config_rank: usize, who: &str) -
 ///
 /// # Layer selection
 ///
-/// Faithful to mlx-lm's two-part predicate:
+/// The rule depends on [`config.selection`](LoraConfig::selection):
 ///
-/// - **`num_layers`** — only the **last** `num_layers` decoder blocks are
-///   adapted (mlx-lm `model.layers[-max(num_layers, 0):]`,
-///   `tuner/utils.py:103`), EXCEPT that a **non-positive** `num_layers` selects
-///   ALL blocks (the Python `-0` slice quirk: `layers[-0:]` == `layers[0:]`),
-///   so `num_layers: -1` (and `0`) adapt every block. A path's block index is
-///   parsed from the
-///   `…layers.N.…` segment; a path with no such segment (e.g. a top-level
-///   `lm_head`) is adapted only when it matches `keys` AND `num_layers`
-///   covers all blocks is not applicable to it — to stay faithful, non-block
-///   paths are wrapped only when `keys` is explicit and the path matches (the
-///   per-layer-block window does not gate a non-block path).
-/// - **`keys`** — when `config.lora_parameters.keys` is set, a path is adapted
-///   only if it **ends with** one of the keys (e.g. key `"self_attn.q_proj"`
-///   matches `"model.layers.27.self_attn.q_proj"`), mirroring mlx-lm's
-///   `k in keys` module-name match (`tuner/utils.py:104`). When `keys` is
-///   `None`, every eligible linear in the window is adapted (mlx-lm's
-///   auto-discovery, `tuner/utils.py:85-101`); a weight is "an eligible
-///   linear" when its `<path>.weight` is rank-2 (the structural analogue of
-///   mlx-lm's `isinstance(layer, nn.Linear)` — the same rank-2 gate
-///   [`crate::lm::quant`] uses).
+/// - **[`AdapterSelection::MlxLm`]** — mlx-lm's two-part predicate: the
+///   trailing-`num_layers`-block window (a non-positive `num_layers` selects
+///   ALL blocks — the Python `-0` slice quirk) **plus** the
+///   `lora_parameters.keys` suffix allowlist (`None` ⇒ every rank-2 linear in
+///   the window — mlx-lm's auto-discovery).
+/// - **[`AdapterSelection::Peft`]** — PEFT's selection
+///   (`check_target_module_exists`): `exclude_modules` removes a match first,
+///   then `target_modules` (exact-or-`.endswith` list, or `re.fullmatch`
+///   regex) selects, then `layers_to_transform` + `layers_pattern` restrict to
+///   explicit block indices. **No** trailing-`num_layers` window — PEFT adapts
+///   EVERY matching block (this is why a PEFT config must NOT inherit mlx-lm's
+///   `num_layers=16`). A PEFT config with no `target_modules` falls back to the
+///   rank-2 auto-discovery (mlxrs has no module tree for PEFT's "auto-detect
+///   linear layers" — see the module docs).
+///
+/// # Per-module scale
+///
+/// The low-rank scale is resolved **per module** ([`LoraConfig::scale_for`]):
+/// the single config-wide scale for mlx-lm-native, or PEFT's
+/// `lora_alpha / r` — `/ sqrt(r)` under `use_rslora` — with `rank_pattern` /
+/// `alpha_pattern` overrides for a PEFT config.
 ///
 /// `adapter_params` supplies the per-path [`AdapterParams`] (loaded from
-/// `adapters.safetensors`). The total number of decoder blocks (`num_blocks`)
-/// is needed to resolve the trailing-`num_layers` window; pass the model's
-/// layer count (mlx-lm reads `len(model.layers)`).
+/// `adapters.safetensors`). `num_blocks` is the model's decoder-block count
+/// (needed for the mlx-lm trailing window; ignored on the PEFT path).
 ///
 /// # Completeness postcondition
 ///
@@ -1443,17 +1811,18 @@ fn validate_config_rank(params: &AdapterParams, config_rank: usize, who: &str) -
 /// path-prefix mismatch / missing tensor group / empty safetensors /
 /// `adapter_config.json` drift cannot silently return a partially- or
 /// un-adapted model. It is a recoverable [`Error::Backend`] when (a) an
-/// explicit `keys` selection is missing factors for a selected target, (b) an
-/// `adapter_params` factor group matches no base layer, or (c) nothing was
-/// adapted at all.
+/// explicit target selection (mlx-lm `keys` / PEFT `target_modules`) is missing
+/// factors for a selected target, (b) an `adapter_params` factor group matches
+/// no base layer, or (c) nothing was adapted at all.
 ///
 /// A selected path whose factor shapes don't match the base (or a DoRA path
 /// with no magnitude) is a recoverable [`Error::ShapeMismatch`] /
 /// [`Error::Backend`]. A selected path whose factor tensors' rank axis
-/// disagrees with `config.rank()` (a stale `adapter_config.json`, or a PEFT
-/// `r` key that defaulted) is a recoverable [`Error::ShapeMismatch`]
-/// (`validate_config_rank`) — caught before the `alpha / rank` scale is
-/// applied, so a rank drift cannot silently scale by the wrong divisor.
+/// disagrees with the module's resolved rank ([`LoraConfig::rank_for`] — the
+/// `rank_pattern`-overridden rank for a PEFT module) is a recoverable
+/// [`Error::ShapeMismatch`] (`validate_config_rank`) — caught before the
+/// scale is applied, so a rank drift cannot silently scale by the wrong
+/// divisor.
 pub fn linear_to_lora_layers(
   weights: &Weights,
   config: &LoraConfig,
@@ -1462,82 +1831,65 @@ pub fn linear_to_lora_layers(
   num_blocks: i32,
 ) -> Result<LoraLayers> {
   let mut out: LoraLayers = HashMap::new();
-  let scale = config.scale();
   let is_dora = config.is_dora();
-  let keys = config.lora_parameters.keys.as_deref();
-  // The config-declared rank, cross-checked against every adapter factor group
-  // below (`validate_config_rank`). A non-positive rank cannot index a tensor
-  // axis — `load_adapters` already rejects it, but `linear_to_lora_layers` is
-  // also a public entry point, so guard here too. `None` ⇒ skip the
-  // config-rank cross-check (degenerate config; the empty/zero-rank factors it
-  // would build are caught by the shape checks instead).
-  let config_rank: Option<usize> = usize::try_from(config.rank()).ok().filter(|&r| r > 0);
-  // mlx-lm selects `model.layers[-max(num_layers, 0):]` (`tuner/utils.py:103`).
-  // Note the Python `-0` quirk: when `num_layers <= 0`, `max(num_layers, 0)` is
-  // `0` and `layers[-0:]` == `layers[0:]` == ALL blocks (so `num_layers: -1` —
-  // and `0` — selects every block, NOT none). For `num_layers > 0` it is the
-  // trailing `num_layers` blocks. Reproduce: a non-positive `num_layers` starts
-  // the window at block 0 (all blocks); a positive one at `num_blocks -
-  // num_layers`.
-  let first_adapted = if config.num_layers <= 0 {
-    0
-  } else {
-    (num_blocks - config.num_layers).max(0)
+  let fan_in_fan_out = config.fan_in_fan_out();
+
+  // The mlx-lm trailing window's first adapted block index — `tuner/utils.py:103`
+  // `model.layers[-max(num_layers, 0):]`, with the Python `-0` quirk
+  // (`num_layers <= 0` ⇒ `layers[0:]` == ALL blocks). Unused on the PEFT path.
+  let first_adapted = match &config.selection {
+    AdapterSelection::MlxLm { num_layers } if *num_layers > 0 => (num_blocks - num_layers).max(0),
+    _ => 0,
   };
 
   // Completeness tracking (the postcondition below): every adapter factor
-  // group MUST be applied to a base layer, and an explicit `keys` selection
+  // group MUST be applied to a base layer, and an explicit target selection
   // MUST find its factors — otherwise a path-prefix mismatch / missing tensor
   // group / config drift would silently yield a partially- or un-adapted model.
   let mut consumed: HashSet<&str> = HashSet::with_capacity(adapter_params.len());
   // Targets the predicate selected but for which no factors were supplied —
-  // only an *error* when `keys` is explicit (with auto-discovery, an unmatched
-  // linear is expected — the adapter legitimately trains only a subset).
+  // only an *error* when the selection is explicit (with auto-discovery, an
+  // unmatched linear is expected: the adapter trains only a subset).
   let mut selected_without_factors: Vec<&str> = Vec::new();
+  // Whether the target selection is *explicit* (an allowlist the adapter is
+  // expected to fully cover) vs auto-discovery. mlx-lm: `keys` is set. PEFT:
+  // `target_modules` is set.
+  let explicit_selection = match &config.selection {
+    AdapterSelection::MlxLm { .. } => config.lora_parameters.keys.is_some(),
+    AdapterSelection::Peft(peft) => peft.target_modules.is_some(),
+  };
 
   for (key, weight) in weights {
     let Some(path) = key.strip_suffix(".weight") else {
       continue;
     };
 
-    // keys filter (suffix match) — or rank-2 auto-discovery when keys is None.
-    if let Some(keys) = keys {
-      if !keys.iter().any(|k| path_matches_key(path, k)) {
-        continue;
-      }
-    } else if weight.shape().len() != 2 {
-      // auto-discovery: only rank-2 weights are "linears".
-      continue;
-    }
-
-    // num_layers window: a path inside a decoder block is adapted only when
-    // its block index is in the trailing window. A non-block path (no
-    // `layers.N`) is governed by `keys` alone (it has no block index to gate).
-    if let Some(block) = parse_block_index(path)
-      && block < first_adapted
-    {
+    if !module_is_selected(path, weight, config, first_adapted) {
       continue;
     }
 
     // `path` is now a SELECTED target (predicate-matched). Build a layer only
     // when we actually have factors for it; record a missing-factor target so
-    // the postcondition can reject an incomplete explicit-`keys` selection.
+    // the postcondition can reject an incomplete explicit selection.
     let Some(params) = adapter_params.get(path) else {
       selected_without_factors.push(path);
       continue;
     };
     consumed.insert(path);
 
-    // Cross-check the factor tensors' rank axis against the config-declared
-    // rank BEFORE building the layer (and resolving the alpha/rank scale): a
-    // config/tensor rank drift must fail loudly here, not silently scale by
-    // the wrong divisor (`alpha / config.rank()`).
-    if let Some(rank) = config_rank {
+    // The module's resolved rank / scale (PEFT `rank_pattern` / `alpha_pattern`
+    // overrides applied; mlx-lm: the config-wide values). Cross-check the
+    // factor tensors' rank axis against the resolved rank BEFORE building the
+    // layer: a config/tensor rank drift must fail loudly, not silently scale by
+    // the wrong divisor.
+    let module_rank = config.rank_for(path);
+    let scale = config.scale_for(path);
+    if let Some(rank) = usize::try_from(module_rank).ok().filter(|&r| r > 0) {
       let who = if is_dora { "DoRALinear" } else { "LoRALinear" };
       validate_config_rank(params, rank, who)?;
     }
 
-    let base = build_base_linear(weights, path, weight, quant)?;
+    let base = build_base_linear(weights, path, weight, quant, fan_in_fan_out)?;
     let layer = if is_dora {
       LoraLayer::Dora(DoRALinear::new(base, params.try_clone()?, scale)?)
     } else {
@@ -1551,25 +1903,143 @@ pub fn linear_to_lora_layers(
     adapter_params,
     &consumed,
     &selected_without_factors,
-    keys,
+    explicit_selection,
   )?;
   Ok(out)
+}
+
+/// Whether the base-weight path `path` (weight `weight`) is selected for
+/// adaptation under `config` — the per-shape predicate `linear_to_lora_layers`
+/// applies to every `<path>.weight` in the weight map. `first_adapted` is the
+/// mlx-lm trailing window's first block index (unused on the PEFT path).
+fn module_is_selected(path: &str, weight: &Array, config: &LoraConfig, first_adapted: i32) -> bool {
+  match &config.selection {
+    AdapterSelection::MlxLm { .. } => {
+      // mlx-lm: `keys` suffix allowlist, or rank-2 auto-discovery, then the
+      // trailing-`num_layers`-block window.
+      match config.lora_parameters.keys.as_deref() {
+        Some(keys) => {
+          if !keys.iter().any(|k| path_matches_key(path, k)) {
+            return false;
+          }
+        }
+        None => {
+          // auto-discovery: only rank-2 weights are "linears".
+          if weight.shape().len() != 2 {
+            return false;
+          }
+        }
+      }
+      // A path inside a decoder block is adapted only when its block index is
+      // in the trailing window; a non-block path (no `layers.N`) has no block
+      // index to gate, so `keys` alone governs it.
+      match parse_block_index(path) {
+        Some(block) => block >= first_adapted,
+        None => true,
+      }
+    }
+    AdapterSelection::Peft(peft) => peft_module_is_selected(path, weight, peft),
+  }
+}
+
+/// PEFT's `check_target_module_exists` + `layers_to_transform` selection for
+/// one module path (`peft/tuners/tuners_utils.py`):
+///
+/// 1. `exclude_modules` — if it matches, the module is excluded (PEFT's early
+///    `_ExcludedModule` return, checked *first*).
+/// 2. `target_modules` — must match (list exact-or-`.endswith`, or
+///    `re.fullmatch` regex). `None` ⇒ rank-2 auto-discovery (mlxrs has no
+///    module tree for PEFT's `_maybe_include_all_linear_layers`).
+/// 3. `layers_to_transform` — when set, the module's decoder-block index (from
+///    `layers_pattern`, or PEFT's default index regex) must be in the list.
+fn peft_module_is_selected(path: &str, weight: &Array, peft: &PeftSelection) -> bool {
+  // (1) exclude first.
+  if let Some(exclude) = &peft.exclude_modules
+    && exclude.matches(path)
+  {
+    return false;
+  }
+
+  // (2) target match — or rank-2 auto-discovery when `target_modules` is None.
+  match &peft.target_modules {
+    Some(target) => {
+      if !target.matches(path) {
+        return false;
+      }
+    }
+    None => {
+      if weight.shape().len() != 2 {
+        return false;
+      }
+    }
+  }
+
+  // (3) layers_to_transform: restrict to explicit block indices. PEFT only
+  // applies this when `layers_to_transform` is non-empty AND the target
+  // matched; a module with no extractable block index is then NOT selected
+  // (PEFT sets `target_module_found = False` when `layer_index is None`).
+  if let Some(layers) = &peft.layers_to_transform
+    && !layers.is_empty()
+  {
+    match peft_layer_index(path, &peft.layers_pattern) {
+      Some(idx) => return layers.contains(&idx),
+      None => return false,
+    }
+  }
+
+  true
+}
+
+/// Extract a module's decoder-block index the way PEFT's
+/// `check_target_module_exists` does for `layers_to_transform`
+/// (`peft/tuners/tuners_utils.py`):
+///
+/// - `layers_pattern` empty ⇒ PEFT's default `re.match(r".*\.[^.]*\.(\d+)\.",
+///   key)` — the digits between two dots after some prefix.
+/// - `layers_pattern` non-empty ⇒ for each `pattern`, PEFT's
+///   `re.match(rf".*\.{pattern}\.(\d+)\.", key)` — the digits right after the
+///   named `ModuleList` attribute.
+///
+/// `None` when no pattern extracts an index (PEFT then de-selects the module).
+fn peft_layer_index(path: &str, layers_pattern: &[String]) -> Option<i32> {
+  if layers_pattern.is_empty() {
+    // PEFT default: `.*\.[^.]*\.(\d+)\.` — anchored at start by `re.match`.
+    let re = Regex::new(r"^.*\.[^.]*\.(\d+)\.").ok()?;
+    let caps = re.captures(path)?;
+    return caps.get(1)?.as_str().parse::<i32>().ok();
+  }
+  for pattern in layers_pattern {
+    // PEFT: `.*\.{pattern}\.(\d+)\.` — `{pattern}` is a literal attribute name
+    // (e.g. "layers" / "h"), escaped so a dotted name cannot inject regex.
+    let escaped = regex::escape(pattern);
+    let Ok(re) = Regex::new(&format!(r"^.*\.{escaped}\.(\d+)\.")) else {
+      continue;
+    };
+    if let Some(caps) = re.captures(path)
+      && let Some(m) = caps.get(1)
+      && let Ok(idx) = m.as_str().parse::<i32>()
+    {
+      return Some(idx);
+    }
+  }
+  None
 }
 
 /// The adapter-completeness postcondition for [`linear_to_lora_layers`]:
 /// reject a result that would leave inference silently-wrong.
 ///
-/// A base path matching the `keys`/`num_layers` predicate but carrying no
+/// A base path matching the selection predicate but carrying no
 /// [`AdapterParams`] used to be skipped silently — a path-prefix mismatch,
 /// missing tensor group, empty `adapters.safetensors`, or `adapter_config.json`
 /// drift would then return `Ok` with a partially- or un-adapted model. This
 /// catches all three failure modes:
 ///
-/// - **(a) explicitly-selected target with no factors** — when `keys` is an
-///   explicit list, every `(key × in-window-block)` path is a target the
-///   adapter is expected to provide; a missing factor group is config drift.
-///   (With `keys: None` auto-discovery an unmatched linear is *expected* — the
-///   adapter trains only a subset — so this is not checked there.)
+/// - **(a) explicitly-selected target with no factors** — when the selection
+///   is explicit (`explicit_selection`: an mlx-lm `keys` list or a PEFT
+///   `target_modules`), every selected path is a target the adapter is
+///   expected to provide; a missing factor group is config drift. (With
+///   auto-discovery an unmatched linear is *expected* — the adapter trains only
+///   a subset — so this is not checked there.)
 /// - **(b) unused adapter factor group** — every path present in
 ///   `adapter_params` (i.e. every `<path>.lora_a`/`lora_b` group in the
 ///   safetensors) MUST have matched a base layer; one that matched nothing is a
@@ -1584,17 +2054,18 @@ fn check_adapter_completeness(
   adapter_params: &HashMap<String, AdapterParams>,
   consumed: &HashSet<&str>,
   selected_without_factors: &[&str],
-  keys: Option<&[String]>,
+  explicit_selection: bool,
 ) -> Result<()> {
-  // (a) explicit `keys` selection that is missing factors.
-  if keys.is_some() && !selected_without_factors.is_empty() {
+  // (a) explicit selection (mlx-lm `keys` / PEFT `target_modules`) missing
+  // factors.
+  if explicit_selection && !selected_without_factors.is_empty() {
     let mut missing: Vec<&str> = selected_without_factors.to_vec();
     missing.sort_unstable();
     return Err(Error::Backend {
       message: format!(
         "load_adapters: adapter is missing factors for {} explicitly-selected target(s): {:?}; \
-         the adapter_config.json `keys`/`num_layers` selection does not match the \
-         adapters.safetensors contents",
+         the adapter_config.json target selection does not match the adapters.safetensors \
+         contents",
         missing.len(),
         missing
       ),
@@ -1623,8 +2094,9 @@ fn check_adapter_completeness(
   // (c) nothing adapted at all.
   if applied.is_empty() {
     return Err(Error::Backend {
-      message: "load_adapters: no base layer was adapted — the adapter_config.json \
-                `keys`/`num_layers` selection matched nothing in the base model, or \
+      message: "load_adapters: no base layer was adapted — the adapter_config.json target \
+                selection (mlx-lm `keys`/`num_layers` or PEFT \
+                `target_modules`/`layers_to_transform`) matched nothing in the base model, or \
                 adapters.safetensors carried no factors"
         .to_string(),
     });
@@ -1638,11 +2110,24 @@ fn check_adapter_completeness(
 /// resolves a [`Quantization`] for `path` AND a `<path>.scales` sibling
 /// exists; otherwise a dense base (from `<path>.weight` + optional
 /// `<path>.bias`).
+///
+/// `fan_in_fan_out` (PEFT `LoraConfig.fan_in_fan_out`): when `true` the stored
+/// dense `<path>.weight` is laid out `[in_features, out_features]` (a
+/// `transformers.Conv1D`-style transposed weight) rather than the standard
+/// `[out_features, in_features]`. The weight is transposed back here so every
+/// downstream consumer ([`BaseLinear`]'s forward, the factor-shape
+/// cross-check, `fuse`) sees the standard `[out, in]` orientation — exactly
+/// PEFT's `transpose(weight, fan_in_fan_out)` at the matmul boundary. A
+/// `fan_in_fan_out` *quantized* base is rejected: transposing a packed
+/// quantized weight would corrupt the bit-packing, and the combination does
+/// not occur in practice (PEFT's `fan_in_fan_out` targets `Conv1D`, which is
+/// never the `(weight, scales, biases)` quantized triple).
 fn build_base_linear(
   weights: &Weights,
   path: &str,
   weight: &Array,
   quant: Option<&PerLayerQuantization>,
+  fan_in_fan_out: bool,
 ) -> Result<BaseLinear> {
   let scales_key = format!("{path}.scales");
   let biases_key = format!("{path}.biases");
@@ -1653,6 +2138,16 @@ fn build_base_linear(
   // `f"{p}.scales" in weights` check, `utils.py:349-355`).
   let q: Option<Quantization> = quant.and_then(|c| c.quantization_for(path));
   if let (Some(q), Some(scales)) = (q, weights.get(&scales_key)) {
+    if fan_in_fan_out {
+      return Err(Error::Backend {
+        message: format!(
+          "load_adapters: base layer {path:?} is quantized AND the adapter_config.json sets \
+           `fan_in_fan_out` — a packed quantized weight cannot be transposed without \
+           corrupting the bit-packing; `fan_in_fan_out` applies only to a dense \
+           (Conv1D-style) base"
+        ),
+      });
+    }
     let quant_biases = weights.get(&biases_key).map(Array::try_clone).transpose()?;
     let bias = weights.get(&bias_key).map(Array::try_clone).transpose()?;
     return BaseLinear::quantized(
@@ -1666,9 +2161,15 @@ fn build_base_linear(
     );
   }
 
-  // Dense base.
+  // Dense base. With `fan_in_fan_out` the stored weight is `[in, out]` — undo
+  // the transpose so `BaseLinear::dense` receives the standard `[out, in]`.
   let bias = weights.get(&bias_key).map(Array::try_clone).transpose()?;
-  BaseLinear::dense(weight.try_clone()?, bias)
+  let dense_weight = if fan_in_fan_out {
+    weight.transpose()?
+  } else {
+    weight.try_clone()?
+  };
+  BaseLinear::dense(dense_weight, bias)
 }
 
 /// Whether `path` should match the adapter key `key`: mlx-lm matches a module
@@ -1701,11 +2202,26 @@ fn parse_block_index(path: &str) -> Option<i32> {
 /// `load(into:)`, restricted to the local-path, no-network surface.
 ///
 /// Reads `<dir>/adapter_config.json` (bounded, untrusted-dir-safe — same
-/// discipline as [`crate::lm::load::load_config`]) and
-/// `<dir>/adapters.safetensors` (via [`crate::io::load_safetensors`]), splits
-/// the safetensors into per-path [`AdapterParams`] (`<path>.lora_a` /
-/// `<path>.lora_b` / `<path>.m`), then runs [`linear_to_lora_layers`] over
-/// `base_weights` to build the [`LoraLayers`] map.
+/// discipline as [`crate::lm::load::load_config`]) and the adapter weights
+/// file (via [`crate::io::load_safetensors`]), splits it into per-path
+/// [`AdapterParams`], then runs [`linear_to_lora_layers`] over `base_weights`
+/// to build the [`LoraLayers`] map.
+///
+/// # mlx-lm-native and HuggingFace PEFT adapters
+///
+/// Both adapter formats are supported (the format is detected from the
+/// `adapter_config.json` shape — see [`LoraConfig`]):
+///
+/// - **mlx-lm-native** — weights in `adapters.safetensors`, keyed
+///   `<path>.lora_a` / `.lora_b` / `.m`; selection by the
+///   trailing-`num_layers` window + `lora_parameters.keys`.
+/// - **PEFT** — weights in `adapter_model.safetensors`, keyed
+///   `base_model.model.<path>.lora_A.weight` / `.lora_B.weight` /
+///   `.lora_magnitude_vector` (the PEFT key scheme is translated to the mlxrs
+///   scheme, transposing the factor tensors — PEFT stores them transposed);
+///   selection by PEFT's `target_modules` / `exclude_modules` /
+///   `layers_to_transform`; per-module rsLoRA + `rank_pattern` / `alpha_pattern`
+///   scaling.
 ///
 /// `base_weights` is the loaded base-model weight map ([`crate::lm::load::load_weights`]);
 /// `quant` is the base model's [`PerLayerQuantization`] (from
@@ -1715,9 +2231,9 @@ fn parse_block_index(path: &str) -> Option<i32> {
 ///
 /// # Errors (recoverable)
 ///
-/// - Missing adapter dir / `adapter_config.json` / `adapters.safetensors`,
+/// - Missing adapter dir / `adapter_config.json` / adapter weights file,
 ///   oversized / non-regular / non-UTF-8 config → [`Error::Backend`].
-/// - An `adapters.safetensors` that is not a regular file (FIFO / device /
+/// - An adapter weights file that is not a regular file (FIFO / device /
 ///   directory) or exceeds [`MAX_ADAPTER_SAFETENSORS_BYTES`] → [`Error::Backend`]
 ///   (the file is stat-checked before mlx-c mmaps it).
 /// - `fine_tune_type: "full"` (a full-weight fine-tune, not an adapter — see
@@ -1727,8 +2243,8 @@ fn parse_block_index(path: &str) -> Option<i32> {
 /// - A target path with a magnitude-less DoRA factor, or factor shapes that
 ///   don't match the base → [`Error::ShapeMismatch`] / [`Error::Backend`].
 /// - The completeness postcondition of [`linear_to_lora_layers`]: an explicit
-///   `keys` selection missing factors, an unused adapter factor group, or an
-///   empty result → [`Error::Backend`].
+///   target selection (mlx-lm `keys` / PEFT `target_modules`) missing factors,
+///   an unused adapter factor group, or an empty result → [`Error::Backend`].
 pub fn load_adapters(
   base_weights: &Weights,
   dir: &Path,
@@ -1762,20 +2278,132 @@ pub fn load_adapters(
     });
   }
 
-  // 2) adapters.safetensors → per-path AdapterParams. Stat the file FIRST
-  // (regular-file + size-budget) so an untrusted adapter dir cannot point us at
-  // a FIFO/device (hang/opaque error) or an oversized blob (OOM) — the
-  // safetensors path is otherwise handed straight to mlx-c, which would mmap
-  // whatever it is given.
-  let st_path = dir.join("adapters.safetensors");
+  // 2) Locate the adapter weights file. mlx-lm names it `adapters.safetensors`;
+  // HuggingFace PEFT names it `adapter_model.safetensors`. Pick by the config
+  // shape, but fall back to whichever file is actually on disk (some exporters
+  // pair a PEFT config with the mlx-lm filename, or vice versa).
+  let st_path = locate_adapter_safetensors(dir, &config)?;
+  // Stat the file FIRST (regular-file + size-budget) so an untrusted adapter
+  // dir cannot point us at a FIFO/device (hang/opaque error) or an oversized
+  // blob (OOM) — the safetensors path is otherwise handed straight to mlx-c,
+  // which would mmap whatever it is given.
   check_adapter_safetensors(&st_path)?;
   let adapter_arrays = crate::io::load_safetensors(&st_path).map_err(|e| Error::Backend {
     message: format!("load_adapters: cannot load {}: {e}", st_path.display()),
   })?;
+  // PEFT keys (`base_model.model.<path>.lora_A.weight`, …) → the mlxrs
+  // `<path>.lora_a` / `.lora_b` / `.m` scheme, transposing the factor tensors
+  // (PEFT stores them in the opposite orientation — see `translate_peft_keys`).
+  // mlx-lm-native keys are already in the mlxrs scheme — used verbatim.
+  let adapter_arrays = match config.selection {
+    AdapterSelection::Peft(_) => translate_peft_keys(adapter_arrays)?,
+    AdapterSelection::MlxLm { .. } => adapter_arrays,
+  };
   let adapter_params = split_adapter_params(adapter_arrays, config.is_dora())?;
 
   // 3) Build + apply the LoRA/DoRA layers over the base weight map.
   linear_to_lora_layers(base_weights, &config, &adapter_params, quant, num_blocks)
+}
+
+/// mlx-lm's adapter weights filename (`tuner/utils.py:137`
+/// `adapter_path / "adapters.safetensors"`).
+const MLX_LM_ADAPTER_FILE: &str = "adapters.safetensors";
+
+/// HuggingFace PEFT's adapter weights filename — `peft`'s
+/// `SAFETENSORS_WEIGHTS_NAME`, written by `PeftModel.save_pretrained`.
+const PEFT_ADAPTER_FILE: &str = "adapter_model.safetensors";
+
+/// Locate the adapter weights file in `dir`. The *preferred* name follows the
+/// config shape — mlx-lm-native ⇒ [`MLX_LM_ADAPTER_FILE`], PEFT ⇒
+/// [`PEFT_ADAPTER_FILE`] — but if the preferred file is absent and the other
+/// name is present, that is used (an exporter pairing one project's config
+/// with the other's filename is not a hard error). A recoverable
+/// [`Error::Backend`] when neither file exists.
+fn locate_adapter_safetensors(dir: &Path, config: &LoraConfig) -> Result<std::path::PathBuf> {
+  let (preferred, fallback) = match config.selection {
+    AdapterSelection::Peft(_) => (PEFT_ADAPTER_FILE, MLX_LM_ADAPTER_FILE),
+    AdapterSelection::MlxLm { .. } => (MLX_LM_ADAPTER_FILE, PEFT_ADAPTER_FILE),
+  };
+  let preferred_path = dir.join(preferred);
+  if preferred_path.exists() {
+    return Ok(preferred_path);
+  }
+  let fallback_path = dir.join(fallback);
+  if fallback_path.exists() {
+    return Ok(fallback_path);
+  }
+  Err(Error::Backend {
+    message: format!(
+      "load_adapters: no adapter weights file in {}; expected {preferred:?} (or {fallback:?})",
+      dir.display()
+    ),
+  })
+}
+
+/// PEFT adapter-weight key prefix — every tensor in a `peft`
+/// `adapter_model.safetensors` is named `base_model.model.<module_path>.<...>`
+/// (`peft/utils/save_and_load.py`: the non-prompt-learning `prefix =
+/// "base_model.model."`).
+const PEFT_KEY_PREFIX: &str = "base_model.model.";
+
+/// Translate a PEFT-keyed `adapter_model.safetensors` array map into the mlxrs
+/// `<path>.lora_a` / `<path>.lora_b` / `<path>.m` scheme that
+/// [`split_adapter_params`] consumes.
+///
+/// # PEFT's on-disk key scheme
+///
+/// `peft` (`utils/save_and_load.py`) saves a LoRA tensor as
+/// `base_model.model.<module_path>.lora_A.weight` (and `lora_B.weight`,
+/// `lora_magnitude_vector` for DoRA). The adapter-name segment PEFT carries
+/// in-memory (`lora_A.<adapter>.weight`) is **stripped before saving** — on
+/// disk there is no adapter name (`peft` `remove_adapter_name`: "the adapter
+/// name is just an arbitrary name that can be changed when loading"). So this
+/// strips the `base_model.model.` prefix and maps the trailing component:
+///
+/// | PEFT on-disk suffix          | mlxrs suffix |
+/// |------------------------------|--------------|
+/// | `.lora_A.weight`             | `.lora_a`    |
+/// | `.lora_B.weight`             | `.lora_b`    |
+/// | `.lora_magnitude_vector` / `.lora_magnitude_vector.weight` | `.m` |
+///
+/// # Factor-tensor transpose
+///
+/// PEFT's `lora_A` is an `nn.Linear(in_features, r)`, so `lora_A.weight` is
+/// stored `[r, in_features]`; `lora_B` is `nn.Linear(r, out_features)`, so
+/// `lora_B.weight` is `[out_features, r]`. mlxrs's [`AdapterParams`] uses the
+/// **opposite** orientation — `lora_a` is `[input_dims, r]`, `lora_b` is
+/// `[r, output_dims]` (mlx-lm's `tuner/lora.py` layout). So each factor tensor
+/// is transposed during translation. The DoRA `lora_magnitude_vector` is a
+/// length-`out_features` vector in both — copied without transpose.
+///
+/// A tensor whose key neither carries the PEFT prefix nor a recognized LoRA
+/// suffix is dropped (a PEFT checkpoint may also store `modules_to_save` base
+/// weights, which this low-rank loader does not consume).
+fn translate_peft_keys(arrays: HashMap<String, Array>) -> Result<HashMap<String, Array>> {
+  let mut out: HashMap<String, Array> = HashMap::with_capacity(arrays.len());
+  for (key, arr) in arrays {
+    // Strip the `base_model.model.` prefix. A key without it is not a PEFT
+    // adapter tensor (e.g. a stray base weight) — skip it.
+    let Some(rest) = key.strip_prefix(PEFT_KEY_PREFIX) else {
+      continue;
+    };
+    if let Some(path) = rest.strip_suffix(".lora_A.weight") {
+      // [r, in] → [in, r].
+      out.insert(format!("{path}.lora_a"), arr.transpose()?);
+    } else if let Some(path) = rest.strip_suffix(".lora_B.weight") {
+      // [out, r] → [r, out].
+      out.insert(format!("{path}.lora_b"), arr.transpose()?);
+    } else if let Some(path) = rest
+      .strip_suffix(".lora_magnitude_vector.weight")
+      .or_else(|| rest.strip_suffix(".lora_magnitude_vector"))
+    {
+      // DoRA magnitude — [out_features] in both schemes, no transpose.
+      out.insert(format!("{path}.m"), arr);
+    }
+    // Any other suffix (a `modules_to_save` base weight, …) is not a low-rank
+    // factor — dropped.
+  }
+  Ok(out)
 }
 
 /// Split the flat `adapters.safetensors` array map into per-path
@@ -2013,6 +2641,38 @@ mod tests {
       lora_a: lora_a(),
       lora_b: lora_b(),
       magnitude: None,
+    }
+  }
+
+  /// Build an mlx-lm-native [`LoraConfig`] (LoRA, the given `num_layers`
+  /// trailing-block window and `lora_parameters`).
+  fn mlxlm_config(num_layers: i32, lora_parameters: LoraParameters) -> LoraConfig {
+    LoraConfig {
+      fine_tune_type: FineTuneType::Lora,
+      lora_parameters,
+      use_dora: false,
+      selection: AdapterSelection::MlxLm { num_layers },
+    }
+  }
+
+  /// The mlx-lm trailing-block window count of a config — asserts the config
+  /// is mlx-lm-native (NOT PEFT, which has no `num_layers`). Test-only.
+  fn mlxlm_num_layers(cfg: &LoraConfig) -> i32 {
+    match &cfg.selection {
+      AdapterSelection::MlxLm { num_layers } => *num_layers,
+      AdapterSelection::Peft(_) => panic!("expected an mlx-lm-native config, got PEFT"),
+    }
+  }
+
+  /// The `keys`-allowlisted rank-2 `LoraParameters` the layer-selection tests
+  /// reuse (`scale = 2.0`, the given `keys`).
+  fn keyed_params(keys: Option<Vec<String>>) -> LoraParameters {
+    LoraParameters {
+      rank: 2,
+      scale: Some(2.0),
+      alpha: None,
+      keys,
+      dropout: None,
     }
   }
 
@@ -2269,7 +2929,7 @@ mod tests {
     }"#;
     let cfg = LoraConfig::from_json(json).unwrap();
     assert_eq!(cfg.fine_tune_type, FineTuneType::Lora);
-    assert_eq!(cfg.num_layers, 4);
+    assert_eq!(mlxlm_num_layers(&cfg), 4);
     assert_eq!(cfg.rank(), 16);
     assert_eq!(cfg.scale(), 20.0);
     assert!(!cfg.is_dora());
@@ -2294,16 +2954,26 @@ mod tests {
     assert_eq!(cfg.rank(), 16, "PEFT top-level `r` must populate `rank`");
     // alpha/rank = 32/16 = 2.0 — `lora_alpha`/`r` resolves the scale.
     assert_eq!(cfg.scale(), 2.0);
-    // `target_modules` becomes the `keys` layer-selection allowlist.
-    assert_eq!(
-      cfg.lora_parameters.keys.as_deref(),
-      Some(&["q_proj".to_string(), "v_proj".to_string()][..])
-    );
+    // `target_modules` lands in the PEFT selection (NOT `keys` — PEFT
+    // selection is the richer `PeftSelection`).
+    assert!(cfg.lora_parameters.keys.is_none());
+    let peft = cfg.peft().expect("PEFT config must carry a PeftSelection");
+    match &peft.target_modules {
+      Some(ModuleMatcher::List(names)) => {
+        assert_eq!(names, &["q_proj".to_string(), "v_proj".to_string()]);
+      }
+      other => panic!("expected a target_modules List, got {other:?}"),
+    }
     // `lora_dropout` maps to `dropout` (carried, ignored at inference).
     assert_eq!(cfg.lora_parameters.dropout, Some(0.05));
-    // PEFT has no `fine_tune_type` / `num_layers` ⇒ defaults.
     assert_eq!(cfg.fine_tune_type, FineTuneType::Lora);
-    assert_eq!(cfg.num_layers, DEFAULT_NUM_LAYERS);
+    // ROUND-4 BUG: a PEFT config must NOT inherit mlx-lm's `num_layers` window
+    // — PEFT adapts EVERY matching block. The selection is `Peft`, never
+    // `MlxLm { num_layers }`.
+    assert!(
+      matches!(cfg.selection, AdapterSelection::Peft(_)),
+      "a PEFT config must select via PeftSelection, never the mlx-lm num_layers window"
+    );
     assert!(!cfg.is_dora());
   }
 
@@ -2337,10 +3007,13 @@ mod tests {
     let cfg = LoraConfig::from_json(json).unwrap();
     assert_eq!(cfg.rank(), 4);
     assert_eq!(cfg.scale(), 2.0);
-    assert_eq!(
-      cfg.lora_parameters.keys.as_deref(),
-      Some(&["o_proj".to_string()][..])
-    );
+    let peft = cfg
+      .peft()
+      .expect("PEFT shape detected ⇒ PeftSelection present");
+    assert!(matches!(
+      &peft.target_modules,
+      Some(ModuleMatcher::List(n)) if n == &["o_proj".to_string()]
+    ));
   }
 
   #[test]
@@ -2376,14 +3049,30 @@ mod tests {
   }
 
   #[test]
-  fn config_parse_peft_target_modules_regex_is_err() {
-    // PEFT `target_modules` may be a single regex string — that has no
-    // faithful `keys` suffix-match analogue, so it is a recoverable error
-    // (rather than a silent mis-selection).
-    let json = r#"{ "peft_type": "LORA", "r": 8, "target_modules": ".*proj$" }"#;
+  fn config_parse_peft_target_modules_regex() {
+    // PEFT `target_modules` may be a single regex string — modeled faithfully
+    // via the `regex` crate (`re.fullmatch` semantics), NOT rejected.
+    let json = r#"{ "peft_type": "LORA", "r": 8, "target_modules": ".*\\.(q|v)_proj" }"#;
+    let cfg = LoraConfig::from_json(json).unwrap();
+    let peft = cfg.peft().unwrap();
+    let target = match &peft.target_modules {
+      Some(ModuleMatcher::Regex(re)) => re,
+      other => panic!("expected a target_modules Regex, got {other:?}"),
+    };
+    // `re.fullmatch` — the whole module key must match.
+    assert!(target.is_match("model.layers.0.self_attn.q_proj"));
+    assert!(target.is_match("model.layers.7.self_attn.v_proj"));
+    assert!(!target.is_match("model.layers.0.self_attn.k_proj"));
+  }
+
+  #[test]
+  fn config_parse_peft_invalid_regex_target_modules_is_err() {
+    // A `target_modules` regex string that fails to compile is a recoverable
+    // parse error (a malformed regex must not silently match nothing).
+    let json = r#"{ "peft_type": "LORA", "r": 8, "target_modules": "(unclosed" }"#;
     assert!(
       LoraConfig::from_json(json).is_err(),
-      "a regex-string `target_modules` must be rejected"
+      "an uncompilable `target_modules` regex must be rejected"
     );
   }
 
@@ -2405,7 +3094,7 @@ mod tests {
       8.0,
       "nested literal `scale` wins, flat keys ignored"
     );
-    assert_eq!(cfg.num_layers, 3);
+    assert_eq!(mlxlm_num_layers(&cfg), 3);
   }
 
   #[test]
@@ -2439,7 +3128,7 @@ mod tests {
     let json = r#"{ "optimizer": "adam", "learning_rate": 1e-4 }"#;
     let cfg = LoraConfig::from_json(json).unwrap();
     assert_eq!(cfg.fine_tune_type, FineTuneType::Lora);
-    assert_eq!(cfg.num_layers, DEFAULT_NUM_LAYERS);
+    assert_eq!(mlxlm_num_layers(&cfg), DEFAULT_NUM_LAYERS);
     assert_eq!(cfg.rank(), DEFAULT_LORA_RANK);
     assert_eq!(cfg.scale(), DEFAULT_LORA_SCALE);
   }
@@ -2525,18 +3214,7 @@ mod tests {
     // `lora_layers_extra_factors_outside_window_is_err`).
     let weights = toy_weights();
     let params = toy_adapter_params_for(&[2, 3]);
-    let cfg = LoraConfig {
-      fine_tune_type: FineTuneType::Lora,
-      num_layers: 2,
-      lora_parameters: LoraParameters {
-        rank: 2,
-        scale: Some(2.0),
-        alpha: None,
-        keys: Some(vec!["self_attn.q_proj".to_string()]),
-        dropout: None,
-      },
-      use_dora: false,
-    };
+    let cfg = mlxlm_config(2, keyed_params(Some(vec!["self_attn.q_proj".to_string()])));
     let layers = linear_to_lora_layers(&weights, &cfg, &params, None, 4).unwrap();
     // Only blocks 2 and 3 are inside the trailing-2 window.
     assert!(layers.contains_key("model.layers.2.self_attn.q_proj"));
@@ -2554,18 +3232,8 @@ mod tests {
   fn lora_layers_covers_all_blocks_when_num_layers_large() {
     let weights = toy_weights();
     let params = toy_adapter_params();
-    let cfg = LoraConfig {
-      fine_tune_type: FineTuneType::Lora,
-      num_layers: 16, // > 4 blocks ⇒ all q_proj blocks wrap
-      lora_parameters: LoraParameters {
-        rank: 2,
-        scale: Some(2.0),
-        alpha: None,
-        keys: Some(vec!["self_attn.q_proj".to_string()]),
-        dropout: None,
-      },
-      use_dora: false,
-    };
+    // num_layers 16 > 4 blocks ⇒ all q_proj blocks wrap.
+    let cfg = mlxlm_config(16, keyed_params(Some(vec!["self_attn.q_proj".to_string()])));
     let layers = linear_to_lora_layers(&weights, &cfg, &params, None, 4).unwrap();
     assert_eq!(layers.len(), 4);
   }
@@ -2644,6 +3312,49 @@ mod tests {
     crate::io::save_safetensors(&dir.join("adapters.safetensors"), &arrays).unwrap();
   }
 
+  /// Write a mock **PEFT** adapter dir: a caller-supplied
+  /// `adapter_config.json` plus a PEFT-keyed `adapter_model.safetensors`.
+  /// `paths` are the base-module paths (without `.weight`) to ship factors
+  /// for; for each, the PEFT tensors `base_model.model.<path>.lora_A.weight`
+  /// (`[r, in=3]`) and `.lora_B.weight` (`[out=2, r]`) are written — the PEFT
+  /// orientation (transposed vs the mlxrs scheme). When `with_dora`, a
+  /// `.lora_magnitude_vector` (`[out=2]`) is added per path. The PEFT factor
+  /// values are `value` (so the post-translation `lora_a`/`lora_b` are
+  /// constant — handy for hand-traced math).
+  fn write_mock_peft_adapter(
+    dir: &Path,
+    config_json: &str,
+    paths: &[&str],
+    r: usize,
+    with_dora: bool,
+    value: f32,
+  ) {
+    std::fs::write(dir.join("adapter_config.json"), config_json).unwrap();
+    // PEFT `lora_A.weight` is `[r, in_features]`; `lora_B.weight` is
+    // `[out_features, r]` (the transpose of the mlxrs `lora_a` / `lora_b`).
+    let lora_a_peft = Array::full::<f32>(&(r, 3usize), value).unwrap();
+    let lora_b_peft = Array::full::<f32>(&(2usize, r), value).unwrap();
+    let mut arrays: HashMap<String, Array> = HashMap::new();
+    for path in paths {
+      arrays.insert(
+        format!("base_model.model.{path}.lora_A.weight"),
+        lora_a_peft.try_clone().unwrap(),
+      );
+      arrays.insert(
+        format!("base_model.model.{path}.lora_B.weight"),
+        lora_b_peft.try_clone().unwrap(),
+      );
+      if with_dora {
+        // DoRA magnitude — [out_features=2], no transpose in either scheme.
+        arrays.insert(
+          format!("base_model.model.{path}.lora_magnitude_vector"),
+          Array::from_slice::<f32>(&[1.0, 1.0], &(2usize,)).unwrap(),
+        );
+      }
+    }
+    crate::io::save_safetensors(&dir.join("adapter_model.safetensors"), &arrays).unwrap();
+  }
+
   #[test]
   fn load_adapters_peft_flat_shape_rank16_end_to_end() {
     // A REAL PEFT-shaped adapter_config.json — flat top-level `peft_type` /
@@ -2662,7 +3373,11 @@ mod tests {
       "lora_dropout": 0.0,
       "bias": "none"
     }"#;
-    write_mock_adapter_rank(&tmp, cfg, 16);
+    let q_paths: Vec<String> = (0..4)
+      .map(|b| format!("model.layers.{b}.self_attn.q_proj"))
+      .collect();
+    let q_refs: Vec<&str> = q_paths.iter().map(String::as_str).collect();
+    write_mock_peft_adapter(&tmp, cfg, &q_refs, 16, false, 0.01);
     let weights = toy_weights();
     let layers = load_adapters(&weights, &tmp, None, 4).unwrap();
     // `target_modules: ["self_attn.q_proj"]` selects the 4 q_proj paths (and
@@ -2693,7 +3408,11 @@ mod tests {
       "lora_alpha": 32.0,
       "target_modules": ["self_attn.q_proj"]
     }"#;
-    write_mock_adapter_rank(&tmp, cfg, 8);
+    let q_paths: Vec<String> = (0..4)
+      .map(|b| format!("model.layers.{b}.self_attn.q_proj"))
+      .collect();
+    let q_refs: Vec<&str> = q_paths.iter().map(String::as_str).collect();
+    write_mock_peft_adapter(&tmp, cfg, &q_refs, 8, false, 0.01);
     let weights = toy_weights();
     let layers = load_adapters(&weights, &tmp, None, 4).unwrap();
     assert_eq!(layers.len(), 4);
@@ -2745,7 +3464,12 @@ mod tests {
       "lora_alpha": 32.0,
       "target_modules": ["self_attn.q_proj"]
     }"#;
-    write_mock_adapter_rank(&tmp, cfg, 16);
+    // `r:8` declared, but rank-16 factors shipped.
+    let q_paths: Vec<String> = (0..4)
+      .map(|b| format!("model.layers.{b}.self_attn.q_proj"))
+      .collect();
+    let q_refs: Vec<&str> = q_paths.iter().map(String::as_str).collect();
+    write_mock_peft_adapter(&tmp, cfg, &q_refs, 16, false, 0.01);
     let weights = toy_weights();
     let err = load_adapters(&weights, &tmp, None, 4).unwrap_err();
     assert!(
@@ -3018,18 +3742,7 @@ mod tests {
     // num_layers: -1 adapts EVERY decoder block, not none.
     let weights = toy_weights();
     let params = toy_adapter_params(); // factors for all 4 q_proj blocks
-    let cfg = LoraConfig {
-      fine_tune_type: FineTuneType::Lora,
-      num_layers: -1,
-      lora_parameters: LoraParameters {
-        rank: 2,
-        scale: Some(2.0),
-        alpha: None,
-        keys: Some(vec!["self_attn.q_proj".to_string()]),
-        dropout: None,
-      },
-      use_dora: false,
-    };
+    let cfg = mlxlm_config(-1, keyed_params(Some(vec!["self_attn.q_proj".to_string()])));
     let layers = linear_to_lora_layers(&weights, &cfg, &params, None, 4).unwrap();
     assert_eq!(layers.len(), 4, "num_layers=-1 must adapt all 4 blocks");
     for b in 0..4 {
@@ -3042,18 +3755,7 @@ mod tests {
     // num_layers: 0 ⇒ `max(0,0)=0` ⇒ `layers[-0:]` == all blocks too.
     let weights = toy_weights();
     let params = toy_adapter_params();
-    let cfg = LoraConfig {
-      fine_tune_type: FineTuneType::Lora,
-      num_layers: 0,
-      lora_parameters: LoraParameters {
-        rank: 2,
-        scale: Some(2.0),
-        alpha: None,
-        keys: Some(vec!["self_attn.q_proj".to_string()]),
-        dropout: None,
-      },
-      use_dora: false,
-    };
+    let cfg = mlxlm_config(0, keyed_params(Some(vec!["self_attn.q_proj".to_string()])));
     let layers = linear_to_lora_layers(&weights, &cfg, &params, None, 4).unwrap();
     assert_eq!(layers.len(), 4, "num_layers=0 must adapt all 4 blocks");
   }
@@ -3067,18 +3769,7 @@ mod tests {
     // targets with no factors ⇒ Err (case a).
     let weights = toy_weights();
     let params = toy_adapter_params_for(&[0, 1]);
-    let cfg = LoraConfig {
-      fine_tune_type: FineTuneType::Lora,
-      num_layers: 16,
-      lora_parameters: LoraParameters {
-        rank: 2,
-        scale: Some(2.0),
-        alpha: None,
-        keys: Some(vec!["self_attn.q_proj".to_string()]),
-        dropout: None,
-      },
-      use_dora: false,
-    };
+    let cfg = mlxlm_config(16, keyed_params(Some(vec!["self_attn.q_proj".to_string()])));
     let err = linear_to_lora_layers(&weights, &cfg, &params, None, 4).unwrap_err();
     match err {
       Error::Backend { message } => {
@@ -3102,18 +3793,7 @@ mod tests {
       "model.layers.99.self_attn.q_proj".to_string(),
       plain_params(),
     );
-    let cfg = LoraConfig {
-      fine_tune_type: FineTuneType::Lora,
-      num_layers: 16,
-      lora_parameters: LoraParameters {
-        rank: 2,
-        scale: Some(2.0),
-        alpha: None,
-        keys: Some(vec!["self_attn.q_proj".to_string()]),
-        dropout: None,
-      },
-      use_dora: false,
-    };
+    let cfg = mlxlm_config(16, keyed_params(Some(vec!["self_attn.q_proj".to_string()])));
     let err = linear_to_lora_layers(&weights, &cfg, &params, None, 4).unwrap_err();
     match err {
       Error::Backend { message } => {
@@ -3133,18 +3813,10 @@ mod tests {
     // factors ⇒ nothing adapted ⇒ Err (case c).
     let weights = toy_weights();
     let params: HashMap<String, AdapterParams> = HashMap::new();
-    let cfg = LoraConfig {
-      fine_tune_type: FineTuneType::Lora,
-      num_layers: 16,
-      lora_parameters: LoraParameters {
-        rank: 2,
-        scale: Some(2.0),
-        alpha: None,
-        keys: Some(vec!["self_attn.nonexistent_proj".to_string()]),
-        dropout: None,
-      },
-      use_dora: false,
-    };
+    let cfg = mlxlm_config(
+      16,
+      keyed_params(Some(vec!["self_attn.nonexistent_proj".to_string()])),
+    );
     let err = linear_to_lora_layers(&weights, &cfg, &params, None, 4).unwrap_err();
     match err {
       Error::Backend { message } => {
@@ -3164,18 +3836,7 @@ mod tests {
     // empty-result (c) checks apply. Factors for 2 of the 4 q_proj blocks ⇒ Ok.
     let weights = toy_weights();
     let params = toy_adapter_params_for(&[2, 3]);
-    let cfg = LoraConfig {
-      fine_tune_type: FineTuneType::Lora,
-      num_layers: 16,
-      lora_parameters: LoraParameters {
-        rank: 2,
-        scale: Some(2.0),
-        alpha: None,
-        keys: None,
-        dropout: None,
-      },
-      use_dora: false,
-    };
+    let cfg = mlxlm_config(16, keyed_params(None));
     let layers = linear_to_lora_layers(&weights, &cfg, &params, None, 4).unwrap();
     assert_eq!(layers.len(), 2);
   }
@@ -3408,5 +4069,718 @@ mod tests {
       other => panic!("expected Backend, got {other:?}"),
     }
     std::fs::remove_dir_all(&tmp).ok();
+  }
+
+  // ═════════════════ HuggingFace PEFT — full surface ═════════════════
+
+  /// A weight map with `n` decoder blocks, each carrying a `self_attn.q_proj`
+  /// and a `self_attn.v_proj`, plus a top-level `lm_head.weight`.
+  fn peft_toy_weights(n: usize) -> Weights {
+    let mut w = Weights::new();
+    for b in 0..n {
+      w.insert(
+        format!("model.layers.{b}.self_attn.q_proj.weight"),
+        base_weight(),
+      );
+      w.insert(
+        format!("model.layers.{b}.self_attn.v_proj.weight"),
+        base_weight(),
+      );
+    }
+    w.insert("lm_head.weight".to_string(), base_weight());
+    w
+  }
+
+  // ───────────── PEFT config: fields + defaults ─────────────
+
+  #[test]
+  fn peft_config_lora_alpha_defaults_to_8() {
+    // PEFT `LoraConfig.lora_alpha` defaults to 8 (NOT the mlx-lm 20.0 literal).
+    // A PEFT config omitting `lora_alpha` with `r:16` ⇒ scale 8/16 = 0.5.
+    let json = r#"{ "peft_type": "LORA", "r": 16, "target_modules": ["q_proj"] }"#;
+    let cfg = LoraConfig::from_json(json).unwrap();
+    assert_eq!(cfg.lora_parameters.alpha, Some(DEFAULT_PEFT_LORA_ALPHA));
+    assert_eq!(cfg.scale_for("model.layers.0.self_attn.q_proj"), 0.5);
+  }
+
+  #[test]
+  fn peft_config_accepts_and_ignores_training_only_fields() {
+    // A real PEFT `LoraConfig` carries training-only fields with no inference
+    // effect — they must parse cleanly (accept-and-ignore), not error.
+    let json = r#"{
+      "peft_type": "LORA",
+      "r": 8,
+      "lora_alpha": 16.0,
+      "target_modules": ["q_proj"],
+      "init_lora_weights": "gaussian",
+      "loftq_config": {},
+      "eva_config": null,
+      "corda_config": null,
+      "task_type": "CAUSAL_LM",
+      "modules_to_save": ["embed_tokens"],
+      "layer_replication": [[0, 4]],
+      "megatron_config": null,
+      "megatron_core": "megatron.core",
+      "revision": null,
+      "base_model_name_or_path": "meta-llama/Llama-3-8B"
+    }"#;
+    let cfg = LoraConfig::from_json(json).expect("training-only fields must not error");
+    assert_eq!(cfg.rank(), 8);
+    assert_eq!(cfg.scale_for("q_proj"), 2.0);
+  }
+
+  #[test]
+  fn peft_config_lora_bias_true_is_err() {
+    // `lora_bias: true` puts a bias on lora_B that PEFT adds in the forward —
+    // mlxrs's LoRALinear has no such term, so a silent drop would be wrong
+    // inference. It must be a recoverable parse error.
+    let json = r#"{
+      "peft_type": "LORA", "r": 8, "lora_alpha": 16.0,
+      "target_modules": ["q_proj"], "lora_bias": true
+    }"#;
+    assert!(
+      LoraConfig::from_json(json).is_err(),
+      "`lora_bias: true` must be rejected (no lora_B-bias term in LoRALinear)"
+    );
+    // `lora_bias: false` (the default) is accepted.
+    let ok = r#"{ "peft_type": "LORA", "r": 8, "lora_alpha": 16.0,
+      "target_modules": ["q_proj"], "lora_bias": false }"#;
+    assert!(LoraConfig::from_json(ok).is_ok());
+  }
+
+  #[test]
+  fn peft_config_all_selection_fields_parse() {
+    // Every inference-affecting PEFT selection field on one config.
+    let json = r#"{
+      "peft_type": "LORA",
+      "r": 8,
+      "lora_alpha": 16.0,
+      "target_modules": ["q_proj", "v_proj"],
+      "exclude_modules": ["lm_head"],
+      "use_rslora": true,
+      "use_dora": false,
+      "fan_in_fan_out": true,
+      "layers_to_transform": [0, 2, 4],
+      "layers_pattern": "layers",
+      "rank_pattern": { "q_proj": 16 },
+      "alpha_pattern": { "v_proj": 64 }
+    }"#;
+    let cfg = LoraConfig::from_json(json).unwrap();
+    let peft = cfg.peft().unwrap();
+    assert!(matches!(&peft.target_modules, Some(ModuleMatcher::List(_))));
+    assert!(matches!(
+      &peft.exclude_modules,
+      Some(ModuleMatcher::List(_))
+    ));
+    assert!(peft.use_rslora);
+    assert!(peft.fan_in_fan_out);
+    assert_eq!(peft.layers_to_transform.as_deref(), Some(&[0, 2, 4][..]));
+    assert_eq!(peft.layers_pattern, vec!["layers".to_string()]);
+    assert!(cfg.fan_in_fan_out());
+  }
+
+  // ───────────── PEFT scale: rsLoRA + rank/alpha patterns ─────────────
+
+  #[test]
+  fn peft_rslora_scale_is_alpha_over_sqrt_r() {
+    // use_rslora=true ⇒ scale = lora_alpha / sqrt(r). r=16, alpha=32 ⇒
+    // 32/sqrt(16) = 32/4 = 8.0. Non-rsLoRA would be 32/16 = 2.0.
+    let json = r#"{
+      "peft_type": "LORA", "r": 16, "lora_alpha": 32.0,
+      "target_modules": ["q_proj"], "use_rslora": true
+    }"#;
+    let cfg = LoraConfig::from_json(json).unwrap();
+    assert_eq!(cfg.scale_for("model.layers.0.self_attn.q_proj"), 8.0);
+  }
+
+  #[test]
+  fn peft_non_rslora_scale_is_alpha_over_r() {
+    // use_rslora absent ⇒ scale = lora_alpha / r = 32/16 = 2.0.
+    let json = r#"{
+      "peft_type": "LORA", "r": 16, "lora_alpha": 32.0,
+      "target_modules": ["q_proj"]
+    }"#;
+    let cfg = LoraConfig::from_json(json).unwrap();
+    assert!(!cfg.peft().unwrap().use_rslora);
+    assert_eq!(cfg.scale_for("model.layers.0.self_attn.q_proj"), 2.0);
+  }
+
+  #[test]
+  fn peft_rank_pattern_overrides_rank_per_module() {
+    // `rank_pattern: {"q_proj": 32}` ⇒ a q_proj module resolves rank 32; a
+    // v_proj module (no pattern) keeps the config-wide `r:8`.
+    let json = r#"{
+      "peft_type": "LORA", "r": 8, "lora_alpha": 16.0,
+      "target_modules": ["q_proj", "v_proj"],
+      "rank_pattern": { "q_proj": 32 }
+    }"#;
+    let cfg = LoraConfig::from_json(json).unwrap();
+    assert_eq!(cfg.rank_for("model.layers.0.self_attn.q_proj"), 32);
+    assert_eq!(cfg.rank_for("model.layers.0.self_attn.v_proj"), 8);
+    // The scale follows the overridden rank: q_proj is 16/32 = 0.5; v_proj
+    // is the config-wide 16/8 = 2.0.
+    assert_eq!(cfg.scale_for("model.layers.0.self_attn.q_proj"), 0.5);
+    assert_eq!(cfg.scale_for("model.layers.0.self_attn.v_proj"), 2.0);
+  }
+
+  #[test]
+  fn peft_alpha_pattern_overrides_alpha_per_module() {
+    // `alpha_pattern: {"q_proj": 64}` ⇒ a q_proj module scales by 64/r; a
+    // v_proj module keeps the config-wide `lora_alpha:16`.
+    let json = r#"{
+      "peft_type": "LORA", "r": 8, "lora_alpha": 16.0,
+      "target_modules": ["q_proj", "v_proj"],
+      "alpha_pattern": { "q_proj": 64 }
+    }"#;
+    let cfg = LoraConfig::from_json(json).unwrap();
+    // q_proj: alpha 64 / r 8 = 8.0; v_proj: alpha 16 / r 8 = 2.0.
+    assert_eq!(cfg.scale_for("model.layers.0.self_attn.q_proj"), 8.0);
+    assert_eq!(cfg.scale_for("model.layers.0.self_attn.v_proj"), 2.0);
+  }
+
+  #[test]
+  fn peft_rank_and_alpha_pattern_with_rslora() {
+    // rank_pattern + alpha_pattern + rsLoRA compose: q_proj resolves rank 16,
+    // alpha 64 ⇒ rsLoRA scale 64/sqrt(16) = 64/4 = 16.0.
+    let json = r#"{
+      "peft_type": "LORA", "r": 8, "lora_alpha": 16.0,
+      "target_modules": ["q_proj"], "use_rslora": true,
+      "rank_pattern": { "q_proj": 16 }, "alpha_pattern": { "q_proj": 64 }
+    }"#;
+    let cfg = LoraConfig::from_json(json).unwrap();
+    assert_eq!(cfg.scale_for("model.layers.0.self_attn.q_proj"), 16.0);
+  }
+
+  #[test]
+  fn peft_pattern_lookup_anchors_at_segment_boundary() {
+    // PEFT `get_pattern_key` is `re.match(rf"(.*\.)?({key})$", module)` — the
+    // pattern key matches a dotted suffix, NOT a mid-string substring.
+    let patterns = vec![("q_proj".to_string(), 99i32)];
+    assert_eq!(
+      pattern_lookup(&patterns, "model.layers.0.self_attn.q_proj"),
+      Some(99)
+    );
+    assert_eq!(pattern_lookup(&patterns, "q_proj"), Some(99));
+    // a substring `xq_proj` must NOT match (the `(.*\.)?` needs a dot).
+    assert_eq!(pattern_lookup(&patterns, "model.xq_proj"), None);
+    // no match ⇒ None (caller falls back to the default).
+    assert_eq!(pattern_lookup(&patterns, "model.layers.0.mlp.down"), None);
+  }
+
+  #[test]
+  fn peft_pattern_lookup_regex_key() {
+    // PEFT pattern keys are themselves regex fragments — a `layers.0.*q_proj`
+    // pattern keys block 0 only.
+    let patterns = vec![("layers\\.0\\..*q_proj".to_string(), 64i32)];
+    assert_eq!(
+      pattern_lookup(&patterns, "model.layers.0.self_attn.q_proj"),
+      Some(64)
+    );
+    assert_eq!(
+      pattern_lookup(&patterns, "model.layers.1.self_attn.q_proj"),
+      None
+    );
+  }
+
+  // ───────────── PEFT selection: target / exclude / layers ─────────────
+
+  #[test]
+  fn peft_select_target_modules_list() {
+    // PEFT `target_modules` list: every block's q_proj wraps (NO num_layers
+    // window — this is the round-4 bug), v_proj does not.
+    let weights = peft_toy_weights(4);
+    let mut params = HashMap::new();
+    for b in 0..4 {
+      params.insert(format!("model.layers.{b}.self_attn.q_proj"), plain_params());
+    }
+    let json = r#"{ "peft_type": "LORA", "r": 2, "lora_alpha": 4.0,
+      "target_modules": ["q_proj"] }"#;
+    let cfg = LoraConfig::from_json(json).unwrap();
+    let layers = linear_to_lora_layers(&weights, &cfg, &params, None, 4).unwrap();
+    assert_eq!(layers.len(), 4);
+    assert!(layers.contains_key("model.layers.3.self_attn.q_proj"));
+    assert!(!layers.contains_key("model.layers.0.self_attn.v_proj"));
+  }
+
+  #[test]
+  fn peft_select_target_modules_regex() {
+    // PEFT `target_modules` as a regex string — `re.fullmatch` over the whole
+    // module path. `.*self_attn\.q_proj` matches only the q_proj paths.
+    let weights = peft_toy_weights(3);
+    let mut params = HashMap::new();
+    for b in 0..3 {
+      params.insert(format!("model.layers.{b}.self_attn.q_proj"), plain_params());
+    }
+    let json = r#"{ "peft_type": "LORA", "r": 2, "lora_alpha": 4.0,
+      "target_modules": ".*self_attn\\.q_proj" }"#;
+    let cfg = LoraConfig::from_json(json).unwrap();
+    let layers = linear_to_lora_layers(&weights, &cfg, &params, None, 3).unwrap();
+    assert_eq!(layers.len(), 3);
+    assert!(layers.contains_key("model.layers.2.self_attn.q_proj"));
+    assert!(!layers.contains_key("model.layers.0.self_attn.v_proj"));
+  }
+
+  #[test]
+  fn peft_select_exclude_modules_list() {
+    // PEFT `exclude_modules` removes a target match. target=regex matching
+    // both q and v proj; exclude=["v_proj"] ⇒ only q_proj wraps.
+    let weights = peft_toy_weights(2);
+    let mut params = HashMap::new();
+    for b in 0..2 {
+      params.insert(format!("model.layers.{b}.self_attn.q_proj"), plain_params());
+    }
+    let json = r#"{ "peft_type": "LORA", "r": 2, "lora_alpha": 4.0,
+      "target_modules": ".*_proj", "exclude_modules": ["v_proj"] }"#;
+    let cfg = LoraConfig::from_json(json).unwrap();
+    let layers = linear_to_lora_layers(&weights, &cfg, &params, None, 2).unwrap();
+    assert_eq!(layers.len(), 2);
+    assert!(layers.contains_key("model.layers.0.self_attn.q_proj"));
+    assert!(!layers.contains_key("model.layers.0.self_attn.v_proj"));
+  }
+
+  #[test]
+  fn peft_select_exclude_modules_regex() {
+    // `exclude_modules` as a regex (`re.fullmatch`): exclude every v_proj.
+    let weights = peft_toy_weights(2);
+    let mut params = HashMap::new();
+    for b in 0..2 {
+      params.insert(format!("model.layers.{b}.self_attn.q_proj"), plain_params());
+    }
+    let json = r#"{ "peft_type": "LORA", "r": 2, "lora_alpha": 4.0,
+      "target_modules": ".*_proj", "exclude_modules": ".*\\.v_proj" }"#;
+    let cfg = LoraConfig::from_json(json).unwrap();
+    let layers = linear_to_lora_layers(&weights, &cfg, &params, None, 2).unwrap();
+    assert_eq!(layers.len(), 2);
+    assert!(!layers.contains_key("model.layers.1.self_attn.v_proj"));
+  }
+
+  #[test]
+  fn peft_select_layers_to_transform_int() {
+    // `layers_to_transform: 1` (a bare int) ⇒ only block 1's q_proj wraps.
+    let weights = peft_toy_weights(4);
+    let mut params = HashMap::new();
+    params.insert(
+      "model.layers.1.self_attn.q_proj".to_string(),
+      plain_params(),
+    );
+    let json = r#"{ "peft_type": "LORA", "r": 2, "lora_alpha": 4.0,
+      "target_modules": ["q_proj"], "layers_to_transform": 1 }"#;
+    let cfg = LoraConfig::from_json(json).unwrap();
+    let layers = linear_to_lora_layers(&weights, &cfg, &params, None, 4).unwrap();
+    assert_eq!(layers.len(), 1);
+    assert!(layers.contains_key("model.layers.1.self_attn.q_proj"));
+  }
+
+  #[test]
+  fn peft_select_layers_to_transform_list() {
+    // `layers_to_transform: [0, 3]` ⇒ only blocks 0 and 3 wrap.
+    let weights = peft_toy_weights(5);
+    let mut params = HashMap::new();
+    for b in [0, 3] {
+      params.insert(format!("model.layers.{b}.self_attn.q_proj"), plain_params());
+    }
+    let json = r#"{ "peft_type": "LORA", "r": 2, "lora_alpha": 4.0,
+      "target_modules": ["q_proj"], "layers_to_transform": [0, 3] }"#;
+    let cfg = LoraConfig::from_json(json).unwrap();
+    let layers = linear_to_lora_layers(&weights, &cfg, &params, None, 5).unwrap();
+    assert_eq!(layers.len(), 2);
+    assert!(layers.contains_key("model.layers.0.self_attn.q_proj"));
+    assert!(layers.contains_key("model.layers.3.self_attn.q_proj"));
+    assert!(!layers.contains_key("model.layers.1.self_attn.q_proj"));
+  }
+
+  #[test]
+  fn peft_select_layers_pattern_custom_attr() {
+    // `layers_pattern: "h"` extracts the block index after a `.h.` attribute
+    // (GPT-2-style `transformer.h.0.…`) instead of `.layers.`.
+    let mut weights = Weights::new();
+    for b in 0..3 {
+      weights.insert(
+        format!("transformer.h.{b}.attn.c_attn.weight"),
+        base_weight(),
+      );
+    }
+    let mut params = HashMap::new();
+    params.insert("transformer.h.2.attn.c_attn".to_string(), plain_params());
+    let json = r#"{ "peft_type": "LORA", "r": 2, "lora_alpha": 4.0,
+      "target_modules": ["c_attn"], "layers_to_transform": [2],
+      "layers_pattern": "h" }"#;
+    let cfg = LoraConfig::from_json(json).unwrap();
+    let layers = linear_to_lora_layers(&weights, &cfg, &params, None, 3).unwrap();
+    assert_eq!(layers.len(), 1);
+    assert!(layers.contains_key("transformer.h.2.attn.c_attn"));
+  }
+
+  #[test]
+  fn peft_select_no_restriction_adapts_all_blocks_over_16() {
+    // THE ROUND-4 BUG: a PEFT config with no `layers_to_transform` must adapt
+    // EVERY matching block — including blocks 16..19 on a 20-block model. The
+    // old code wrongly applied mlx-lm's `num_layers=16` trailing window, which
+    // would have dropped blocks 0..3.
+    let weights = peft_toy_weights(20);
+    let mut params = HashMap::new();
+    for b in 0..20 {
+      params.insert(format!("model.layers.{b}.self_attn.q_proj"), plain_params());
+    }
+    let json = r#"{ "peft_type": "LORA", "r": 2, "lora_alpha": 4.0,
+      "target_modules": ["q_proj"] }"#;
+    let cfg = LoraConfig::from_json(json).unwrap();
+    let layers = linear_to_lora_layers(&weights, &cfg, &params, None, 20).unwrap();
+    assert_eq!(layers.len(), 20, "PEFT must adapt ALL 20 blocks, no window");
+    // Block 0 (which a trailing-16 window would drop) IS adapted.
+    assert!(layers.contains_key("model.layers.0.self_attn.q_proj"));
+    assert!(layers.contains_key("model.layers.19.self_attn.q_proj"));
+  }
+
+  // ───────────── ModuleMatcher / peft_layer_index units ─────────────
+
+  #[test]
+  fn module_matcher_list_is_exact_or_dotted_suffix() {
+    let m = ModuleMatcher::List(vec!["q_proj".to_string()]);
+    assert!(m.matches("model.layers.0.self_attn.q_proj"));
+    assert!(m.matches("q_proj"));
+    // a substring without a dot boundary must NOT match.
+    assert!(!m.matches("model.xq_proj"));
+    assert!(!m.matches("q_proj_extra"));
+  }
+
+  #[test]
+  fn module_matcher_regex_is_full_match() {
+    let m = ModuleMatcher::Regex(Box::new(Regex::new(r".*\.q_proj").unwrap()));
+    assert!(m.matches("model.layers.0.self_attn.q_proj"));
+    // `re.fullmatch` — a trailing extra segment must NOT match (the `.*\.q_proj`
+    // pattern cannot consume the trailing `.bias`).
+    assert!(!m.matches("model.layers.0.self_attn.q_proj.bias"));
+    // A regex anchored to a specific suffix only — `re.fullmatch` requires the
+    // WHOLE key to match, so a key with extra leading content is rejected (a
+    // `search`-style match would wrongly accept it).
+    let suffix = ModuleMatcher::Regex(Box::new(Regex::new(r"q_proj").unwrap()));
+    assert!(suffix.matches("q_proj"));
+    assert!(!suffix.matches("model.layers.0.self_attn.q_proj"));
+  }
+
+  #[test]
+  fn peft_layer_index_default_and_custom_pattern() {
+    // default pattern: digits between dots after a prefix.
+    assert_eq!(
+      peft_layer_index("model.layers.7.self_attn.q_proj", &[]),
+      Some(7)
+    );
+    // custom attribute name.
+    assert_eq!(
+      peft_layer_index("transformer.h.3.attn.c_attn", &["h".to_string()]),
+      Some(3)
+    );
+    // no extractable index ⇒ None.
+    assert_eq!(peft_layer_index("lm_head", &[]), None);
+  }
+
+  // ───────────── PEFT weight-key translation ─────────────
+
+  #[test]
+  fn peft_key_translation_strips_prefix_maps_suffix_transposes() {
+    // `base_model.model.<path>.lora_A.weight` → `<path>.lora_a`, transposed
+    // ([r,in] → [in,r]); `lora_B.weight` → `.lora_b` ([out,r] → [r,out]);
+    // `lora_magnitude_vector` → `.m` (no transpose).
+    let mut raw: HashMap<String, Array> = HashMap::new();
+    // PEFT lora_A: [r=2, in=3]; lora_B: [out=4, r=2]; magnitude: [out=4].
+    raw.insert(
+      "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight".to_string(),
+      Array::zeros::<f32>(&(2, 3)).unwrap(),
+    );
+    raw.insert(
+      "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight".to_string(),
+      Array::zeros::<f32>(&(4, 2)).unwrap(),
+    );
+    raw.insert(
+      "base_model.model.model.layers.0.self_attn.q_proj.lora_magnitude_vector".to_string(),
+      Array::zeros::<f32>(&(4usize,)).unwrap(),
+    );
+    // A non-PEFT key (no `base_model.model.` prefix) is dropped.
+    raw.insert("some.stray.weight".to_string(), base_weight());
+
+    let out = translate_peft_keys(raw).unwrap();
+    assert_eq!(out.len(), 3, "3 LoRA tensors, the stray key dropped");
+    let path = "model.layers.0.self_attn.q_proj";
+    // lora_a: PEFT [2,3] transposed → [3,2].
+    assert_eq!(out[&format!("{path}.lora_a")].shape(), &[3, 2]);
+    // lora_b: PEFT [4,2] transposed → [2,4].
+    assert_eq!(out[&format!("{path}.lora_b")].shape(), &[2, 4]);
+    // m: PEFT [4] unchanged.
+    assert_eq!(out[&format!("{path}.m")].shape(), &[4]);
+  }
+
+  #[test]
+  fn peft_key_translation_magnitude_vector_dot_weight_variant() {
+    // PEFT may store the DoRA magnitude as `lora_magnitude_vector.weight`
+    // (the in-memory `ModuleDict` form) — both spellings map to `.m`.
+    let mut raw: HashMap<String, Array> = HashMap::new();
+    raw.insert(
+      "base_model.model.q_proj.lora_magnitude_vector.weight".to_string(),
+      Array::zeros::<f32>(&(2usize,)).unwrap(),
+    );
+    let out = translate_peft_keys(raw).unwrap();
+    assert!(out.contains_key("q_proj.m"));
+  }
+
+  // ───────────── PEFT end-to-end ─────────────
+
+  #[test]
+  fn peft_end_to_end_rslora_scale_and_all_blocks() {
+    // A real PEFT adapter dir (config + adapter_model.safetensors): rsLoRA
+    // scale, all matching blocks adapted.
+    let tmp = std::env::temp_dir().join(format!("mlxrs_peft_e2e_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let cfg = r#"{
+      "peft_type": "LORA", "r": 16, "lora_alpha": 32.0,
+      "target_modules": ["self_attn.q_proj"], "use_rslora": true
+    }"#;
+    let q_paths: Vec<String> = (0..4)
+      .map(|b| format!("model.layers.{b}.self_attn.q_proj"))
+      .collect();
+    let q_refs: Vec<&str> = q_paths.iter().map(String::as_str).collect();
+    write_mock_peft_adapter(&tmp, cfg, &q_refs, 16, false, 0.01);
+    let weights = toy_weights();
+    let layers = load_adapters(&weights, &tmp, None, 4).unwrap();
+    assert_eq!(layers.len(), 4);
+    // rsLoRA scale = lora_alpha / sqrt(r) = 32 / 4 = 8.0.
+    if let Some(LoraLayer::Lora(l)) = layers.get("model.layers.0.self_attn.q_proj") {
+      assert_eq!(l.scale(), 8.0, "rsLoRA scale must be alpha/sqrt(r)");
+    } else {
+      panic!("expected a LoRA layer");
+    }
+    std::fs::remove_dir_all(&tmp).ok();
+  }
+
+  #[test]
+  fn peft_end_to_end_dora_with_magnitude_vector() {
+    // A PEFT DoRA adapter: `use_dora: true` + a `lora_magnitude_vector` tensor
+    // per module. The DoRA layer must build (the magnitude is loaded from the
+    // PEFT-keyed safetensors).
+    let tmp = std::env::temp_dir().join(format!("mlxrs_peft_dora_e2e_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let cfg = r#"{
+      "peft_type": "LORA", "r": 2, "lora_alpha": 4.0,
+      "target_modules": ["self_attn.q_proj"], "use_dora": true
+    }"#;
+    let q_paths: Vec<String> = (0..4)
+      .map(|b| format!("model.layers.{b}.self_attn.q_proj"))
+      .collect();
+    let q_refs: Vec<&str> = q_paths.iter().map(String::as_str).collect();
+    write_mock_peft_adapter(&tmp, cfg, &q_refs, 2, true, 0.01);
+    let weights = toy_weights();
+    let layers = load_adapters(&weights, &tmp, None, 4).unwrap();
+    assert_eq!(layers.len(), 4);
+    assert!(matches!(
+      layers.get("model.layers.0.self_attn.q_proj"),
+      Some(LoraLayer::Dora(_))
+    ));
+    std::fs::remove_dir_all(&tmp).ok();
+  }
+
+  #[test]
+  fn peft_end_to_end_rank_pattern_per_module_scale() {
+    // A PEFT adapter where `rank_pattern` overrides one block's rank. Block 0
+    // gets rank 4 (via the pattern, factors shipped at rank 4); blocks 1..3
+    // get the config-wide rank 2. Each module's scale follows its rank.
+    let tmp = std::env::temp_dir().join(format!("mlxrs_peft_rankpat_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let cfg = r#"{
+      "peft_type": "LORA", "r": 2, "lora_alpha": 8.0,
+      "target_modules": ["self_attn.q_proj"],
+      "rank_pattern": { "layers\\.0\\..*q_proj": 4 }
+    }"#;
+    std::fs::write(tmp.join("adapter_config.json"), cfg).unwrap();
+    // Block 0: rank-4 PEFT factors; blocks 1..3: rank-2.
+    let mut arrays: HashMap<String, Array> = HashMap::new();
+    for b in 0..4 {
+      let r = if b == 0 { 4 } else { 2 };
+      let path = format!("model.layers.{b}.self_attn.q_proj");
+      arrays.insert(
+        format!("base_model.model.{path}.lora_A.weight"),
+        Array::full::<f32>(&(r, 3usize), 0.01).unwrap(),
+      );
+      arrays.insert(
+        format!("base_model.model.{path}.lora_B.weight"),
+        Array::full::<f32>(&(2usize, r), 0.01).unwrap(),
+      );
+    }
+    crate::io::save_safetensors(&tmp.join("adapter_model.safetensors"), &arrays).unwrap();
+
+    let weights = toy_weights();
+    let layers = load_adapters(&weights, &tmp, None, 4).unwrap();
+    assert_eq!(layers.len(), 4);
+    // Block 0: alpha 8 / rank 4 = 2.0 (the rank_pattern override).
+    if let Some(LoraLayer::Lora(l)) = layers.get("model.layers.0.self_attn.q_proj") {
+      assert_eq!(l.scale(), 2.0, "rank_pattern block-0 scale = alpha/4");
+    } else {
+      panic!("expected a LoRA layer at block 0");
+    }
+    // Block 1: alpha 8 / rank 2 = 4.0 (the config-wide rank).
+    if let Some(LoraLayer::Lora(l)) = layers.get("model.layers.1.self_attn.q_proj") {
+      assert_eq!(l.scale(), 4.0, "default-rank block-1 scale = alpha/2");
+    } else {
+      panic!("expected a LoRA layer at block 1");
+    }
+    std::fs::remove_dir_all(&tmp).ok();
+  }
+
+  #[test]
+  fn peft_end_to_end_exclude_modules() {
+    // A PEFT adapter targeting `.*_proj` but excluding v_proj — the v_proj
+    // base layers must NOT be adapted (and the adapter ships no v_proj
+    // factors, so a wrong selection would also trip the completeness check).
+    let tmp = std::env::temp_dir().join(format!("mlxrs_peft_excl_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let cfg = r#"{
+      "peft_type": "LORA", "r": 2, "lora_alpha": 4.0,
+      "target_modules": ".*_proj", "exclude_modules": ".*\\.v_proj"
+    }"#;
+    let weights = peft_toy_weights(3);
+    let q_paths: Vec<String> = (0..3)
+      .map(|b| format!("model.layers.{b}.self_attn.q_proj"))
+      .collect();
+    let q_refs: Vec<&str> = q_paths.iter().map(String::as_str).collect();
+    write_mock_peft_adapter(&tmp, cfg, &q_refs, 2, false, 0.01);
+    let layers = load_adapters(&weights, &tmp, None, 3).unwrap();
+    assert_eq!(layers.len(), 3);
+    for b in 0..3 {
+      assert!(layers.contains_key(&format!("model.layers.{b}.self_attn.q_proj")));
+      assert!(!layers.contains_key(&format!("model.layers.{b}.self_attn.v_proj")));
+    }
+    std::fs::remove_dir_all(&tmp).ok();
+  }
+
+  // ───────────── fan_in_fan_out ─────────────
+
+  #[test]
+  fn peft_fan_in_fan_out_transposes_base_weight() {
+    // With `fan_in_fan_out: true` the base weight is stored `[in, out]`.
+    // `build_base_linear` transposes it back to `[out, in]` so the LoRA
+    // forward matches the same adapter applied to a standard `[out, in]` base.
+    //
+    // Standard base: W = [[1,0,0],[0,1,0]] ([out=2, in=3]).
+    // fan_in_fan_out base: Wᵀ = [[1,0],[0,1],[0,0]] ([in=3, out=2]).
+    let standard_w = base_weight();
+    let fifo_w = standard_w.transpose().unwrap(); // [3, 2] — the [in, out] layout
+    let mut std_weights = Weights::new();
+    std_weights.insert(
+      "model.layers.0.self_attn.q_proj.weight".to_string(),
+      standard_w,
+    );
+    let mut fifo_weights = Weights::new();
+    fifo_weights.insert("model.layers.0.self_attn.q_proj.weight".to_string(), fifo_w);
+
+    let mut params = HashMap::new();
+    params.insert(
+      "model.layers.0.self_attn.q_proj".to_string(),
+      plain_params(),
+    );
+
+    let std_cfg = LoraConfig::from_json(
+      r#"{ "peft_type": "LORA", "r": 2, "lora_alpha": 4.0,
+        "target_modules": ["q_proj"], "fan_in_fan_out": false }"#,
+    )
+    .unwrap();
+    let fifo_cfg = LoraConfig::from_json(
+      r#"{ "peft_type": "LORA", "r": 2, "lora_alpha": 4.0,
+        "target_modules": ["q_proj"], "fan_in_fan_out": true }"#,
+    )
+    .unwrap();
+
+    let std_layers = linear_to_lora_layers(&std_weights, &std_cfg, &params, None, 1).unwrap();
+    let fifo_layers = linear_to_lora_layers(&fifo_weights, &fifo_cfg, &params, None, 1).unwrap();
+
+    let x = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &(1, 3)).unwrap();
+    let mut std_out = std_layers["model.layers.0.self_attn.q_proj"]
+      .forward(&x)
+      .unwrap();
+    let mut fifo_out = fifo_layers["model.layers.0.self_attn.q_proj"]
+      .forward(&x)
+      .unwrap();
+    // The fan_in_fan_out base, after the transpose, must give the SAME forward
+    // as the standard base.
+    approx_eq(
+      &fifo_out.to_vec::<f32>().unwrap(),
+      &std_out.to_vec::<f32>().unwrap(),
+      1e-5,
+    );
+  }
+
+  #[test]
+  fn peft_fan_in_fan_out_quantized_is_err() {
+    // `fan_in_fan_out` over a quantized base is rejected — transposing a
+    // packed quantized weight would corrupt the bit-packing.
+    let weight = Array::zeros::<u32>(&(8, 4)).unwrap();
+    let scales = Array::zeros::<f32>(&(8, 4)).unwrap();
+    let qbiases = Array::zeros::<f32>(&(8, 4)).unwrap();
+    let mut weights = Weights::new();
+    weights.insert("model.layers.0.self_attn.q_proj.weight".to_string(), weight);
+    weights.insert("model.layers.0.self_attn.q_proj.scales".to_string(), scales);
+    weights.insert(
+      "model.layers.0.self_attn.q_proj.biases".to_string(),
+      qbiases,
+    );
+
+    let quant =
+      crate::lm::quant::PerLayerQuantization::from_global(crate::lm::quant::Quantization {
+        group_size: 32,
+        bits: 4,
+        mode: crate::lm::quant::QuantMode::Affine,
+      });
+    let err = build_base_linear(
+      &weights,
+      "model.layers.0.self_attn.q_proj",
+      &weights["model.layers.0.self_attn.q_proj.weight"],
+      Some(&quant),
+      true, // fan_in_fan_out
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Backend { .. }));
+  }
+
+  // ───────────── safetensors filename + neither-shape ─────────────
+
+  #[test]
+  fn peft_load_uses_adapter_model_safetensors_filename() {
+    // A PEFT config pairs with `adapter_model.safetensors` (not mlx-lm's
+    // `adapters.safetensors`). `load_adapters` picks the file by config shape.
+    let tmp = std::env::temp_dir().join(format!("mlxrs_peft_fname_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let cfg = r#"{ "peft_type": "LORA", "r": 2, "lora_alpha": 4.0,
+      "target_modules": ["self_attn.q_proj"] }"#;
+    let q_paths: Vec<String> = (0..4)
+      .map(|b| format!("model.layers.{b}.self_attn.q_proj"))
+      .collect();
+    let q_refs: Vec<&str> = q_paths.iter().map(String::as_str).collect();
+    // write_mock_peft_adapter writes `adapter_model.safetensors` — NOT
+    // `adapters.safetensors`. Confirm load still succeeds.
+    write_mock_peft_adapter(&tmp, cfg, &q_refs, 2, false, 0.01);
+    assert!(!tmp.join("adapters.safetensors").exists());
+    assert!(tmp.join("adapter_model.safetensors").exists());
+    let weights = toy_weights();
+    let layers = load_adapters(&weights, &tmp, None, 4).unwrap();
+    assert_eq!(layers.len(), 4);
+    std::fs::remove_dir_all(&tmp).ok();
+  }
+
+  #[test]
+  fn mlxlm_native_path_unchanged_by_peft_work() {
+    // A faithful mlx-lm-native config still parses to the MlxLm selection and
+    // loads via `adapters.safetensors` — the PEFT additions did not regress
+    // the native path.
+    let json = r#"{
+      "fine_tune_type": "lora", "num_layers": 8,
+      "lora_parameters": { "rank": 4, "scale": 16.0, "keys": ["q_proj"] }
+    }"#;
+    let cfg = LoraConfig::from_json(json).unwrap();
+    assert!(matches!(
+      cfg.selection,
+      AdapterSelection::MlxLm { num_layers: 8 }
+    ));
+    assert!(cfg.peft().is_none());
+    assert_eq!(cfg.scale_for("anything"), 16.0);
+    assert_eq!(cfg.rank_for("anything"), 4);
+    assert!(!cfg.fan_in_fan_out());
   }
 }
