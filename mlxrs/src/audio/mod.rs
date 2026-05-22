@@ -20,11 +20,19 @@
 //!   ([`crate::audio::dsp::integrated_loudness`]) +
 //!   [`crate::audio::dsp::normalize_loudness`].
 //!
+//! - [`crate::audio::features`] — Kaldi-compatible log-mel-filterbank features
+//!   (`mel_scale_kaldi` / `inverse_mel_scale_kaldi` / `get_mel_banks_kaldi` /
+//!   `compute_fbank_kaldi`, sibling to the HTK/Whisper mel front-end in
+//!   [`crate::audio::dsp`]).
+//!
 //! Out of scope for this PR (separate follow-ups per the M5 plan):
 //! - The `ISTFTCache` batched/cached overlap-add helper.
 //! - High-quality resampling (polyphase sinc, libsamplerate-style).
 //! - Pitch shifting, time stretching, voice activity detection,
-//!   `normalize_peak`, Kaldi-compatible feature extraction.
+//!   `normalize_peak`, biquad filters, Kaldi `compute_deltas_kaldi` deltas.
+//! - The Kaldi `snip_edges=false` reflect-bookend framing path (the standard
+//!   ASR pipelines all use `snip_edges=true`; see
+//!   [`crate::audio::features`] for the scope fence).
 //! - MP3/FLAC/OGG codecs (additional symphonia feature flags become
 //!   opt-in in future PRs; the `symphonia` crate already supports them,
 //!   we just don't enable them yet to keep the dep tree minimal).
@@ -35,5 +43,6 @@
 //! [`dsp.py`]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/dsp.py
 
 pub mod dsp;
+pub mod features;
 pub mod io;
 pub mod stt;
