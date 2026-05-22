@@ -78,6 +78,31 @@
 //! `Result`-fallible, no implicit eval (the weight `Array`s are returned
 //! lazily — no `eval`/`item`/`to_vec` here), recoverable failures map to
 //! [`Error::Backend`] / [`Error::ShapeMismatch`] with a clear message.
+//!
+//! ## Validation contract
+//!
+//! The already-quantized-triple classifier (`classify_triple`, private to
+//! this module) does basic shape-sanity checks (weight dtype, rank ≥ 2,
+//! leading-dims-match, mode arity); it does **not** validate per-mode
+//! bits/group_size pairings, the scales-last-axis invariant, or scale dtypes.
+//! Those per-mode contracts are enforced by `mlx-c`'s
+//! `validate_quantized_input` (`mlx/mlx/ops.cpp:75-115`) at the
+//! [`crate::ops::quantized::quantize`] / [`crate::ops::quantized::dequantize`]
+//! call site and surface as recoverable [`Error::Backend`] from mlx-c with a
+//! precise message. Mirroring mlx-c-internal validation here would duplicate
+//! work mlx-c already does and would diverge from the reference behavior of
+//! mlx-lm's `quantize_module_predicate` (`mlx_lm/utils.py:823-835`, which only
+//! checks `hasattr(module, "to_quantized")` and last-axis-divisible-by-group_size)
+//! and mlx-swift's `QuantizationContainer.decode`
+//! (`Libraries/MLXLMCommon/BaseConfiguration.swift:139-171`, which only decodes
+//! group_size/bits/mode + per-layer overrides) — both trust mlx-c.
+//!
+//! See [project memory `feedback_match_official_binding_design`]: mlxrs
+//! wrappers are thin forwards mirroring mlx-swift/python; we do not chase
+//! mlx-core-internal hardening. Per-mode contracts (e.g. `bits ∈ {2,3,4,5,6,8}`
+//! for affine — `mlx/mlx/ops.cpp:4745-4750`; `mxfp4` requires `(32, 4)`,
+//! `nvfp4` requires `(16, 4)` — `mlx/mlx/ops.cpp:4808-4823`) are upstream of
+//! this module.
 
 use std::collections::HashMap;
 
@@ -443,35 +468,34 @@ enum TripleClass {
   /// A structurally valid already-quantized triple. mlx-lm
   /// `class_predicate` (`utils.py:349-355`) gates on `f"{p}.scales" in
   /// weights` as the signal that the checkpoint already pre-quantized
-  /// this layer; on top of that signal, this validates the FULL layout
-  /// mlx's `quantize` actually produces
-  /// (`mlx/mlx/ops.cpp:4789-4798,4893-4904`):
+  /// this layer. Per the [module-level validation contract](self#validation-contract),
+  /// this performs only basic shape sanity (the checks below); per-mode
+  /// bits/group_size pairings, the scales-last-axis invariant
+  /// (`mlx/mlx/ops.cpp:107`) and scale dtypes are validated by mlx-c at
+  /// the [`crate::ops::quantized::quantize`] /
+  /// [`crate::ops::quantized::dequantize`] call site and surface as
+  /// recoverable [`Error::Backend`].
+  ///
+  /// Checks enforced here (faithful to mlx-lm / mlx-swift loader paths,
+  /// which validate only the structural shape):
   ///
   /// - `.weight` dtype is `uint32` (packed quantized — both `affine`
   ///   and the `fp` modes write a `uint32` packed matrix; a float
   ///   `.weight` next to a `.scales` is the orphan case).
-  /// - `.weight` rank ≥ 2 (mlx `quantize` requires rank ≥ 2 inputs,
-  ///   `mlx/ops.cpp:4925-4929`; a rank-0/1 `.weight` next to a
-  ///   `.scales` cannot be a real quantized triple).
+  /// - `.weight` rank ≥ 2 (rank-0/1 next to a `.scales` is not a layout
+  ///   mlx's `quantize` can have produced).
   /// - `.scales` rank equals `.weight` rank, and the leading dims (all
   ///   but the last) match — mlx preserves the leading shape across
-  ///   `quantize`.
-  /// - `.scales` last-axis equals
-  ///   `packed_last * (32 / bits) / group_size` — mlx's invariant
-  ///   `w.shape(-1) * 32 / bits == scales.shape(-1) * group_size`
-  ///   (`mlx/ops.cpp:107`). The unpack factor `32 / bits` is the
-  ///   number of bits-wide elements packed per `uint32` lane
-  ///   (`mlx/backend/metal/kernels/quantized.h:705`,
-  ///   `mlx/backend/cpu/quantized.cpp:249`).
+  ///   `quantize` and `mlx-c`'s `validate_quantized_input` enforces it
+  ///   (`mlx/mlx/ops.cpp:97-105`).
   /// - `.biases` arity matches the resolved mode (`mlx/ops.cpp:4908-4951`):
   ///   `affine` REQUIRES `.biases` (3-output `affine_quantize`,
   ///   `mlx/ops.cpp:4793-4798`); `mxfp4` / `mxfp8` / `nvfp4` MUST NOT
   ///   carry `.biases` (2-output `fp_quantize`, `mlx/ops.cpp:4890,4898-4904`).
-  /// - If `.biases` is present (affine), it has the same shape and
-  ///   dtype as `.scales` — `affine_quantize` writes `scales` and
-  ///   `biases` from the same template (`mlx/mlx/ops.cpp:4780-4786`,
-  ///   `4793-4798`); the `.biases` last-axis check is therefore
-  ///   subsumed by the shape-equality check.
+  ///   This arity is a *layout* contract (which keys exist), not a
+  ///   per-mode params contract; mlx-c does not check it because the
+  ///   shape of the call (`dequantize(w, scales, biases?, ...)`) already
+  ///   encodes it at the Rust binding site.
   ///
   /// Pass-through unchanged.
   Valid,
@@ -490,11 +514,11 @@ enum TripleClass {
 ///
 /// `layer_weight` is the `<layer_path>.weight` array (the caller has
 /// already stripped the suffix); `cfg` carries the global +
-/// per-layer-override [`Quantization`] parameters this triple must
-/// match (the [`Quantization::bits`] / [`Quantization::group_size`] for
-/// the layer determine the expected `.scales` last-axis, see below).
+/// per-layer-override [`Quantization`] parameters used to resolve the
+/// triple's mode (which determines the `.biases` arity, see
+/// [`TripleClass::Valid`]).
 ///
-/// **Precondition.** `cfg` must carry a usable [`Quantization`] for
+/// **Precondition.** `cfg` must carry a resolvable [`Quantization`] for
 /// `layer_path` whenever a triple is present: either via the global
 /// `cfg.quantization` (the common case — Fix 2 enforces that any parsed
 /// `"quantization"` block contains `group_size` + `bits`) or via a
@@ -504,14 +528,14 @@ enum TripleClass {
 /// that path is therefore a stale collision (returned as
 /// [`Invalid`](TripleClass::Invalid), not [`Valid`](TripleClass::Valid)).
 /// A `cfg.quantization == None` with no per-layer override leaves no
-/// way to resolve the expected `.scales` shape; this should not arise
-/// in production (it would mean `quantize_weights` was called without
-/// any quantization params at all, in which case there is nothing for
-/// it to do), but it is treated as [`Invalid`](TripleClass::Invalid)
-/// defensively.
+/// way to resolve the triple's mode; this should not arise in production
+/// (it would mean `quantize_weights` was called without any quantization
+/// params at all, in which case there is nothing for it to do), but it
+/// is treated as [`Invalid`](TripleClass::Invalid) defensively.
 ///
-/// See [`TripleClass`] for the exact invariants enforced, and the
-/// module-level [Sibling-name reservation](self#sibling-name-reservation)
+/// See [`TripleClass`] for the exact invariants enforced, the
+/// [validation contract](self#validation-contract) for what is delegated
+/// to mlx-c, and the [Sibling-name reservation](self#sibling-name-reservation)
 /// section for the surrounding contract.
 fn classify_triple(
   weights: &Weights,
@@ -667,7 +691,10 @@ fn classify_triple(
       }
       // Leading dims (all but the last) must match. Rank ≥ 2 is
       // already enforced above, so both slices are non-empty and the
-      // index is safe.
+      // index is safe. This is the structural shape mlx `quantize`
+      // preserves and `mlx-c`'s `validate_quantized_input` enforces
+      // (`mlx/mlx/ops.cpp:97-105`); checking it here surfaces the
+      // mismatch with a layer-named error before mlx-c sees it.
       if s_shape[..s_shape.len() - 1] != w_shape[..w_shape.len() - 1] {
         return TripleClass::Invalid(format!(
           "quantize_weights: layer {layer_path}: `{scales_key}` leading dims \
@@ -677,100 +704,13 @@ fn classify_triple(
           &w_shape[..w_shape.len() - 1],
         ));
       }
-      // `.scales` last-axis must match the mlx invariant
-      // `w.shape(-1) * 32 / bits == scales.shape(-1) * group_size`
-      // (`mlx/ops.cpp:107`). Rearranged: the expected `.scales`
-      // last-axis is `(packed_last * 32 / bits) / group_size`. The
-      // unpack factor `32 / bits` is the elements-per-uint32 packing
-      // mlx applies (`mlx/backend/metal/kernels/quantized.h:705`,
-      // `mlx/backend/cpu/quantized.cpp:249`).
-      if q.bits <= 0 || q.group_size <= 0 {
-        return TripleClass::Invalid(format!(
-          "quantize_weights: layer {layer_path}: per-layer `Quantization` \
-           has non-positive `bits` ({}) or `group_size` ({}); cannot resolve \
-           expected `.scales` last-axis",
-          q.bits, q.group_size
-        ));
-      }
-      let bits = q.bits as usize;
-      let group_size = q.group_size as usize;
-      let packed_last = *w_shape.last().expect("rank >= 2");
-      // `bits` is positive (checked above); but it might not divide 32
-      // cleanly for an exotic value. mlx only accepts bits ∈ {2,3,4,6,8}
-      // (`mlx/ops.cpp:4815` etc.), all of which divide 32, but defensively
-      // refuse the case where `32 % bits != 0` rather than truncating.
-      if !32_usize.is_multiple_of(bits) {
-        return TripleClass::Invalid(format!(
-          "quantize_weights: layer {layer_path}: `bits` ({bits}) does not \
-           divide 32 evenly; mlx-supported bit widths are {{2,3,4,6,8}} — \
-           cannot resolve expected `.scales` last-axis"
-        ));
-      }
-      let unpacked_last = packed_last * (32 / bits);
-      if !unpacked_last.is_multiple_of(group_size) {
-        return TripleClass::Invalid(format!(
-          "quantize_weights: layer {layer_path}: unpacked `.weight` last-axis \
-           ({unpacked_last} = packed {packed_last} * 32 / {bits}) is not \
-           divisible by group_size ({group_size}); mlx's invariant \
-           `w.shape(-1) * 32 / bits == scales.shape(-1) * group_size` \
-           (`mlx/ops.cpp:107`) cannot hold for this `.weight` under \
-           `bits={bits}`, `group_size={group_size}`"
-        ));
-      }
-      let expected_scales_last = unpacked_last / group_size;
-      let actual_scales_last = *s_shape.last().expect("rank >= 2");
-      if actual_scales_last != expected_scales_last {
-        return TripleClass::Invalid(format!(
-          "quantize_weights: layer {layer_path}: `{scales_key}` last-axis \
-           ({actual_scales_last}) does not match the expected last-axis \
-           ({expected_scales_last} = packed-`.weight`-last \
-           {packed_last} * 32 / {bits} / {group_size}) under `bits={bits}`, \
-           `group_size={group_size}` — mlx invariant \
-           `w.shape(-1) * 32 / bits == scales.shape(-1) * group_size` \
-           (`mlx/ops.cpp:107`)"
-        ));
-      }
-      // `.biases` (if present): same shape and dtype as `.scales` —
-      // `affine_quantize` writes them from the same template
-      // (`mlx/ops.cpp:4780-4786`, `4793-4798`). The shape-equality
-      // check subsumes the `.biases` last-axis check.
-      if let Some(b) = b_opt {
-        let b_shape = b.shape();
-        if b_shape != s_shape {
-          return TripleClass::Invalid(format!(
-            "quantize_weights: layer {layer_path}: `{biases_key}` shape \
-             {b_shape:?} does not match `{scales_key}` shape {s_shape:?} \
-             (mlx `affine_quantize` writes them from the same template, \
-             `mlx/ops.cpp:4780-4786,4793-4798`)"
-          ));
-        }
-        let s_dtype = match s.dtype() {
-          Ok(d) => d,
-          Err(e) => {
-            return TripleClass::Invalid(format!(
-              "quantize_weights: layer {layer_path}: cannot read \
-               `{scales_key}` dtype: {e}"
-            ));
-          }
-        };
-        let b_dtype = match b.dtype() {
-          Ok(d) => d,
-          Err(e) => {
-            return TripleClass::Invalid(format!(
-              "quantize_weights: layer {layer_path}: cannot read \
-               `{biases_key}` dtype: {e}"
-            ));
-          }
-        };
-        if s_dtype != b_dtype {
-          return TripleClass::Invalid(format!(
-            "quantize_weights: layer {layer_path}: `{biases_key}` dtype \
-             ({b_dtype:?}) does not match `{scales_key}` dtype \
-             ({s_dtype:?}) (mlx `affine_quantize` writes them from the \
-             same template, `mlx/ops.cpp:4780-4786`)"
-          ));
-        }
-      }
+      // Per the [module-level validation contract](self#validation-contract):
+      // per-mode bits/group_size pairings, the scales-last-axis invariant
+      // (`mlx/mlx/ops.cpp:107`), and scale dtypes are validated by mlx-c
+      // at the [`crate::ops::quantized::quantize`] /
+      // [`crate::ops::quantized::dequantize`] call site. Faithful-port to
+      // mlx-lm (`utils.py:823-835`) / mlx-swift (`BaseConfiguration.swift:139-171`)
+      // does NOT duplicate those checks in the loader path.
       TripleClass::Valid
     }
   }
@@ -962,6 +902,16 @@ pub fn quantize_weights(
 /// [`Error::Backend`] for that triple — there is no way to dequantize
 /// without parameters.
 ///
+/// **Mode arity.** Symmetric with [`quantize_weights`]: after resolving
+/// `q` for each triple, the resolved mode dictates the bias slot —
+/// `affine` requires `.biases`, `mxfp4` / `mxfp8` / `nvfp4` forbid it
+/// (`mlx/ops.cpp:5085-5099,5198-5210`). A mode/bias mismatch returns
+/// [`Error::Backend`] for that triple. Per the
+/// [module-level validation contract](self#validation-contract), other
+/// per-mode checks (bits/group_size pairings, scales-last-axis, scale
+/// dtypes) are delegated to mlx-c at the
+/// [`crate::ops::quantized::dequantize`] call site.
+///
 /// Non-triple entries (no `.scales` sibling) pass through verbatim — a
 /// `.weight` without a matching `.scales` is an already-dense weight, and
 /// stray `.scales` / `.biases` without a `.weight` are passed through too
@@ -1026,6 +976,46 @@ pub fn dequantize_weights(weights: Weights, cfg: &PerLayerQuantization) -> Resul
            (no global default and no per-layer override)"
       ),
     })?;
+    // Symmetric mode-arity check with [`quantize_weights`] /
+    // [`classify_triple`]: mlx `dequantize` dispatches on mode and the
+    // expected bias slot is fully determined by it (`mlx/ops.cpp:4908-4951`).
+    // `affine` requires `.biases` (3-input `affine_dequantize`,
+    // `mlx/ops.cpp:5085-5099`); `mxfp4` / `mxfp8` / `nvfp4` forbid `.biases`
+    // (2-input `fp_dequantize`, `mlx/ops.cpp:5198-5210`). Forwarding a
+    // mode/bias mismatch to mlx-c would corrupt the dequantized output (an
+    // `affine` triple with no `.biases` reconstructs without the zero-point,
+    // and an `fp_*` triple with a stale `.biases` retains a bias from a
+    // different mode); a clear early failure is better than silent corruption.
+    match (q.mode, b_opt.as_ref()) {
+      (QuantMode::Affine, None) => {
+        return Err(Error::Backend {
+          message: format!(
+            "dequantize_weights: layer {path}: `affine` mode \
+             (bits={}, group_size={}) requires `{path}.biases` alongside \
+             `{path}.scales` (mlx `affine_dequantize` takes \
+             `{{w_q, scales, biases}}`, `mlx/ops.cpp:5085-5099`), but the \
+             input carries no `.biases` — this is a structurally incomplete \
+             affine triple",
+            q.bits, q.group_size
+          ),
+        });
+      }
+      (QuantMode::Mxfp4 | QuantMode::Mxfp8 | QuantMode::Nvfp4, Some(_)) => {
+        return Err(Error::Backend {
+          message: format!(
+            "dequantize_weights: layer {path}: `{}` mode is scale-only \
+             (mlx `fp_dequantize` takes `{{w_q, scales}}` with no biases, \
+             `mlx/ops.cpp:5198-5210`), but the input carries a stale \
+             `{path}.biases` — refusing to silently retain a bias from a \
+             different (affine) mode",
+            q.mode.as_mlx_str()
+          ),
+        });
+      }
+      // `(Affine, Some(_))` / `(Mxfp4 | Mxfp8 | Nvfp4, None)` are the
+      // valid arity arms — fall through to the `dequantize` call.
+      _ => {}
+    }
     let dense = ops::quantized::dequantize(
       &w,
       &scales,
@@ -1609,41 +1599,16 @@ mod tests {
     }
   }
 
-  /// Fix 4 (this PR): a `.weight` + `.scales` + `.biases` with MISMATCHED
-  /// `.biases` dtype (vs `.scales`). mlx `affine_quantize` writes scales
-  /// and biases from the same template (`mlx/ops.cpp:4780-4786`), so a
-  /// dtype mismatch is a corrupt triple. Classified as
-  /// [`TripleClass::Invalid`] → `Err(Backend)`.
-  #[test]
-  fn quantize_weights_mismatched_biases_dtype_errors() {
-    let n_rows = 2_usize;
-    let w = arr_u32(&vec![0_u32; n_rows * 8], &[n_rows, 8]);
-    // `.scales` f32, `.biases` u32 (mlx always writes matching dtypes).
-    let scales = arr_f32(&vec![1.0_f32; n_rows], &[n_rows, 1]);
-    let biases = arr_u32(&vec![0_u32; n_rows], &[n_rows, 1]);
-    let mut weights: Weights = HashMap::new();
-    weights.insert("model.foo.weight".to_string(), w);
-    weights.insert("model.foo.scales".to_string(), scales);
-    weights.insert("model.foo.biases".to_string(), biases);
+  // R5 structural pivot: the `quantize_weights_mismatched_biases_dtype_errors`
+  // test from R4 asserted a `.biases`/`.scales` dtype-equality check we are
+  // intentionally removing to match the mlx-lm / mlx-swift reference loader
+  // paths (which trust mlx-c to validate scale dtypes at the
+  // `quantize` / `dequantize` call site — `mlx/mlx/ops.cpp:75-115`). The
+  // dtype-mismatched triple is now passed through to mlx-c, which surfaces
+  // a precise `[dequantize] ...` error. See the module-level "Validation
+  // contract" section.
 
-    let cfg = PerLayerQuantization::from_global(Quantization::affine(64, 4));
-    let err = quantize_weights(weights, &cfg, &default_eligible).unwrap_err();
-    match err {
-      Error::Backend { message } => {
-        assert!(
-          message.contains("model.foo"),
-          "error should name the colliding layer, got: {message}"
-        );
-        assert!(
-          message.contains("dtype"),
-          "error should explain the `.biases` / `.scales` dtype mismatch, got: {message}"
-        );
-      }
-      other => panic!("expected Error::Backend, got: {other:?}"),
-    }
-  }
-
-  // ──────────────── Fix 5 (this PR): full mlx layout validation ────────────────
+  // ──────────────── Structural shape sanity ────────────────
 
   /// Fix 5: a uint32 rank-1 `.weight` next to a uint32 rank-1 `.scales`
   /// (rank-equal, even leading-dim-equal trivially since both have only
@@ -1683,22 +1648,31 @@ mod tests {
     }
   }
 
-  /// Fix 5: a `.weight` `[2, 8]` packed at `bits=4, group_size=64` with
-  /// a `.scales` `[2, 2]`. Leading dims match (`[2] == [2]`) and rank
-  /// matches (2 == 2) — would slip past the pre-fix check. But mlx's
-  /// invariant says `expected_scales_last = packed_last * 32 / bits
-  /// / group_size = 8 * 8 / 64 = 1`, not 2; the actual `.scales`
-  /// last-axis (2) does not match.
+  /// R5 structural pivot: a `.weight` + `.scales` triple whose
+  /// `.scales` last-axis does NOT match the mlx invariant
+  /// `w.shape(-1) * 32 / bits == scales.shape(-1) * group_size`
+  /// (`mlx/ops.cpp:107`) now passes `classify_triple` (which only
+  /// checks dtype/rank/leading-dims, see the module-level "Validation
+  /// contract" section). The mismatch is caught downstream by mlx-c
+  /// at the `dequantize` call — the loader path no longer rejects it
+  /// upfront, mirroring mlx-lm's `quantize_module_predicate`
+  /// (`utils.py:823-835`) and mlx-swift's `QuantizationContainer.decode`
+  /// (`BaseConfiguration.swift:139-171`), which both trust mlx-c.
+  ///
+  /// This test asserts the new pass-through behavior: an
+  /// already-quantized triple with structurally-sound dtype/rank/leading
+  /// dims is preserved verbatim regardless of the per-mode bits /
+  /// group_size pairing (mlx-c will validate when the user later
+  /// invokes `dequantize_weights` or any quantized matmul).
   #[test]
-  fn quantize_weights_mismatched_scales_last_axis_errors() {
+  fn quantize_weights_pre_quantized_triple_passes_through_to_mlxc() {
+    // Packed `.weight` `[2, 8]` u32 + `.scales` `[2, 2]` f32 (+ `.biases`
+    // matching). Under the OLD R4 check, `bits=4, group_size=64` would
+    // have rejected this (expected scales-last = 8 * 32 / 4 / 64 = 1, not
+    // 2). Under R5, this passes through — mlx-c is the validator.
     let n_rows = 2_usize;
-    // Packed `.weight`: [N=2, 8] uint32 — under bits=4, this unpacks
-    // to [N=2, 64], so expected `.scales` last-axis = 64 / 64 = 1.
     let w = arr_u32(&vec![0_u32; n_rows * 8], &[n_rows, 8]);
-    // BAD `.scales` last-axis: 2 instead of the expected 1.
     let scales = arr_f32(&vec![1.0_f32; n_rows * 2], &[n_rows, 2]);
-    // `.biases` matching `.scales` so the triple advances past Fix 6's
-    // affine-arity check and reaches the scales last-axis check.
     let biases = arr_f32(&vec![0.0_f32; n_rows * 2], &[n_rows, 2]);
     let mut weights: Weights = HashMap::new();
     weights.insert("model.foo.weight".to_string(), w);
@@ -1706,34 +1680,52 @@ mod tests {
     weights.insert("model.foo.biases".to_string(), biases);
 
     let cfg = PerLayerQuantization::from_global(Quantization::affine(64, 4));
-    let err = quantize_weights(weights, &cfg, &default_eligible).unwrap_err();
-    match err {
-      Error::Backend { message } => {
-        assert!(
-          message.contains("model.foo"),
-          "error should name the layer, got: {message}"
-        );
-        assert!(
-          message.contains("last-axis"),
-          "error should call out the `.scales` last-axis, got: {message}"
-        );
-        // Should name both expected and actual values.
-        assert!(
-          message.contains("1") && message.contains("2"),
-          "error should name expected (1) and actual (2) last-axis, got: {message}"
-        );
-      }
-      other => panic!("expected Error::Backend, got: {other:?}"),
-    }
+    let out = quantize_weights(weights, &cfg, &default_eligible)
+      .expect("triple now passes through; mlx-c validates per-mode params at call time");
+    // Triple preserved verbatim.
+    let w_out = out.get("model.foo.weight").expect(".weight");
+    assert_eq!(w_out.shape(), vec![n_rows, 8]);
+    assert_eq!(w_out.dtype().unwrap(), crate::dtype::Dtype::U32);
+    let s_out = out.get("model.foo.scales").expect(".scales");
+    assert_eq!(s_out.shape(), vec![n_rows, 2]);
+    assert!(out.contains_key("model.foo.biases"));
   }
 
-  /// Fix 5 regression: a CORRECT `.weight` `[2, 8]` packed at
-  /// `bits=4, group_size=64` with `.scales` `[2, 1]` (+ `.biases`
-  /// matching `.scales` shape/dtype — Fix 6 enforces affine-arity).
-  /// The tightened last-axis check must not regress this valid layout
-  /// (`expected = 8 * 32 / 4 / 64 = 1` = actual).
+  /// R5 faithful-port: an affine triple with `bits=3` (mlx-supported,
+  /// `mlx/ops.cpp:4745-4750`: bits ∈ {2,3,4,5,6,8}) passes through.
+  /// The old R4 `32 % bits == 0` guard incorrectly rejected `bits ∈
+  /// {3, 5, 6}`; per the new validation contract, per-mode bits
+  /// validation is delegated to mlx-c.
   #[test]
-  fn quantize_weights_valid_triple_with_correct_last_axis_skipped() {
+  fn quantize_weights_pre_quantized_bits3_triple_passes_through() {
+    // A structurally-sound triple with `bits=3` per the per-layer
+    // override. `classify_triple` only checks `.weight` is u32, rank
+    // ≥ 2, leading-dims match — none of which depend on the bit width.
+    // (The exact packed last-axis would depend on mlx's bits=3 packing,
+    // but the loader path does not compute it.)
+    let n_rows = 2_usize;
+    let w = arr_u32(&vec![0_u32; n_rows * 8], &[n_rows, 8]);
+    let scales = arr_f32(&vec![1.0_f32; n_rows], &[n_rows, 1]);
+    let biases = arr_f32(&vec![0.0_f32; n_rows], &[n_rows, 1]);
+    let mut weights: Weights = HashMap::new();
+    weights.insert("model.foo.weight".to_string(), w);
+    weights.insert("model.foo.scales".to_string(), scales);
+    weights.insert("model.foo.biases".to_string(), biases);
+
+    let cfg = PerLayerQuantization::from_global(Quantization::affine(64, 3));
+    let out = quantize_weights(weights, &cfg, &default_eligible)
+      .expect("bits=3 triple passes through; mlx supports bits ∈ {2,3,4,5,6,8}");
+    let w_out = out.get("model.foo.weight").expect(".weight");
+    assert_eq!(w_out.shape(), vec![n_rows, 8]);
+    assert_eq!(w_out.dtype().unwrap(), crate::dtype::Dtype::U32);
+  }
+
+  /// R5 structural-shape regression: a CORRECT `.weight` `[2, 8]`
+  /// packed at `bits=4, group_size=64` with `.scales` `[2, 1]` (+
+  /// `.biases` matching `.scales` shape — affine-arity holds). Still
+  /// passes through (the basic shape-sanity checks all hold).
+  #[test]
+  fn quantize_weights_valid_triple_skipped() {
     let n_rows = 2_usize;
     let w = arr_u32(&vec![0_u32; n_rows * 8], &[n_rows, 8]);
     let scales = arr_f32(&vec![1.0_f32; n_rows], &[n_rows, 1]);
@@ -1752,30 +1744,6 @@ mod tests {
     let s_out = out.get("model.foo.scales").expect(".scales");
     assert_eq!(s_out.shape(), vec![n_rows, 1]);
     assert!(out.contains_key("model.foo.biases"));
-  }
-
-  /// Fix 5 regression on a different shape: `.weight` `[2, 16]` packed
-  /// at `bits=4, group_size=64` with `.scales` `[2, 2]` (+ `.biases`
-  /// matching) (`expected = 16 * 32 / 4 / 64 = 2` = actual). Confirms
-  /// the formula matches multiple shapes, not just the minimal one.
-  #[test]
-  fn quantize_weights_valid_triple_multi_group_passes() {
-    let n_rows = 2_usize;
-    // Packed [N=2, 16]: under bits=4, unpacks to [N=2, 128] = two
-    // group_size=64 groups along the last axis → scales last-axis = 2.
-    let w = arr_u32(&vec![0_u32; n_rows * 16], &[n_rows, 16]);
-    let scales = arr_f32(&vec![1.0_f32; n_rows * 2], &[n_rows, 2]);
-    let biases = arr_f32(&vec![0.0_f32; n_rows * 2], &[n_rows, 2]);
-    let mut weights: Weights = HashMap::new();
-    weights.insert("model.foo.weight".to_string(), w);
-    weights.insert("model.foo.scales".to_string(), scales);
-    weights.insert("model.foo.biases".to_string(), biases);
-
-    let cfg = PerLayerQuantization::from_global(Quantization::affine(64, 4));
-    let out =
-      quantize_weights(weights, &cfg, &default_eligible).expect("valid multi-group triple passes");
-    let s_out = out.get("model.foo.scales").expect(".scales");
-    assert_eq!(s_out.shape(), vec![n_rows, 2]);
   }
 
   /// Fix 5: a triple at a path that the per-layer config marks as
@@ -1942,5 +1910,86 @@ mod tests {
     let s_out = out.get("model.mxfp4_ok.scales").expect(".scales");
     assert_eq!(s_out.shape(), vec![n_rows, 1]);
     assert!(!out.contains_key("model.mxfp4_ok.biases"));
+  }
+
+  // ──────────────── R5 dequantize_weights mode-arity symmetry ────────────────
+
+  /// R5 Finding 1: `dequantize_weights` is symmetric with
+  /// `quantize_weights`'s mode-arity check (the `affine`-requires-biases
+  /// / `mxfp*|nvfp4`-forbids-biases contract). An affine triple WITHOUT
+  /// `.biases` was previously forwarded to mlx-c's `dequantize`, which
+  /// would silently reconstruct without the zero-point. The arity check
+  /// now catches this upfront and returns a clear error naming the layer
+  /// and the resolved `affine` mode.
+  #[test]
+  fn dequantize_weights_affine_missing_biases_errors() {
+    let n_rows = 2_usize;
+    // Structurally-valid affine `.weight` + `.scales` pair, but no
+    // `.biases` — incomplete affine triple.
+    let w = arr_u32(&vec![0_u32; n_rows * 8], &[n_rows, 8]);
+    let scales = arr_f32(&vec![1.0_f32; n_rows], &[n_rows, 1]);
+    let mut weights: Weights = HashMap::new();
+    weights.insert("model.affine_no_bias.weight".to_string(), w);
+    weights.insert("model.affine_no_bias.scales".to_string(), scales);
+
+    let cfg = PerLayerQuantization::from_global(Quantization::affine(64, 4));
+    let err = dequantize_weights(weights, &cfg).unwrap_err();
+    match err {
+      Error::Backend { message } => {
+        assert!(
+          message.contains("model.affine_no_bias"),
+          "error should name the layer, got: {message}"
+        );
+        assert!(
+          message.contains("affine"),
+          "error should name the resolved `affine` mode, got: {message}"
+        );
+        assert!(
+          message.contains(".biases"),
+          "error should name the missing `.biases` sibling, got: {message}"
+        );
+      }
+      other => panic!("expected Error::Backend, got: {other:?}"),
+    }
+  }
+
+  /// R5 Finding 1: an `mxfp4` triple WITH a stale `.biases` would be
+  /// forwarded to mlx-c, which silently dequantizes (ignoring the
+  /// biases). The arity check now catches this upfront and returns a
+  /// clear error naming the layer and the offending `mxfp4` mode.
+  #[test]
+  fn dequantize_weights_mxfp4_with_stale_biases_errors() {
+    let n_rows = 2_usize;
+    let w = arr_u32(&vec![0_u32; n_rows * 4], &[n_rows, 4]);
+    let scales = arr_f32(&vec![1.0_f32; n_rows], &[n_rows, 1]);
+    let stale_biases = arr_f32(&vec![0.0_f32; n_rows], &[n_rows, 1]);
+    let mut weights: Weights = HashMap::new();
+    weights.insert("model.mxfp4_stale.weight".to_string(), w);
+    weights.insert("model.mxfp4_stale.scales".to_string(), scales);
+    weights.insert("model.mxfp4_stale.biases".to_string(), stale_biases);
+
+    let cfg = PerLayerQuantization::from_global(Quantization {
+      group_size: 32,
+      bits: 4,
+      mode: QuantMode::Mxfp4,
+    });
+    let err = dequantize_weights(weights, &cfg).unwrap_err();
+    match err {
+      Error::Backend { message } => {
+        assert!(
+          message.contains("model.mxfp4_stale"),
+          "error should name the layer, got: {message}"
+        );
+        assert!(
+          message.contains("mxfp4"),
+          "error should name the offending `mxfp4` mode, got: {message}"
+        );
+        assert!(
+          message.contains(".biases"),
+          "error should name the stale `.biases` sibling, got: {message}"
+        );
+      }
+      other => panic!("expected Error::Backend, got: {other:?}"),
+    }
   }
 }
