@@ -517,7 +517,10 @@ struct DiscoveredShard {
   /// root — every key is rewritten to `<folder>.<key>` (mlx-embeddings'
   /// `f"{folder_name}.{key}"`, where `folder_name = Path(wf).parent.name`, the
   /// **immediate** parent's name). `None` for a root-level shard (keys
-  /// verbatim).
+  /// verbatim) — and *only* for a genuine root shard: a nested shard whose
+  /// immediate parent folder name is not valid UTF-8 cannot be a `String`
+  /// prefix and is rejected by [`collect_glob_shards`] rather than collapsed to
+  /// `None`.
   prefix: Option<String>,
 }
 
@@ -676,7 +679,13 @@ fn load_weights(dir: &Path) -> Result<EmbeddingWeights> {
 /// `to_str().unwrap()` hidden-filter over directory children, so a non-UTF-8
 /// sibling on a mounted NFS/exFAT/case-sensitive volume no longer panics the
 /// walk — it simply does not match the ASCII `model*.safetensors` pattern and is
-/// skipped. The literal `dir` portion of the pattern is
+/// skipped. One non-UTF-8 case *is* still reachable, because the match is
+/// name-based: a legitimately-named (ASCII) `model*.safetensors` shard sitting
+/// in a *child directory whose folder name is non-UTF-8* is yielded by the
+/// pattern, yet its non-UTF-8 immediate-parent name cannot become the `String`
+/// key prefix — that shard is rejected with a recoverable [`Error::Backend`]
+/// naming its path (rather than silently mis-merging its keys as if it were a
+/// root shard). The literal `dir` portion of the pattern is
 /// [`glob::Pattern::escape`]d so a real directory name containing a glob
 /// metacharacter (`*`, `?`, `[`, `]`) is matched literally, not interpreted —
 /// only the `pattern_suffix` carries pattern metacharacters.
@@ -825,11 +834,26 @@ fn collect_glob_shards(dir: &Path, pattern_suffix: &str) -> Result<Vec<Discovere
     // (`a/b/model.safetensors` → `b`), never the full relative path. `wf` is the
     // glob-returned path, so a symlinked component dir contributes its LINK
     // name (the path glob walked), not the canonical target.
+    //
+    // A NESTED shard whose immediate parent folder name is not valid UTF-8
+    // cannot become a `String` prefix — and must NOT fall through to `None`,
+    // which would silently mis-merge its keys verbatim (and collide with a real
+    // root shard). Fail loudly with a path-naming `Error::Backend` instead. A
+    // genuine ROOT shard (no parent below `dir`) still correctly yields `None`.
     let prefix = match path.parent() {
-      Some(parent) if parent != dir => parent
-        .file_name()
-        .and_then(|n| n.to_str())
-        .map(str::to_owned),
+      Some(parent) if parent != dir => {
+        let folder = parent
+          .file_name()
+          .and_then(|n| n.to_str())
+          .ok_or_else(|| Error::Backend {
+            message: format!(
+              "weight shard {} has a non-UTF-8 parent directory name; cannot derive the key \
+               prefix",
+              path.display()
+            ),
+          })?;
+        Some(folder.to_owned())
+      }
       _ => None,
     };
     out.push(DiscoveredShard { path, prefix });
@@ -2498,6 +2522,59 @@ mod tests {
       weights.keys().collect::<Vec<_>>()
     );
     assert_eq!(weights.len(), 2);
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn load_weights_non_utf8_nested_parent_is_recoverable_error() {
+    // A NESTED shard `<bad>/model.safetensors` whose immediate parent FOLDER
+    // name is not valid UTF-8. The shard file itself is ASCII-named, so the
+    // `model*.safetensors` glob DOES yield it — but the non-UTF-8 parent folder
+    // name cannot become the `String` key prefix. It must fail loudly with a
+    // path-naming `Error::Backend`, NOT silently collapse to a `None` prefix
+    // (which would mis-merge the nested shard's keys verbatim and could collide
+    // with a real root shard).
+    //
+    // macOS/APFS enforces UTF-8 directory names and will reject creating the
+    // non-UTF-8 folder — the test then `return`s cleanly (the error code path,
+    // not this fixture, is the deliverable; on a mounted NFS/exFAT/case
+    // -sensitive volume the folder creates and the error is exercised for real).
+    use std::os::unix::ffi::OsStringExt;
+
+    let dir = fresh_dir("non-utf8-parent");
+    // A child directory whose name is `t` followed by an invalid byte (0xFF).
+    let bad_folder = std::ffi::OsString::from_vec(vec![b't', 0xFF]);
+    let nested = dir.join(&bad_folder);
+    if std::fs::create_dir_all(&nested).is_err() {
+      // APFS (and any UTF-8-enforcing filesystem) rejects the directory name —
+      // the error code path cannot be exercised here; skip without failing.
+      return;
+    }
+    // The ASCII-named shard inside the non-UTF-8 folder — this is what the glob
+    // matches and what `collect_glob_shards` must reject for its bad prefix.
+    write_one_tensor(&nested.join("model.safetensors"), "encoder.weight");
+
+    let Err(err) = load_weights(&dir) else {
+      panic!(
+        "a nested shard under a non-UTF-8 parent folder must be a recoverable error, not a \
+         silent root-merge or a panic"
+      );
+    };
+    assert!(
+      matches!(err, Error::Backend { .. }),
+      "expected a recoverable Backend error; got {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+      msg.contains("non-UTF-8 parent directory name"),
+      "the error should explain the non-UTF-8 parent rejection; got: {msg}"
+    );
+    // The error must name the offending shard path: its UTF-8 prefix is the
+    // model directory, which is present in the path `Display`.
+    assert!(
+      msg.contains(&dir.display().to_string()),
+      "the error should name the offending shard path; got: {msg}"
+    );
   }
 
   #[test]
