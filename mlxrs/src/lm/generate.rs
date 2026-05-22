@@ -274,6 +274,16 @@ pub struct GenConfig {
   /// this set.
   pub eos: Vec<u32>,
 
+  /// Multi-token / string stop sequences (mlx-lm's `stop_words` / the
+  /// server's `stop` strings). Generation ends (`finish_reason = "stop"`)
+  /// once any of these strings appears in the decoded output, and the matched
+  /// stop sequence is trimmed from the returned text (see
+  /// [`crate::lm::stop`]). Default empty ⇒ eos-only stopping, byte-for-byte
+  /// the prior behavior. Only consulted by the text-level entry points
+  /// ([`stream_generate`] / [`generate`]); [`generate_step`] is token-only,
+  /// like mlx-lm.
+  pub stop_strings: Vec<String>,
+
   /// Stochastic-sampler RNG seed (mlx-lm's `mx.random.seed` analogue).
   /// `Some(s)` ⇒ a non-greedy run is reproducible; `None` ⇒ a fresh
   /// process-unique seed per run so independent non-greedy generations never
@@ -325,6 +335,7 @@ impl Default for GenConfig {
       frequency_penalty: None,
       frequency_context_size: DEFAULT_REPETITION_CONTEXT_SIZE,
       eos: Vec::new(),
+      stop_strings: Vec::new(),
       seed: None,
       collect_logprobs: false,
     }
@@ -1211,6 +1222,16 @@ pub fn stream_generate<'a, M: Model>(
   let max_tokens = cfg.max_tokens;
   let eos: Vec<u32> = cfg.eos.clone();
 
+  // L5: multi-token / string stop sequences (mlx-lm `stop_words`). Built from
+  // the decoded text (see [`crate::lm::stop`]); inert when `stop_strings` is
+  // empty, in which case the loop takes the original `last_segment()` path
+  // unchanged (eos-only, byte-for-byte the prior behavior).
+  let matcher = crate::lm::stop::StopMatcher::new(cfg.stop_strings.clone());
+  // Bytes of the cumulative decoded text already emitted to the caller. Only
+  // used on the active-matcher path (which drives emission off `detok.text()`
+  // and never advances the detokenizer offset).
+  let mut emitted_len: usize = 0;
+
   let mut steps = generate_step(model, prompt, cache, cfg);
   let mut detok = tokenizer.detokenizer();
   let mut n: usize = 0;
@@ -1262,7 +1283,14 @@ pub fn stream_generate<'a, M: Model>(
     if eos.contains(&token) {
       finished = true;
       detok.finalize();
-      let text = detok.last_segment();
+      // Active path: emit the remaining unflushed tail of the cumulative
+      // text (the matcher never advanced the detok offset). Inert path:
+      // unchanged `last_segment()`.
+      let text = if matcher.is_active() {
+        emit_tail(detok.as_ref(), &mut emitted_len)
+      } else {
+        detok.last_segment()
+      };
       return Some(Ok(GenerationResponse {
         text,
         token,
@@ -1278,6 +1306,69 @@ pub fn stream_generate<'a, M: Model>(
 
     detok.add_token(token);
     n += 1;
+
+    // L5: string stop-sequence check (active matcher only). Runs AFTER
+    // `add_token` so the just-produced token's text participates, and BEFORE
+    // the `max_tokens` check so a stop string still reports `finish_reason=
+    // "stop"` on the final allowed token. The matched stop sequence (and any
+    // trailing text) is trimmed from the output; the inert path skips this
+    // entirely and behaves exactly as before.
+    if matcher.is_active() {
+      let full = detok.text();
+      match matcher.step(&full) {
+        crate::lm::stop::StopDecision::Stop { trimmed_len, .. } => {
+          finished = true;
+          let end = trimmed_len.max(emitted_len).min(full.len());
+          let text = full[emitted_len..end].to_string();
+          emitted_len = end;
+          drop(full);
+          return Some(Ok(GenerationResponse {
+            text,
+            token,
+            logprobs,
+            prompt_tokens,
+            prompt_tps,
+            generation_tokens: n,
+            generation_tps: gen_tps(n),
+            finish_reason: Some("stop".to_string()),
+          }));
+        }
+        crate::lm::stop::StopDecision::Continue { safe_len } => {
+          // mlx-lm: `if (n + 1) == max_tokens: break` ⇒ a final
+          // `finish_reason="length"` response with the finalized tail.
+          if n >= max_tokens {
+            finished = true;
+            drop(full);
+            detok.finalize();
+            let text = emit_tail(detok.as_ref(), &mut emitted_len);
+            return Some(Ok(GenerationResponse {
+              text,
+              token,
+              logprobs,
+              prompt_tokens,
+              prompt_tps,
+              generation_tokens: n,
+              generation_tps: gen_tps(n),
+              finish_reason: Some("length".to_string()),
+            }));
+          }
+          let end = safe_len.max(emitted_len).min(full.len());
+          let text = full[emitted_len..end].to_string();
+          emitted_len = end;
+          drop(full);
+          return Some(Ok(GenerationResponse {
+            text,
+            token,
+            logprobs,
+            prompt_tokens,
+            prompt_tps,
+            generation_tokens: n,
+            generation_tps: gen_tps(n),
+            finish_reason: None,
+          }));
+        }
+      }
+    }
 
     // mlx-lm: `if (n + 1) == max_tokens: break` (n is 0-based there; here
     // `n` already counts this token) ⇒ a final `finish_reason="length"`
@@ -1312,6 +1403,23 @@ pub fn stream_generate<'a, M: Model>(
       finish_reason: None,
     }))
   })
+}
+
+/// Emit the still-unflushed tail of the streaming detokenizer's cumulative
+/// text on the active-stop-matcher path: returns
+/// `text()[*emitted_len..]` and advances `*emitted_len` to the end. The
+/// matcher path drives emission off byte offsets into `detok.text()` (never
+/// `last_segment`, so the detok offset stays at 0); this finalizes the tail
+/// the same way for the eos / `max_tokens` terminal responses.
+fn emit_tail(
+  detok: &dyn crate::tokenizer::StreamingDetokenizer,
+  emitted_len: &mut usize,
+) -> String {
+  let full = detok.text();
+  let start = (*emitted_len).min(full.len());
+  let text = full[start..].to_string();
+  *emitted_len = full.len();
+  text
 }
 
 /// Generate a complete response string for `prompt` — a 1:1 port of
@@ -2456,5 +2564,240 @@ mod batch_tests {
       emits_per_row[1]
     );
     assert_eq!(finish_per_row[1].as_deref(), Some("length"));
+  }
+}
+
+#[cfg(test)]
+mod stop_sequence_tests {
+  //! L5 — multi-token / string stop sequences driven through the real
+  //! [`stream_generate`] / [`generate`] entry points with a deterministic,
+  //! scriptable single-seq model and the committed `WordLevel` fixture
+  //! tokenizer (tokens 3-8 = `hello world the quick brown fox`). Stop
+  //! strings are derived from `tok.decode(...)` so the tests never hardcode
+  //! the tokenizer's spacing. The pure matcher logic (overlap, char
+  //! boundaries, first-match-wins) is unit-tested in [`crate::lm::stop`];
+  //! these assert the generate-loop wiring: `finish_reason="stop"`, the
+  //! trim, and the eos-only fallback when `stop_strings` is empty.
+
+  use super::*;
+  use crate::lm::cache::{CacheConfig, KvCache, make_prompt_cache};
+
+  /// Resolve the fixture tokenizer directory (`mlxrs/tests/fixtures`),
+  /// reachable from the in-crate `#[cfg(test)]` build via `CARGO_MANIFEST_DIR`.
+  fn fixture_tokenizer() -> crate::tokenizer::Tokenizer {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+      .join("tests")
+      .join("fixtures");
+    crate::tokenizer::Tokenizer::from_path(&dir, None).expect("load fixture tokenizer")
+  }
+
+  /// A scriptable single-seq model: at decode step `t` (0-based, first decode
+  /// after prefill) it emits `script[t]` as the argmax. The script cursor is
+  /// `cache.offset() - prompt_len` (offset reaches `prompt_len` at the first
+  /// decode forward, then +1/step), so prefill chunking never shifts it —
+  /// identical wiring to the L1 `MockBatchModel`, single row.
+  struct ScriptModel {
+    vocab: usize,
+    prompt_len: usize,
+    script: Vec<u32>,
+  }
+
+  impl Model for ScriptModel {
+    fn forward(&self, tokens: &Array, cache: &mut [Box<dyn KvCache>]) -> Result<Array> {
+      let shape = tokens.shape();
+      let (batch, seq) = match shape.as_slice() {
+        [b, s] => (*b, *s),
+        [s] => (1usize, *s),
+        other => {
+          return Err(Error::ShapeMismatch {
+            message: format!("ScriptModel::forward expects [B, S] tokens, got {other:?}"),
+          });
+        }
+      };
+      // Advance every cache so `offset()` increments like a real layer.
+      for layer in cache.iter_mut() {
+        let elems = batch * seq;
+        let k = Array::from_slice::<f32>(&vec![1.0_f32; elems], &(batch, 1usize, seq, 1usize))?;
+        let v = Array::from_slice::<f32>(&vec![2.0_f32; elems], &(batch, 1usize, seq, 1usize))?;
+        layer.update(&k, &v)?;
+      }
+      let cache_offset = cache.first().map(|c| c.offset()).unwrap_or(0);
+      let script_idx = cache_offset.checked_sub(self.prompt_len);
+      let pred = script_idx
+        .and_then(|i| self.script.get(i).copied())
+        .unwrap_or(0);
+
+      let mut data = vec![0.0_f32; batch * seq * self.vocab];
+      if (pred as usize) < self.vocab {
+        for pos in 0..batch * seq {
+          data[pos * self.vocab + pred as usize] = 10.0;
+        }
+      }
+      Array::from_slice::<f32>(&data, &(batch, seq, self.vocab))
+    }
+  }
+
+  /// Run `generate` (collect every streamed segment) over a scripted decode.
+  /// `prompt` seeds the cache offset; `script` is the per-step argmax id
+  /// sequence; `stop_strings` configures L5. Returns the collected text plus
+  /// the per-response `finish_reason`s (in order) for assertions.
+  fn run(
+    prompt: &[u32],
+    script: Vec<u32>,
+    max_tokens: usize,
+    stop_strings: Vec<String>,
+  ) -> (String, Vec<Option<String>>) {
+    let tok = fixture_tokenizer();
+    let vocab = 16usize;
+    let model = ScriptModel {
+      vocab,
+      prompt_len: prompt.len(),
+      script,
+    };
+    let cache = make_prompt_cache(&CacheConfig {
+      num_hidden_layers: 1,
+      sliding_window: None,
+    });
+    let cfg = GenConfig {
+      max_tokens,
+      stop_strings,
+      ..Default::default()
+    };
+    let mut text = String::new();
+    let mut reasons = Vec::new();
+    for resp in stream_generate(&model, &tok, prompt, cache, cfg) {
+      let r = resp.expect("stream step");
+      text.push_str(&r.text);
+      reasons.push(r.finish_reason);
+    }
+    (text, reasons)
+  }
+
+  /// The fixture's decode of a token-id slice (the exact text the
+  /// detokenizer reconstructs), used to build spacing-agnostic stop strings.
+  fn decode(ids: &[u32]) -> String {
+    fixture_tokenizer().decode(ids, false).expect("decode")
+  }
+
+  #[test]
+  fn empty_stop_strings_is_eos_only_unchanged() {
+    // Script: hello world </s>(eos=2) ... . With no stop strings, generation
+    // ends on the eos token (finish_reason="stop"); the eos token is not
+    // detokenized. Output is exactly the decode of the pre-eos tokens.
+    let prompt = [1u32, 3]; // <s> hello
+    let script = vec![4u32, 5, 2, 6, 7]; // world the </s> ...
+    let (text, reasons) = run(&prompt, script, 32, Vec::new());
+    assert_eq!(text, decode(&[4, 5]));
+    assert_eq!(reasons.last().unwrap().as_deref(), Some("stop"));
+    // Only one "stop" (the eos), no premature stop.
+    assert_eq!(reasons.iter().filter(|r| r.is_some()).count(), 1);
+  }
+
+  #[test]
+  fn single_token_stop_string_stops_and_trims() {
+    // Stop on the single token `world` (id 4). Script produces hello world
+    // the ...; generation must stop AT world and trim it, leaving `hello`.
+    let prompt = [1u32, 3];
+    let script = vec![3u32, 4, 5, 6, 7]; // hello world the quick brown
+    let stop = decode(&[4]); // " world" (or "world") — whatever the fixture renders
+    let (text, reasons) = run(&prompt, script, 32, vec![stop.clone()]);
+    let full = decode(&[3, 4, 5]); // hello world the
+    let cut = full.find(&stop).expect("stop substring present in decode");
+    assert_eq!(text, full[..cut].to_string());
+    assert_eq!(reasons.last().unwrap().as_deref(), Some("stop"));
+  }
+
+  #[test]
+  fn multi_token_stop_spanning_boundary_stops_and_trims() {
+    // Stop string spans TWO tokens: decode([5,6]) = "the quick" (+ leading
+    // space per the fixture). The match completes only when BOTH tokens have
+    // been produced — a token boundary in the middle of the stop string.
+    let prompt = [1u32, 3];
+    let script = vec![3u32, 5, 6, 7, 8]; // hello the quick brown fox
+    let stop = decode(&[5, 6]); // multi-token stop
+    let (text, reasons) = run(&prompt, script, 32, vec![stop.clone()]);
+    let full = decode(&[3, 5, 6, 7]); // up to brown
+    let cut = full.find(&stop).expect("multi-token stop present");
+    assert_eq!(text, full[..cut].to_string());
+    assert_eq!(reasons.last().unwrap().as_deref(), Some("stop"));
+    // Crucially: it did NOT stop after the first token of the stop sequence —
+    // the leading `hello` token survived (text is the non-empty pre-stop
+    // prefix), and the full stop string is absent from the output.
+    assert!(!text.is_empty());
+    assert!(!text.contains(&stop));
+  }
+
+  #[test]
+  fn partial_match_then_diverge_does_not_stop() {
+    // Stop string = decode([5,6]) ("the quick"). Script produces the FIRST
+    // token of it (`the`) then DIVERGES to `fox` — the partial match must
+    // NOT fire; generation runs to max_tokens.
+    let prompt = [1u32, 3];
+    let script = vec![3u32, 5, 8, 4, 7]; // hello the fox world brown (no "the quick")
+    let stop = decode(&[5, 6]);
+    let (text, reasons) = run(&prompt, script, 5, vec![stop.clone()]);
+    // No stop completed ⇒ ends on length, full text retained.
+    assert!(!text.contains(&stop), "stop string must not appear");
+    assert_eq!(text, decode(&[3, 5, 8, 4, 7]));
+    assert_eq!(reasons.last().unwrap().as_deref(), Some("length"));
+    assert!(
+      reasons.iter().all(|r| r.as_deref() != Some("stop")),
+      "no premature stop on the partial match"
+    );
+  }
+
+  #[test]
+  fn stop_completes_mid_token_trims_at_char_boundary() {
+    // The "mid-token" case the token-level trie cannot handle: the stop
+    // string is a CHARACTER PREFIX of a token's decoded text. Token `quick`
+    // (id 6) decodes to text containing "qui"; stopping on "qui" must trim
+    // mid-token at the exact character boundary, dropping "qui" and the rest.
+    let prompt = [1u32, 3];
+    let script = vec![3u32, 6, 7, 8, 4]; // hello quick brown fox world
+    let quick = decode(&[6]); // e.g. " quick"
+    // Build a stop that is a strict character prefix of the `quick` token
+    // text, ending mid-token (drop the last char so it cannot be a whole
+    // token). Skip a leading space if present so we cut inside the word.
+    let trimmed = quick.trim_start();
+    assert!(trimmed.len() >= 3, "need a multi-char token to cut");
+    let stop = trimmed[..trimmed.len() - 1].to_string(); // e.g. "quic"
+    let (text, reasons) = run(&prompt, script, 32, vec![stop.clone()]);
+    let full = decode(&[3, 6, 7]); // hello quick brown
+    let cut = full.find(&stop).expect("mid-token stop prefix present");
+    assert_eq!(text, full[..cut].to_string());
+    // The stop string itself must be gone, and the cut is at the char
+    // boundary where the stop began (mid the `quick` token's text).
+    assert!(!text.contains(&stop));
+    assert_eq!(reasons.last().unwrap().as_deref(), Some("stop"));
+  }
+
+  #[test]
+  fn multiple_stop_strings_first_completion_wins() {
+    // Two stops: one completes earlier in the stream than the other. The
+    // earlier completion wins and trims there.
+    let prompt = [1u32, 3];
+    let script = vec![3u32, 4, 5, 6, 7]; // hello world the quick brown
+    let early = decode(&[4]); // "world" — completes at step 2
+    let late = decode(&[6]); // "quick" — would complete at step 4
+    let (text, reasons) = run(&prompt, script, 32, vec![late.clone(), early.clone()]);
+    let full = decode(&[3, 4]); // hello world
+    let cut = full.find(&early).expect("early stop present");
+    assert_eq!(text, full[..cut].to_string());
+    assert!(!text.contains(&early));
+    assert!(!text.contains(&late));
+    assert_eq!(reasons.last().unwrap().as_deref(), Some("stop"));
+  }
+
+  #[test]
+  fn finish_reason_is_stop_on_stop_string_match() {
+    // Focused assertion: a stop-string match yields exactly one terminal
+    // response with finish_reason == Some("stop") and nothing after it.
+    let prompt = [1u32, 3];
+    let script = vec![3u32, 4, 5, 6, 7];
+    let stop = decode(&[5]); // "the"
+    let (_text, reasons) = run(&prompt, script, 32, vec![stop]);
+    assert_eq!(reasons.last().unwrap().as_deref(), Some("stop"));
+    // Exactly one terminal reason, and it's the final element.
+    assert_eq!(reasons.iter().filter(|r| r.is_some()).count(), 1);
   }
 }
