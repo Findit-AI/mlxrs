@@ -438,11 +438,12 @@ struct ProcessorClassOnly {
 ///
 /// The "single bounded read" contract holds per file: each of
 /// `preprocessor_config.json` / `processor_config.json` is read at most
-/// once. The common path (preprocessor file carries `processor_class`)
-/// still reads only `preprocessor_config.json` — `processor_config.json`
-/// is opened only when it is actually needed for the dispatch class, and
-/// when it *is* opened that one body is carried out rather than
-/// discarded.
+/// once. Whenever `preprocessor_config.json` is present (cases 2 and 3)
+/// `processor_config.json` is also bounded-read once if it exists — for
+/// the dispatch class (case 3) or purely to carry its processor-level
+/// body (case 2) — and when it *is* opened that one body is carried out
+/// rather than discarded. An absent `processor_config.json` is the
+/// `ENOENT` "no body" signal, leaving its slot `None`.
 pub fn load_processor_config(
   dir: &Path,
 ) -> Result<(
@@ -487,20 +488,23 @@ pub fn load_processor_config(
     })?;
 
     if let Some(processor_class) = parsed.processor_class {
-      // (2) Preferred file has `processor_class` — use it directly. The
-      // dispatch class came from `preprocessor_config.json`, so
-      // `processor_config.json` is NOT read here: doing so would add a
-      // second `stat`+open+read on the common-checkpoint path purely
-      // speculatively, breaking the per-file single-bounded-read
-      // contract. The `processor_config.json` slot is therefore `None`;
-      // a per-model processor whose layout puts processor-level fields
-      // in `processor_config.json` ships them in `preprocessor_config.
-      // json` too (the case below) or in a preprocessor-only file —
-      // either way nothing read here is discarded.
+      // (2) Preferred file has `processor_class` — that's the dispatch
+      // class (precedence stays with `preprocessor_config.json`; the
+      // bounded read of `processor_config.json` below NEVER overrides
+      // it). But `processor_config.json` may ALSO exist and carry
+      // processor-level fields a per-model processor needs *alongside*
+      // the image-preprocessor metadata in `preprocessor_config.json`.
+      // Bounded-read it through the SAME `read_bounded_config_file`
+      // helper (each file still read at most once) so its body reaches
+      // the constructor instead of forcing a re-open (the TOCTOU/
+      // config-divergence this factory exists to prevent). If
+      // `processor_config.json` is absent, `ENOENT` → `None` and the
+      // slot stays `None` exactly as before.
+      let fallback_body = load::read_bounded_config_file(&fallback_path, "processor config")?;
       return Ok((
         ProcessorConfig { processor_class },
         Some(body),
-        None,
+        fallback_body,
         PREFERRED,
       ));
     }
@@ -695,16 +699,18 @@ pub struct LoadedProcessor<'a> {
   /// The verbatim body of `processor_config.json` — the newer combined
   /// `AutoProcessor` config (carries `processor_class` plus
   /// processor-level fields like `image_seq_len`, chat-template knobs,
-  /// …). `Some` iff that file was read: always for the
-  /// `processor_config.json`-only layout, and for the split layout where
+  /// …). `Some` iff the directory contained that file: the
+  /// `processor_config.json`-only layout, the split layout where
   /// `preprocessor_config.json` lacked `processor_class` so this file
-  /// supplied the dispatch class. A per-model processor needing BOTH
-  /// image-preprocessor metadata AND processor-level metadata reads this
-  /// alongside [`preprocessor_config_json`](Self::preprocessor_config_json)
-  /// — neither body is discarded, so no file is re-opened. `None` when
-  /// the dispatch class came from `preprocessor_config.json` and
-  /// `processor_config.json` was therefore never read (the per-file
-  /// single-bounded-read contract — see [`load_processor_config`]).
+  /// supplied the dispatch class, AND the common layout where
+  /// `preprocessor_config.json` carried `processor_class` but
+  /// `processor_config.json` also exists with extra processor-level
+  /// fields. A per-model processor needing BOTH image-preprocessor
+  /// metadata AND processor-level metadata reads this alongside
+  /// [`preprocessor_config_json`](Self::preprocessor_config_json) — neither
+  /// body is discarded, so no file is re-opened. `None` only when
+  /// `processor_config.json` is genuinely absent from the directory
+  /// (see [`load_processor_config`]).
   pub processor_config_json: Option<&'a str>,
   /// Name of the file the dispatch class + primary image-preprocessor
   /// metadata came from (one of `"preprocessor_config.json"` /
@@ -2626,6 +2632,138 @@ mod tests {
     // The constructor read `mock_image_size = 24` off the preprocessor
     // body — proof the preprocessor body also reached it alongside the
     // processor_config.json body.
+    assert_eq!(ctx.processor.image_processor_config().size, (24, 24));
+  }
+
+  #[test]
+  fn preferred_class_layout_still_carries_processor_config_body() {
+    // **Regression** for the Codex finding on the *preferred-class* path:
+    // `preprocessor_config.json` carries the `processor_class` (so it
+    // wins dispatch) AND its own image-preprocessor metadata, while
+    // `processor_config.json` ALSO exists with a required non-class
+    // processor-level field (`image_seq_len`). Before the fix this path
+    // returned `processor_config_json: None` and discarded the
+    // `processor_config.json` body even though it was on disk — a
+    // per-model processor needing that field had to re-open the file
+    // (the TOCTOU/config-divergence the loader exists to prevent). After
+    // the fix BOTH bodies are carried, and the dispatch class still
+    // comes from `preprocessor_config.json` (precedence unchanged).
+    let dir = fresh_dir("preferred-class-carries-processor-body");
+    // `preprocessor_config.json`: HAS `processor_class` + image metadata.
+    std::fs::write(
+      dir.join("preprocessor_config.json"),
+      mock_preprocessor_config_json("MockProc", 24),
+    )
+    .unwrap();
+    // `processor_config.json`: also present, carrying a REQUIRED
+    // non-class processor-level field (plus a class that must NOT be the
+    // one used for dispatch).
+    std::fs::write(
+      dir.join("processor_config.json"),
+      mock_processor_config_with_seq_len("OtherProc", 256),
+    )
+    .unwrap();
+
+    // (a) `load_processor_config` directly: dispatch class is the
+    // preferred file's, filename is the preferred file, and BOTH bodies
+    // are populated — `processor_config.json`'s body is NOT discarded.
+    let (proc_config, preprocessor_body, processor_body, filename) =
+      load_processor_config(&dir).expect("preferred-class processor config must resolve");
+    assert_eq!(
+      proc_config.processor_class, "MockProc",
+      "dispatch class must come from preprocessor_config.json (precedence unchanged)"
+    );
+    assert_eq!(
+      filename, "preprocessor_config.json",
+      "primary-body filename is the preprocessor file"
+    );
+    let preprocessor_body =
+      preprocessor_body.expect("preprocessor_config.json body must be carried");
+    assert!(
+      preprocessor_body.contains("mock_image_size"),
+      "preprocessor body must carry the image-preprocessor metadata, got: {preprocessor_body}"
+    );
+    let processor_body = processor_body
+      .expect("processor_config.json body must be carried in the preferred-class path too");
+    assert!(
+      processor_body.contains("image_seq_len"),
+      "processor_config.json body must survive with its non-class field, got: {processor_body}"
+    );
+
+    // (b) Through the full `load()` pipeline: the per-model processor
+    // constructor sees BOTH bodies on `LoadedProcessor`. The constructor
+    // asserts `processor_config_json` is `Some` exposing `image_seq_len
+    // = 256` AND `preprocessor_config_json` is `Some` with the
+    // image-preprocessor metadata — failure of either makes `load()`
+    // error.
+    std::fs::write(dir.join("config.json"), mock_config_json("mockvlm")).unwrap();
+    let mut weights: Weights = HashMap::new();
+    weights.insert(
+      "mock.weight".to_owned(),
+      Array::from_slice::<f32>(&[1.0], &(1usize,)).unwrap(),
+    );
+    crate::io::save_safetensors(&dir.join("model.safetensors"), &weights).unwrap();
+    write_tokenizer(&dir);
+
+    let asserting_processor_ctor: ProcessorConstructor = Box::new(
+      |loaded: &LoadedProcessor<'_>| -> Result<Box<dyn Processor>> {
+        let preprocessor = loaded
+          .preprocessor_config_json
+          .ok_or_else(|| Error::Backend {
+            message: "expected preprocessor_config.json body on LoadedProcessor".into(),
+          })?;
+        let processor = loaded.processor_config_json.ok_or_else(|| Error::Backend {
+          message: "expected processor_config.json body on LoadedProcessor (the carried body)"
+            .into(),
+        })?;
+        let pre: serde_json::Value =
+          serde_json::from_str(preprocessor).map_err(|e| Error::Backend {
+            message: format!("bad preprocessor body: {e}"),
+          })?;
+        let image_size = pre
+          .get("mock_image_size")
+          .and_then(serde_json::Value::as_u64)
+          .and_then(|x| u32::try_from(x).ok())
+          .ok_or_else(|| Error::Backend {
+            message: "preprocessor body missing mock_image_size".into(),
+          })?;
+        let proc: serde_json::Value =
+          serde_json::from_str(processor).map_err(|e| Error::Backend {
+            message: format!("bad processor_config.json body: {e}"),
+          })?;
+        let seq_len = proc
+          .get("image_seq_len")
+          .and_then(serde_json::Value::as_u64)
+          .ok_or_else(|| Error::Backend {
+            message: "processor_config.json body missing image_seq_len (the discarded field)"
+              .into(),
+          })?;
+        if seq_len != 256 {
+          return Err(Error::Backend {
+            message: format!("image_seq_len must round-trip as 256, got {seq_len}"),
+          });
+        }
+        Ok(Box::new(MockVlmProcessor {
+          processor_class: loaded.processor_class.to_owned(),
+          image_size,
+        }))
+      },
+    );
+
+    let model_registry = VlmTypeRegistry::new().with("mockvlm", mock_vlm_constructor());
+    // ONLY `MockProc` is registered — if dispatch had used the
+    // `processor_config.json` class (`OtherProc`) the lookup would miss.
+    let processor_registry =
+      VlmProcessorTypeRegistry::new().with("MockProc", asserting_processor_ctor);
+    let configuration = VlmModelConfiguration::from_directory(&dir);
+
+    let ctx = load(&configuration, &model_registry, &processor_registry).expect(
+      "preferred-class load must dispatch on preprocessor_config.json's class and surface \
+       BOTH config bodies",
+    );
+    // Round-trip proof: the constructor decoded `mock_image_size = 24`
+    // off the preprocessor body, and only `MockProc` is registered so
+    // dispatch used the preprocessor file's `processor_class`.
     assert_eq!(ctx.processor.image_processor_config().size, (24, 24));
   }
 
