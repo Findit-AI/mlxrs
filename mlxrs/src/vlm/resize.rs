@@ -127,6 +127,64 @@ const ROUND_BIAS: i32 = 1 << (PRECISION_BITS - 1);
 /// caller materializes every source variant to RGBA8 first).
 const CHANNELS: usize = 4;
 
+/// Byte ceiling for EVERY allocation in the resize path — the same 512 MiB
+/// budget [`crate::vlm::image::MAX_DECODED_IMAGE_BYTES`] caps the
+/// RGBA-expanded source and final destination with. The public
+/// [`crate::vlm::image::resize`] wrapper guards only those two end buffers;
+/// the *internal* scratch this module allocates (the horizontal-pass
+/// intermediate, the per-axis coefficient tables, the nearest-resize
+/// x-index map) is sized from the SAME untrusted target dimensions and can
+/// dwarf both ends — e.g. a `1×131072` source resized to `131072×1` has a
+/// 0.5 MiB source and a 0.5 MiB destination but a `131072 * 131072 * 4`
+/// ≈ 68 GiB horizontal intermediate. `try_reserve_exact` makes an allocator
+/// *refusal* recoverable, but on an overcommitting allocator the reservation
+/// succeeds and the subsequent zero-fill faults in all 68 GiB → process
+/// death. So every scratch buffer is checked against this ceiling BEFORE its
+/// `try_reserve_exact` (see [`checked_buffer_bytes`]).
+///
+/// Kept in sync with — and equal to — `image::MAX_DECODED_IMAGE_BYTES`
+/// (`u64` there; `usize` here because these byte counts are compared
+/// against `Vec` capacities). On a 32-bit host `usize` is 32-bit but
+/// `512 * 1024 * 1024` still fits, so the `as usize` is lossless.
+const MAX_DECODED_IMAGE_BYTES: usize = 512 * 1024 * 1024;
+
+/// Compute `elems * elem_size` as a byte count, rejecting BOTH a `usize`
+/// overflow and a product exceeding [`MAX_DECODED_IMAGE_BYTES`]. Every
+/// `try_with_capacity` / `try_reserve_exact` in the resize path is preceded
+/// by this check, so no resize allocation — source, horizontal
+/// intermediate, coefficient table, x-index map, destination — can overflow
+/// `usize` or exceed the 512 MiB budget.
+///
+/// `try_reserve_exact` already turns an *allocator refusal* into a
+/// recoverable [`Error::OutOfMemory`], but it does not bound the request:
+/// an overcommitting allocator hands back a 68 GiB reservation that only
+/// faults (and kills the process) when the caller's zero-fill touches the
+/// pages. This ceiling check makes the *request itself* recoverable.
+///
+/// `what` names the buffer (with its dimensions) for the error message.
+///
+/// # Errors
+/// [`Error::ShapeMismatch`] if `elems * elem_size` overflows `usize` or
+/// exceeds [`MAX_DECODED_IMAGE_BYTES`]; the message carries `what` and the
+/// offending byte count.
+fn checked_buffer_bytes(elems: usize, elem_size: usize, what: &str) -> Result<usize> {
+  let bytes = elems
+    .checked_mul(elem_size)
+    .ok_or_else(|| Error::ShapeMismatch {
+      message: format!("resize: {what} size overflows usize ({elems} elems * {elem_size} B/elem)"),
+    })?;
+  if bytes > MAX_DECODED_IMAGE_BYTES {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "resize: {what} needs {bytes} bytes, exceeds \
+         MAX_DECODED_IMAGE_BYTES={MAX_DECODED_IMAGE_BYTES} \
+         ({elems} elems * {elem_size} B/elem)"
+      ),
+    });
+  }
+  Ok(bytes)
+}
+
 /// Continuous filter support radius (the half-width of the kernel before
 /// the antialiasing filterscale stretch).
 fn filter_support(f: Filter) -> f64 {
@@ -211,7 +269,16 @@ struct Coeffs {
 ///
 /// Every buffer is `try_reserve_exact`-backed; an allocator refusal
 /// surfaces as [`Error::OutOfMemory`]. A degenerate `in_size`/`out_size`
-/// (zero) or a `ksize` overflow surfaces as [`Error::ShapeMismatch`].
+/// (zero), a `ksize` overflow, or a coefficient table exceeding
+/// [`MAX_DECODED_IMAGE_BYTES`] surfaces as [`Error::ShapeMismatch`].
+///
+/// The coefficient table is `out_size * ksize` taps. `ksize` is small for
+/// a sane resize (`ceil(filter_support * filterscale) * 2 + 1`, clamped to
+/// `in_size`), but a `131072`-wide output combined with a stretched
+/// downscale support could still size a multi-hundred-MiB table — so the
+/// table's byte size, the bounds vector, and the per-row f64 scratch are
+/// each capped against [`MAX_DECODED_IMAGE_BYTES`] via
+/// [`checked_buffer_bytes`] BEFORE their `try_reserve_exact`.
 fn precompute_coeffs(in_size: usize, out_size: usize, filter: Filter) -> Result<Coeffs> {
   // Caller guarantees non-zero, but guard defensively: a zero `out_size`
   // would divide by zero in `scale`, a zero `in_size` makes the window
@@ -235,20 +302,39 @@ fn precompute_coeffs(in_size: usize, out_size: usize, filter: Filter) -> Result<
     })?;
   let ksize = ksize_unclamped.min(in_size.max(1));
 
+  // `bounds` is `out_size` `(usize, usize)` pairs; cap its byte size
+  // against the 512 MiB budget before reserving — a `131072`-wide output
+  // alone is tiny, but the same guard applies uniformly to every scratch
+  // buffer so no resize allocation bypasses the ceiling.
+  checked_buffer_bytes(
+    out_size,
+    std::mem::size_of::<(usize, usize)>(),
+    "coefficient bounds table",
+  )?;
   let mut bounds: Vec<(usize, usize)> = try_with_capacity(out_size)?;
-  // `out_size * ksize` weights, fallibly. `checked_mul` so a hostile
-  // product (already bounded by the caller's MAX_DECODED cap, but be
-  // explicit) routes to a recoverable error rather than a wrap.
+  // `out_size * ksize` `i32` weights. `checked_mul` rejects a `usize`
+  // overflow of the element count; `checked_buffer_bytes` then rejects a
+  // table whose byte size exceeds `MAX_DECODED_IMAGE_BYTES` — a
+  // `131072`-wide output with a stretched downscale support could
+  // otherwise reserve a multi-GiB coefficient table that
+  // `try_reserve_exact` cannot bound on an overcommitting allocator.
   let weight_len = out_size
     .checked_mul(ksize)
     .ok_or_else(|| Error::ShapeMismatch {
       message: format!("precompute_coeffs: out_size*ksize overflows for {out_size}*{ksize}"),
     })?;
+  checked_buffer_bytes(
+    weight_len,
+    std::mem::size_of::<i32>(),
+    "coefficient weight table",
+  )?;
   let mut weights: Vec<i32> = try_with_capacity(weight_len)?;
   weights.resize(weight_len, 0i32);
 
   // Scratch for one row of f64 weights before fixed-point conversion.
-  // Bounded by `ksize` (small), reserved fallibly.
+  // Bounded by `ksize`; capped against the budget before reserving (a
+  // stretched downscale support can make `ksize` large).
+  checked_buffer_bytes(ksize, std::mem::size_of::<f64>(), "coefficient row scratch")?;
   let mut row: Vec<f64> = try_with_capacity(ksize)?;
 
   let inv_filterscale = 1.0 / filterscale;
@@ -328,11 +414,24 @@ fn clip8(acc: i32) -> u8 {
 ///
 /// EVERY buffer (coefficient tables for both axes, the horizontal-pass
 /// intermediate, the output) is `try_reserve_exact`-backed; an allocator
-/// refusal surfaces as [`Error::OutOfMemory`], never a process abort.
+/// refusal surfaces as [`Error::OutOfMemory`], never a process abort. In
+/// addition, every buffer is capped against [`MAX_DECODED_IMAGE_BYTES`]
+/// (512 MiB) via [`checked_buffer_bytes`] BEFORE its reservation — the
+/// public [`crate::vlm::image::resize`] wrapper only bounds the
+/// RGBA-source and the destination, but the horizontal intermediate
+/// (`src_h * dst_w * 4`) and the coefficient tables are sized from the
+/// SAME untrusted target and can dwarf both ends (a `1×131072` →
+/// `131072×1` resize has 0.5 MiB ends but a ~68 GiB intermediate). Capping
+/// the request itself — not just relying on `try_reserve_exact` — closes
+/// the overcommit zero-fill abort. So `resize_rgba8` is safe to call
+/// directly, not only through the public wrapper.
 ///
 /// # Errors
 /// - [`Error::ShapeMismatch`] if any dimension is `0`, if a byte/element
-///   product overflows `usize`, or if `src.len() != src_w * src_h * 4`.
+///   product overflows `usize`, if `src.len() != src_w * src_h * 4`, or if
+///   ANY buffer in the resize path (source copy, coefficient tables,
+///   horizontal intermediate, destination) would exceed
+///   [`MAX_DECODED_IMAGE_BYTES`].
 /// - [`Error::OutOfMemory`] if any `try_reserve_exact` fails.
 ///
 /// # Panics
@@ -368,12 +467,21 @@ pub(crate) fn resize_rgba8(
       ),
     });
   }
+  // Cap the source against the 512 MiB budget too: `src` is borrowed (not
+  // allocated here), but the premultiplied copy below is `src.len()` bytes
+  // — and a direct caller (not the public `resize` wrapper) has no other
+  // guard. `src_len` already cleared the overflow check above.
+  checked_buffer_bytes(src_len, 1, &format!("RGBA8 source ({src_w}x{src_h})"))?;
   let dst_len = dst_w
     .checked_mul(dst_h)
     .and_then(|v| v.checked_mul(CHANNELS))
     .ok_or_else(|| Error::ShapeMismatch {
       message: format!("resize_rgba8: dst_w*dst_h*4 overflows usize for {dst_w}x{dst_h}"),
     })?;
+  // Cap the destination against the 512 MiB budget. The public `resize`
+  // wrapper already bounds it, but `resize_rgba8` is `pub(crate)` and may
+  // be called directly — every entry path is covered here.
+  checked_buffer_bytes(dst_len, 1, &format!("destination ({dst_w}x{dst_h} RGBA8)"))?;
 
   if filter == Filter::Nearest {
     // PIL exempts `NEAREST` from premultiplication: it is a pure pixel
@@ -409,13 +517,27 @@ pub(crate) fn resize_rgba8(
 
   // Intermediate buffer: src_h * dst_w * 4 bytes, fallible. (PIL emits an
   // 8-bit clamped image between the two passes; the vertical pass reads
-  // it back.)
+  // it back.) CRITICAL: this intermediate's dimensions are `src_h` (input)
+  // by `dst_w` (untrusted target) — it is NOT bounded by either the
+  // RGBA-source cap (`src_w*src_h*4`) or the destination cap
+  // (`dst_w*dst_h*4`) the public `resize` wrapper enforces. A `1×131072`
+  // source resized to `131072×1` has a 0.5 MiB source, a 0.5 MiB
+  // destination, but a `131072 * 131072 * 4` ≈ 68 GiB intermediate. So
+  // cap it explicitly against `MAX_DECODED_IMAGE_BYTES` (overflow OR
+  // > 512 MiB -> ShapeMismatch) BEFORE the `try_reserve_exact` + zero-fill
+  // — `try_reserve_exact` alone cannot stop an overcommitting allocator
+  // from handing back 68 GiB that the `resize`/zero-fill then faults in.
   let inter_len = src_h
     .checked_mul(dst_w)
     .and_then(|v| v.checked_mul(CHANNELS))
     .ok_or_else(|| Error::ShapeMismatch {
       message: format!("resize_rgba8: src_h*dst_w*4 overflows usize for {src_h}x{dst_w}"),
     })?;
+  checked_buffer_bytes(
+    inter_len,
+    1,
+    &format!("horizontal-pass intermediate ({src_h}x{dst_w} RGBA8)"),
+  )?;
   let mut inter: Vec<u8> = try_with_capacity(inter_len)?;
   inter.resize(inter_len, 0u8);
 
@@ -529,6 +651,11 @@ fn clip8_div(c: u32, a: u32) -> u8 {
 
 /// Nearest-neighbor resize (pure pixel gather, PIL `Image.NEAREST`).
 /// Output index `o` maps to input `min(floor((o+0.5)*in/out), in-1)`.
+///
+/// Both the per-column x-index map (`dst_w` `usize`s) and the destination
+/// (`dst_len` bytes) are capped against [`MAX_DECODED_IMAGE_BYTES`] via
+/// [`checked_buffer_bytes`] before their `try_reserve_exact`, so this
+/// covers a direct caller as well as the dispatch from [`resize_rgba8`].
 fn resize_nearest(
   src: &[u8],
   src_w: usize,
@@ -537,12 +664,27 @@ fn resize_nearest(
   dst_h: usize,
   dst_len: usize,
 ) -> Result<Vec<u8>> {
-  // Precompute per-output-column source x indices (fallible, small).
+  // Precompute per-output-column source x indices. `dst_w` is an untrusted
+  // target dimension; cap the x-index map's byte size against the 512 MiB
+  // budget before reserving.
+  checked_buffer_bytes(
+    dst_w,
+    std::mem::size_of::<usize>(),
+    &format!("nearest x-index map ({dst_w} columns)"),
+  )?;
   let mut xmap: Vec<usize> = try_with_capacity(dst_w)?;
   for ox in 0..dst_w {
     let sx = ((ox as f64 + 0.5) * src_w as f64 / dst_w as f64).floor() as usize;
     xmap.push(sx.min(src_w - 1));
   }
+  // Cap the destination too — `resize_rgba8` already caps `dst_len` before
+  // the dispatch, but a direct caller of `resize_nearest` has no other
+  // guard.
+  checked_buffer_bytes(
+    dst_len,
+    1,
+    &format!("nearest destination ({dst_len} bytes)"),
+  )?;
   let mut dst: Vec<u8> = try_with_capacity(dst_len)?;
   dst.resize(dst_len, 0u8);
   for oy in 0..dst_h {
@@ -995,6 +1137,149 @@ mod tests {
     let big = usize::MAX / 2 + 1;
     let r = resize_rgba8(&src, 1, 1, big, big, Filter::Bilinear);
     assert!(matches!(r, Err(Error::ShapeMismatch { .. })), "got {r:?}");
+  }
+
+  #[test]
+  fn rejects_skinny_to_wide_oversized_intermediate() {
+    // Codex adversarial case: a `1x131072` source resized to `131072x1`.
+    // The RGBA source is `1*131072*4` = 512 KiB (under the 512 MiB cap)
+    // and the destination is `131072*1*4` = 512 KiB (under the cap), but
+    // the horizontal-pass intermediate is `src_h * dst_w * 4`
+    // = `131072 * 131072 * 4` ≈ 68 GiB. `checked_buffer_bytes` must
+    // reject the intermediate BEFORE any `try_reserve_exact` / zero-fill,
+    // so this returns a recoverable `Err` — no 68 GiB allocation, no
+    // overcommit zero-fill abort. (A convolution filter, not NEAREST:
+    // NEAREST has no intermediate and a `1x131072`->`131072x1` NEAREST is
+    // a legitimate small resize.)
+    let src = vec![0u8; 131072 * CHANNELS];
+    for f in [Filter::Bilinear, Filter::Bicubic, Filter::Lanczos3] {
+      let r = resize_rgba8(&src, 1, 131072, 131072, 1, f);
+      assert!(
+        matches!(r, Err(Error::ShapeMismatch { .. })),
+        "{f:?}: 1x131072->131072x1 must reject the ~68 GiB intermediate, got {r:?}"
+      );
+      // The message must name the intermediate + its byte count so the
+      // failure is diagnosable.
+      if let Err(Error::ShapeMismatch { message }) = &r {
+        assert!(
+          message.contains("intermediate"),
+          "{f:?}: error should name the intermediate buffer, got: {message}"
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn wide_to_skinny_does_not_abort() {
+    // The reverse orientation: a `131072x1` source resized to `1x131072`.
+    // Unlike skinny->wide, this orientation has NO oversized buffer — the
+    // intermediate is `src_h * dst_w * 4` = `1 * 1 * 4` = 4 bytes, the
+    // destination is `1 * 131072 * 4` = 512 KiB, and both coefficient
+    // tables are small (the `131072`-tall output axis upscales from
+    // `in_size=1`, so `ksize=1` and the table is `131072 * 4` = 512 KiB).
+    // So a correct implementation SUCCEEDS here with an exactly-sized
+    // small output — the guarantee under test is simply "no abort, no
+    // 68 GiB allocation": the asymmetry is the point (the 68 GiB scratch
+    // needs a large `src_h` AND a large `dst_w`, see
+    // `rejects_huge_intermediate_with_tiny_ends`).
+    let src = vec![0u8; 131072 * CHANNELS];
+    for f in [Filter::Bilinear, Filter::Bicubic, Filter::Lanczos3] {
+      let r = resize_rgba8(&src, 131072, 1, 1, 131072, f);
+      match r {
+        Ok(out) => assert_eq!(
+          out.len(),
+          131072 * CHANNELS,
+          "{f:?}: wide->skinny output must be exactly dst_w*dst_h*4"
+        ),
+        Err(Error::ShapeMismatch { .. }) => {}
+        Err(other) => panic!("{f:?}: unexpected error {other:?}"),
+      }
+    }
+  }
+
+  #[test]
+  fn rejects_huge_intermediate_with_tiny_ends() {
+    // The horizontal-pass intermediate is `src_h * dst_w * 4` — it blows
+    // up only when BOTH `src_h` (input height) and `dst_w` (untrusted
+    // target width) are large, which is exactly the gap the public
+    // `resize` wrapper's source/destination caps miss. A `1x131072`
+    // source (`src_h = 131072`) resized to a `131072`-WIDE, 1-tall target
+    // gives a 512 KiB source, a 512 KiB destination, and an intermediate
+    // of `131072 * 131072 * 4` ≈ 68 GiB. Use `dst_h = 1` so the
+    // destination stays tiny and ONLY the intermediate trips the cap —
+    // this proves the intermediate guard fires, not the destination
+    // guard. (Same shape as `rejects_skinny_to_wide_oversized_intermediate`
+    // but kept distinct to document the both-ends-tiny adversarial framing
+    // explicitly.)
+    let src = vec![7u8; 131072 * CHANNELS];
+    let r = resize_rgba8(&src, 1, 131072, 131072, 1, Filter::Bicubic);
+    assert!(
+      matches!(r, Err(Error::ShapeMismatch { .. })),
+      "huge intermediate with tiny source+dest must be ShapeMismatch, got {r:?}"
+    );
+  }
+
+  #[test]
+  fn rejects_oversized_coefficient_table() {
+    // Coefficient-buffer adversarial case, exercised directly through
+    // `precompute_coeffs`. The weight table is `out_size * ksize` `i32`s
+    // and the `bounds` table is `out_size` `(usize, usize)` pairs — both
+    // scale with the (untrusted) output dimension. With
+    // `out_size = 200_000_000` and `in_size = 1` the weight table is
+    // `200_000_000 * ksize(=1) * 4` = 800 MB and the `bounds` table is
+    // `200_000_000 * 16` = 3.2 GB — both far over the 512 MiB cap, so
+    // `checked_buffer_bytes` (whichever of the two is reached first)
+    // rejects with `ShapeMismatch` rather than reserving + zero-filling
+    // multiple GB.
+    // `Coeffs` is not `Debug`; match the result rather than `{:?}`-ing it.
+    let r = precompute_coeffs(1, 200_000_000, Filter::Bilinear);
+    assert!(
+      matches!(r, Err(Error::ShapeMismatch { .. })),
+      "200M-wide coefficient table must exceed the 512 MiB cap (got Ok or wrong error)"
+    );
+    // And via the full resize: a `1x4` source upscaled to a
+    // `200_000_000`-wide target must reject — recoverable, no abort. (The
+    // destination `200_000_000*1*4` = 800 MB already trips the
+    // destination cap; were it not for that, the h-axis coefficient table
+    // and the horizontal intermediate would. Every one of these guards
+    // yields `ShapeMismatch`.)
+    let src = vec![0u8; 4 * CHANNELS];
+    let r2 = resize_rgba8(&src, 1, 4, 200_000_000, 1, Filter::Bilinear);
+    assert!(
+      matches!(r2, Err(Error::ShapeMismatch { .. })),
+      "resize to a 200M-wide target must be ShapeMismatch, got {r2:?}"
+    );
+  }
+
+  #[test]
+  fn checked_buffer_bytes_caps_and_overflows() {
+    // Direct unit test of the helper. Under-cap passes and returns the
+    // byte product; over-cap and overflow both yield ShapeMismatch.
+    assert_eq!(
+      checked_buffer_bytes(1024, 4, "ok").unwrap(),
+      4096,
+      "under-cap product must pass through"
+    );
+    // Exactly at the cap (512 MiB) is allowed; one byte over is not.
+    assert_eq!(
+      checked_buffer_bytes(MAX_DECODED_IMAGE_BYTES, 1, "at-cap").unwrap(),
+      MAX_DECODED_IMAGE_BYTES,
+      "a buffer exactly at the cap must be allowed"
+    );
+    assert!(
+      matches!(
+        checked_buffer_bytes(MAX_DECODED_IMAGE_BYTES + 1, 1, "over"),
+        Err(Error::ShapeMismatch { .. })
+      ),
+      "one byte over the cap must be rejected"
+    );
+    assert!(
+      matches!(
+        checked_buffer_bytes(usize::MAX, 4, "overflow"),
+        Err(Error::ShapeMismatch { .. })
+      ),
+      "a product overflowing usize must be rejected (not wrap)"
+    );
   }
 
   #[test]
