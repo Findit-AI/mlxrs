@@ -2534,7 +2534,16 @@ pub fn integrated_loudness(data: &Array, rate: u32, block_size: f64, overlap: f6
   // `step` is in `(0, 1]` (overlap in [0, 1)) so `block_size * step > 0`;
   // the division is safe. The `round + 1` produces the count of blocks
   // whose overlap-strided start fits inside `[0, duration]`.
-  let num_blocks_f64 = ((duration_seconds - block_size) / (block_size * step)).round() + 1.0;
+  //
+  // The reference rounds with `np.round`, which is round-half-to-EVEN
+  // (banker's rounding) — so `round_ties_even` is REQUIRED here, NOT the
+  // half-away-from-zero `f64::round`. They disagree on exact `*.5`
+  // quotients: e.g. a default-parameter 0.65 s clip at 48 kHz gives
+  // quotient 2.5 → `round_ties_even` ⇒ 2 (→ 3 blocks, the reference's
+  // count), `round` ⇒ 3 (→ 4 blocks). A wrong block count shifts the
+  // absolute/relative gates and the final LUFS for non-stationary audio.
+  let num_blocks_f64 =
+    ((duration_seconds - block_size) / (block_size * step)).round_ties_even() + 1.0;
   if !num_blocks_f64.is_finite() || num_blocks_f64 < 1.0 {
     return Err(Error::Backend {
       message: format!(
@@ -3985,6 +3994,64 @@ mod tests {
       (delta - 3.0103).abs() < 0.05,
       "duplicating a mono signal to stereo (same content, gains [1, 1]) \
        should add ~3 LU (got delta {delta} = {lufs_stereo} - {lufs_mono})"
+    );
+  }
+
+  /// Regression: the BS.1770 block count must use round-half-to-EVEN
+  /// (`np.round` parity), NOT half-away-from-zero `f64::round`. They
+  /// disagree on exact `*.5` quotients.
+  ///
+  /// With the default parameters (`block_size = 0.4 s`, `overlap = 0.75`,
+  /// so `step = 0.25`), a `0.65 s` clip at `48 kHz` (= `31200` samples)
+  /// gives a block-count quotient of exactly
+  ///   `(0.65 - 0.4) / (0.4 * 0.25) = 0.25 / 0.1 = 2.5`,
+  /// so `num_blocks = round(2.5) + 1`:
+  ///   - `round_ties_even(2.5) = 2` ⇒ **3 blocks** (the reference's count)
+  ///   - `f64::round(2.5)      = 3` ⇒ **4 blocks** (a parity bug)
+  ///
+  /// The block start/stride is `lower = floor(block_index * step *
+  /// block_size * rate)`, `upper = floor((block_index * step + 1) *
+  /// block_size * rate)`, so the four candidate blocks cover
+  ///   block 0 = `[0, 19200)`, block 1 = `[4800, 24000)`,
+  ///   block 2 = `[9600, 28800)`, block 3 = `[14400, 31200)`.
+  /// Crucially, samples `[28800, 31200)` (the last `0.05 s`) fall ONLY in
+  /// block 3. This test builds a signal that is pure silence everywhere
+  /// EXCEPT that tail, which carries a loud 1 kHz sine. A correct 3-block
+  /// analysis then sees only silent blocks — every block is below the
+  /// `-70 LUFS` absolute gate, so the integrated LUFS is `-inf`
+  /// (`10 * log10(0)`). A buggy 4-block analysis additionally measures
+  /// block 3, which is loud, yielding a finite integrated LUFS well above
+  /// `-70`. Asserting `-inf` therefore pins the block count at 3 and fails
+  /// loudly if the rounding ever regresses to `f64::round`.
+  #[test]
+  fn integrated_loudness_block_count_uses_round_ties_even() {
+    let rate = 48_000u32;
+    // 0.65 s @ 48 kHz = exactly 31200 samples (0.65 * 48000 is exact in
+    // f64); quotient is exactly 2.5 — the tie that round vs round_ties_even
+    // disagree on.
+    let n = 31_200usize;
+    debug_assert_eq!(n, (0.65_f64 * f64::from(rate)) as usize);
+    // Pure silence except the final 0.05 s ([28800, 31200)) — that span is
+    // covered ONLY by the would-be 4th block (block index 3).
+    let loud_start = 28_800usize;
+    let mut buf: Vec<f32> = vec![0.0_f32; n];
+    let two_pi_freq = 2.0 * std::f64::consts::PI * 1000.0;
+    let rate_f64 = f64::from(rate);
+    for (i, s) in buf.iter_mut().enumerate().skip(loud_start) {
+      let t = i as f64 / rate_f64;
+      *s = 0.5_f32 * (two_pi_freq * t).sin() as f32;
+    }
+    let x = Array::from_slice::<f32>(&buf, &[n as i32]).unwrap();
+
+    let lufs = integrated_loudness(&x, rate, 0.4, 0.75).unwrap();
+    // 3 blocks (tie-to-even): every block is silent → -inf.
+    // 4 blocks (half-away-from-zero, the bug): block 3 is loud → finite.
+    assert!(
+      lufs == f64::NEG_INFINITY,
+      "0.65 s clip @ 48 kHz must yield 3 blocks (round-ties-even); a silent \
+       signal with a loud tail only in the would-be 4th block must return \
+       -inf LUFS. Got {lufs} — a finite value means the block count \
+       regressed to 4 (f64::round instead of round_ties_even)"
     );
   }
 
