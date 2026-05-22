@@ -570,43 +570,50 @@ fn strided_frames_no_snip_edges(
   // (`frame_work` / `out_elems` / `output_elems`) bound the *framed* matrix
   // `num_frames * n_fft_padded`, NOT this intermediate reflected buffer: a
   // `(samples_len = MAX_FBANK_WORK, win_len = 2, win_inc = 4)` input gives a
-  // tiny `num_frames` (so the framing caps pass), yet the `pad <= 0` branch
-  // below concatenates `wf[|pad| ..]` (`n - |pad|` samples) + `reverse(wf)`
-  // (`n` samples) ≈ `2 * MAX_FBANK_WORK` elements — defeating the 64 Mi
-  // budget by ~2×. Compute the exact `padded` length each branch will build
-  // and reject (recoverable `Error`) when it exceeds the cap, BEFORE any
-  // slice/reverse/concatenate alloc — consistent with the other fbank caps.
-  //   - `pad > 0`:  `pad_left` (`pad`) ++ `waveform` (`n`) ++ `pad_right`
-  //     (`pad` when `pad > 1`, else `n - 1`) ⇒ `n + 2*pad` (pad>1) or `2n`
-  //     (pad==1). `n + 2*pad` is the conservative upper bound for both.
-  //   - `pad <= 0`: `head` (`n - |pad|`) ++ `reverse(wf)` (`n`) ⇒ `2n - |pad|`,
-  //     bounded above by `2n`.
-  let reflected_len = if pad_i64 > 0 {
-    let pad = pad_i64 as usize;
-    pad
-      .checked_mul(2)
-      .and_then(|two_pad| two_pad.checked_add(n))
-      .ok_or_else(|| Error::Backend {
+  // tiny `num_frames` (so the framing caps pass), yet the branches below
+  // concatenate ≈ `2 * MAX_FBANK_WORK` elements — defeating the 64 Mi budget
+  // by ~2×. The reflected length is NOT a single uniform formula: each of the
+  // three branches concatenates DIFFERENT segment lengths —
+  //   - `pad > 1`:  `pad_left` (`pad`) ++ `waveform` (`n`) ++ `pad_right`
+  //     (`pad`)              ⇒ `n + 2*pad`
+  //   - `pad == 1`: `pad_left` (`1`) ++ `waveform` (`n`) ++ `pad_right`
+  //     (`n - 1`, the reference's over-long inert tail) ⇒ `2*n`
+  //   - `pad <= 0`: `head` (`n - |pad|`) ++ `reverse(wf)` (`n`)
+  //                                        ⇒ `2*n - |pad|`
+  // so a uniform `n + 2*pad` would UNDERCOUNT the `pad == 1` branch by ~`n`
+  // (it builds `2*n`, not `n + 2`) and let an adversarial 64 Mi `pad == 1`
+  // input slip a ~128 Mi `concatenate` through. The cap is therefore computed
+  // INSIDE each branch from the exact `pad_left`/`pad_right` segment lengths
+  // that branch will concatenate (`reflected_len_checked`), so the capped
+  // length and the built length cannot diverge — and the rejection still
+  // happens BEFORE any slice/reverse/concatenate alloc.
+
+  /// Sum the concatenated segment lengths, `checked_mul` against the f32
+  /// element budget, and reject (recoverable `Error`) when the reflected
+  /// buffer would exceed [`MAX_FBANK_WORK`]. Called with the *actual* segment
+  /// lengths each branch concatenates, so the cap matches the built buffer.
+  fn cap_reflected_len(seg_lens: &[usize], n: usize, pad: i64) -> Result<()> {
+    let mut reflected_len: usize = 0;
+    for &seg in seg_lens {
+      reflected_len = reflected_len
+        .checked_add(seg)
+        .ok_or_else(|| Error::Backend {
+          message: format!(
+            "strided_frames_no_snip_edges: reflect-padded length overflows usize \
+             (n={n}, pad={pad})"
+          ),
+        })?;
+    }
+    if reflected_len > MAX_FBANK_WORK {
+      return Err(Error::Backend {
         message: format!(
-          "strided_frames_no_snip_edges: reflect-padded length n + 2*pad overflows usize \
-           (n={n}, pad={pad})"
+          "strided_frames_no_snip_edges: reflect-padded buffer length {reflected_len} \
+           (waveform len={n}, pad={pad}) exceeds the {MAX_FBANK_WORK} work cap; the \
+           snip_edges=false reflect bookends would more than double the waveform's memory"
         ),
-      })?
-  } else {
-    n.checked_mul(2).ok_or_else(|| Error::Backend {
-      message: format!(
-        "strided_frames_no_snip_edges: reflect-padded length 2*n overflows usize (n={n})"
-      ),
-    })?
-  };
-  if reflected_len > MAX_FBANK_WORK {
-    return Err(Error::Backend {
-      message: format!(
-        "strided_frames_no_snip_edges: reflect-padded buffer length {reflected_len} \
-         (waveform len={n}, pad={pad_i64}) exceeds the {MAX_FBANK_WORK} work cap; the \
-         snip_edges=false reflect bookends would more than double the waveform's memory"
-      ),
-    });
+      });
+    }
+    Ok(())
   }
 
   // Build the reflect-padded waveform exactly as the reference does.
@@ -628,22 +635,31 @@ fn strided_frames_no_snip_edges(
       message: format!("strided_frames_no_snip_edges: pad {pad} exceeds i32::MAX"),
     })?;
     // pad_left = reverse(wf[1 .. pad+1]) — the reference's `waveform[1:pad+1][::-1]`,
-    // an edge-EXCLUSIVE type-1 reflect on the left (excludes wf[0]).
-    let left_seg = ops::indexing::slice(waveform, &[1_i32], &[pad_i32 + 1], &[1_i32])?;
-    let pad_left = reverse_1d(&left_seg)?;
+    // an edge-EXCLUSIVE type-1 reflect on the left (excludes wf[0]). Length `pad`.
+    let left_lo = 1_i32;
+    let left_hi = pad_i32 + 1;
+    let left_len = (left_hi - left_lo) as usize; // == pad
     // pad_right (note the asymmetry vs the left — this is the reference's exact
     // behavior, NOT a symmetric reflect):
     //  - pad > 1: `waveform[-1:-pad-1:-1]` = indices n-1, n-2, …, n-pad =
-    //    reverse(wf[n-pad .. n]) — edge-INCLUSIVE (includes wf[n-1]).
+    //    reverse(wf[n-pad .. n]) — edge-INCLUSIVE (includes wf[n-1]). Length `pad`.
     //  - pad == 1: `waveform[-1:0:-1]` = reverse(wf[1 .. n]) (n-1 samples; only
     //    the first is read by the strided view, so the over-long tail is inert).
-    let pad_right = if pad > 1 {
-      let right_seg = ops::indexing::slice(waveform, &[n_i32 - pad_i32], &[n_i32], &[1_i32])?;
-      reverse_1d(&right_seg)?
+    //    Length `n - 1` — so the `pad == 1` buffer is `1 + n + (n-1)` = `2*n`,
+    //    NOT `n + 2`; the cap is computed from these exact slice bounds.
+    let (right_lo, right_hi) = if pad > 1 {
+      (n_i32 - pad_i32, n_i32)
     } else {
-      let right_seg = ops::indexing::slice(waveform, &[1_i32], &[n_i32], &[1_i32])?;
-      reverse_1d(&right_seg)?
+      (1_i32, n_i32)
     };
+    let right_len = (right_hi - right_lo) as usize; // pad (pad>1) or n-1 (pad==1)
+    // Cap from the EXACT segment lengths this branch concatenates, before any
+    // slice/reverse/concatenate materializes the buffer.
+    cap_reflected_len(&[left_len, n, right_len], n, pad_i64)?;
+    let left_seg = ops::indexing::slice(waveform, &[left_lo], &[left_hi], &[1_i32])?;
+    let pad_left = reverse_1d(&left_seg)?;
+    let right_seg = ops::indexing::slice(waveform, &[right_lo], &[right_hi], &[1_i32])?;
+    let pad_right = reverse_1d(&right_seg)?;
     ops::shape::concatenate(&[&pad_left, waveform, &pad_right], 0)?
   } else {
     // pad <= 0: padded = concat(wf[|pad| ..], reverse(wf)).
@@ -662,6 +678,10 @@ fn strided_frames_no_snip_edges(
     let abs_pad_i32 = i32::try_from(abs_pad).map_err(|_| Error::Backend {
       message: format!("strided_frames_no_snip_edges: |pad| {abs_pad} exceeds i32::MAX"),
     })?;
+    // head = wf[|pad| .. n] (length `n - |pad|`); rev = reverse(wf) (length `n`)
+    // ⇒ reflected = `2*n - |pad|`. Cap from these exact lengths.
+    let head_len = n - abs_pad;
+    cap_reflected_len(&[head_len, n], n, pad_i64)?;
     let head = ops::indexing::slice(waveform, &[abs_pad_i32], &[n_i32], &[1_i32])?;
     let rev = reverse_1d(waveform)?;
     ops::shape::concatenate(&[&head, &rev], 0)?
@@ -2503,6 +2523,57 @@ mod tests {
     );
   }
 
+  /// Codex review (round 3): the same reflect-buffer cap, but for the
+  /// `pad == 1` branch — the regression the round-2 fix missed. That branch
+  /// concatenates `pad_left` (`1`) ++ `waveform` (`n`) ++ `pad_right`
+  /// (`reverse(wf[1..n])`, length `n - 1`) = `2*n`, NOT the `n + 2` a uniform
+  /// `n + 2*pad` estimate gives. So a `pad == 1` input whose `n + 2` is within
+  /// `MAX_FBANK_WORK` but whose true `2*n` exceeds it slipped a ~128 Mi
+  /// `concatenate` through. The Codex example: `win_len = 1_048_576`,
+  /// `win_inc = 1_048_574` ⇒ `pad = 524288 - 524287 = 1`; `n = MAX_FBANK_WORK
+  /// - 2` ⇒ `n + 2 == 64 Mi` (an `n + 2*pad` estimate would PASS) yet
+  /// `2*n ≈ 128 Mi > 64 Mi`. The per-branch `2*n` cap MUST reject it.
+  #[test]
+  fn compute_fbank_kaldi_snip_edges_false_reflect_buffer_cap_rejects_pad_one_undercount() {
+    // Framing caps for `win_len = 1_048_576` (n_fft_padded = 2^20), `win_inc =
+    // 1_048_574`, `n = 64Mi - 2`:
+    //   num_frames  = (64Mi - 2 + 1_048_574/2) / 1_048_574 = 64
+    //   frame_work  = 64 * 1_048_576 = 64 Mi  <= 64 Mi cap   (ok, at-cap)
+    //   out_elems   = 64 * (2^20/2 + 1)        <= cap         (ok)
+    //   output_elems= 64 * 4 = 256             <= cap         (ok)
+    //   mel_padded  = 4 * (2^20/2 + 1)          <= cap         (ok)
+    // Only the per-branch reflect-buffer cap (pad==1 builds `2*n` ≈ 128 Mi)
+    // can stop it. `Array::zeros` is lazy; `contiguous` is a no-op refcount
+    // bump on the already-row-contiguous zeros, so the cap rejects before any
+    // host buffer or `concatenate` materializes.
+    let samples_len = MAX_FBANK_WORK - 2; // n + 2 == MAX_FBANK_WORK
+    let len_i32 = i32::try_from(samples_len).unwrap();
+    let x = Array::zeros::<f32>(&[len_i32]).unwrap();
+    let err = compute_fbank_kaldi(
+      &x,
+      16_000,
+      1_048_576, // win_len  → n_fft_padded = 2^20, pad = 524288 - 524287 = 1
+      1_048_574, // win_inc  → pad == 1 (the undercounted branch)
+      4,         // num_mels = 4
+      KaldiWindow::Rectangular,
+      0.0,
+      0.0,
+      false, // snip_edges = false → reflect-bookend framing
+      0.0,
+      0.0,
+      None,
+    )
+    .expect_err(
+      "expected the per-branch reflect-buffer cap to reject a pad==1 waveform \
+       whose true 2*n reflected buffer exceeds the cap (n + 2 is within it)",
+    );
+    let msg = format!("{err:?}");
+    assert!(
+      msg.contains("reflect-padded buffer length") && msg.contains("work cap"),
+      "expected error to mention the reflect-padded buffer cap, got: {msg}"
+    );
+  }
+
   /// Same reflect-buffer cap exercised directly on the module-private
   /// `strided_frames_no_snip_edges` (the `pad <= 0` branch). A 64 Mi waveform
   /// with `win_size = 2`, `win_inc = 4` (→ `pad = -1`) would concatenate
@@ -2537,6 +2608,71 @@ mod tests {
       ok.shape(),
       vec![5, 4],
       "normal snip_edges=false framing still works"
+    );
+  }
+
+  /// Codex review (round 3): the `pad == 1` branch concatenates `pad_left`
+  /// (`1`) ++ `waveform` (`n`) ++ `pad_right` (`n - 1`, the reference's
+  /// over-long inert reflect tail) = `2*n` — NOT the `n + 2` a uniform
+  /// `n + 2*pad` estimate would give. So a `pad == 1` waveform whose `n + 2`
+  /// sits at/under `MAX_FBANK_WORK` but whose true `2*n` exceeds it must STILL
+  /// be rejected before the `concatenate` materializes the ~128 Mi buffer.
+  /// `win_size = 4`, `win_inc = 2` ⇒ `pad = 4/2 - 2/2 = 1` (the `pad == 1`
+  /// branch). With `n = MAX_FBANK_WORK - 2`, `n + 2 == MAX_FBANK_WORK` (an
+  /// `n + 2*pad` estimate would PASS) yet `2*n ≈ 128 Mi > 64 Mi` (the true
+  /// built length) — only a per-branch `2*n` cap stops it.
+  #[test]
+  fn strided_no_snip_edges_pad_one_rejects_undercounted_reflect_buffer() {
+    // `Array::zeros` is lazy — no host buffer is materialized; the per-branch
+    // element-count cap engages on the shape alone before any concatenate.
+    let n = MAX_FBANK_WORK - 2; // n + 2 == MAX_FBANK_WORK (uniform estimate passes)
+    assert!(
+      n + 2 <= MAX_FBANK_WORK,
+      "the bug's `n + 2*pad` estimate must be within the cap"
+    );
+    assert!(
+      n.checked_mul(2).unwrap() > MAX_FBANK_WORK,
+      "the actual `2*n` pad==1 reflected buffer must exceed the cap"
+    );
+    let n_i32 = i32::try_from(n).unwrap();
+    let huge = Array::zeros::<f32>(&[n_i32]).unwrap();
+    // num_frames is irrelevant to the cap (checked before the strided-read
+    // bound); use the centered count `(n + win_inc/2) / win_inc`.
+    let num_frames = (n + 2 / 2) / 2;
+    let err = strided_frames_no_snip_edges(&huge, 4, 2, num_frames).expect_err(
+      "expected the per-branch cap to reject a pad==1 waveform whose true 2*n \
+       reflected buffer exceeds the cap (even though n + 2 is within it)",
+    );
+    let msg = format!("{err:?}");
+    assert!(
+      msg.contains("reflect-padded buffer length") && msg.contains("work cap"),
+      "expected a reflect-padded buffer cap error, got: {msg}"
+    );
+  }
+
+  /// A normal small `snip_edges=false` `pad == 1` input still frames correctly
+  /// after the per-branch cap restructure (the `pad == 1` right bookend is the
+  /// reference's over-long `reverse(wf[1..n])` tail, of which only the first
+  /// sample is read by the strided view). waveform = [0..7], win_size=4,
+  /// win_inc=2 ⇒ pad = 1, m = (8 + 1)/2 = 4. Reference padded read region:
+  ///   [1, 0,1,2,3,4,5,6,7, 7,...]  frames: [1,0,1,2] [1,2,3,4] [3,4,5,6] [5,6,7,7]
+  #[test]
+  fn strided_no_snip_edges_pad_one_small_input_correct_frames() {
+    let wf: Vec<f32> = (0..8).map(|v| v as f32).collect();
+    let x = Array::from_slice::<f32>(&wf, &[8]).unwrap();
+    let m = (8 + 2 / 2) / 2; // 4
+    let frames = strided_frames_no_snip_edges(&x, 4, 2, m).unwrap();
+    assert_eq!(frames.shape(), vec![4, 4]);
+    let got = to_vec_2d(&frames, 4, 4);
+    let want = [
+      [1.0_f32, 0.0, 1.0, 2.0],
+      [1.0, 2.0, 3.0, 4.0],
+      [3.0, 4.0, 5.0, 6.0],
+      [5.0, 6.0, 7.0, 7.0],
+    ];
+    assert_eq!(
+      got, want,
+      "pad==1 small-input snip_edges=false frames mismatch"
     );
   }
 
