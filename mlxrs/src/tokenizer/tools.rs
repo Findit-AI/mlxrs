@@ -86,6 +86,22 @@ pub trait ToolParser: Send + Sync {
   fn tool_call_end(&self) -> &'static str {
     marker_end(self.name())
   }
+
+  /// Whether a *tagged* call's payload (the text between `tool_call_start` and
+  /// `tool_call_end`) is exactly one top-level JSON object.
+  ///
+  /// Default `false`. When `true`, the streaming [`ToolCallProcessor`] locates
+  /// the end tag with a JSON-string-aware balanced-object scan rather than a
+  /// naive substring search, so an end-delimiter that occurs *inside* a JSON
+  /// string argument value (e.g. `{"s":"</tool_call>"}`) is not mistaken for
+  /// the real closing tag and the call is not corrupted (Codex round-2
+  /// finding 2). Only formats whose payload is unambiguously a single JSON
+  /// object may opt in; structured/XML payloads (`qwen3_coder`, `glm47`,
+  /// `longcat`, `minimax_m2`, `kimi_k2`, the `gemma` family, `pythonic`) keep
+  /// the simple substring detection.
+  fn tagged_payload_is_json(&self) -> bool {
+    false
+  }
 }
 
 fn err(msg: impl Into<String>) -> Error {
@@ -199,6 +215,11 @@ impl ToolParser for JsonTools {
   }
   fn name(&self) -> &'static str {
     "json_tools"
+  }
+  /// `json_tools`' tagged payload is exactly `{json}`, so the end tag is
+  /// located with the JSON-aware balanced-object scan.
+  fn tagged_payload_is_json(&self) -> bool {
+    true
   }
 }
 
@@ -1601,8 +1622,13 @@ impl ToolCallProcessor {
       if self.state == State::PotentialToolCall {
         if partial_match(&self.tool_call_buffer, start_tag) {
           if self.tool_call_buffer.starts_with(start_tag) {
-            // Confirmed start tag — fall through to collecting.
+            // Confirmed start tag — fall through to collecting. The text that
+            // preceded the tag is now unambiguously display text, so emit it
+            // in stream order *before* the call (Codex round-2 finding 1):
+            // it must surface whether or not the end tag has streamed yet,
+            // and identically to splitting the stream right before the tag.
             self.state = State::CollectingToolCall;
+            push_display(&mut display, &leading_token.take().unwrap_or_default());
           } else {
             // Still an ambiguous start-tag prefix. `partial_match` only holds
             // here while the buffer is a *strict* prefix of `start_tag`, so it
@@ -1632,9 +1658,25 @@ impl ToolCallProcessor {
         return display;
       }
 
-      if self.tool_call_buffer.contains(end_tag) {
-        // Split off the trailing token after the end tag.
-        let trailing_token = separate_token_str(&mut self.tool_call_buffer, end_tag, false);
+      // Locate the *real* end tag. For JSON-payload formats (`json_tools`) an
+      // end delimiter inside a JSON string argument value must not be mistaken
+      // for the close (Codex round-2 finding 2); `find_tagged_end_tag` uses a
+      // JSON-string-aware scan there and the plain substring search otherwise.
+      let end_at = find_tagged_end_tag(
+        &self.tool_call_buffer,
+        start_tag,
+        end_tag,
+        self.parser.tagged_payload_is_json(),
+      );
+
+      if let Some(end_at) = end_at {
+        // Split the buffer at the confirmed end-tag offset: everything after
+        // the end tag becomes the trailing token (Swift `separateToken` with
+        // `returnLeading: false`), and the buffer keeps up to and including
+        // the end tag for parsing.
+        let after = end_at + end_tag.len();
+        let trailing_token = self.tool_call_buffer[after..].to_owned();
+        self.tool_call_buffer.truncate(after);
 
         self.try_parse_buffer();
 
@@ -1643,16 +1685,12 @@ impl ToolCallProcessor {
 
         // If the trailing token holds the start char there may be more calls
         // — loop on it instead of recursing.
-        match trailing_token {
-          Some(tok) if tok.contains(start_char) => {
-            chunk = std::borrow::Cow::Owned(tok);
-            // Re-enter the loop with the trailing suffix as the next chunk.
-          }
-          Some(tok) if !tok.is_empty() => {
-            push_display(&mut display, &tok);
-            return display;
-          }
-          _ => return display,
+        if trailing_token.contains(start_char) {
+          chunk = std::borrow::Cow::Owned(trailing_token);
+          // Re-enter the loop with the trailing suffix as the next chunk.
+        } else {
+          push_display(&mut display, &trailing_token);
+          return display;
         }
       } else {
         // End tag not yet seen — confirmed tool call still collecting. Cap the
@@ -1731,6 +1769,54 @@ fn balanced_json_object_prefix(text: &str) -> Option<(usize, usize)> {
   None
 }
 
+/// Locate the byte offset of the *real* `end_tag` in a buffered **tagged**
+/// tool call, accounting for the end delimiter possibly occurring inside the
+/// payload (Codex round-2 finding 2).
+///
+/// Two regimes, selected by `payload_is_json`:
+///
+/// - **Non-JSON payloads** (`payload_is_json == false`): the payload cannot be
+///   reasoned about structurally, so the end tag is the first substring match
+///   — identical to the previous `contains` / `find` behaviour.
+/// - **JSON payloads** (`payload_is_json == true`, e.g. `json_tools`): the
+///   payload between `start_tag` and the end tag is exactly one JSON object.
+///   A naive search would stop at an `end_tag` that is merely a character
+///   sequence *inside a JSON string value* (`{"s":"</tool_call>"}`), cutting
+///   the object in half. Instead the JSON-string-aware
+///   [`balanced_json_object_prefix`] scanner finds where the object actually
+///   closes, and the end tag is the first match **after** that close. While
+///   the object is still open (`balanced_json_object_prefix` → `None`) no end
+///   tag is accepted — any match so far is inside the unfinished object — so
+///   the caller keeps buffering until the object completes.
+///
+/// Returns the offset (into `buffer`) at which `end_tag` begins, or `None`
+/// when no end tag has been confirmed yet (keep collecting). `end_tag` is
+/// assumed non-empty (callers handle the empty-end-tag formats separately).
+fn find_tagged_end_tag(
+  buffer: &str,
+  start_tag: &str,
+  end_tag: &str,
+  payload_is_json: bool,
+) -> Option<usize> {
+  if !payload_is_json {
+    return buffer.find(end_tag);
+  }
+  // The buffer of a confirmed tagged call starts with `start_tag`; the JSON
+  // object is whatever follows it. If (defensively) it does not, fall back to
+  // the naive search rather than mis-slicing.
+  let payload_at = match buffer.find(start_tag) {
+    Some(idx) => idx + start_tag.len(),
+    None => return buffer.find(end_tag),
+  };
+  let payload = &buffer[payload_at..];
+  // `balanced_json_object_prefix` is JSON-string aware: an `end_tag` inside a
+  // `"..."` value is *within* `obj_end`, so the post-object search skips it.
+  let (_, obj_end) = balanced_json_object_prefix(payload)?;
+  // The end tag is the first occurrence strictly after the JSON object.
+  let rel = payload[obj_end..].find(end_tag)?;
+  Some(payload_at + obj_end + rel)
+}
+
 /// Split `buffer` on the first occurrence of the `char` `separator`, mirroring
 /// Swift `separateToken(returnLeading:)`.
 ///
@@ -1746,26 +1832,6 @@ fn separate_token(buffer: &mut String, separator: char, return_leading: bool) ->
     Some(token)
   } else {
     let after = idx + separator.len_utf8();
-    let token = buffer[after..].to_owned();
-    buffer.truncate(after);
-    Some(token)
-  }
-}
-
-/// String-separator variant of [`separate_token`] (Swift `separateToken` with
-/// a multi-character separator), used for end tags.
-fn separate_token_str(
-  buffer: &mut String,
-  separator: &str,
-  return_leading: bool,
-) -> Option<String> {
-  let idx = buffer.find(separator)?;
-  if return_leading {
-    let token = buffer[..idx].to_owned();
-    buffer.replace_range(..idx, "");
-    Some(token)
-  } else {
-    let after = idx + separator.len();
     let token = buffer[after..].to_owned();
     buffer.truncate(after);
     Some(token)
@@ -1858,9 +1924,11 @@ mod tests {
   #[test]
   fn streaming_leading_text_then_tool_call() {
     let mut p = ToolCallProcessor::new(Box::new(JsonTools), None);
-    // Leading prose in the same chunk as the start tag is returned for display.
+    // Leading prose in the same chunk as the start tag is display text and is
+    // emitted as soon as the start tag is confirmed (Codex round-2 finding 1)
+    // — it must not be silently dropped because the call completes later.
     let out = p.process_chunk(r#"Let me check. <tool_call>{"name": "ls", "arguments": {}}"#);
-    assert_eq!(out, None); // tag-bearing chunk buffers; leading text not yet flushed
+    assert_eq!(out.as_deref(), Some("Let me check. "));
     assert_eq!(p.process_chunk("</tool_call>"), None);
     assert_eq!(p.tool_calls.len(), 1);
     assert_eq!(p.tool_calls[0].name, "ls");
@@ -2195,6 +2263,169 @@ mod tests {
     }
   }
 
+  // --- adversarial: Codex round-2 findings 1-2 -----------------------------
+
+  /// Feed `full` to a fresh `json_tools` processor in the given `chunks`,
+  /// returning the concatenated display text and the extracted tool calls.
+  /// A `None` from `process_chunk` contributes nothing to the display string.
+  fn run_tagged_stream(chunks: &[&str]) -> (String, Vec<ToolCall>) {
+    let mut p = ToolCallProcessor::new(Box::new(JsonTools), None);
+    let mut display = String::new();
+    for c in chunks {
+      if let Some(d) = p.process_chunk(c) {
+        display.push_str(&d);
+      }
+    }
+    p.process_eos();
+    (display, p.tool_calls)
+  }
+
+  #[test]
+  fn streaming_tagged_leading_text_is_boundary_equivalent() {
+    // Codex round-2 finding 1: display text before a *real* start tag must be
+    // emitted, and the stream's output must be identical regardless of where
+    // chunk boundaries fall. Whole-chunk vs split-immediately-before-the-tag
+    // must yield the same display text and the same tool calls.
+    let whole = r#"Let me check. <tool_call>{"name":"ls","arguments":{}}</tool_call>"#;
+    let (d_whole, calls_whole) = run_tagged_stream(&[whole]);
+    let (d_split, calls_split) = run_tagged_stream(&[
+      "Let me check. ",
+      r#"<tool_call>{"name":"ls","arguments":{}}</tool_call>"#,
+    ]);
+    // The leading prose is never dropped...
+    assert_eq!(d_whole, "Let me check. ");
+    // ...and is identical no matter the boundary.
+    assert_eq!(d_whole, d_split);
+    assert_eq!(calls_whole.len(), 1);
+    assert_eq!(calls_split.len(), 1);
+    assert_eq!(calls_whole[0].name, "ls");
+    assert_eq!(calls_split[0].name, "ls");
+    // A boundary in the *middle* of the leading text is equivalent too.
+    let (d_mid, calls_mid) = run_tagged_stream(&[
+      "Let me ",
+      r#"check. <tool_call>{"name":"ls","arguments":{}}</tool_call>"#,
+    ]);
+    assert_eq!(d_mid, "Let me check. ");
+    assert_eq!(calls_mid.len(), 1);
+  }
+
+  #[test]
+  fn streaming_tagged_display_text_between_two_calls() {
+    // Codex round-2 finding 1 (continued): display text *between* two
+    // back-to-back tagged calls must also be emitted, both when the whole
+    // stream arrives in one chunk and when it is split. The trailing-suffix
+    // loop re-enters `Normal` on the second start tag, so the inter-call text
+    // is leading text for the second call and must surface.
+    let whole = concat!(
+      r#"<tool_call>{"name":"a","arguments":{}}</tool_call>"#,
+      " and then ",
+      r#"<tool_call>{"name":"b","arguments":{}}</tool_call>"#,
+    );
+    let (d_whole, calls_whole) = run_tagged_stream(&[whole]);
+    assert_eq!(d_whole, " and then ");
+    assert_eq!(calls_whole.len(), 2);
+    assert_eq!(calls_whole[0].name, "a");
+    assert_eq!(calls_whole[1].name, "b");
+    // Same stream, split at every gap — identical output.
+    let (d_split, calls_split) = run_tagged_stream(&[
+      r#"<tool_call>{"name":"a","arguments":{}}</tool_call>"#,
+      " and then ",
+      r#"<tool_call>{"name":"b","arguments":{}}</tool_call>"#,
+    ]);
+    assert_eq!(d_split, " and then ");
+    assert_eq!(calls_split.len(), 2);
+    assert_eq!(calls_split[1].name, "b");
+  }
+
+  #[test]
+  fn streaming_tagged_end_delimiter_inside_json_string_value() {
+    // Codex round-2 finding 2: a `json_tools` tagged call whose argument
+    // *string value* contains the literal end delimiter `</tool_call>`. A
+    // naive `contains` / first-match split would cut the JSON object at the
+    // delimiter inside the string, fail to parse, and discard the call (the
+    // tail leaking as display text). The JSON-string-aware end-tag scan must
+    // find the *real* close after the balanced object, extracting the call
+    // intact with the delimiter preserved inside the string.
+    let mut p = ToolCallProcessor::new(Box::new(JsonTools), None);
+    let out =
+      p.process_chunk(r#"<tool_call>{"name":"echo","arguments":{"s":"</tool_call>"}}</tool_call>"#);
+    assert_eq!(out, None, "no suffix may leak as display text");
+    assert_eq!(p.tool_calls.len(), 1, "the call must not be discarded");
+    assert_eq!(p.tool_calls[0].name, "echo");
+    assert_eq!(
+      p.tool_calls[0].arguments,
+      serde_json::json!({"s": "</tool_call>"}),
+      "the delimiter inside the string argument is preserved verbatim"
+    );
+  }
+
+  #[test]
+  fn streaming_tagged_end_delimiter_in_string_split_across_chunks() {
+    // Finding 2 (continued): the same payload, but the chunk boundary lands
+    // *inside* the string value that contains the delimiter. The premature
+    // `</tool_call>` inside the still-open object must not end collection;
+    // only the real end tag after the balanced object completes the call.
+    let mut p = ToolCallProcessor::new(Box::new(JsonTools), None);
+    assert_eq!(
+      p.process_chunk(r#"<tool_call>{"name":"echo","arguments":{"s":"<"#),
+      None
+    );
+    assert_eq!(p.tool_calls.len(), 0);
+    assert_eq!(p.process_chunk(r#"/tool_call>"}}</tool_call>"#), None);
+    assert_eq!(p.tool_calls.len(), 1);
+    assert_eq!(p.tool_calls[0].name, "echo");
+    assert_eq!(
+      p.tool_calls[0].arguments,
+      serde_json::json!({"s": "</tool_call>"})
+    );
+  }
+
+  #[test]
+  fn streaming_tagged_end_delimiter_in_string_then_trailing_text() {
+    // Finding 2 (continued): a delimiter-bearing call followed by genuine
+    // display text. The real end tag is located after the balanced object, so
+    // the trailing text — and only the trailing text — is emitted.
+    let mut p = ToolCallProcessor::new(Box::new(JsonTools), None);
+    let out = p.process_chunk(
+      r#"<tool_call>{"name":"echo","arguments":{"s":"</tool_call>"}}</tool_call> done"#,
+    );
+    assert_eq!(out.as_deref(), Some(" done"));
+    assert_eq!(p.tool_calls.len(), 1);
+    assert_eq!(p.tool_calls[0].name, "echo");
+    assert_eq!(
+      p.tool_calls[0].arguments,
+      serde_json::json!({"s": "</tool_call>"})
+    );
+  }
+
+  #[test]
+  fn find_tagged_end_tag_json_vs_plain() {
+    // JSON-payload mode: an end tag inside a string value is skipped; the
+    // first end tag after the balanced object is the real one.
+    let buf = r#"<tool_call>{"s":"</tool_call>"}</tool_call>"#;
+    let pos = find_tagged_end_tag(buf, "<tool_call>", "</tool_call>", true)
+      .expect("real end tag after the balanced object");
+    assert_eq!(&buf[..pos], r#"<tool_call>{"s":"</tool_call>"}"#);
+    assert_eq!(&buf[pos..], "</tool_call>");
+    // Plain (non-JSON) mode finds the *first* occurrence — the in-string one.
+    let plain = find_tagged_end_tag(buf, "<tool_call>", "</tool_call>", false)
+      .expect("first substring match");
+    assert!(
+      plain < pos,
+      "plain detection stops at the in-string delimiter"
+    );
+    // JSON mode while the object is still open: no end tag is accepted.
+    assert_eq!(
+      find_tagged_end_tag(
+        r#"<tool_call>{"s":"</tool_call>"#,
+        "<tool_call>",
+        "</tool_call>",
+        true,
+      ),
+      None
+    );
+  }
+
   // --- helper unit coverage ------------------------------------------------
 
   #[test]
@@ -2263,15 +2494,19 @@ mod tests {
 
   #[test]
   fn separate_token_leading_and_trailing() {
+    // `return_leading == true`: text *before* the separator, buffer keeps the
+    // separator onward.
     let mut buf = String::from("abc<tool_call>def");
     let leading = separate_token(&mut buf, '<', true);
     assert_eq!(leading.as_deref(), Some("abc"));
     assert_eq!(buf, "<tool_call>def");
 
-    let mut buf = String::from("abc</tool_call>def");
-    let trailing = separate_token_str(&mut buf, "</tool_call>", false);
+    // `return_leading == false`: text *after* the separator, buffer keeps up
+    // to and including the separator.
+    let mut buf = String::from("abc<def");
+    let trailing = separate_token(&mut buf, '<', false);
     assert_eq!(trailing.as_deref(), Some("def"));
-    assert_eq!(buf, "abc</tool_call>");
+    assert_eq!(buf, "abc<");
 
     // Absent separator leaves the buffer untouched.
     let mut buf = String::from("no sep here");
