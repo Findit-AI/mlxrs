@@ -219,11 +219,20 @@ impl VisionFeatureCache {
   ///
   /// # Errors
   ///
-  /// [`Error::ShapeMismatch`] if `max_size == 0`. The reference does not
-  /// raise on a zero cap, but a zero-capacity cache is a useless state —
-  /// every [`put`](Self::put) would store then immediately self-evict its
-  /// own entry, so [`get`](Self::get) could never hit. mlxrs surfaces the
-  /// misuse instead of silently building a cache that can hold nothing.
+  /// - [`Error::ShapeMismatch`] if `max_size == 0`. The reference does not
+  ///   raise on a zero cap, but a zero-capacity cache is a useless state —
+  ///   every [`put`](Self::put) would store then immediately self-evict its
+  ///   own entry, so [`get`](Self::get) could never hit. mlxrs surfaces the
+  ///   misuse instead of silently building a cache that can hold nothing.
+  /// - [`Error::OutOfMemory`] if pre-reserving `max_size` slots fails. The
+  ///   pre-reserve is via the fallible [`try_reserve`](HashMap::try_reserve)
+  ///   (not the infallible `with_capacity`) precisely so a caller-,
+  ///   config-, or request-derived `max_size` cannot abort the process on a
+  ///   capacity-overflow or allocator failure: an oversized cap fails
+  ///   recoverably here rather than panicking before this constructor can
+  ///   return. (Capacity is only an optimization — the cache is correct at
+  ///   any reservation — but the *infallible* reserve is the abort path the
+  ///   `Result` API would otherwise leak around.)
   pub fn with_max_size(max_size: usize) -> Result<Self> {
     if max_size == 0 {
       return Err(Error::ShapeMismatch {
@@ -232,14 +241,25 @@ impl VisionFeatureCache {
           .into(),
       });
     }
+    // Reserve the final size up front (the cache never grows past
+    // `max_size`, so this avoids rehash / reallocation churn) but via the
+    // FALLIBLE `try_reserve`: an oversized `max_size` (huge config value,
+    // hostile request) would make the infallible `with_capacity` panic on
+    // capacity overflow or abort on allocator failure BEFORE this fn could
+    // return `Err`, turning any size knob into a process-DoS. `try_reserve`
+    // maps that to a recoverable [`Error::OutOfMemory`] instead.
+    let mut entries = HashMap::new();
+    entries
+      .try_reserve(max_size)
+      .map_err(|_| Error::OutOfMemory)?;
+    let mut recency = VecDeque::new();
+    recency
+      .try_reserve(max_size)
+      .map_err(|_| Error::OutOfMemory)?;
     Ok(Self {
       max_size,
-      // Capacity hint == max_size: the map never grows past it, so this
-      // reserves exactly the final size up front (no rehash churn) and is
-      // a small fixed allocation (<= max_size buckets), not request-
-      // scaled — the infallible `with_capacity` is appropriate here.
-      entries: HashMap::with_capacity(max_size),
-      recency: VecDeque::with_capacity(max_size),
+      entries,
+      recency,
     })
   }
 

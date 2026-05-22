@@ -367,6 +367,23 @@ fn zero_max_size_is_rejected() {
   );
 }
 
+/// A pathological `max_size` (here `usize::MAX`) must fail RECOVERABLY with
+/// [`Error::OutOfMemory`], never panic on capacity overflow or abort on
+/// allocator failure. `with_max_size` pre-reserves `max_size` slots via the
+/// fallible `try_reserve`; reserving `usize::MAX` slots overflows the
+/// capacity * size_of computation, which `try_reserve` reports as an `Err`
+/// instead of the process-killing infallible `with_capacity` path. (The
+/// zero-capacity `ShapeMismatch` guard runs first, so a non-zero
+/// pathological value reaches — and is caught by — the reserve.)
+#[test]
+fn with_max_size_pathological_capacity_returns_err_not_abort() {
+  let err = VisionFeatureCache::with_max_size(usize::MAX).unwrap_err();
+  assert!(
+    matches!(err, Error::OutOfMemory),
+    "an oversized max_size must return OutOfMemory, not abort, got {err:?}"
+  );
+}
+
 // ───────────────── fill exactly to capacity (no eviction) ────────────────
 
 /// Filling to EXACTLY capacity must not evict anything — eviction only
