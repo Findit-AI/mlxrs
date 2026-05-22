@@ -917,8 +917,47 @@ pub fn quantize_weights(
 /// stray `.scales` / `.biases` without a `.weight` are passed through too
 /// (a hostile / corrupt checkpoint shape; mlx-lm leaves them in place too —
 /// `dequantize_model` only replaces *modules*, never deletes parameters).
+/// Symmetric with the orphan-`.biases` guard in
+/// [`quantize_weights`]'s triple classifier, the one exception is a
+/// layer carrying `.weight` + `.biases` with NO `.scales` — that
+/// combination is never a valid mlx-produced triple (mlx
+/// `affine_quantize` always writes `.scales` alongside `.biases`,
+/// `mlx/ops.cpp:4793-4798`) and would otherwise leave the
+/// `uint32`-packed `.weight` as a pass-through in the dequantized
+/// output; it returns [`Error::Backend`] naming the layer + the
+/// missing `.scales` instead.
 pub fn dequantize_weights(weights: Weights, cfg: &PerLayerQuantization) -> Result<Weights> {
   let mut out: Weights = HashMap::with_capacity(weights.len());
+
+  // Symmetric with [`classify_triple`]'s orphan-`.biases` guard
+  // (`(None, Some(_))` arm above): a layer with `.weight` + `.biases`
+  // but NO `.scales` is never a valid mlx-produced triple — mlx
+  // `affine_quantize` always writes `.scales` alongside `.biases`
+  // (`mlx/ops.cpp:4793-4798`) and the `fp_*` schemes write no biases
+  // at all (`mlx/ops.cpp:4898-4900`). Without this guard the `.biases`
+  // would fall into the pass-through branch (no triple → not staged)
+  // and the `.weight` (still `uint32` packed) would ALSO pass through,
+  // handing the caller a packed weight in an output it expects dense.
+  // Catch this upfront with the same exit point + message style as the
+  // dequantize arity check below.
+  for key in weights.keys() {
+    if let Some(path) = key.strip_suffix(BIASES_SUFFIX) {
+      let scales_key = format!("{path}{SCALES_SUFFIX}");
+      let weight_key = format!("{path}{WEIGHT_SUFFIX}");
+      if !weights.contains_key(&scales_key) && weights.contains_key(&weight_key) {
+        return Err(Error::Backend {
+          message: format!(
+            "dequantize_weights: layer {path}: input has a stale \
+             `{path}{BIASES_SUFFIX}` with no matching `{path}{SCALES_SUFFIX}` \
+             (mlx `quantize` always writes `.scales` alongside `.biases`, \
+             `mlx/ops.cpp:4793-4798`); this is a structurally incomplete \
+             triple — refusing to silently leave the `uint32`-packed \
+             `{path}{WEIGHT_SUFFIX}` as a pass-through in the dequantized output"
+          ),
+        });
+      }
+    }
+  }
 
   // Identify the triples upfront so the SECOND walk can consume the input
   // map without rechecking sibling presence per key.
@@ -1987,6 +2026,43 @@ mod tests {
         assert!(
           message.contains(".biases"),
           "error should name the stale `.biases` sibling, got: {message}"
+        );
+      }
+      other => panic!("expected Error::Backend, got: {other:?}"),
+    }
+  }
+
+  /// R6 Finding: `dequantize_weights` is symmetric with
+  /// `classify_triple`'s orphan-`.biases` guard. A map carrying
+  /// `.weight` (`uint32` packed) + `.biases` but NO `.scales` is never
+  /// a valid mlx-produced triple (mlx `affine_quantize` always writes
+  /// `.scales` alongside `.biases`, `mlx/ops.cpp:4793-4798`). Pre-fix
+  /// the orphan would fall through the discovery walk (which only
+  /// indexed `.scales` keys) and the `uint32` packed `.weight` would
+  /// pass through to the dequantized output as-is. The new orphan-bias
+  /// guard catches this upfront with the same exit point + message
+  /// style as the dequantize arity check.
+  #[test]
+  fn dequantize_weights_orphan_biases_with_packed_weight_errors() {
+    let n_rows = 2_usize;
+    // `uint32`-packed `.weight` shaped [2, 8] + `.biases` [2, 1], NO `.scales`.
+    let w = arr_u32(&vec![0_u32; n_rows * 8], &[n_rows, 8]);
+    let biases = arr_f32(&vec![0.0_f32; n_rows], &[n_rows, 1]);
+    let mut weights: Weights = HashMap::new();
+    weights.insert("model.orphan_bias.weight".to_string(), w);
+    weights.insert("model.orphan_bias.biases".to_string(), biases);
+
+    let cfg = PerLayerQuantization::from_global(Quantization::affine(64, 4));
+    let err = dequantize_weights(weights, &cfg).unwrap_err();
+    match err {
+      Error::Backend { message } => {
+        assert!(
+          message.contains("model.orphan_bias"),
+          "error should name the layer, got: {message}"
+        );
+        assert!(
+          message.contains(".scales"),
+          "error should name the missing `.scales` sibling, got: {message}"
         );
       }
       other => panic!("expected Error::Backend, got: {other:?}"),
