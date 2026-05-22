@@ -218,4 +218,30 @@ mod differential_tests {
     let b = vec![1.0_f64; 4];
     let _ = super::dot(&a, &b);
   }
+
+  /// `scalar::dot` (the public scalar API, not the dispatcher) must
+  /// `panic!` on mismatched lengths with the **shorter slice first**.
+  /// Pre-fix this branch used a `debug_assert!`, so in release it
+  /// silently returned the dot over `a.len()` (the shorter length) —
+  /// a wrong result, no panic. The unconditional `assert_eq!` makes
+  /// it fail loud, matching the dispatcher.
+  #[test]
+  #[should_panic(expected = "scalar::dot")]
+  fn scalar_dot_panics_on_length_mismatch_shorter_first() {
+    let a = vec![1.0_f64; 4];
+    let b = vec![1.0_f64; 8];
+    let _ = super::scalar::dot(&a, &b);
+  }
+
+  /// Symmetric case: `scalar::dot` with the **longer slice first**.
+  /// This direction always panicked (out-of-bounds indexing of `b`),
+  /// but it now panics via the explicit length `assert_eq!` instead —
+  /// the contract is symmetric, fail-loud in both orders.
+  #[test]
+  #[should_panic(expected = "scalar::dot")]
+  fn scalar_dot_panics_on_length_mismatch_longer_first() {
+    let a = vec![1.0_f64; 8];
+    let b = vec![1.0_f64; 4];
+    let _ = super::scalar::dot(&a, &b);
+  }
 }

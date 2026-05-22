@@ -22,14 +22,23 @@
 
 /// Inner product of two equal-length f64 slices: `Σ a[i] * b[i]`.
 ///
-/// # Panics (debug only)
+/// # Panics
 ///
-/// Debug asserts on `a.len() == b.len()`. The public dispatcher
-/// [`crate::simd::dot`] asserts this *unconditionally* before routing
-/// to the unsafe SIMD kernel.
+/// If `a.len() != b.len()`. Enforced **unconditionally** (in release
+/// too), matching the public dispatcher [`crate::simd::dot`]: without
+/// it, `dot(&short, &long)` would silently return the dot over the
+/// shorter length, and `dot(&long, &short)` would panic via indexing
+/// — an asymmetric, fail-quiet contract. The unconditional assert
+/// makes this public scalar API reject mismatched input symmetrically.
 #[inline]
 pub fn dot(a: &[f64], b: &[f64]) -> f64 {
-  debug_assert_eq!(a.len(), b.len(), "scalar::dot: length mismatch");
+  assert_eq!(
+    a.len(),
+    b.len(),
+    "scalar::dot: a.len() ({}) must equal b.len() ({})",
+    a.len(),
+    b.len()
+  );
   let n = a.len();
   let mut s00 = 0.0_f64; // accumulates positions ≡ 0 mod 4
   let mut s01 = 0.0_f64; // ≡ 1 mod 4
