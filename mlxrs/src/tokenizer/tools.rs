@@ -1245,6 +1245,27 @@ fn parse_eos(parser: &dyn ToolParser, buffer: &str, tools: Option<&Value>) -> Ve
     .collect()
 }
 
+/// Bound on the streaming tool-call buffer, in bytes.
+///
+/// Once a chunk has entered `PotentialToolCall` or `CollectingToolCall` every
+/// subsequent chunk is appended until an end tag / balanced JSON / EOS
+/// arrives. A malformed or adversarial generation (inline JSON whose braces
+/// never balance, or a tagged format — including Mistral's empty end tag —
+/// whose end tag never appears) would otherwise let the buffer grow without
+/// bound and OOM before EOS (Codex finding 2).
+///
+/// 256 KiB is far larger than any genuine tool-call payload (function names +
+/// JSON arguments are kilobytes at most) yet small enough that retaining it is
+/// harmless. After **each** chunk is appended the buffer length is checked
+/// against this cap; on exceeding it `ToolCallProcessor` *recovers* rather
+/// than panics (see `recover_at_cap`): a not-yet-confirmed start flushes the
+/// buffered bytes back as ordinary display text; a confirmed-but-overlong tool
+/// call drops the buffer. Either way the buffer is then emptied and the state
+/// reset, so growth is `O(1)` per generation rather than `O(total output)` —
+/// the buffer peaks at this cap plus at most one chunk (a single detokenized
+/// token's worth of text), never unbounded.
+const MAX_TOOL_CALL_BUFFER_BYTES: usize = 256 * 1024;
+
 /// Streaming state-machine for detecting and extracting tool calls while a
 /// model is still generating, fed text chunk-by-chunk.
 ///
@@ -1261,9 +1282,16 @@ fn parse_eos(parser: &dyn ToolParser, buffer: &str, tools: Option<&Value>) -> Ve
 ///   `<tool_call>`): the buffer is matched against the start tag character by
 ///   character; once the full start tag is seen the state advances to
 ///   collecting, and the call is parsed when the end tag arrives.
-/// - **Inline** (`tool_call_start` empty): brace counting drives detection —
-///   while `{`/`}` are unbalanced the content is buffered; a balanced buffer
-///   that fails to parse is flushed back out as ordinary text.
+/// - **Inline** (`tool_call_start` empty): a JSON-string-aware balanced-object
+///   scan drives detection — while the JSON object is still open the content
+///   is buffered; a complete object that fails to parse is flushed back out as
+///   ordinary text, and any text *after* the object is processed separately so
+///   extraction does not depend on chunk boundaries.
+///
+/// The buffer is bounded by an internal `MAX_TOOL_CALL_BUFFER_BYTES` cap: a
+/// malformed stream that never completes a tool call recovers (false starts
+/// flush as display text, runaway tool content is dropped) instead of growing
+/// without bound.
 ///
 /// # Example
 ///
@@ -1380,149 +1408,327 @@ impl ToolCallProcessor {
     }
   }
 
+  /// Recover when [`tool_call_buffer`](Self::tool_call_buffer) has reached
+  /// [`MAX_TOOL_CALL_BUFFER_BYTES`] without the tool call completing.
+  ///
+  /// This enforces the bounded-memory contract (Codex finding 2): the buffer
+  /// is *always* emptied here and the state reset to [`State::Normal`], so it
+  /// can never grow past the cap. The recovery action depends on how far
+  /// detection had progressed:
+  ///
+  /// - [`State::PotentialToolCall`] — the start tag was never confirmed, so
+  ///   the buffered bytes are (at worst) a false start; they are flushed back
+  ///   to the caller verbatim as ordinary display text, losing nothing.
+  /// - [`State::CollectingToolCall`] — a real tool call was in progress but is
+  ///   pathologically long / never terminates; its partial content is dropped
+  ///   (it is not valid display text and cannot be parsed) and `None` is
+  ///   returned. This is a clear "give up on this call" signal, never a panic.
+  /// - [`State::Normal`] — unreachable (the buffer only fills past `Normal`);
+  ///   handled defensively by flushing.
+  ///
+  /// Returns the text to display, if any.
+  fn recover_at_cap(&mut self) -> Option<String> {
+    let recovered = std::mem::take(&mut self.tool_call_buffer);
+    let drop_as_malformed = self.state == State::CollectingToolCall;
+    self.state = State::Normal;
+    if drop_as_malformed {
+      // Malformed / unbounded tool-call content — drop it, do not display.
+      None
+    } else {
+      // False start (or defensive `Normal`) — the bytes are display text.
+      Some(recovered)
+    }
+  }
+
+  /// Enforce the buffer cap once per appended chunk.
+  ///
+  /// If `tool_call_buffer` has exceeded `MAX_TOOL_CALL_BUFFER_BYTES` this runs
+  /// `recover_at_cap` and folds any flushed display text into `display`;
+  /// otherwise it does nothing. Called from every buffering branch so the
+  /// bound holds after each chunk regardless of which state the processor is
+  /// in (Codex finding 2).
+  fn cap_recover_into(&mut self, display: &mut Option<String>) {
+    if self.tool_call_buffer.len() <= MAX_TOOL_CALL_BUFFER_BYTES {
+      return;
+    }
+    if let Some(flushed) = self.recover_at_cap() {
+      push_display(display, &flushed);
+    }
+  }
+
   /// Process a chunk for inline formats (no wrapper tags).
   ///
-  /// Uses brace counting to decide when output looks like a JSON tool call.
-  /// While braces are unbalanced the content is buffered (returns `None`) so
-  /// partial JSON is never leaked; a balanced buffer that fails to parse is
-  /// not a tool call and is flushed back out.
+  /// Uses a JSON-string-aware balanced-object scan to decide when output
+  /// looks like a JSON tool call. While the object is still open the content
+  /// is buffered (returns `None`) so partial JSON is never leaked; a balanced
+  /// buffer that fails to parse is not a tool call and is flushed back out.
+  /// Any text *after* the first balanced JSON object in the same buffer is
+  /// processed separately, so extraction never depends on where chunk
+  /// boundaries fall (Codex finding 1).
   fn process_inline_chunk(&mut self, chunk: &str) -> Option<String> {
-    match self.state {
+    // Leading display text in front of the first `{` of a *fresh* detection.
+    let leading = match self.state {
       State::Normal => {
-        // Does this chunk start what looks like a JSON tool call?
-        if let Some(brace) = chunk.find('{') {
-          let leading = chunk[..brace].to_owned();
-          self.tool_call_buffer.clear();
-          self.tool_call_buffer.push_str(&chunk[brace..]);
-          self.state = State::CollectingToolCall;
-
-          if self.try_parse_buffer() {
-            self.tool_call_buffer.clear();
-            self.state = State::Normal;
-            return if leading.is_empty() {
-              None
-            } else {
-              Some(leading)
-            };
-          }
-
-          // Still collecting — balanced braces with a failed parse means this
-          // was complete JSON that is not a tool call, so flush it.
-          if json_braces_balanced(&self.tool_call_buffer) {
-            self.state = State::Normal;
-            let buffer = std::mem::take(&mut self.tool_call_buffer);
-            return Some(leading + &buffer);
-          }
-
-          return if leading.is_empty() {
-            None
-          } else {
-            Some(leading)
-          };
-        }
-
-        // No brace seen — pass through as regular text.
-        Some(chunk.to_owned())
+        let Some(brace) = chunk.find('{') else {
+          // No brace seen — pass through as regular text.
+          return Some(chunk.to_owned());
+        };
+        let leading = chunk[..brace].to_owned();
+        self.tool_call_buffer.clear();
+        self.tool_call_buffer.push_str(&chunk[brace..]);
+        self.state = State::CollectingToolCall;
+        leading
       }
-
       State::PotentialToolCall | State::CollectingToolCall => {
         self.tool_call_buffer.push_str(chunk);
+        String::new()
+      }
+    };
 
-        if self.try_parse_buffer() {
-          self.tool_call_buffer.clear();
-          self.state = State::Normal;
-          return None;
+    let mut display = self.drain_inline_buffer();
+
+    // Bounded-memory guard (Codex finding 2): if the buffer is still holding
+    // an unterminated JSON object after draining, recover (drop the runaway
+    // content) instead of buffering without bound. No-op below the cap.
+    if self.state == State::CollectingToolCall {
+      self.cap_recover_into(&mut display);
+    }
+
+    // Prepend any leading text from this chunk.
+    if leading.is_empty() {
+      display
+    } else {
+      Some(leading + display.as_deref().unwrap_or(""))
+    }
+  }
+
+  /// Iteratively consume balanced JSON-object prefixes from
+  /// [`tool_call_buffer`](Self::tool_call_buffer).
+  ///
+  /// Each complete `{ ... }` object (string/escape aware — Codex finding 3) is
+  /// parsed: a successful parse appends [`ToolCall`]s, a failed parse means
+  /// "complete JSON that is not a tool call" and the object's bytes become
+  /// display text. Whatever follows the object in the buffer is then examined
+  /// again — extraction therefore never depends on chunk boundaries (Codex
+  /// finding 1): `{...} done` and the same bytes split after `}` behave
+  /// identically. Looping stops when the remainder is an incomplete object
+  /// (kept buffered, state stays `CollectingToolCall`) or has no `{` left
+  /// (any plain remainder is emitted and state returns to `Normal`).
+  ///
+  /// The loop is bounded by the strictly shrinking buffer (each iteration
+  /// removes a non-empty prefix), so it is iterative with no recursion.
+  fn drain_inline_buffer(&mut self) -> Option<String> {
+    let mut display: Option<String> = None;
+    loop {
+      match balanced_json_object_prefix(&self.tool_call_buffer) {
+        Some((obj_start, obj_end)) => {
+          // A complete JSON object occupies `[obj_start..obj_end]`; anything
+          // before `obj_start` is plain leading text, anything after
+          // `obj_end` is a suffix to re-examine.
+          if obj_start > 0 {
+            push_display(&mut display, &self.tool_call_buffer[..obj_start]);
+          }
+          let object: String = self.tool_call_buffer[obj_start..obj_end].to_owned();
+          let suffix: String = self.tool_call_buffer[obj_end..].to_owned();
+
+          let inner = strip_markers(self.parser.as_ref(), &object);
+          match self.parser.parse(inner, self.tools.as_ref()) {
+            Ok(calls) if !calls.is_empty() => self.tool_calls.extend(calls),
+            // Balanced JSON that is not a tool call — surface as display text.
+            _ => push_display(&mut display, &object),
+          }
+
+          self.tool_call_buffer = suffix;
+          if self.tool_call_buffer.is_empty() {
+            self.state = State::Normal;
+            return display;
+          }
+          // Re-examine the suffix on the next iteration.
         }
-
-        // Balanced braces but parse failed — not a tool call, flush it.
-        if json_braces_balanced(&self.tool_call_buffer) {
+        None => {
+          if self.tool_call_buffer.contains('{') {
+            // An object is open but not yet closed — keep buffering.
+            return display;
+          }
+          // No (more) JSON object — flush any plain remainder as display text.
           self.state = State::Normal;
-          return Some(std::mem::take(&mut self.tool_call_buffer));
+          let remainder = std::mem::take(&mut self.tool_call_buffer);
+          push_display(&mut display, &remainder);
+          return display;
         }
-
-        // Still collecting.
-        None
       }
     }
   }
 
   /// Process a chunk for tagged formats.
+  ///
+  /// When the text after an end tag itself contains the start character there
+  /// may be further back-to-back tool calls. This is handled by an explicit
+  /// **loop** over that trailing suffix (Codex finding 4) — re-feeding it as
+  /// the next chunk — rather than a recursive `process_chunk` self-call, so a
+  /// single batched chunk packed with many tool calls cannot overflow the
+  /// stack. Each iteration's output is concatenated in stream order, exactly
+  /// matching the previous recursive behaviour.
   fn process_tagged_chunk(&mut self, chunk: &str) -> Option<String> {
     let start_tag = self.parser.tool_call_start();
     let Some(start_char) = self.start_tag_first_char() else {
       return Some(chunk.to_owned());
     };
 
-    // In `Normal`, ignore chunks that cannot begin a tag; once past `Normal`
-    // every chunk is appended regardless.
-    if self.state == State::Normal && !chunk.contains(start_char) {
-      return Some(chunk.to_owned());
-    }
+    // The chunk currently being processed. After an end tag, the trailing
+    // suffix is fed back here for the next loop iteration (no recursion).
+    let mut chunk: std::borrow::Cow<'_, str> = std::borrow::Cow::Borrowed(chunk);
+    // Display text accumulated across iterations, in stream order.
+    let mut display: Option<String> = None;
 
-    self.tool_call_buffer.push_str(chunk);
-    let mut leading_token: Option<String> = None;
+    loop {
+      // In `Normal`, ignore chunks that cannot begin a tag; once past `Normal`
+      // every chunk is appended regardless.
+      if self.state == State::Normal && !chunk.contains(start_char) {
+        push_display(&mut display, &chunk);
+        return display;
+      }
 
-    if self.state == State::Normal {
-      // Advance to potential tool call, splitting off any leading text.
-      self.state = State::PotentialToolCall;
-      leading_token = separate_token(&mut self.tool_call_buffer, start_char, true);
-    }
+      self.tool_call_buffer.push_str(&chunk);
+      let mut leading_token: Option<String> = None;
 
-    if self.state == State::PotentialToolCall {
-      if partial_match(&self.tool_call_buffer, start_tag) {
-        if self.tool_call_buffer.starts_with(start_tag) {
-          // Confirmed start tag — fall through to collecting.
-          self.state = State::CollectingToolCall;
+      if self.state == State::Normal {
+        // Advance to potential tool call, splitting off any leading text.
+        self.state = State::PotentialToolCall;
+        leading_token = separate_token(&mut self.tool_call_buffer, start_char, true);
+      }
+
+      if self.state == State::PotentialToolCall {
+        if partial_match(&self.tool_call_buffer, start_tag) {
+          if self.tool_call_buffer.starts_with(start_tag) {
+            // Confirmed start tag — fall through to collecting.
+            self.state = State::CollectingToolCall;
+          } else {
+            // Still an ambiguous start-tag prefix. `partial_match` only holds
+            // here while the buffer is a *strict* prefix of `start_tag`, so it
+            // is already bounded by the (tiny) tag length and cannot grow
+            // unbounded — but apply the same cap defensively (Codex finding 2)
+            // so the bound holds unconditionally regardless of tag length.
+            self.cap_recover_into(&mut display);
+            return display;
+          }
         } else {
-          return None;
+          // Not a tool call after all — return the collected text and reset.
+          self.state = State::Normal;
+          let buffer = std::mem::take(&mut self.tool_call_buffer);
+          push_display(&mut display, &leading_token.unwrap_or_default());
+          push_display(&mut display, &buffer);
+          return display;
+        }
+      }
+
+      // State::CollectingToolCall
+      let end_tag = self.parser.tool_call_end();
+      if end_tag.is_empty() {
+        // No end tag (e.g. `mistral`): the call is closed at EOS, not
+        // in-stream. With no closing delimiter the buffer would otherwise
+        // grow without bound on a runaway generation (Codex finding 2).
+        self.cap_recover_into(&mut display);
+        return display;
+      }
+
+      if self.tool_call_buffer.contains(end_tag) {
+        // Split off the trailing token after the end tag.
+        let trailing_token = separate_token_str(&mut self.tool_call_buffer, end_tag, false);
+
+        self.try_parse_buffer();
+
+        self.state = State::Normal;
+        self.tool_call_buffer.clear();
+
+        // If the trailing token holds the start char there may be more calls
+        // — loop on it instead of recursing.
+        match trailing_token {
+          Some(tok) if tok.contains(start_char) => {
+            chunk = std::borrow::Cow::Owned(tok);
+            // Re-enter the loop with the trailing suffix as the next chunk.
+          }
+          Some(tok) if !tok.is_empty() => {
+            push_display(&mut display, &tok);
+            return display;
+          }
+          _ => return display,
         }
       } else {
-        // Not a tool call after all — return the collected text and reset.
-        self.state = State::Normal;
-        let buffer = std::mem::take(&mut self.tool_call_buffer);
-        return Some(leading_token.unwrap_or_default() + &buffer);
+        // End tag not yet seen — confirmed tool call still collecting. Cap the
+        // buffer so a never-terminated tagged call cannot OOM (Codex finding
+        // 2); recovery here drops the malformed content.
+        self.cap_recover_into(&mut display);
+        return display;
       }
-    }
-
-    // State::CollectingToolCall
-    let end_tag = self.parser.tool_call_end();
-    if end_tag.is_empty() {
-      // No end tag (e.g. `mistral`): the call is closed at EOS, not in-stream.
-      return None;
-    }
-
-    if self.tool_call_buffer.contains(end_tag) {
-      // Split off the trailing token after the end tag.
-      let trailing_token = separate_token_str(&mut self.tool_call_buffer, end_tag, false);
-
-      self.try_parse_buffer();
-
-      self.state = State::Normal;
-      self.tool_call_buffer.clear();
-
-      // If the trailing token holds the start char there may be more calls.
-      match trailing_token {
-        Some(tok) if tok.contains(start_char) => self.process_chunk(&tok),
-        Some(tok) if !tok.is_empty() => Some(tok),
-        _ => None,
-      }
-    } else {
-      None
     }
   }
 }
 
-/// Count whether `{` / `}` are balanced in `text` (Swift `jsonBracesBalanced`).
-fn json_braces_balanced(text: &str) -> bool {
+/// Append `text` to an optional display accumulator, allocating the `String`
+/// lazily so a pure-`None` (fully buffered) result stays `None`.
+fn push_display(display: &mut Option<String>, text: &str) {
+  if text.is_empty() {
+    return;
+  }
+  display.get_or_insert_with(String::new).push_str(text);
+}
+
+/// Find the first balanced top-level JSON-*object* span of `text`.
+///
+/// Returns `(obj_start, obj_end)` byte offsets: `text[obj_start]` is the
+/// first `{`, and `text[obj_start..obj_end]` is the shortest complete
+/// `{ ... }` object (depth returns to zero). Returning the start as well as
+/// the end lets the caller slice the object and its trailing suffix without a
+/// second brace search, and process any suffix separately — fixing the
+/// chunk-boundary dependency (Codex finding 1).
+///
+/// Unlike the Swift `jsonBracesBalanced` byte-counter this is JSON-string
+/// aware: `{`/`}` inside a `"..."` string literal — including after a `\"`
+/// escape — are not counted (Codex finding 3), so input such as
+/// `{"unrelated":"}"}` is balanced correctly.
+///
+/// Scanning starts at the first `{`; bytes before it are ignored (they are
+/// the caller's leading text). A `}` that would drive depth below zero makes
+/// the object unparseable, so `None` is returned (the caller then flushes the
+/// buffer as display text). `None` is also returned while the object is still
+/// open (depth never returns to zero), meaning "keep buffering". Brace bytes
+/// are ASCII, so every returned index is a UTF-8 char boundary even for
+/// multibyte content inside string values.
+fn balanced_json_object_prefix(text: &str) -> Option<(usize, usize)> {
+  let bytes = text.as_bytes();
+  let start = bytes.iter().position(|&b| b == b'{')?;
   let mut depth: i32 = 0;
-  for ch in text.chars() {
-    match ch {
-      '{' => depth += 1,
-      '}' => depth -= 1,
+  let mut in_string = false;
+  let mut escaped = false;
+  for (i, &b) in bytes.iter().enumerate().skip(start) {
+    if in_string {
+      if escaped {
+        escaped = false;
+      } else if b == b'\\' {
+        escaped = true;
+      } else if b == b'"' {
+        in_string = false;
+      }
+      continue;
+    }
+    match b {
+      b'"' => in_string = true,
+      b'{' => depth += 1,
+      b'}' => {
+        depth -= 1;
+        if depth == 0 {
+          return Some((start, i + 1));
+        }
+        if depth < 0 {
+          // More closes than opens: not a well-formed object prefix.
+          return None;
+        }
+      }
       _ => {}
     }
   }
-  depth == 0
+  None
 }
 
 /// Split `buffer` on the first occurrence of the `char` `separator`, mirroring
@@ -1837,15 +2043,212 @@ mod tests {
     assert!(p.tool_calls.is_empty());
   }
 
+  // --- adversarial: Codex findings 1-4 -------------------------------------
+
+  #[test]
+  fn streaming_inline_object_then_suffix_one_chunk() {
+    // Codex finding 1: an inline JSON object immediately followed by display
+    // text in the SAME chunk. Extraction must not depend on the chunk ending
+    // exactly at the closing brace: the object is parsed as the tool call and
+    // the suffix is returned as display text.
+    let mut p = ToolCallProcessor::new(Box::new(InlineJson), None);
+    let out = p.process_chunk(r#"{"name":"now","arguments":{}} done"#);
+    assert_eq!(out.as_deref(), Some(" done"));
+    assert_eq!(p.tool_calls.len(), 1);
+    assert_eq!(p.tool_calls[0].name, "now");
+    // And the same bytes split right after the brace behave identically.
+    let mut p2 = ToolCallProcessor::new(Box::new(InlineJson), None);
+    assert_eq!(p2.process_chunk(r#"{"name":"now","arguments":{}}"#), None);
+    assert_eq!(p2.process_chunk(" done").as_deref(), Some(" done"));
+    assert_eq!(p2.tool_calls.len(), 1);
+    assert_eq!(p2.tool_calls[0].name, "now");
+  }
+
+  #[test]
+  fn streaming_inline_suffix_is_a_second_tool_call() {
+    // Codex finding 1 (continued): when the suffix after a balanced object is
+    // itself another object, it is extracted as a subsequent tool call rather
+    // than leaked as text — all in one chunk.
+    let mut p = ToolCallProcessor::new(Box::new(InlineJson), None);
+    let out = p.process_chunk(r#"{"name":"a","arguments":{}}{"name":"b","arguments":{}}"#);
+    assert_eq!(out, None);
+    assert_eq!(p.tool_calls.len(), 2);
+    assert_eq!(p.tool_calls[0].name, "a");
+    assert_eq!(p.tool_calls[1].name, "b");
+  }
+
+  #[test]
+  fn streaming_inline_braces_inside_string_value() {
+    // Codex finding 3: braces inside a JSON string value must not be counted
+    // by the balance scan. `{"unrelated":"}"}` is ONE balanced object, not a
+    // truncated `{"unrelated":"}` plus stray `"}`. It has no `name`, so the
+    // flush-on-balanced-but-unparseable path returns it verbatim as text.
+    let mut p = ToolCallProcessor::new(Box::new(InlineJson), None);
+    let out = p.process_chunk(r#"{"unrelated":"}"}"#);
+    assert_eq!(out.as_deref(), Some(r#"{"unrelated":"}"}"#));
+    assert!(p.tool_calls.is_empty());
+    // The same braces-in-string inside a real tool call still parse.
+    let mut p2 = ToolCallProcessor::new(Box::new(InlineJson), None);
+    let out2 = p2.process_chunk(r#"{"name":"echo","arguments":{"s":"a}b{c"}}"#);
+    assert_eq!(out2, None);
+    assert_eq!(p2.tool_calls.len(), 1);
+    assert_eq!(p2.tool_calls[0].name, "echo");
+    assert_eq!(
+      p2.tool_calls[0].arguments,
+      serde_json::json!({"s": "a}b{c"})
+    );
+  }
+
+  #[test]
+  fn streaming_inline_unbalanced_stream_is_bounded() {
+    // Codex finding 2: an inline JSON object whose braces never balance must
+    // not let the buffer grow without bound. Once past the cap the processor
+    // recovers (drops the runaway tool content) instead of OOM-ing/panicking.
+    let mut p = ToolCallProcessor::new(Box::new(InlineJson), None);
+    // Open an object and never close it; feed well past the cap in chunks.
+    assert_eq!(p.process_chunk(r#"{"name":"now","arguments":{"x":""#), None);
+    let big = "a".repeat(64 * 1024);
+    // Peak after a post-append cap check: the cap plus the last chunk.
+    let bound = MAX_TOOL_CALL_BUFFER_BYTES + big.len();
+    let total_fed: usize = 8 * big.len();
+    for _ in 0..8 {
+      let _ = p.process_chunk(&big);
+      // Bounded at every step: it tracks the cap, never the total fed.
+      assert!(p.tool_call_buffer.len() <= bound);
+    }
+    // Far more bytes were fed than the buffer ever held — growth is O(cap),
+    // not O(total output).
+    assert!(total_fed > bound);
+    // The runaway tool content was dropped, never parsed into a tool call.
+    assert!(p.tool_calls.is_empty());
+    assert_eq!(p.tool_call_buffer.len(), 0);
+    // The processor recovers to a working state: a fresh valid call parses.
+    let out = p.process_chunk(r#"{"name":"ok","arguments":{}}"#);
+    assert_eq!(out, None);
+    assert_eq!(p.tool_calls.len(), 1);
+    assert_eq!(p.tool_calls[0].name, "ok");
+  }
+
+  #[test]
+  fn streaming_tagged_missing_end_tag_is_bounded() {
+    // Codex finding 2: a tagged tool call whose end tag never arrives must
+    // also be bounded. `<tool_call>` is confirmed, then content streams
+    // forever with no `</tool_call>`; at the cap the malformed content is
+    // dropped and the buffer reset.
+    let mut p = ToolCallProcessor::new(Box::new(JsonTools), None);
+    assert_eq!(p.process_chunk(r#"<tool_call>{"name":"now""#), None);
+    let big = "b".repeat(64 * 1024);
+    let bound = MAX_TOOL_CALL_BUFFER_BYTES + big.len();
+    for _ in 0..8 {
+      let _ = p.process_chunk(&big);
+      assert!(p.tool_call_buffer.len() <= bound);
+    }
+    assert_eq!(p.tool_call_buffer.len(), 0);
+    assert!(p.tool_calls.is_empty());
+  }
+
+  #[test]
+  fn streaming_mistral_empty_end_tag_is_bounded() {
+    // Codex finding 2: Mistral's end tag is empty (closed at EOS only). A
+    // runaway generation must still be bounded rather than buffering forever.
+    let mut p = ToolCallProcessor::new(Box::new(Mistral), None);
+    assert_eq!(
+      p.process_chunk(r#"[TOOL_CALLS]get_weather[ARGS]{"city":""#),
+      None
+    );
+    let big = "c".repeat(64 * 1024);
+    let bound = MAX_TOOL_CALL_BUFFER_BYTES + big.len();
+    for _ in 0..8 {
+      let _ = p.process_chunk(&big);
+      assert!(p.tool_call_buffer.len() <= bound);
+    }
+    assert_eq!(p.tool_call_buffer.len(), 0);
+    // EOS after recovery is a clean no-op (nothing buffered, nothing parsed).
+    p.process_eos();
+    assert!(p.tool_calls.is_empty());
+  }
+
+  #[test]
+  fn streaming_many_back_to_back_tagged_calls_no_stack_overflow() {
+    // Codex finding 4: a single chunk packed with thousands of back-to-back
+    // tagged tool calls. The trailing-text-after-end-tag handling must be an
+    // iterative loop, not recursive self-calls — recursion would overflow the
+    // stack here. All calls must be extracted, in order.
+    const N: usize = 4000;
+    let mut chunk = String::with_capacity(N * 56);
+    for i in 0..N {
+      chunk.push_str(&format!(
+        r#"<tool_call>{{"name":"f","arguments":{{"i":{i}}}}}</tool_call>"#
+      ));
+    }
+    // The whole batch stays under the buffer cap, so only finding 4 (not the
+    // finding-2 cap) is exercised.
+    assert!(chunk.len() <= MAX_TOOL_CALL_BUFFER_BYTES);
+    let mut p = ToolCallProcessor::new(Box::new(JsonTools), None);
+    let out = p.process_chunk(&chunk);
+    assert_eq!(out, None);
+    assert_eq!(p.tool_calls.len(), N);
+    // Ordering preserved: argument `i` increases monotonically with index.
+    for (idx, call) in p.tool_calls.iter().enumerate() {
+      assert_eq!(call.name, "f");
+      assert_eq!(call.arguments, serde_json::json!({ "i": idx }));
+    }
+  }
+
   // --- helper unit coverage ------------------------------------------------
 
   #[test]
-  fn json_braces_balanced_basics() {
-    assert!(json_braces_balanced(""));
-    assert!(json_braces_balanced("{}"));
-    assert!(json_braces_balanced(r#"{"a": {"b": 1}}"#));
-    assert!(!json_braces_balanced("{"));
-    assert!(!json_braces_balanced("{}}"));
+  fn balanced_json_object_prefix_basics() {
+    // No brace at all -> no object.
+    assert_eq!(balanced_json_object_prefix(""), None);
+    assert_eq!(balanced_json_object_prefix("plain text"), None);
+    // Smallest object, and a nested one.
+    assert_eq!(balanced_json_object_prefix("{}"), Some((0, 2)));
+    assert_eq!(
+      balanced_json_object_prefix(r#"{"a": {"b": 1}}"#),
+      Some((0, 15))
+    );
+    // Still open -> keep buffering.
+    assert_eq!(balanced_json_object_prefix("{"), None);
+    assert_eq!(balanced_json_object_prefix(r#"{"a": {"b":"#), None);
+  }
+
+  #[test]
+  fn balanced_json_object_prefix_is_string_aware() {
+    // Codex finding 3: braces *inside* a JSON string value must not count.
+    // A naive byte counter sees `{ } {` -> unbalanced; the JSON-aware scan
+    // sees one balanced object.
+    assert_eq!(
+      balanced_json_object_prefix(r#"{"unrelated":"}"}"#),
+      Some((0, 17))
+    );
+    // An escaped quote inside the string keeps string state correct, so the
+    // brace after it is still inside the string and not counted.
+    assert_eq!(
+      balanced_json_object_prefix(r#"{"k":"a\"}b"}"#),
+      Some((0, 13))
+    );
+    // A brace-only string body: every brace is inside the string.
+    assert_eq!(
+      balanced_json_object_prefix(r#"{"x":"{{{{"}"#),
+      Some((0, 12))
+    );
+  }
+
+  #[test]
+  fn balanced_json_object_prefix_finds_prefix_and_suffix() {
+    // Codex finding 1: a complete object followed by trailing text returns
+    // the object span only, so the suffix can be handled separately.
+    let s = r#"{"name":"now","arguments":{}} done"#;
+    let (start, end) = balanced_json_object_prefix(s).expect("balanced object");
+    assert_eq!(start, 0);
+    assert_eq!(&s[start..end], r#"{"name":"now","arguments":{}}"#);
+    assert_eq!(&s[end..], " done");
+    // Leading text before the first `{` is excluded from the object span.
+    let s2 = r#"hi {"a":1} bye"#;
+    let (start2, end2) = balanced_json_object_prefix(s2).expect("balanced object");
+    assert_eq!(&s2[..start2], "hi ");
+    assert_eq!(&s2[start2..end2], r#"{"a":1}"#);
   }
 
   #[test]
