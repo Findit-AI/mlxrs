@@ -619,7 +619,16 @@ impl From<GenStep> for (u32, Option<Array>) {
 /// yields `Err` (a step failed) or finishes (eos / `max_tokens`) every
 /// further `next()` is `None` — never a panic, never a poisoned re-entry
 /// (spec §4).
-pub struct Generator<'a, M: Model> {
+///
+/// `M: Model + ?Sized` — the loop only ever touches the model behind the
+/// `&'a M` borrow (`model.forward(...)`), never by value and never via a
+/// `Sized`-requiring associated item, so `M` may be an unsized trait
+/// object. This lets a `&dyn Model` (or a deref-coerced
+/// `Box<dyn Model>` / `Box<dyn VlmModel>`, since `VlmModel: Model`) drive
+/// generation directly — the exact handle a load factory returns
+/// ([`crate::lm::factory::LoadedModelContext::model`],
+/// [`crate::vlm::load::LoadedVlmContext::model`]).
+pub struct Generator<'a, M: Model + ?Sized> {
   model: &'a M,
   cache: Vec<Box<dyn KvCache>>,
   sampler: Sampler,
@@ -688,7 +697,7 @@ pub struct Generator<'a, M: Model> {
   done: bool,
 }
 
-impl<M: Model> Generator<'_, M> {
+impl<M: Model + ?Sized> Generator<'_, M> {
   /// Run the prompt prefill once: feed the first `total - 1` tokens through
   /// the model in `prefill_step_size` chunks (logits discarded, cache
   /// filled) by advancing [`Generator::prefill_offset`] over `self.prompt`,
@@ -832,7 +841,7 @@ impl<M: Model> Generator<'_, M> {
   }
 }
 
-impl<M: Model> Iterator for Generator<'_, M> {
+impl<M: Model + ?Sized> Iterator for Generator<'_, M> {
   type Item = Result<GenStep>;
 
   fn next(&mut self) -> Option<Self::Item> {
@@ -977,7 +986,7 @@ fn last_position(logits: &Array) -> Result<Array> {
 /// token is the final yielded item) or [`GenConfig::max_tokens`] tokens
 /// have been produced. A step error is yielded once as `Err`, after which
 /// the iterator ends (spec §4 — no panic, no poison).
-pub fn generate_step<'a, M: Model>(
+pub fn generate_step<'a, M: Model + ?Sized>(
   model: &'a M,
   prompt: &[u32],
   cache: Vec<Box<dyn KvCache>>,
@@ -1205,7 +1214,7 @@ pub struct GenerationStats {
 /// `prompt` here is the already-encoded prompt ids (the caller encodes via
 /// [`crate::tokenizer::Tokenizer::encode`]); mlx-lm's `str`-encoding
 /// convenience belongs to a higher-level entry point.
-pub fn stream_generate<'a, M: Model>(
+pub fn stream_generate<'a, M: Model + ?Sized>(
   model: &'a M,
   tokenizer: &'a crate::tokenizer::Tokenizer,
   prompt: &[u32],
@@ -1481,7 +1490,7 @@ fn finalize_active_tail(
 ///
 /// Any step error is surfaced as `Err` (it short-circuits the collection,
 /// exactly the [`stream_generate`] Iterator-`Err` contract).
-pub fn generate<M: Model>(
+pub fn generate<M: Model + ?Sized>(
   model: &M,
   tokenizer: &crate::tokenizer::Tokenizer,
   prompt: &[u32],

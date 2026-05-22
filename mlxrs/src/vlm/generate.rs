@@ -167,6 +167,17 @@ pub struct VlmGenConfig {
 /// fallback can drop in without an API break). Borrows `&'a M` plus owns
 /// the cache, so no aliasing of the model across the borrow.
 ///
+/// `M: Model + ?Sized` — the loop only ever touches the model behind the
+/// `&'a M` borrow (`model.embed_tokens(...)`, `model.encode_image(...)`,
+/// `model.forward*(...)`), never by value and never via a
+/// `Sized`-requiring associated item. `M` may therefore be an unsized
+/// trait object: a deref-coerced `Box<dyn VlmModel>` — the exact handle
+/// the load factory returns ([`crate::vlm::load::LoadedVlmContext::model`])
+/// — drives generation directly without a forwarding shim. The
+/// zero-image passthrough hands the same `&'a M` to
+/// [`crate::lm::generate::generate_step`], which is likewise
+/// `?Sized`-generic (and accepts it because `VlmModel: Model`).
+///
 /// **Zero-image passthrough**: when `images.is_empty()`, the function
 /// dispatches directly to [`crate::lm::generate::generate_step`] (the
 /// merge/encode steps are skipped entirely) — the iterator's per-step
@@ -194,7 +205,7 @@ pub struct VlmGenConfig {
 ///
 /// - sampler / logits-processor construction failure
 /// - any per-step forward / sample failure
-pub fn vlm_generate<'a, M: Model>(
+pub fn vlm_generate<'a, M: Model + ?Sized>(
   model: &'a M,
   text_tokens: &[u32],
   images: &[PathBuf],
@@ -472,7 +483,7 @@ pub fn vlm_generate<'a, M: Model>(
 /// pattern (its `step` is `&mut self`; we use `&self + RefCell` because
 /// the prefill / decode branches share the same step body and one borrow
 /// scope keeps the code linear).
-struct VlmDecode<'a, M: Model> {
+struct VlmDecode<'a, M: Model + ?Sized> {
   model: &'a M,
   cache: RefCell<Vec<Box<dyn KvCache>>>,
   sampler: RefCell<Sampler>,
@@ -527,7 +538,7 @@ struct VlmDecode<'a, M: Model> {
   done: bool,
 }
 
-impl<M: Model> VlmDecode<'_, M> {
+impl<M: Model + ?Sized> VlmDecode<'_, M> {
   /// Sample one token from `logits` (`[1, V]`) using the sampler and the
   /// configured logits processors. Mirrors the post-forward portion of
   /// [`crate::lm::generate::Generator::step`] (steps 3–6 in that file's
@@ -778,7 +789,7 @@ impl<M: Model> VlmDecode<'_, M> {
   }
 }
 
-impl<M: Model> Iterator for VlmDecode<'_, M> {
+impl<M: Model + ?Sized> Iterator for VlmDecode<'_, M> {
   type Item = Result<GenStep>;
 
   fn next(&mut self) -> Option<Self::Item> {

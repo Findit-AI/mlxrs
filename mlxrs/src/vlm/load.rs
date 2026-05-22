@@ -1165,8 +1165,12 @@ mod tests {
   use super::*;
   use crate::{
     array::Array,
-    lm::{cache::KvCache, model::Model as LmModel},
-    vlm::image::{ColorOrder, ImageProcessorConfig, ResizeFilter},
+    lm::{cache::KvCache, generate::GenConfig, model::Model as LmModel},
+    vlm::{
+      generate::{VlmGenConfig, vlm_generate},
+      image::{ColorOrder, ImageProcessorConfig, ResizeFilter},
+      prompt::MarkerPolicy,
+    },
   };
 
   /// A "flat" mock `config.json` for the mock VLM architecture: the
@@ -1539,6 +1543,58 @@ mod tests {
     // The tokenizer loaded from the same directory.
     let ids = ctx.tokenizer.encode("a b c", false).unwrap();
     assert_eq!(ids.len(), 3);
+  }
+
+  #[test]
+  fn loaded_model_drives_vlm_generate_end_to_end() {
+    // Codex review (load↔generate integration gap): `load()` hands back a
+    // `LoadedVlmContext` whose `model` is a `Box<dyn VlmModel>`, and the
+    // public `vlm_generate` is generic over `M: vlm::Model + ?Sized`. This
+    // test proves the loader's trait-object output drives the generation
+    // loop *directly* — `&*ctx.model` deref-coerces `Box<dyn VlmModel>` to
+    // `&dyn VlmModel`, an UNSIZED `M`, which satisfies the relaxed bound.
+    // Before the `?Sized` relaxation this call did not compile at all (the
+    // implicit `Sized` bound rejected `dyn VlmModel`), so the loader's
+    // output was unusable by the generation loop; that regression is now
+    // caught here. Zero-image path — `vlm_generate` dispatches straight to
+    // `lm::generate::generate_step` (also `?Sized`-generic, accepted
+    // because `VlmModel: Model`) — so this needs no image fixture.
+    let dir = fresh_dir("e2e-generate");
+    write_vlm_dir(&dir, "mockvlm", "preprocessor_config.json", "MockProc", 64);
+    let model_registry = VlmTypeRegistry::new().with("mockvlm", mock_vlm_constructor());
+    let processor_registry =
+      VlmProcessorTypeRegistry::new().with("MockProc", mock_processor_constructor());
+    let config = VlmModelConfiguration::from_directory(&dir);
+
+    let ctx = load(&config, &model_registry, &processor_registry).expect("load should succeed");
+
+    // Drive `vlm_generate` on the LOADED model — `&*ctx.model` is a
+    // `&dyn VlmModel` (the `Box<dyn VlmModel>` field deref-coerced). The
+    // mock's `forward` returns `[B, S, vocab]` zero logits ⇒ greedy argmax
+    // is token id 0 every step; an empty eos set lets it run to
+    // `max_tokens`. The mock ignores the KV cache, so an empty cache is
+    // sufficient to exercise the decode loop.
+    let cfg = VlmGenConfig {
+      lm: GenConfig {
+        max_tokens: 4,
+        ..Default::default()
+      },
+      image_token_id: 99,
+      image_marker_id: None,
+      num_tokens_per_image: 3,
+      marker_policy: MarkerPolicy::Required,
+    };
+    let prompt = [0_u32, 1, 2];
+    let steps = vlm_generate(&*ctx.model, &prompt, &[], Vec::new(), cfg)
+      .expect("vlm_generate constructs against the loaded trait-object model");
+
+    let tokens: Vec<u32> = steps
+      .map(|s| s.expect("each generation step succeeds").token)
+      .collect();
+    // The loaded model produced exactly `max_tokens` tokens — load→generate
+    // works for the trait-object output. (Greedy argmax of all-zero logits
+    // is the lowest index, 0.)
+    assert_eq!(tokens, vec![0_u32, 0, 0, 0]);
   }
 
   #[test]
