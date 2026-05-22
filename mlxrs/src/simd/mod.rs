@@ -15,9 +15,9 @@
 //! Mirrors the `dia` project's `src/ops/` four-layer shape:
 //!
 //! - [`scalar`](crate::simd::scalar) — bit-exact scalar reference
-//!   kernels. **Always compiled**, independent of the `simd` feature
-//!   and `target_arch`. The math contract is anchored here; it is
-//!   also the differential-test oracle and the fallback path.
+//!   kernels. **Always compiled**, independent of `target_arch`. The
+//!   math contract is anchored here; it is also the differential-test
+//!   oracle and the fallback path.
 //! - [`arch`](crate::simd::arch) — architecture-specific SIMD
 //!   backends. `arch::neon` (`#[cfg(target_arch = "aarch64")]`) holds
 //!   `#[target_feature(enable = "neon")] unsafe fn` kernels.
@@ -35,15 +35,21 @@
 //!   f64. Used by [`crate::audio`]'s `integrated_loudness` for the
 //!   per-block K-weighted mean-square.
 //!
-//! ## Cargo feature
+//! ## Always on — no cargo feature
 //!
-//! Gated behind the `simd` cargo feature (**default-on**, per the
-//! project's "feature-gate in `mlxrs`, no new crate" rule). NEON is
-//! baseline-mandatory on `aarch64`, so default-on is safe for the
-//! primary `aarch64-darwin` target. With `simd` **off** the
-//! dispatchers still compile and route every call to
-//! [`scalar`](crate::simd::scalar) — a pure-scalar build for bisecting
-//! a numeric regression or for an exotic target.
+//! SIMD is **unconditional**: there is no `simd` cargo feature. Whether
+//! the NEON backend runs is gated purely on `#[cfg(target_arch =
+//! "aarch64")]` plus runtime CPU detection
+//! ([`neon_available`](crate::simd::neon_available)); on every other
+//! target the dispatchers route to [`scalar`](crate::simd::scalar)
+//! automatically. The [`scalar`](crate::simd::scalar) and `dispatch`
+//! layers therefore compile on **all** targets — only
+//! [`arch`](crate::simd::arch) and
+//! [`neon_available`](crate::simd::neon_available) are `aarch64`-gated.
+//! This matches the `dia` reference (no simd feature). A pure-scalar
+//! build for bisecting a numeric regression — even on a NEON-capable
+//! host — is available via the `--cfg mlxrs_force_scalar` build escape
+//! (see [`neon_available`](crate::simd::neon_available)).
 //!
 //! ## Cross-path determinism
 //!
@@ -60,7 +66,7 @@
 //! Verified by the `differential_tests` module below
 //! (`assert_eq!` on `f64::to_bits()`).
 
-#[cfg(all(feature = "simd", target_arch = "aarch64"))]
+#[cfg(target_arch = "aarch64")]
 pub mod arch;
 mod dispatch;
 pub mod scalar;
@@ -81,10 +87,11 @@ pub use dispatch::{dot, sum_of_squares};
 /// `true`; the explicit check keeps the scalar fallback a real,
 /// reachable branch and honours the force-scalar escape.
 ///
-/// Compiled only when the `simd` feature is on (and on `aarch64`) —
-/// with `simd` off there is no NEON backend to gate, so the detector
-/// itself is elided and every dispatcher routes to [`scalar`].
-#[cfg(all(feature = "simd", target_arch = "aarch64"))]
+/// Compiled only on `aarch64` — the single target with a NEON backend
+/// to gate. On every other target there is no SIMD backend, so the
+/// detector itself is elided and every dispatcher routes to
+/// [`scalar`].
+#[cfg(target_arch = "aarch64")]
 pub fn neon_available() -> bool {
   if cfg!(mlxrs_force_scalar) {
     return false;

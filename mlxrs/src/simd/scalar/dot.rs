@@ -17,8 +17,8 @@
 //! Result is bit-identical to the `crate::simd::arch::neon` kernels
 //! (`dot` / `sum_of_squares`) for every input on `aarch64`. (There is
 //! no x86 backend in mlxrs today; the dispatcher falls through to this
-//! scalar reference on `x86_64`, and on `aarch64` with the `simd`
-//! feature off.)
+//! scalar reference on `x86_64`, and on `aarch64` under `--cfg
+//! mlxrs_force_scalar`.)
 
 /// Inner product of two equal-length f64 slices: `Σ a[i] * b[i]`.
 ///

@@ -43,11 +43,12 @@ pub mod shape;
 /// MLX-delegated tensor math. Scalar reference + `aarch64` NEON
 /// backend behind a runtime-detection dispatcher.
 ///
-/// The module is **always compiled** so feature-gated callers (e.g.
-/// `audio`) can rely on it. The `simd` cargo feature (default-on)
-/// toggles only whether the NEON backend is used: with the feature
-/// **off** the dispatchers route every call to the always-compiled
-/// scalar path.
+/// **Always compiled** so any caller (e.g. `audio`) can rely on it —
+/// there is no `simd` cargo feature. Whether the NEON backend runs is
+/// gated purely on `#[cfg(target_arch = "aarch64")]` + runtime CPU
+/// detection; on every other target the dispatchers route to the
+/// always-compiled scalar path. The `--cfg mlxrs_force_scalar` build
+/// escape forces the scalar path even on a NEON-capable host.
 pub mod simd;
 pub mod stream;
 pub mod version;

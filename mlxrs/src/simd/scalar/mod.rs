@@ -3,13 +3,13 @@
 
 //! Scalar reference implementations of the [`crate::simd`] primitives.
 //!
-//! **Always compiled** — independent of the `simd` cargo feature and
-//! of `target_arch`. The scalar path is:
+//! **Always compiled** — independent of `target_arch` (there is no
+//! `simd` cargo feature). The scalar path is:
 //!
 //! 1. the *algorithmic* contract — same math, same input handling;
 //! 2. the differential-test oracle;
-//! 3. the fallback path when `simd` is off, on non-`aarch64` targets,
-//!    or when `--cfg mlxrs_force_scalar` is set.
+//! 3. the fallback path on non-`aarch64` targets, or when `--cfg
+//!    mlxrs_force_scalar` is set.
 //!
 //! The reduction kernels here are written to mirror the NEON kernels'
 //! reduction tree (4 partial accumulators over modulo-4 residues, then
