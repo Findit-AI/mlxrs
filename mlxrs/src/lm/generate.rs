@@ -1283,11 +1283,17 @@ pub fn stream_generate<'a, M: Model>(
     if eos.contains(&token) {
       finished = true;
       detok.finalize();
-      // Active path: emit the remaining unflushed tail of the cumulative
-      // text (the matcher never advanced the detok offset). Inert path:
-      // unchanged `last_segment()`.
+      // Active path: a detokenizer may withhold tail text from `text()`
+      // until `finalize()` (e.g. the BPE detok holds a bare-space token),
+      // so re-check the matcher against the now-finalized text before
+      // emitting — a stop completed by the finalized tail still trims. The
+      // finish_reason is "stop" either way here (this is the eos token).
+      // Inert path: unchanged `last_segment()`.
       let text = if matcher.is_active() {
-        emit_tail(detok.as_ref(), &mut emitted_len)
+        // eos path: reason is "stop" regardless of the matcher, so pass
+        // "stop" as the default (a finalized-tail stop also reports "stop").
+        let (text, _) = finalize_active_tail(detok.as_ref(), &matcher, &mut emitted_len, "stop");
+        text
       } else {
         detok.last_segment()
       };
@@ -1335,12 +1341,17 @@ pub fn stream_generate<'a, M: Model>(
         }
         crate::lm::stop::StopDecision::Continue { safe_len } => {
           // mlx-lm: `if (n + 1) == max_tokens: break` ⇒ a final
-          // `finish_reason="length"` response with the finalized tail.
+          // `finish_reason="length"` response with the finalized tail. But a
+          // detokenizer may withhold tail text from `text()` until
+          // `finalize()` (e.g. the BPE detok holds a bare-space token), so
+          // re-check the matcher against the finalized text: a stop completed
+          // by the finalized tail wins over `length` (trim + "stop").
           if n >= max_tokens {
             finished = true;
             drop(full);
             detok.finalize();
-            let text = emit_tail(detok.as_ref(), &mut emitted_len);
+            let (text, reason) =
+              finalize_active_tail(detok.as_ref(), &matcher, &mut emitted_len, "length");
             return Some(Ok(GenerationResponse {
               text,
               token,
@@ -1349,7 +1360,7 @@ pub fn stream_generate<'a, M: Model>(
               prompt_tps,
               generation_tokens: n,
               generation_tps: gen_tps(n),
-              finish_reason: Some("length".to_string()),
+              finish_reason: Some(reason.to_string()),
             }));
           }
           let end = safe_len.max(emitted_len).min(full.len());
@@ -1405,21 +1416,45 @@ pub fn stream_generate<'a, M: Model>(
   })
 }
 
-/// Emit the still-unflushed tail of the streaming detokenizer's cumulative
-/// text on the active-stop-matcher path: returns
-/// `text()[*emitted_len..]` and advances `*emitted_len` to the end. The
-/// matcher path drives emission off byte offsets into `detok.text()` (never
-/// `last_segment`, so the detok offset stays at 0); this finalizes the tail
-/// the same way for the eos / `max_tokens` terminal responses.
-fn emit_tail(
+/// Active-matcher terminal finalization. The caller MUST have already called
+/// `detok.finalize()`; this re-runs the stop matcher against the now-finalized
+/// `detok.text()` and decides the final emitted tail + `finish_reason`.
+///
+/// Mid-stream matching runs on `text()` BEFORE finalization, but some
+/// detokenizers withhold tail text from `text()` until `finalize()` (e.g. the
+/// BPE detok holds a single bare-space token for one step). A stop string can
+/// therefore be completed only by that finalized tail, so the terminal paths
+/// must re-check rather than blindly emit the tail:
+///
+/// - [`StopDecision::Stop`](crate::lm::stop::StopDecision::Stop): emit only up
+///   to `trimmed_len` (clamped exactly like the mid-stream Stop arm) and report
+///   `"stop"` — even on the `max_tokens` path, where a stop completed by the
+///   finalized tail wins over `"length"`.
+/// - Otherwise: emit the remaining safe tail (`text()[*emitted_len..]`,
+///   advancing `*emitted_len` to the end — the matcher path drives emission off
+///   byte offsets into `text()`, never `last_segment`) and report
+///   `default_reason` (`"stop"` on the eos path, `"length"` on `max_tokens`).
+fn finalize_active_tail(
   detok: &dyn crate::tokenizer::StreamingDetokenizer,
+  matcher: &crate::lm::stop::StopMatcher,
   emitted_len: &mut usize,
-) -> String {
+  default_reason: &'static str,
+) -> (String, &'static str) {
   let full = detok.text();
-  let start = (*emitted_len).min(full.len());
-  let text = full[start..].to_string();
-  *emitted_len = full.len();
-  text
+  match matcher.step(&full) {
+    crate::lm::stop::StopDecision::Stop { trimmed_len, .. } => {
+      let end = trimmed_len.max(*emitted_len).min(full.len());
+      let text = full[*emitted_len..end].to_string();
+      *emitted_len = end;
+      (text, "stop")
+    }
+    crate::lm::stop::StopDecision::Continue { .. } => {
+      let start = (*emitted_len).min(full.len());
+      let text = full[start..].to_string();
+      *emitted_len = full.len();
+      (text, default_reason)
+    }
+  }
 }
 
 /// Generate a complete response string for `prompt` — a 1:1 port of
@@ -2799,5 +2834,177 @@ mod stop_sequence_tests {
     assert_eq!(reasons.last().unwrap().as_deref(), Some("stop"));
     // Exactly one terminal reason, and it's the final element.
     assert_eq!(reasons.iter().filter(|r| r.is_some()).count(), 1);
+  }
+
+  // ── finalized-tail re-check on the active-matcher terminal paths ──────────
+  //
+  // Some detokenizers withhold tail text from `text()` until `finalize()`
+  // (the real BPE detok holds a single bare-space token for one step). The
+  // mid-stream matcher runs on `text()` BEFORE finalization, so a stop string
+  // completed only by that withheld tail is invisible until the terminal
+  // branch finalizes. These tests drive the exact unit the EOS / max_tokens
+  // active-matcher branches now call — [`finalize_active_tail`] — through a
+  // mock that reproduces the withhold-until-finalize behavior, asserting the
+  // tail completes the stop (trim + "stop"), including the max_tokens case
+  // where a finalized-tail stop must win over "length".
+
+  /// A mock [`StreamingDetokenizer`](crate::tokenizer::StreamingDetokenizer)
+  /// that withholds the most-recently-added "tail" token's text from `text()`
+  /// until the next `add_token` / `finalize` flushes it — exactly the BPE
+  /// detok's single-bare-space hold-back, but deterministic and tokenizer-free.
+  #[derive(Default)]
+  struct WithholdDetokenizer {
+    /// Committed (visible) text — what `text()` returns.
+    text: String,
+    /// The withheld tail not yet visible in `text()` (flushed on the next
+    /// `push` / `finalize`).
+    pending: String,
+    tokens: Vec<u32>,
+    offset: usize,
+  }
+
+  impl WithholdDetokenizer {
+    /// Add a token whose decoded text is `s`. When `withhold` is true the text
+    /// is held back from `text()` until the next push/finalize (BPE bare-space
+    /// semantics); otherwise it (and any pending tail) commits immediately.
+    fn push(&mut self, s: &str, withhold: bool) {
+      // A previously-withheld tail becomes visible as soon as another token
+      // arrives (the BPE detok flushes `unflushed` on the next step).
+      self.text.push_str(&self.pending);
+      self.pending.clear();
+      if withhold {
+        self.pending.push_str(s);
+      } else {
+        self.text.push_str(s);
+      }
+      self.tokens.push(self.tokens.len() as u32);
+    }
+  }
+
+  impl crate::tokenizer::StreamingDetokenizer for WithholdDetokenizer {
+    fn reset(&mut self) {
+      self.text.clear();
+      self.pending.clear();
+      self.tokens.clear();
+      self.offset = 0;
+    }
+    fn add_token(&mut self, _token: u32) {}
+    fn finalize(&mut self) {
+      // Flush the withheld tail into the visible text (BPE `finalize`).
+      self.text.push_str(&self.pending);
+      self.pending.clear();
+    }
+    fn text(&self) -> std::borrow::Cow<'_, str> {
+      std::borrow::Cow::Borrowed(&self.text)
+    }
+    fn tokens(&self) -> &[u32] {
+      &self.tokens
+    }
+    fn offset(&self) -> usize {
+      self.offset
+    }
+    fn set_offset(&mut self, offset: usize) {
+      self.offset = offset;
+    }
+  }
+
+  /// Sanity: before `finalize`, the withheld tail is invisible in `text()`;
+  /// `finalize` makes it visible — the precondition that makes the bug bite.
+  #[test]
+  fn mock_withholds_tail_until_finalize() {
+    use crate::tokenizer::StreamingDetokenizer;
+    let mut d = WithholdDetokenizer::default();
+    d.push("hello", false);
+    d.push(" ", true); // bare space withheld
+    assert_eq!(d.text().as_ref(), "hello"); // the space is NOT yet visible
+    d.finalize();
+    assert_eq!(d.text().as_ref(), "hello "); // now flushed
+  }
+
+  #[test]
+  fn finalized_tail_completes_stop_on_eos_trims_and_reports_stop() {
+    // EOS terminal path: a withheld bare-space token completes the stop " ".
+    // The mid-stream matcher (run on pre-finalize text "hello") never saw the
+    // space; only the finalized text "hello " contains the stop. The eos
+    // branch passes default_reason="stop"; finalize_active_tail must trim the
+    // space and report "stop".
+    let stop = crate::lm::stop::StopMatcher::new(vec![" ".to_string()]);
+    let mut d = WithholdDetokenizer::default();
+    d.push("hello", false);
+    d.push(" ", true); // the eos-preceding token; held back until finalize
+    // The visible "hello" was already streamed mid-loop (emitted_len tracks it).
+    let mut emitted_len = "hello".len();
+    crate::tokenizer::StreamingDetokenizer::finalize(&mut d);
+    let (text, reason) = finalize_active_tail(&d, &stop, &mut emitted_len, "stop");
+    // The stop " " starts at byte 5; trimmed_len=5 == emitted_len ⇒ nothing
+    // new emitted (the space is trimmed away, not returned), reason "stop".
+    assert_eq!(text, "");
+    assert_eq!(reason, "stop");
+    assert!(!text.contains(' '), "the bare space must not be emitted");
+  }
+
+  #[test]
+  fn finalized_tail_completes_stop_on_max_tokens_wins_over_length() {
+    // max_tokens terminal path: the final allowed token is a withheld bare
+    // space that completes the stop " ". finalize_active_tail is called with
+    // default_reason="length", but a stop completed by the finalized tail must
+    // OVERRIDE to "stop" (and trim), not report "length".
+    let stop = crate::lm::stop::StopMatcher::new(vec![" ".to_string()]);
+    let mut d = WithholdDetokenizer::default();
+    d.push("hi", false);
+    d.push(" ", true); // final allowed token, withheld until finalize
+    let mut emitted_len = "hi".len();
+    crate::tokenizer::StreamingDetokenizer::finalize(&mut d);
+    let (text, reason) = finalize_active_tail(&d, &stop, &mut emitted_len, "length");
+    assert_eq!(reason, "stop", "finalized-tail stop must win over length");
+    assert_eq!(text, ""); // the space is trimmed, not emitted
+    assert!(!text.contains(' '));
+  }
+
+  #[test]
+  fn finalized_tail_no_stop_emits_tail_with_default_reason() {
+    // Control: when the finalized tail does NOT complete a stop, the tail is
+    // emitted and default_reason is preserved (length on max_tokens, stop on
+    // eos). Guards against the re-check spuriously trimming/relabeling.
+    let stop = crate::lm::stop::StopMatcher::new(vec!["ZZZ".to_string()]); // never matches
+    let mut d = WithholdDetokenizer::default();
+    d.push("hi", false);
+    d.push(" ", true); // withheld tail, no stop completion
+    let mut emitted_len = "hi".len();
+    crate::tokenizer::StreamingDetokenizer::finalize(&mut d);
+    // max_tokens semantics → "length", and the withheld space is emitted.
+    let (text, reason) = finalize_active_tail(&d, &stop, &mut emitted_len, "length");
+    assert_eq!(text, " ");
+    assert_eq!(reason, "length");
+    // eos semantics → "stop", same emitted tail.
+    let mut d2 = WithholdDetokenizer::default();
+    d2.push("hi", false);
+    d2.push(" ", true);
+    let mut emitted_len2 = "hi".len();
+    crate::tokenizer::StreamingDetokenizer::finalize(&mut d2);
+    let (text2, reason2) = finalize_active_tail(&d2, &stop, &mut emitted_len2, "stop");
+    assert_eq!(text2, " ");
+    assert_eq!(reason2, "stop");
+  }
+
+  #[test]
+  fn finalized_tail_completes_multichar_stop_spanning_into_tail() {
+    // The withheld tail supplies the final char of a multi-char stop that
+    // straddles the commit/withhold boundary: visible "ab", withheld "c",
+    // stop "abc". Pre-finalize text "ab" has no match; finalized "abc" does.
+    // finalize_active_tail trims at the match start (byte 0), but emitted_len
+    // is already 2 (the "ab" was streamed), so nothing new is emitted and the
+    // reason is "stop".
+    let stop = crate::lm::stop::StopMatcher::new(vec!["abc".to_string()]);
+    let mut d = WithholdDetokenizer::default();
+    d.push("ab", false);
+    d.push("c", true);
+    let mut emitted_len = "ab".len();
+    crate::tokenizer::StreamingDetokenizer::finalize(&mut d);
+    let (text, reason) = finalize_active_tail(&d, &stop, &mut emitted_len, "length");
+    assert_eq!(reason, "stop");
+    assert_eq!(text, "");
+    // emitted_len clamped to match start (0) max emitted (2) = 2.
+    assert_eq!(emitted_len, 2);
   }
 }
