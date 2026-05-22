@@ -421,3 +421,175 @@ fn driver_high_level_empty_string_is_consistent() {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// `continue_final_message` regression (Codex finding).
+//
+// `cache_prompt.py` encodes the chat-template prompt with
+// `add_generation_prompt=False, continue_final_message=True`. For a chat
+// template that appends an end-of-turn token after the final user message,
+// `continue_final_message=True` must STRIP that terminator so the saved KV
+// cache ends exactly at the prompt's last content token (matching mlx-lm); a
+// non-continued encode would cache an EXTRA terminator token, diverging the
+// offset + later generation.
+// ---------------------------------------------------------------------------
+
+/// A `tokenizer_config.json` whose chat template appends `</s>` (an end-of-turn
+/// terminator, vocab id 2 in the fixture) after EVERY message's content — the
+/// Qwen/ChatML-style shape `continue_final_message` exists to handle.
+const EOT_TEMPLATE_CONFIG_JSON: &str = r#"{
+  "bos_token": "<s>",
+  "eos_token": "</s>",
+  "clean_up_tokenization_spaces": false,
+  "unk_token": "<unk>",
+  "chat_template": "{{ bos_token }}{% for m in messages %}{{ '<|' + m['role'] + '|>' }}{{ m['content'] }}</s>{% endfor %}{% if add_generation_prompt %}<|assistant|>{% endif %}"
+}"#;
+
+/// Build a [`Tokenizer`] from the committed `tokenizer.json` fixture plus a
+/// caller-supplied `tokenizer_config.json` body — used to install the
+/// terminator-appending chat template above.
+fn tokenizer_with_config(dir: &std::path::Path, config_json: &str) -> mlxrs::tokenizer::Tokenizer {
+  let mut tj = fs::File::create(dir.join("tokenizer.json")).unwrap();
+  tj.write_all(TOKENIZER_JSON.as_bytes()).unwrap();
+  let mut tc = fs::File::create(dir.join("tokenizer_config.json")).unwrap();
+  tc.write_all(config_json.as_bytes()).unwrap();
+  mlxrs::tokenizer::Tokenizer::from_path(dir, None).unwrap()
+}
+
+/// The chat-template encode used by `cache_prompt` (`continue_final_message =
+/// true`) drops the trailing end-of-turn token a non-continued encode keeps —
+/// so the cached prompt is one-or-more tokens SHORTER and ends exactly at the
+/// final message's content (the Codex finding's correctness contract).
+#[test]
+fn continue_final_message_encode_drops_trailing_terminator() {
+  let dir = temp_dir("cfm_encode");
+  let tok = tokenizer_with_config(&dir, EOT_TEMPLATE_CONFIG_JSON);
+  // One `user` message — exactly what `cache_prompt` builds.
+  let messages = serde_json::json!([{ "role": "user", "content": "hello world" }]);
+
+  // Non-continued: the template's trailing `</s>` is rendered + tokenized, so
+  // the encoded ids END with the `</s>` terminator id (2).
+  let plain = tok
+    .apply_chat_template_ids(&messages, None, false, false, None)
+    .unwrap();
+  assert_eq!(
+    plain.last().copied(),
+    Some(2),
+    "without continue_final_message the encode keeps the trailing </s> (id 2)"
+  );
+
+  // Continued (what `cache_prompt` uses): HF's post-render trim strips the
+  // trailing `</s>`, so the encoded ids do NOT end with id 2 and are strictly
+  // shorter — the cache offset is exactly that many tokens smaller.
+  let continued = tok
+    .apply_chat_template_ids(&messages, None, false, true, None)
+    .unwrap();
+  assert_ne!(
+    continued.last().copied(),
+    Some(2),
+    "continue_final_message must strip the trailing </s> terminator"
+  );
+  assert!(
+    continued.len() < plain.len(),
+    "the continued encode ({} ids) is shorter than the plain encode ({} ids)",
+    continued.len(),
+    plain.len(),
+  );
+  // Exactly the terminator was removed: the continued encode is the plain
+  // encode with its trailing `</s>` id(s) gone — it is a strict prefix.
+  assert_eq!(
+    continued.as_slice(),
+    &plain[..continued.len()],
+    "the continued encode is the plain encode minus the trailing terminator"
+  );
+}
+
+/// L7 round-trip with a terminator-appending chat template: driving
+/// `cache_prompt` (which encodes with `continue_final_message=true`) saves a
+/// cache whose offset == the *continued* encode length (terminator stripped),
+/// NOT the longer plain-encode length — and the loaded cache continues like a
+/// from-scratch prefill of that same continued prompt.
+#[test]
+fn cache_prompt_chat_template_uses_continue_final_message_offset() {
+  let dir = temp_dir("cfm_roundtrip");
+  let tok = tokenizer_with_config(&dir, EOT_TEMPLATE_CONFIG_JSON);
+  let model = MockModel::ramp(64); // vocab >= any fixture id
+  let out = dir.join("cache.safetensors");
+
+  let messages = serde_json::json!([{ "role": "user", "content": "the quick brown fox" }]);
+  let plain = tok
+    .apply_chat_template_ids(&messages, None, false, false, None)
+    .unwrap();
+  let continued = tok
+    .apply_chat_template_ids(&messages, None, false, true, None)
+    .unwrap();
+  assert!(
+    continued.len() < plain.len(),
+    "sanity: the terminator-appending template makes the continued encode shorter"
+  );
+
+  // Drive the high-level `cache_prompt` (its chat-template branch encodes with
+  // continue_final_message=true).
+  let mut c = cache(2);
+  let info = cache_prompt(
+    &model,
+    &tok,
+    "the quick brown fox",
+    &mut c,
+    &out,
+    "fixture-model",
+    "{}",
+    8,
+    &HashMap::new(),
+  )
+  .unwrap();
+
+  // The processed count + cache offset match the CONTINUED encode length (the
+  // terminator-stripped prompt), not the longer plain encode.
+  assert_eq!(
+    info.tokens_processed,
+    continued.len(),
+    "cache_prompt must process the continue_final_message encode (terminator stripped)"
+  );
+  assert_ne!(
+    info.tokens_processed,
+    plain.len(),
+    "cache_prompt must NOT cache the extra terminator token"
+  );
+  assert!(c.iter().all(|x| x.offset() == continued.len()));
+
+  // Loaded cache continues like a from-scratch prefill of the continued
+  // prompt: the cache holds the `continued` prefix, so re-feeding its last
+  // token reproduces a scratch run's first decode (greedy argmax is
+  // position-independent for the ramp MockModel).
+  let (loaded, _meta) = load_prompt_cache(&out).unwrap();
+  assert!(loaded.iter().all(|x| x.offset() == continued.len()));
+  let from_scratch: Vec<u32> = generate_step(
+    &model,
+    &continued,
+    cache(2),
+    GenConfig {
+      max_tokens: 3,
+      eos: vec![],
+      ..GenConfig::default()
+    },
+  )
+  .map(|r| r.unwrap().token)
+  .collect();
+  let from_cache: Vec<u32> = generate_step(
+    &model,
+    &[*continued.last().unwrap()],
+    loaded,
+    GenConfig {
+      max_tokens: 3,
+      eos: vec![],
+      ..GenConfig::default()
+    },
+  )
+  .map(|r| r.unwrap().token)
+  .collect();
+  assert_eq!(
+    from_scratch, from_cache,
+    "loaded cache (continue_final_message prompt) continues like a from-scratch prefill"
+  );
+}

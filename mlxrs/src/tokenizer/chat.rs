@@ -823,18 +823,126 @@ fn utf8_char_len(b: u8) -> usize {
   }
 }
 
+/// HF's sentinel for the `continue_final_message` post-render trim
+/// (`transformers/utils/chat_template_utils.py`,
+/// `continue_final_message_tag = "CONTINUE_FINAL_MESSAGE_TAG "`). Appended to
+/// the final message's `content` before rendering, then located + truncated
+/// out of the rendered string. The trailing space is significant — see
+/// [`continue_final_message_trim`] for how the full-tag-with-space check
+/// selects HF's plain-truncate vs. `rstrip` branch.
+const CONTINUE_FINAL_MESSAGE_TAG: &str = "CONTINUE_FINAL_MESSAGE_TAG ";
+
+/// Faithful port of HF Transformers' `continue_final_message` handling
+/// (`render_jinja_template` in `transformers/utils/chat_template_utils.py`).
+///
+/// HF's mechanism is a *string-level* post-render trim, not a template flag:
+///
+/// 1. **Pre-render** — deep-copy the conversation and append the sentinel
+///    [`CONTINUE_FINAL_MESSAGE_TAG`] to the final message's `content` (HF:
+///    `chat[-1][continue_final_message] = ... + continue_final_message_tag`,
+///    with `continue_final_message` defaulting to the `"content"` field).
+/// 2. **Render** — the template renders the augmented conversation normally.
+/// 3. **Post-render trim** — locate the sentinel and cut everything from it
+///    onward, so the rendered prompt ends *exactly* at the final message's
+///    content (no trailing end-of-turn / EOS / generation-prompt tokens the
+///    template appended after it):
+///    ```text
+///    tag_loc = rendered.rindex(TAG.trim_end())
+///    if rendered[tag_loc .. tag_loc + TAG.len()] == TAG { rendered[..tag_loc] }
+///    else                                                { rendered[..tag_loc].trim_end() }
+///    ```
+///    The `if` branch matches HF byte-for-byte: when the template emits the
+///    final-message content verbatim the trailing space of `TAG` survives, so
+///    the cut is a plain truncation; when the template applied a transform
+///    (e.g. `| trim`) that ate the trailing space, HF `.rstrip()`s the result.
+///
+/// This function returns the pre-render conversation with the sentinel
+/// appended (an `Err` for an empty conversation / a final message lacking a
+/// string `content` — HF raises `ValueError` for the same cases);
+/// [`continue_final_message_trim`] is the post-render step. They are split so
+/// [`render_jinja`] can append the sentinel before building the jinja context
+/// and trim after `render`.
+fn continue_final_message_mutate(messages: &Value) -> Result<Value, Error> {
+  let arr = messages
+    .as_array()
+    .ok_or_else(|| Error::tokenizer("messages must be a list"))?;
+  let last = arr.last().ok_or_else(|| {
+    Error::tokenizer(
+      "continue_final_message is set but the conversation has no final message to continue",
+    )
+  })?;
+  // HF defaults the continued field to "content" and requires it to exist on
+  // the final message (`if (final_message := chat[-1].get(...)) is None:
+  // raise ValueError`). mlxrs only supports the default `content` field, and
+  // it must be a string (HF's list/tuple content-block form is the
+  // multimodal-VLM shape, out of scope for this text-prompt path).
+  let content = last.get("content").and_then(Value::as_str).ok_or_else(|| {
+    Error::tokenizer(
+      "continue_final_message is set but the final message has no string \"content\" to continue",
+    )
+  })?;
+  let mut mutated = arr.clone();
+  let new_content = format!("{content}{CONTINUE_FINAL_MESSAGE_TAG}");
+  // `last` is the final element; reborrow it mutably in the clone.
+  if let Some(obj) = mutated.last_mut().and_then(Value::as_object_mut) {
+    obj.insert("content".to_string(), Value::String(new_content));
+  }
+  Ok(Value::Array(mutated))
+}
+
+/// Post-render trim for `continue_final_message` — see
+/// [`continue_final_message_mutate`]. Cuts the rendered string at the
+/// sentinel; an absent sentinel is an `Err` (the template dropped the final
+/// message's content entirely — HF's `rindex` raises `ValueError` likewise).
+fn continue_final_message_trim(rendered: &str) -> Result<String, Error> {
+  // HF: `rendered_chat.rindex(continue_final_message_tag.strip())`.
+  let needle = CONTINUE_FINAL_MESSAGE_TAG.trim_end();
+  let tag_loc = rendered.rfind(needle).ok_or_else(|| {
+    Error::tokenizer(
+      "continue_final_message: the rendered template does not contain the final \
+       message's content (the template dropped it)",
+    )
+  })?;
+  // HF: if the full tag (with its trailing space) survived verbatim, plain
+  // truncate; otherwise the template transformed the trailing whitespace, so
+  // `rstrip` the truncation. `get` guards the slice when the tail is shorter
+  // than the full tag (sentinel at the very end after a transform).
+  let full_tag_present = rendered.get(tag_loc..tag_loc + CONTINUE_FINAL_MESSAGE_TAG.len())
+    == Some(CONTINUE_FINAL_MESSAGE_TAG);
+  let head = &rendered[..tag_loc];
+  Ok(if full_tag_present {
+    head.to_string()
+  } else {
+    head.trim_end().to_string()
+  })
+}
+
 /// Render a jinja `chat_template` with the HF-compatible environment.
 ///
 /// `messages` / `tools` are JSON values (list of message objects / list of
 /// tool objects). `extra` adds arbitrary template variables (the Python
 /// `additional_context` / template kwargs). `bos_token` / `eos_token` come
 /// from the tokenizer config.
+///
+/// `continue_final_message` ports HF Transformers' flag of the same name
+/// (`render_jinja_template` in `transformers/utils/chat_template_utils.py`):
+/// when set, the rendered prompt is trimmed so it ends exactly at the final
+/// message's content — the model *continues* that message rather than
+/// starting a new turn. HF's mechanism is a string-level post-render trim,
+/// faithfully reproduced here: the `"CONTINUE_FINAL_MESSAGE_TAG "` sentinel
+/// is appended to the final message's `content` before rendering, then the
+/// rendered string is cut at the sentinel (`rendered.rindex(tag.strip())`),
+/// dropping the trailing end-of-turn / EOS tokens the template appended after
+/// the content. It is mutually exclusive with `add_generation_prompt` (HF
+/// rejects both at once); callers must not set both — the dispatching
+/// [`super::Tokenizer`] methods reject the combination up front.
 #[allow(clippy::too_many_arguments)]
 pub fn render_jinja(
   template: &str,
   messages: &Value,
   tools: Option<&Value>,
   add_generation_prompt: bool,
+  continue_final_message: bool,
   bos_token: Option<&str>,
   eos_token: Option<&str>,
   enable_thinking: bool,
@@ -882,6 +990,19 @@ pub fn render_jinja(
     .get_template("chat")
     .map_err(|e| Error::tokenizer(format!("chat template: {e}")))?;
 
+  // HF's `continue_final_message`: append the sentinel to the final message's
+  // content *before* building the jinja context, so the template renders the
+  // augmented conversation; the rendered string is trimmed at the sentinel
+  // after `render` below. An owned `Cow`-style local keeps the borrowed
+  // `messages` untouched for the no-continuation path (no clone).
+  let continued_messages;
+  let messages: &Value = if continue_final_message {
+    continued_messages = continue_final_message_mutate(messages)?;
+    &continued_messages
+  } else {
+    messages
+  };
+
   let mut ctx = serde_json::Map::new();
   ctx.insert("messages".into(), messages.clone());
   ctx.insert(
@@ -912,9 +1033,17 @@ pub fn render_jinja(
     }
   }
 
-  tmpl
+  let rendered = tmpl
     .render(JValue::from_serialize(Value::Object(ctx)))
-    .map_err(|e| Error::tokenizer(format!("chat template render: {e}")))
+    .map_err(|e| Error::tokenizer(format!("chat template render: {e}")))?;
+
+  // HF's `continue_final_message` post-render trim: cut the rendered string at
+  // the sentinel so the prompt ends exactly at the final message's content.
+  if continue_final_message {
+    continue_final_message_trim(&rendered)
+  } else {
+    Ok(rendered)
+  }
 }
 
 /// Register the globals/filters that `transformers`' jinja sandbox exposes so

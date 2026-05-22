@@ -86,20 +86,22 @@ pub struct CachePromptInfo {
 }
 
 /// Encode `prompt` the way `cache_prompt.py` does (cache_prompt.py:100-109):
-/// the chat template when the tokenizer has one (`add_generation_prompt=False,
-/// continue_final_message=True` — a single `user` message), else the plain
-/// [`Tokenizer::encode`].
+/// the chat template when the tokenizer has one
+/// (`add_generation_prompt=False, continue_final_message=True` — a single
+/// `user` message), else the plain [`Tokenizer::encode`].
 ///
-/// `continue_final_message=True` has no first-class flag on
-/// [`Tokenizer::apply_chat_template_ids`]; it is faithfully reproduced by
-/// appending the prompt as the final message with **no** generation prompt
-/// (the cache should end exactly at the prompt's last token, ready for a
-/// later continuation — not after an injected assistant-turn opener).
+/// `continue_final_message=true` is passed through to
+/// [`Tokenizer::apply_chat_template_ids`]'s first-class flag, which ports HF
+/// Transformers' post-render trim: the rendered prompt ends exactly at the
+/// final message's content, with the trailing end-of-turn / EOS tokens the
+/// template would otherwise append stripped — so the cache offset matches
+/// mlx-lm's exactly (the cache must end at the prompt's last *content* token,
+/// ready for a later continuation, not after an injected turn terminator).
 fn encode_prompt(tokenizer: &Tokenizer, prompt: &str) -> Result<Vec<u32>> {
   if tokenizer.has_chat_template() {
     let messages = serde_json::json!([{ "role": "user", "content": prompt }]);
     let ids = tokenizer
-      .apply_chat_template_ids(&messages, None, false, None)
+      .apply_chat_template_ids(&messages, None, false, true, None)
       .map_err(|e| Error::Backend {
         message: format!("cache_prompt: apply_chat_template failed: {e}"),
       })?;
