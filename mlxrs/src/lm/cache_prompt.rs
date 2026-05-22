@@ -48,7 +48,11 @@
 //! (and to a `generate_step` decode that *did* prefill). No sampler, no
 //! logits-processors, no `logprobs` — none of which `cache_prompt` needs.
 
-use std::collections::HashMap;
+use std::{
+  collections::HashMap,
+  fs,
+  path::{Path, PathBuf},
+};
 
 use crate::{
   array::Array,
@@ -126,20 +130,63 @@ fn token_window(ids: &[u32]) -> Result<Array> {
   Array::from_slice::<i32>(&row, &(1usize, row.len()))
 }
 
+/// Force-evaluate the per-layer cache **state** arrays — the prefill
+/// memory-barrier mlx-lm runs after every prompt chunk
+/// (`generate.py:442`: `mx.eval([c.state for c in prompt_cache])`).
+///
+/// `mlxrs::Array` is lazy (an op only records a graph node), so without this
+/// each prefill chunk's `forward` would *append* to a graph spanning every
+/// prior chunk and nothing would materialize until the final save — making
+/// peak memory grow with the whole prompt and defeating `prefill_step_size`
+/// (a long prompt could OOM/abort at the end). [`KvCache::state`] returns the
+/// cache's K/V arrays as refcount-sharing handles ([`Array::try_clone`]) onto
+/// the *same* underlying buffers the cache holds, so evaluating them
+/// materializes the cache itself — exactly mlx-lm's `mx.eval([c.state ...])`.
+/// Evaluation is the crate's explicit `&mut` step ([`Array::eval`]); there is
+/// no hidden eval in `state()` (it only clones handles), so this barrier is
+/// the deliberate materialization point.
+///
+/// mlxrs has no safe vector-eval wrapper (mlx-c's `mlx_eval(mlx_vector_array)`
+/// is unbound here), so each state array is evaluated individually — observably
+/// identical to a single `mx.eval` over the list (each array's graph is forced
+/// to its buffer; order is irrelevant). An empty-state layer (a cache that
+/// holds nothing — `state()` returns `[]`) contributes no work.
+fn eval_cache_state(cache: &mut [Box<dyn KvCache>]) -> Result<()> {
+  for layer in cache.iter() {
+    // `state()` clones the cache's K/V handles (shared buffers); evaluating
+    // each forces materialization of the cache's own arrays.
+    for mut arr in layer.state()? {
+      arr.eval()?;
+    }
+  }
+  Ok(())
+}
+
 /// Run a **prefill-only** forward over the full encoded `prompt`, advancing
 /// `cache` in place — the exact forward sequence mlx-lm's
 /// `generate_step(max_tokens=0)` performs (the prompt-fill `cache_prompt.py`
 /// relies on), minus all sampling.
 ///
 /// mlx-lm prefills the leading `total - 1` tokens in `prefill_step_size`
-/// chunks (`generate.py:430-451`, logits discarded) and then forwards the
-/// final token in the first `_step` (`generate.py:454`) — together the whole
-/// prompt. This reproduces that precisely: the same chunk boundaries for the
-/// first `P - 1` tokens, then a final 1-token forward. The result is a cache
-/// at offset `P`, byte-identical to a `generate_step` run that prefilled the
-/// same prompt. No `logits` are kept (every `forward` return is dropped — the
-/// chunk only fills the cache, no implicit eval beyond what `forward` itself
-/// does).
+/// chunks (`generate.py:430-451`, logits discarded, **evaluating the cache
+/// state after each chunk** at `generate.py:442`) and then forwards the final
+/// token in the first `_step` (`generate.py:454`) — together the whole prompt.
+/// This reproduces that precisely: the same chunk boundaries for the first
+/// `P - 1` tokens with a per-chunk [`eval_cache_state`] barrier, then a final
+/// 1-token forward. The result is a cache at offset `P`, byte-identical to a
+/// `generate_step` run that prefilled the same prompt. No `logits` are kept
+/// (every `forward` return is dropped — the chunk only fills the cache).
+///
+/// ## Why the per-chunk barrier (Codex finding — memory-bounded prefill)
+///
+/// `mlxrs::Array` is lazy, so without [`eval_cache_state`] the chunk loop would
+/// accumulate a single lazy graph spanning **every** chunk and only force it at
+/// the final save — `prefill_step_size` would bound nothing and a long prompt
+/// could OOM/abort. Evaluating the cache state after each chunk caps the live
+/// graph to one chunk's work (mlx-lm's exact discipline). The final tail
+/// token's forward is left to be materialized by the save (mlx-lm `async_eval`s
+/// it rather than blocking) — `save_prompt_cache` reads `state()` and writes
+/// it, forcing that last step.
 ///
 /// `prefill_step_size` is clamped to `>= 1` (a `0` would not make progress),
 /// matching [`crate::lm::generate::generate_step`]'s `prefill_step_size.max(1)`.
@@ -151,8 +198,8 @@ fn prefill_full<M: Model>(
 ) -> Result<()> {
   let step = prefill_step_size.max(1);
   // mlx-lm: `while total - processed > 1: n = min(step, (total-processed)-1);
-  // forward(prompt[:n]); processed += n`. Advance a cursor (never
-  // front-drain) for O(P) with byte-identical chunk boundaries.
+  // forward(prompt[:n]); mx.eval([c.state ...]); processed += n`. Advance a
+  // cursor (never front-drain) for O(P) with byte-identical chunk boundaries.
   let mut processed = 0usize;
   while prompt.len() - processed > 1 {
     let remaining = (prompt.len() - processed) - 1;
@@ -160,11 +207,16 @@ fn prefill_full<M: Model>(
     let chunk = token_window(&prompt[processed..processed + n])?;
     // logits discarded — the chunk only fills the cache.
     let _ = model.forward(&chunk, cache)?;
+    // mlx-lm `generate.py:442`: materialize the cache state so the lazy graph
+    // does not span every chunk (memory-bounded prefill).
+    eval_cache_state(cache)?;
     processed += n;
   }
   // mlx-lm `_step(input_tokens=prompt)` over the final unconsumed token: the
   // same forward, just without sampling its logits. After the loop exactly
-  // one token remains (`prompt[processed..]`).
+  // one token remains (`prompt[processed..]`). mlx-lm `async_eval`s this last
+  // step rather than blocking on it; here the subsequent `save_prompt_cache`
+  // reads `state()` and materializes it, so no extra barrier is needed.
   let tail = token_window(&prompt[processed..])?;
   let _ = model.forward(&tail, cache)?;
   Ok(())
@@ -273,11 +325,203 @@ pub fn cache_prompt_ids<M: Model>(
     META_TOKENIZER_CONFIG.to_string(),
     tokenizer_config_json.to_string(),
   );
-  save_prompt_cache(out_path, cache, &metadata)?;
+  // Atomic save: write to a same-directory tempfile, fsync, then rename over
+  // the destination — a crash / IO error mid-save never leaves a partial or
+  // corrupt cache at `out_path` (Codex finding). Mirrors `audio::io::save_wav`.
+  save_prompt_cache_atomic(out_path, cache, &metadata)?;
 
   Ok(CachePromptInfo {
     tokens_processed: prompt_ids.len(),
   })
+}
+
+/// The path `mlx_save_safetensors` actually writes for `path`: mlx core's
+/// `save_safetensors(std::string, …)` appends `".safetensors"` unless the
+/// path already ends with it (`mlx/io/safetensors.cpp`). The atomic save must
+/// (a) make its tempfile end with `".safetensors"` so mlx writes *that exact*
+/// tempfile (no surprise second extension), and (b) rename onto the SAME
+/// effective path the direct `save_prompt_cache(path, …)` would have produced
+/// — so behavior (including the auto-appended extension) is unchanged.
+fn effective_safetensors_path(path: &Path) -> PathBuf {
+  let ends_with_ext = path.as_os_str().to_string_lossy().ends_with(".safetensors");
+  if ends_with_ext {
+    path.to_path_buf()
+  } else {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".safetensors");
+    PathBuf::from(s)
+  }
+}
+
+/// Open an exclusively-created (`O_CREAT|O_EXCL`), randomized tempfile in the
+/// SAME directory as `final_path`, of the form
+/// `<file_name>.<pid>.<rand>.tmp.safetensors`. Returns the temp path; the
+/// created [`fs::File`] is dropped immediately (mlx-c reopens the path to
+/// write it) — the exclusive create guarantees the path is a regular file we
+/// own (never an attacker-precreated symlink), so the subsequent mlx truncate
+/// of the same path follows no symlink. The trailing `.safetensors` keeps mlx
+/// from appending a second extension (see [`effective_safetensors_path`]).
+/// Same-directory keeps the later [`fs::rename`] single-fs (atomic on
+/// POSIX/Windows; a cross-fs rename silently degrades to copy+unlink, losing
+/// atomicity). Mirrors `audio::io::save_wav`'s `open_excl_tempfile` discipline.
+fn open_excl_temp_safetensors(final_path: &Path, max_retries: u32) -> Result<PathBuf> {
+  use std::{
+    fs::OpenOptions,
+    io::ErrorKind,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+  };
+  static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+  let parent = final_path.parent().unwrap_or_else(|| Path::new("."));
+  let file_name = final_path
+    .file_name()
+    .ok_or_else(|| Error::Backend {
+      message: format!(
+        "cache_prompt: destination {} has no file_name component",
+        final_path.display()
+      ),
+    })?
+    .to_string_lossy()
+    .into_owned();
+  let pid = std::process::id();
+  let mut last_err: Option<std::io::Error> = None;
+  for _ in 0..max_retries {
+    let nanos = SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .map(|d| d.as_nanos() as u64)
+      .unwrap_or(0);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let rand = nanos ^ counter.rotate_left(17);
+    // The trailing `.safetensors` is required so mlx-c writes this exact path
+    // (it would otherwise append the extension).
+    let candidate = parent.join(format!("{file_name}.{pid}.{rand:016x}.tmp.safetensors"));
+    match OpenOptions::new()
+      .write(true)
+      .create_new(true)
+      .open(&candidate)
+    {
+      Ok(file) => {
+        // mlx-c reopens this path by name to write it; drop our handle now.
+        drop(file);
+        return Ok(candidate);
+      }
+      Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+        last_err = Some(e);
+        continue;
+      }
+      Err(e) => {
+        return Err(Error::Backend {
+          message: format!(
+            "cache_prompt: create_new tempfile {} failed: {e}",
+            candidate.display()
+          ),
+        });
+      }
+    }
+  }
+  Err(Error::Backend {
+    message: format!(
+      "cache_prompt: exhausted {max_retries} tempfile retries (last error: {})",
+      last_err
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| "<none>".into())
+    ),
+  })
+}
+
+/// Atomically save `cache` (+ `metadata`) to `out_path` — the durable,
+/// crash-safe form of [`crate::lm::cache::save_prompt_cache`].
+///
+/// `save_prompt_cache` calls `mlx_save_safetensors` straight onto the final
+/// path (no temp / fsync / rename), so a crash or IO error mid-save would
+/// leave a partial/corrupt `.safetensors` at the destination — clobbering a
+/// previously valid cache (Codex finding). This mirrors `audio::io::save_wav`'s
+/// atomic discipline: write to a same-directory `O_EXCL` tempfile, fsync it to
+/// durable storage, restore the destination's prior permissions, then
+/// `fs::rename` it over the destination (atomic-within-fs). On ANY failure the
+/// tempfile is removed (best-effort) and the destination is left
+/// absent/unchanged — never a partial file.
+fn save_prompt_cache_atomic(
+  out_path: &Path,
+  cache: &[Box<dyn KvCache>],
+  metadata: &HashMap<String, String>,
+) -> Result<()> {
+  // The path mlx would actually write (extension auto-appended), so the
+  // permission-capture + rename target match the direct-save destination.
+  let dest = effective_safetensors_path(out_path);
+
+  // Capture the destination's existing permissions (if any) so the renamed
+  // file keeps the user's chosen mode (otherwise a private 0600 cache would
+  // silently widen to the tempfile's umask-granted mode). `None` ⇒ no prior
+  // file, so the tempfile's umask default stands. Mirrors `save_wav`.
+  let existing_perms = fs::metadata(&dest).ok().map(|m| m.permissions());
+
+  // Exclusively-created, same-directory, `.safetensors`-suffixed tempfile.
+  const MAX_TEMPFILE_OPEN_RETRIES: u32 = 16;
+  let tmp_path = open_excl_temp_safetensors(&dest, MAX_TEMPFILE_OPEN_RETRIES)?;
+
+  // Inner closure so any failure cleans up the tempfile before returning.
+  let write_result = (|| -> Result<()> {
+    // mlx-c writes the cache to the tempfile path (it reopens + truncates the
+    // regular file we exclusively created — no symlink follow). `tmp_path`
+    // already ends in `.safetensors`, so mlx writes exactly it.
+    save_prompt_cache(&tmp_path, cache, metadata)?;
+
+    // fsync the tempfile so the bytes are durable before the rename — a
+    // delayed-allocation / NFS / quota writeback failure must surface here,
+    // not after we've renamed a not-yet-on-disk file into place. mlx-c does
+    // not fsync; reopen the path read-only and `sync_all` it.
+    let f = fs::File::open(&tmp_path).map_err(|e| Error::Backend {
+      message: format!(
+        "cache_prompt: reopen tempfile {} for fsync failed: {e}",
+        tmp_path.display()
+      ),
+    })?;
+    f.sync_all().map_err(|e| Error::Backend {
+      message: format!(
+        "cache_prompt: fsync tempfile {} failed: {e}",
+        tmp_path.display()
+      ),
+    })?;
+    drop(f);
+    Ok(())
+  })();
+
+  if let Err(err) = write_result {
+    let _ = fs::remove_file(&tmp_path);
+    return Err(err);
+  }
+
+  // Restore the destination's prior permissions BEFORE the rename (skipped
+  // when the destination did not previously exist). A failure here is handled
+  // like any write-path failure: clean up the tempfile and propagate.
+  if let Some(perms) = existing_perms
+    && let Err(e) = fs::set_permissions(&tmp_path, perms)
+  {
+    let _ = fs::remove_file(&tmp_path);
+    return Err(Error::Backend {
+      message: format!(
+        "cache_prompt: set_permissions on tempfile {} failed: {e}",
+        tmp_path.display()
+      ),
+    });
+  }
+
+  // Atomic-within-fs rename: no observer can see a half-written cache at the
+  // destination. On failure, remove the tempfile and propagate (the
+  // destination keeps whatever it had before — never a partial file).
+  if let Err(e) = fs::rename(&tmp_path, &dest) {
+    let _ = fs::remove_file(&tmp_path);
+    return Err(Error::Backend {
+      message: format!(
+        "cache_prompt: rename {} -> {} failed: {e}",
+        tmp_path.display(),
+        dest.display()
+      ),
+    });
+  }
+  Ok(())
 }
 
 #[cfg(test)]
@@ -288,9 +532,11 @@ mod tests {
   //! integration test `tests/lm_cache_prompt_driver.rs`, which exercises the
   //! public `save_prompt_cache`/`load_prompt_cache`.
 
+  use std::{cell::Cell, rc::Rc};
+
   use super::*;
   use crate::lm::{
-    cache::{CacheConfig, make_prompt_cache},
+    cache::{CacheConfig, MaskMode, StandardKvCache, make_prompt_cache},
     model::MockModel,
   };
 
@@ -299,6 +545,43 @@ mod tests {
       num_hidden_layers: layers,
       sliding_window: None,
     })
+  }
+
+  /// A [`KvCache`] that delegates to a [`StandardKvCache`] but counts every
+  /// [`state`](KvCache::state) call into a shared counter — used to observe
+  /// the per-chunk [`eval_cache_state`] barrier firing during prefill (the
+  /// barrier calls `state()` once per layer per chunk).
+  struct CountingCache {
+    inner: StandardKvCache,
+    state_calls: Rc<Cell<usize>>,
+  }
+
+  impl KvCache for CountingCache {
+    fn offset(&self) -> usize {
+      self.inner.offset()
+    }
+    fn update(&mut self, keys: &Array, values: &Array) -> Result<(Array, Array)> {
+      self.inner.update(keys, values)
+    }
+    fn state(&self) -> Result<Vec<Array>> {
+      self.state_calls.set(self.state_calls.get() + 1);
+      self.inner.state()
+    }
+    fn set_state(&mut self, state: Vec<Array>) -> Result<()> {
+      self.inner.set_state(state)
+    }
+    fn make_mask(&self, n: usize, w: Option<usize>, ret: bool) -> Result<MaskMode> {
+      self.inner.make_mask(n, w, ret)
+    }
+    fn nbytes(&self) -> usize {
+      self.inner.nbytes()
+    }
+    fn is_empty(&self) -> bool {
+      self.inner.is_empty()
+    }
+    fn copy(&self) -> Result<Box<dyn KvCache>> {
+      self.inner.copy()
+    }
   }
 
   /// `prefill_full` advances every layer's cache to exactly the prompt length
@@ -376,6 +659,68 @@ mod tests {
     );
   }
 
+  /// The per-chunk cache-state eval barrier (mlx-lm `generate.py:442`) fires
+  /// once per layer per leading chunk on a multi-chunk prompt (`P > step`):
+  /// the lazy graph is materialized between chunks, not accumulated to the
+  /// save. A [`CountingCache`] counts `state()` calls during prefill; with
+  /// `P = 7`, `step = 2` the leading `P-1 = 6` tokens are 3 chunks `[2,2,2]`,
+  /// so the barrier runs **3 times** (> 1 chunk) — proving the prefill is
+  /// memory-bounded (the graph never spans the whole prompt).
+  #[test]
+  fn prefill_full_evals_cache_state_per_chunk() {
+    let model = MockModel::new(5);
+    let counter = Rc::new(Cell::new(0usize));
+    let mut c: Vec<Box<dyn KvCache>> = vec![Box::new(CountingCache {
+      inner: StandardKvCache::new(),
+      state_calls: Rc::clone(&counter),
+    })];
+    // P = 7, step = 2 ⇒ leading 6 tokens as [2,2,2] ⇒ 3 barrier calls.
+    let prompt = [1u32, 2, 3, 4, 5, 6, 7];
+    prefill_full(&model, &prompt, &mut c, 2).unwrap();
+    assert_eq!(
+      counter.get(),
+      3,
+      "the per-chunk eval barrier must fire once per leading chunk (3 chunks for P=7, step=2)"
+    );
+    assert!(
+      counter.get() > 1,
+      "a multi-chunk prefill runs the barrier more than once"
+    );
+    // The cache still ends at offset P (the tail forward ran after the loop).
+    assert!(c.iter().all(|x| x.offset() == prompt.len()));
+  }
+
+  /// A single-chunk prompt (`P - 1 <= step`) runs the barrier exactly once
+  /// (the lone leading chunk); a `P == 1` prompt (no leading chunk) never
+  /// enters the loop, so the barrier does not fire — both still leave the
+  /// cache at offset `P` via the tail forward.
+  #[test]
+  fn prefill_full_barrier_count_matches_chunking() {
+    // P = 4, step = 8 ⇒ leading 3 tokens in ONE chunk ⇒ 1 barrier call.
+    let model = MockModel::new(5);
+    let one = Rc::new(Cell::new(0usize));
+    let mut c1: Vec<Box<dyn KvCache>> = vec![Box::new(CountingCache {
+      inner: StandardKvCache::new(),
+      state_calls: Rc::clone(&one),
+    })];
+    prefill_full(&model, &[1u32, 2, 3, 4], &mut c1, 8).unwrap();
+    assert_eq!(one.get(), 1, "a single leading chunk runs the barrier once");
+
+    // P = 1 ⇒ no leading chunk ⇒ 0 barrier calls (only the tail forward).
+    let zero = Rc::new(Cell::new(0usize));
+    let mut c0: Vec<Box<dyn KvCache>> = vec![Box::new(CountingCache {
+      inner: StandardKvCache::new(),
+      state_calls: Rc::clone(&zero),
+    })];
+    prefill_full(&model, &[42u32], &mut c0, 8).unwrap();
+    assert_eq!(
+      zero.get(),
+      0,
+      "a 1-token prompt has no leading chunk, so no barrier"
+    );
+    assert!(c0.iter().all(|x| x.offset() == 1));
+  }
+
   /// A `prefill_step_size` of `0` is clamped to `1` (still makes progress),
   /// mirroring `generate_step`'s `prefill_step_size.max(1)`.
   #[test]
@@ -402,5 +747,223 @@ mod tests {
       !out.exists(),
       "no cache file written on the empty-prompt error"
     );
+  }
+
+  /// [`effective_safetensors_path`] mirrors mlx core's extension-append: a
+  /// path already ending in `.safetensors` is unchanged; any other path gets
+  /// `.safetensors` appended (so the atomic rename target == the path mlx
+  /// would write for a direct save).
+  #[test]
+  fn effective_safetensors_path_matches_mlx_extension_rule() {
+    assert_eq!(
+      effective_safetensors_path(Path::new("/tmp/cache.safetensors")),
+      PathBuf::from("/tmp/cache.safetensors"),
+    );
+    assert_eq!(
+      effective_safetensors_path(Path::new("/tmp/cache")),
+      PathBuf::from("/tmp/cache.safetensors"),
+    );
+    assert_eq!(
+      effective_safetensors_path(Path::new("/tmp/cache.bin")),
+      PathBuf::from("/tmp/cache.bin.safetensors"),
+    );
+  }
+
+  /// Atomic-save crash safety (Codex finding): when the save FAILS, a
+  /// previously valid cache at the destination is left **intact** and no
+  /// partial tempfile remains. We first write a good cache, then point a
+  /// second save into a directory made read-only so mlx's write into the
+  /// tempfile fails — the original `out_path` must still load, byte-identical.
+  ///
+  /// Read-only-dir failure injection is POSIX (`unix`); on other targets the
+  /// no-partial-file path is covered by
+  /// [`save_prompt_cache_atomic_failed_save_to_fresh_path_leaves_nothing`].
+  #[cfg(unix)]
+  #[test]
+  fn save_prompt_cache_atomic_failed_save_keeps_original_intact() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use crate::lm::cache::load_prompt_cache;
+
+    let model = MockModel::new(4);
+    let dir = std::env::temp_dir().join(format!(
+      "mlxrs_cache_prompt_atomic_intact_{}",
+      std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("cache.safetensors");
+
+    // 1. Write a good cache.
+    let mut c = cache(2);
+    cache_prompt_ids(
+      &model,
+      &[1u32, 2, 3, 4],
+      &mut c,
+      &out,
+      "good",
+      "{}",
+      2,
+      &HashMap::new(),
+    )
+    .unwrap();
+    assert!(out.exists(), "the first save must produce a cache");
+    let (orig_loaded, orig_meta) = load_prompt_cache(&out).unwrap();
+    let orig_offsets: Vec<usize> = orig_loaded.iter().map(|x| x.offset()).collect();
+
+    // 2. Make the directory read-only so the next save's tempfile create /
+    //    mlx write fails. (Root could bypass this; CI/dev users are not root.)
+    let mut perms = fs::metadata(&dir).unwrap().permissions();
+    let orig_mode = perms.mode();
+    perms.set_mode(0o500); // r-x------ : no write ⇒ create/write fails
+    fs::set_permissions(&dir, perms).unwrap();
+
+    let mut c2 = cache(2);
+    let r = cache_prompt_ids(
+      &model,
+      &[5u32, 6, 7, 8],
+      &mut c2,
+      &out,
+      "SHOULD-NOT-WIN",
+      "{}",
+      2,
+      &HashMap::new(),
+    );
+
+    // Restore write perms BEFORE asserting (so cleanup + reads work even if an
+    // assert fails).
+    let mut restore = fs::metadata(&dir).unwrap().permissions();
+    restore.set_mode(orig_mode);
+    fs::set_permissions(&dir, restore).unwrap();
+
+    assert!(r.is_err(), "a save into a read-only dir must fail");
+
+    // 3. The original cache is untouched: same metadata + offsets, and no
+    //    leftover `.tmp.safetensors` partial file in the directory.
+    assert!(out.exists(), "the failed save must not delete the original");
+    let (after_loaded, after_meta) = load_prompt_cache(&out).unwrap();
+    assert_eq!(
+      after_meta.get(META_MODEL).map(String::as_str),
+      Some("good"),
+      "the original cache's metadata must survive the failed save (not 'SHOULD-NOT-WIN')"
+    );
+    assert_eq!(after_meta, orig_meta, "original metadata must be unchanged");
+    let after_offsets: Vec<usize> = after_loaded.iter().map(|x| x.offset()).collect();
+    assert_eq!(
+      after_offsets, orig_offsets,
+      "the original cache contents must be unchanged"
+    );
+    let leftover_tmp = fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).any(|e| {
+      e.file_name()
+        .to_string_lossy()
+        .ends_with(".tmp.safetensors")
+    });
+    assert!(
+      !leftover_tmp,
+      "no partial tempfile may remain after a failed save"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+  }
+
+  /// Atomic-save crash safety (Codex finding), fresh-path variant: a FAILED
+  /// save to a destination that did not previously exist leaves it **absent**
+  /// (no partial file). Injects failure via a read-only parent directory.
+  #[cfg(unix)]
+  #[test]
+  fn save_prompt_cache_atomic_failed_save_to_fresh_path_leaves_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let model = MockModel::new(4);
+    let dir = std::env::temp_dir().join(format!(
+      "mlxrs_cache_prompt_atomic_fresh_{}",
+      std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("never.safetensors");
+
+    let mut perms = fs::metadata(&dir).unwrap().permissions();
+    let orig_mode = perms.mode();
+    perms.set_mode(0o500);
+    fs::set_permissions(&dir, perms).unwrap();
+
+    let mut c = cache(1);
+    let r = cache_prompt_ids(
+      &model,
+      &[1u32, 2, 3],
+      &mut c,
+      &out,
+      "m",
+      "{}",
+      8,
+      &HashMap::new(),
+    );
+
+    let mut restore = fs::metadata(&dir).unwrap().permissions();
+    restore.set_mode(orig_mode);
+    fs::set_permissions(&dir, restore).unwrap();
+
+    assert!(r.is_err(), "save into a read-only dir must fail");
+    assert!(
+      !out.exists(),
+      "a failed save to a fresh path must leave no file at the destination"
+    );
+    let any_file = fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).count();
+    assert_eq!(
+      any_file, 0,
+      "no partial / tempfile may remain in the directory"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+  }
+
+  /// Atomic-save cleanup AFTER the tempfile is written: when the final
+  /// `rename` fails (here the destination path is an existing **directory**,
+  /// which `fs::rename(file -> dir)` rejects), the tempfile that mlx already
+  /// wrote must be removed — no `.tmp.safetensors` leftover, and the
+  /// destination directory is untouched. This exercises the write-succeeds /
+  /// rename-fails branch the read-only-dir tests (which fail at tempfile
+  /// *create*) do not reach.
+  #[test]
+  fn save_prompt_cache_atomic_rename_failure_cleans_up_tempfile() {
+    let model = MockModel::new(4);
+    let dir = std::env::temp_dir().join(format!(
+      "mlxrs_cache_prompt_atomic_rename_{}",
+      std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    // The destination is itself a directory ⇒ the final rename (file -> dir)
+    // fails, but the tempfile create + mlx write succeed first.
+    let out = dir.join("dest.safetensors");
+    fs::create_dir_all(&out).unwrap();
+
+    let mut c = cache(1);
+    let r = cache_prompt_ids(
+      &model,
+      &[1u32, 2, 3],
+      &mut c,
+      &out,
+      "m",
+      "{}",
+      8,
+      &HashMap::new(),
+    );
+    assert!(r.is_err(), "rename onto an existing directory must fail");
+    // The dest directory still exists (untouched) and is still a directory.
+    assert!(out.is_dir(), "the destination directory must be untouched");
+    // No leftover tempfile: the post-write rename failure cleaned it up.
+    let leftover_tmp = fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).any(|e| {
+      e.file_name()
+        .to_string_lossy()
+        .ends_with(".tmp.safetensors")
+    });
+    assert!(
+      !leftover_tmp,
+      "the tempfile mlx wrote must be removed when the rename fails"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
   }
 }

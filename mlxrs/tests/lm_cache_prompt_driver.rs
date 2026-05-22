@@ -224,6 +224,64 @@ fn driver_fill_save_load_matches_direct_prefill() {
   );
 }
 
+/// A multi-chunk prompt (`P` >> `prefill_step_size`) completes and produces a
+/// **loadable** cache (Codex finding: the per-chunk eval barrier makes prefill
+/// memory-bounded — the lazy graph is materialized between chunks, not spanned
+/// across the whole prompt). With `P = 17`, `step = 4` the leading `P-1 = 16`
+/// tokens are 4 chunks `[4,4,4,4]`, so the barrier runs 4 times; the saved
+/// cache loads back at offset `P`, byte-identical to a single-chunk prefill of
+/// the same prompt (chunk size must not affect the result).
+#[test]
+fn driver_multi_chunk_prefill_completes_and_loads() {
+  let model = MockModel::ramp(8);
+  // 17 tokens, all < vocab(8): a long-enough prompt to span several chunks.
+  let prompt: Vec<u32> = (0..17u32).map(|i| i % 7).collect();
+  let dir = temp_dir("multichunk");
+  let out = dir.join("cache.safetensors");
+
+  let mut chunked = cache(2);
+  let info = cache_prompt_ids(
+    &model,
+    &prompt,
+    &mut chunked,
+    &out,
+    "mock",
+    "{}",
+    4, // P-1 = 16 ⇒ 4 leading chunks ⇒ barrier fires 4 times (> 1)
+    &HashMap::new(),
+  )
+  .unwrap();
+  assert_eq!(info.tokens_processed, prompt.len());
+  assert!(chunked.iter().all(|c| c.offset() == prompt.len()));
+
+  // The multi-chunk cache loads back at offset P.
+  let (loaded, _meta) = load_prompt_cache(&out).unwrap();
+  assert_eq!(loaded.len(), 2);
+  assert!(loaded.iter().all(|c| c.offset() == prompt.len()));
+
+  // Result is independent of chunking: a single-chunk prefill of the same
+  // prompt yields a byte-identical cache (so the per-chunk barrier changed
+  // nothing observable beyond bounding memory).
+  let mut single = cache(2);
+  let throwaway = dir.join("single.safetensors");
+  cache_prompt_ids(
+    &model,
+    &prompt,
+    &mut single,
+    &throwaway,
+    "mock",
+    "{}",
+    1000, // one chunk for the whole leading run
+    &HashMap::new(),
+  )
+  .unwrap();
+  assert_eq!(
+    cache_signature(&loaded),
+    cache_signature(&single),
+    "the multi-chunk (barrier'd) prefill must equal a single-chunk prefill"
+  );
+}
+
 /// A continuation from the **loaded** cache produces the **same next tokens**
 /// as generating from scratch over the same prompt (the whole point of a
 /// prompt cache): `prompt-cache + continue == prompt + generate`.

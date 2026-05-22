@@ -320,3 +320,89 @@ fn continue_final_message_rejects_empty_conversation() {
     "continue_final_message over an empty conversation must error"
   );
 }
+
+/// `render_jinja` with `continue_final_message=true`, returning the `Result`
+/// (the error cases below assert it is `Err`).
+fn render_continue_result(template: &str, messages: &Value) -> Result<String, mlxrs::Error> {
+  render_jinja(
+    template,
+    messages,
+    None,
+    false, // add_generation_prompt
+    true,  // continue_final_message
+    None,  // bos_token
+    None,  // eos_token
+    false, // enable_thinking
+    &json!({}),
+  )
+}
+
+#[test]
+fn continue_final_message_template_emits_literal_sentinel_but_drops_content_errors() {
+  // ADVERSARIAL (Codex finding): a template that emits a LITERAL sentinel
+  // independent of the user's content, and never renders the content itself.
+  // HF's guard (`final_message.strip() not in rendered_chat`) rejects this —
+  // a trim that keyed only off the sentinel would silently return the literal
+  // prefix for the WRONG prompt (caching/saving a cache the user never asked
+  // for). Must be an `Err`.
+  let template =
+    "fixed-prefix CONTINUE_FINAL_MESSAGE_TAG {% for m in messages %}{{ m['role'] }}{% endfor %}";
+  let messages = json!([{"role": "user", "content": "the secret password"}]);
+  let r = render_continue_result(template, &messages);
+  assert!(
+    r.is_err(),
+    "a template that emits a literal sentinel but never renders the final \
+     content must error, not silently return the literal prefix"
+  );
+}
+
+#[test]
+fn continue_final_message_template_drops_sentinel_errors() {
+  // ADVERSARIAL: a template that renders the content but DROPS the appended
+  // sentinel entirely (e.g. it only emits a fixed string, ignoring the
+  // mutated content). HF's guard (`continue_final_message_tag.strip() not in
+  // rendered_chat`) → `ValueError`. Must be an `Err` (no sentinel ⇒ nowhere
+  // to truncate).
+  let template = "{% for m in messages %}<|{{ m['role'] }}|>{% endfor %}only-roles-no-content";
+  let messages = json!([{"role": "user", "content": "hello"}]);
+  let r = render_continue_result(template, &messages);
+  assert!(
+    r.is_err(),
+    "a template that drops the continue sentinel entirely must error"
+  );
+}
+
+#[test]
+fn continue_final_message_normal_case_still_works() {
+  // The normal case (content + sentinel both rendered) still trims correctly
+  // after the validation was added — a guard against over-rejecting.
+  let template = "{% for m in messages %}<|{{ m['role'] }}|>{{ m['content'] }}</s>{% endfor %}";
+  let messages = json!([{"role": "user", "content": "the quick brown fox"}]);
+  assert_eq!(
+    render_continue(template, &messages),
+    "<|user|>the quick brown fox",
+    "the normal continue_final_message case still trims at the content"
+  );
+}
+
+#[test]
+fn continue_final_message_empty_final_content_is_valid() {
+  // EMPTY-CONTENT case: an empty final `content` is valid — `"".strip()` is
+  // `""` and `rendered.contains("")` is always true (Python `"" in s`), so the
+  // guard passes and the trim yields the prefix up to the sentinel. Here the
+  // template emits the role then the (empty) content then `</s>`; continue
+  // truncates at the sentinel, leaving everything before the empty content.
+  let template = "{% for m in messages %}<|{{ m['role'] }}|>{{ m['content'] }}</s>{% endfor %}";
+  let messages = json!([{"role": "user", "content": ""}]);
+  let out = render_continue(template, &messages);
+  assert_eq!(
+    out, "<|user|>",
+    "empty final content + sentinel present is valid and yields the prefix"
+  );
+  // Sanity: the non-continued render keeps the trailing `</s>` the continue
+  // path strips.
+  assert_eq!(
+    render(template, &messages, None, &json!({})),
+    "<|user|></s>"
+  );
+}
