@@ -63,8 +63,9 @@
 //!
 //! For a base linear `W` (shape `[output_dims, input_dims]`), low-rank factors
 //! `lora_a` (`[input_dims, r]`) and `lora_b` (`[r, output_dims]`), and a scalar
-//! `scale` (mlx-lm's `scale = alpha / r` when built from `alpha`, else the
-//! literal `scale` field — default `20.0`):
+//! `scale` (`scale = alpha / r` when `alpha`/`lora_alpha` is present — the PEFT
+//! convention, which WINS over a literal `scale` — else the literal `scale`
+//! field, else the `20.0` default):
 //!
 //! ```text
 //! LoRA:  y = x @ Wᵀ (+ bias)
@@ -102,7 +103,10 @@
 //! [`Error::ShapeMismatch`]: crate::Error::ShapeMismatch
 //! [`feedback_no_per_model_arch_porting`]: crate::lm
 
-use std::{collections::HashMap, path::Path};
+use std::{
+  collections::{HashMap, HashSet},
+  path::Path,
+};
 
 use crate::{
   array::Array,
@@ -127,6 +131,18 @@ pub const DEFAULT_LORA_RANK: i32 = 8;
 /// explicitly; swift `LoRAConfiguration` defaults to `16`,
 /// `LoRAContainer.swift:52`).
 pub const DEFAULT_NUM_LAYERS: i32 = 16;
+
+/// Upper bound on the `adapters.safetensors` file [`load_adapters`] will hand
+/// to [`crate::io::load_safetensors`]. A LoRA/DoRA adapter is **low-rank** —
+/// only the `lora_a` / `lora_b` (and DoRA `m`) factors of the targeted
+/// projections — so even a wide, high-rank adapter over a large model is well
+/// under this bound; a file beyond it is not a plausible adapter. The cap
+/// bounds the damage an untrusted adapter dir can do (a hostile
+/// `adapters.safetensors` pointing at an oversized blob ⇒ a clear recoverable
+/// error, not an OOM). Generous (2 GiB) because the budget is a safety ceiling,
+/// not a tight fit — distinct from the 1-MiB `lm::load`-internal JSON-config
+/// cap (`MAX_CONFIG_BYTES`).
+pub const MAX_ADAPTER_SAFETENSORS_BYTES: u64 = 2 << 30;
 
 // ───────────────────────────── config ─────────────────────────────
 
@@ -170,8 +186,9 @@ impl Default for FineTuneType {
 /// `LoRAConfiguration.LoRAParameters` (`LoRAContainer.swift:34-45`).
 ///
 /// `scale` is the literal low-rank scale (mlx-lm `config["scale"]`). When
-/// `alpha` is present instead (the PEFT/HF convention `scale = alpha / rank`),
-/// [`LoraParameters::resolved_scale`] derives it. `keys` is the explicit
+/// `alpha` is present (the PEFT/HF convention `scale = alpha / rank`), it
+/// **takes precedence** over the literal `scale`
+/// ([`LoraParameters::resolved_scale`]). `keys` is the explicit
 /// target-projection allowlist (e.g. `["self_attn.q_proj",
 /// "self_attn.v_proj"]`); `None` means "every eligible linear" (mlx-lm's
 /// auto-discovery, `tuner/utils.py:85-101`). `dropout` is carried for config
@@ -183,13 +200,15 @@ pub struct LoraParameters {
   /// [`DEFAULT_LORA_RANK`].
   #[serde(default = "default_rank")]
   pub rank: i32,
-  /// Literal low-rank scale (mlx-lm `config["scale"]`). Defaults to
-  /// [`DEFAULT_LORA_SCALE`] when neither `scale` nor `alpha` is present.
+  /// Literal low-rank scale (mlx-lm `config["scale"]`). Used when `alpha` is
+  /// absent; defaults to [`DEFAULT_LORA_SCALE`] when neither `scale` nor
+  /// `alpha` is present.
   #[serde(default)]
   pub scale: Option<f32>,
-  /// PEFT/HF `lora_alpha` — if present (and `scale` is not), the effective
-  /// scale is `alpha / rank`. Carried so adapters trained with the HF
-  /// convention load with the correct scale.
+  /// PEFT/HF `lora_alpha` — if present, the effective scale is `alpha / rank`
+  /// and this **takes precedence** over a literal `scale` (PEFT's `scaling =
+  /// lora_alpha / r`). Carried so adapters trained with the HF convention load
+  /// with the correct scale.
   #[serde(default, alias = "lora_alpha")]
   pub alpha: Option<f32>,
   /// Explicit target-projection allowlist (suffix paths like
@@ -219,21 +238,29 @@ impl Default for LoraParameters {
 }
 
 impl LoraParameters {
-  /// The effective low-rank scale, resolving the mlx-lm / PEFT precedence:
-  /// an explicit `scale` wins; else `alpha / rank` (the HF `lora_alpha`
-  /// convention); else [`DEFAULT_LORA_SCALE`]. A non-positive `rank` with an
-  /// `alpha` present cannot form `alpha / rank`, so it falls back to the
-  /// default scale (the [`LoraConfig`] validator rejects `rank <= 0` before a
-  /// layer is ever built, so this is a defensive floor, not a live path).
+  /// The effective low-rank scale, resolving the PEFT/HF precedence:
+  /// `alpha` (`lora_alpha`) **wins** when present → `alpha / rank` (the HF
+  /// convention an adapter trained with `lora_alpha` carries); else the literal
+  /// `scale` field; else [`DEFAULT_LORA_SCALE`]. This matches PEFT's `scaling =
+  /// lora_alpha / r` taking precedence over a stored scalar, and the
+  /// [module docs](self) (`scale = alpha / r` when built from `alpha`, else the
+  /// literal `scale`, else `20.0`).
+  ///
+  /// A non-positive `rank` with an `alpha` present cannot form `alpha / rank`,
+  /// so it falls back to the literal `scale` (then the default) — the
+  /// [`LoraConfig`]/[`load_adapters`] path rejects `rank <= 0` before a layer is
+  /// ever built, so this is a defensive floor, not a live path.
   pub fn resolved_scale(&self) -> f32 {
+    // `alpha` wins — but only when `rank > 0` can form `alpha / rank`. A
+    // non-positive `rank` (or an absent `alpha`) falls through to the literal
+    // `scale`, then the default.
+    if let Some(a) = self.alpha
+      && self.rank > 0
+    {
+      return a / self.rank as f32;
+    }
     if let Some(s) = self.scale {
       s
-    } else if let Some(a) = self.alpha {
-      if self.rank > 0 {
-        a / self.rank as f32
-      } else {
-        DEFAULT_LORA_SCALE
-      }
     } else {
       DEFAULT_LORA_SCALE
     }
@@ -255,9 +282,11 @@ pub struct LoraConfig {
   #[serde(default)]
   pub fine_tune_type: FineTuneType,
   /// Number of trailing decoder blocks adapted (mlx-lm `config.num_layers`).
-  /// Defaults to [`DEFAULT_NUM_LAYERS`]. A negative value is treated as `0`
-  /// (no layers) — mlx-lm's `model.layers[-max(num_layers, 0):]`
-  /// (`tuner/utils.py:103`).
+  /// Defaults to [`DEFAULT_NUM_LAYERS`]. A **non-positive** value selects ALL
+  /// blocks, not none — mlx-lm's `model.layers[-max(num_layers, 0):]`
+  /// (`tuner/utils.py:103`) reduces to `model.layers[-0:]` == `model.layers[0:]`
+  /// when `num_layers <= 0` (the Python `-0` slice quirk), so `num_layers: -1`
+  /// (and `0`) adapt every decoder block.
   #[serde(default = "default_num_layers")]
   pub num_layers: i32,
   /// The low-rank parameters block (mlx-lm `config.lora_parameters`).
@@ -509,33 +538,34 @@ impl BaseLinear {
     }
   }
 
-  /// The base linear's output `y = x @ Wᵀ (+ bias)` — a plain matmul for the
-  /// dense base, a fused [`ops::quantized::quantized_matmul`] (`transpose=true`)
-  /// for the quantized base. Mirrors mlx-lm `self.linear(x)`
-  /// (`tuner/lora.py:96`) / swift `super.callAsFunction(x)`. Does NOT add the
-  /// low-rank term — that is [`LoRALinear::forward`]'s job.
-  fn base_output(&self, x: &Array) -> Result<Array> {
+  /// The base linear's output **without** the output bias: `x @ Wᵀ` for a dense
+  /// base, a fused [`ops::quantized::quantized_matmul`] (`transpose=true`) for a
+  /// quantized base. This is the bias-free base-output route the DoRA forward
+  /// needs (mlx-lm `tuner/dora.py:113-114` / swift `QDoRALinear` `y = quantizedMM
+  /// (...)` then `DoRALinear` `y = matmul(x, weight.T)`, `DoRA+Layers.swift:111,
+  /// 172-174` — both bias-free, the bias is re-added after the magnitude renorm).
+  ///
+  /// Crucially, the quantized branch routes through `quantized_matmul` rather
+  /// than dequantizing the full weight, so a QDoRA forward never materializes a
+  /// dense `[output_dims, input_dims]` weight just to compute the base output.
+  fn base_output_no_bias(&self, x: &Array) -> Result<Array> {
     match self {
-      BaseLinear::Dense { weight, bias } => {
+      BaseLinear::Dense { weight, .. } => {
         let wt = weight.transpose()?;
-        let y = x.matmul(&wt)?;
-        match bias {
-          Some(b) => y.add(b),
-          None => Ok(y),
-        }
+        x.matmul(&wt)
       }
       BaseLinear::Quantized {
         weight,
         scales,
         quant_biases,
-        bias,
         group_size,
         bits,
         mode,
+        ..
       } => {
         // `transpose=true` matches mlx-lm's QuantizedLinear (the packed weight
         // is laid out for the `output_dims x input_dims` orientation).
-        let y = ops::quantized::quantized_matmul(
+        ops::quantized::quantized_matmul(
           x,
           weight,
           scales,
@@ -544,12 +574,22 @@ impl BaseLinear {
           *group_size,
           *bits,
           mode,
-        )?;
-        match bias {
-          Some(b) => y.add(b),
-          None => Ok(y),
-        }
+        )
       }
+    }
+  }
+
+  /// The base linear's output `y = x @ Wᵀ (+ bias)` — [`base_output_no_bias`]
+  /// plus the optional output bias. Mirrors mlx-lm `self.linear(x)`
+  /// (`tuner/lora.py:96`) / swift `super.callAsFunction(x)`. Does NOT add the
+  /// low-rank term — that is [`LoRALinear::forward`]'s job.
+  ///
+  /// [`base_output_no_bias`]: BaseLinear::base_output_no_bias
+  fn base_output(&self, x: &Array) -> Result<Array> {
+    let y = self.base_output_no_bias(x)?;
+    match self.bias() {
+      Some(b) => y.add(b),
+      None => Ok(y),
     }
   }
 
@@ -730,8 +770,10 @@ impl LoRALinear {
 ///
 /// Construct via [`DoRALinear::new`] (validates the factor shapes AND requires
 /// a magnitude). The same type covers QDoRA (DoRA over a quantized base) — the
-/// base output and the adapted-weight norm both run against the dequantized
-/// weight (mlx-lm `tuner/dora.py:92-106,113`).
+/// base output runs through a fused quantized matmul (swift `QDoRALinear`,
+/// `DoRA+Layers.swift:172-174`), and the dequantized weight is materialized
+/// **only** for the adapted-weight L2-norm + fuse path (mlx-lm
+/// `tuner/dora.py:92-106,120`).
 #[derive(Debug)]
 pub struct DoRALinear {
   base: BaseLinear,
@@ -796,24 +838,28 @@ impl DoRALinear {
   /// `DoRA+Layers.swift::forward`:
   ///
   /// ```text
-  /// w       = dequantized_weight
-  /// y       = x @ wᵀ
+  /// y       = x @ Wᵀ            (base output, NO bias — quantized_matmul for a
+  ///                              quantized base, never a dense dequantize)
   /// z       = (x @ lora_a) @ lora_b
   /// out     = y + (scale · z)
+  /// w       = dequantized_weight (ONLY for the norm below)
   /// adapted = w + (scale · lora_bᵀ) @ lora_aᵀ
   /// denom   = ‖adapted‖₂ (axis 1)
   /// out     = (m / denom) · out  (+ bias)
   /// ```
   ///
   /// The renormalization `(m / denom)` is the weight-decomposition step that
-  /// distinguishes DoRA from LoRA. Lazy — does not evaluate.
+  /// distinguishes DoRA from LoRA. For a quantized (QDoRA) base the base output
+  /// `y` runs through [`ops::quantized::quantized_matmul`] (matching swift's
+  /// `QDoRALinear` `y = quantizedMM(...)`, `DoRA+Layers.swift:172-174`) — the
+  /// full weight is dequantized **only** to compute the adapted-weight L2-norm,
+  /// never to form the base output, so a forward never materializes a dense
+  /// `[output_dims, input_dims]` weight for the matmul. Lazy — does not evaluate.
   pub fn forward(&self, x: &Array) -> Result<Array> {
-    let w = self.base.dequantized_weight()?;
-    // y = x @ wᵀ — DoRA computes the base output WITHOUT the base bias here;
-    // the bias is re-added at the very end (mlx-lm `tuner/dora.py:113,126-127`),
-    // AFTER the magnitude renormalization, so the renorm does not scale it.
-    let wt = w.transpose()?;
-    let y = x.matmul(&wt)?;
+    // y = base(x) WITHOUT the base bias (the bias is re-added at the very end,
+    // mlx-lm `tuner/dora.py:113,126-127`, AFTER the magnitude renorm so it is
+    // not scaled). Quantized base ⇒ quantized_matmul, NOT a dense dequantize.
+    let y = self.base.base_output_no_bias(x)?;
 
     let z = lora_z(x, &self.params)?;
     let scaled_z = scaled(&z, self.scale)?;
@@ -824,6 +870,8 @@ impl DoRALinear {
     let out = y.add(&scaled_z)?;
 
     // adapted = w + (scale · lora_bᵀ) @ lora_aᵀ; denom = ‖adapted‖₂ (axis 1).
+    // The dense weight is needed HERE (and only here) for the row-wise norm.
+    let w = self.base.dequantized_weight()?;
     let delta = lora_delta(&self.params, self.scale)?;
     let delta = match w.dtype() {
       Ok(dt) => delta.astype(dt)?,
@@ -956,13 +1004,49 @@ fn base_output_dims(base: &BaseLinear) -> Result<usize> {
   })
 }
 
-/// Validate `lora_a` / `lora_b` against the base dims. `lora_b` is
-/// `[r, output_dims]`, so its last axis must equal the base `output_dims`;
-/// `lora_a` is `[input_dims, r]`, so its rank-2 shape's last axis (`r`) must
-/// match `lora_b`'s leading axis (`r`). The `input_dims` axis of `lora_a` is
-/// not cross-checked against the (packed) quantized base weight, whose last
-/// axis is `input_dims * bits / 32`; mlx-c validates the matmul contract at
-/// the forward call. Surfaces a recoverable [`Error::ShapeMismatch`].
+/// The base linear's `input_dims` — the contraction dimension `lora_a`'s leading
+/// axis must equal. For a **dense** base it is the weight's trailing axis
+/// (`weight` is `[output_dims, input_dims]`). For a **quantized** base the
+/// *packed* weight's trailing axis is `input_dims * bits / 32` (MLX packs
+/// `32 / bits` weights per `uint32` along the last axis), so the logical input
+/// width is `packed_last_axis * 32 / bits` — exactly mlx-lm's `from_base`
+/// recovery `input_dims = input_dims * 32 // bits` (`tuner/lora.py:23`,
+/// `tuner/dora.py:21`). `bits` is validated `> 0` by [`BaseLinear::quantized`].
+fn base_input_dims(base: &BaseLinear) -> Result<usize> {
+  match base {
+    BaseLinear::Dense { weight, .. } => {
+      let shape = weight.shape();
+      shape.get(1).copied().ok_or_else(|| Error::ShapeMismatch {
+        message: format!(
+          "dense base weight must be 2-D [output_dims, input_dims]; got rank-{} shape {shape:?}",
+          shape.len()
+        ),
+      })
+    }
+    BaseLinear::Quantized { weight, bits, .. } => {
+      let shape = weight.shape();
+      let packed = shape.get(1).copied().ok_or_else(|| Error::ShapeMismatch {
+        message: format!(
+          "quantized base weight must be 2-D [output_dims, input_dims*bits/32]; got rank-{} \
+           shape {shape:?}",
+          shape.len()
+        ),
+      })?;
+      // `bits > 0` is guaranteed by `BaseLinear::quantized`; recover the logical
+      // input width `packed * 32 / bits` (e.g. 4-bit packs 8 weights / u32).
+      Ok(packed * 32 / (*bits as usize))
+    }
+  }
+}
+
+/// Validate `lora_a` / `lora_b` against the base dims. `lora_a` is
+/// `[input_dims, r]`, so its leading axis must equal the base `input_dims`
+/// (recovered from the packed width for a quantized base — see
+/// [`base_input_dims`]) and its last axis (`r`) must match `lora_b`'s leading
+/// axis (`r`); `lora_b` is `[r, output_dims]`, so its last axis must equal the
+/// base `output_dims`. Cross-checking the `input_dims` axis here means a wrong
+/// `lora_a` width is a recoverable [`Error::ShapeMismatch`] at validate/load
+/// time (not an opaque mlx-c matmul failure on the first forward).
 fn validate_factor_shapes(base: &BaseLinear, params: &AdapterParams, who: &str) -> Result<()> {
   let a_shape = params.lora_a.shape();
   let b_shape = params.lora_b.shape();
@@ -982,6 +1066,16 @@ fn validate_factor_shapes(base: &BaseLinear, params: &AdapterParams, who: &str) 
       message: format!(
         "{who}: rank mismatch — lora_a is [_, r={}] but lora_b is [r={}, _]",
         a_shape[1], b_shape[0]
+      ),
+    });
+  }
+  // input_dims consistency: lora_a's leading axis == base input_dims.
+  let input_dims = base_input_dims(base)?;
+  if a_shape[0] != input_dims {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "{who}: lora_a leading axis ({}) must equal base input_dims ({input_dims})",
+        a_shape[0]
       ),
     });
   }
@@ -1016,9 +1110,12 @@ fn validate_factor_shapes(base: &BaseLinear, params: &AdapterParams, who: &str) 
 ///
 /// Faithful to mlx-lm's two-part predicate:
 ///
-/// - **`num_layers`** — only the **last** `max(num_layers, 0)` decoder blocks
-///   are adapted (mlx-lm `model.layers[-max(num_layers, 0):]`,
-///   `tuner/utils.py:103`). A path's block index is parsed from the
+/// - **`num_layers`** — only the **last** `num_layers` decoder blocks are
+///   adapted (mlx-lm `model.layers[-max(num_layers, 0):]`,
+///   `tuner/utils.py:103`), EXCEPT that a **non-positive** `num_layers` selects
+///   ALL blocks (the Python `-0` slice quirk: `layers[-0:]` == `layers[0:]`),
+///   so `num_layers: -1` (and `0`) adapt every block. A path's block index is
+///   parsed from the
 ///   `…layers.N.…` segment; a path with no such segment (e.g. a top-level
 ///   `lm_head`) is adapted only when it matches `keys` AND `num_layers`
 ///   covers all blocks is not applicable to it — to stay faithful, non-block
@@ -1035,10 +1132,19 @@ fn validate_factor_shapes(base: &BaseLinear, params: &AdapterParams, who: &str) 
 ///   [`crate::lm::quant`] uses).
 ///
 /// `adapter_params` supplies the per-path [`AdapterParams`] (loaded from
-/// `adapters.safetensors`); a selected path with no entry in `adapter_params`
-/// is skipped (no factors to apply). The total number of decoder blocks
-/// (`num_blocks`) is needed to resolve the trailing-`num_layers` window; pass
-/// the model's layer count (mlx-lm reads `len(model.layers)`).
+/// `adapters.safetensors`). The total number of decoder blocks (`num_blocks`)
+/// is needed to resolve the trailing-`num_layers` window; pass the model's
+/// layer count (mlx-lm reads `len(model.layers)`).
+///
+/// # Completeness postcondition
+///
+/// After wrapping, the result is checked (`check_adapter_completeness`) so a
+/// path-prefix mismatch / missing tensor group / empty safetensors /
+/// `adapter_config.json` drift cannot silently return a partially- or
+/// un-adapted model. It is a recoverable [`Error::Backend`] when (a) an
+/// explicit `keys` selection is missing factors for a selected target, (b) an
+/// `adapter_params` factor group matches no base layer, or (c) nothing was
+/// adapted at all.
 ///
 /// A selected path whose factor shapes don't match the base (or a DoRA path
 /// with no magnitude) is a recoverable [`Error::ShapeMismatch`] /
@@ -1054,9 +1160,28 @@ pub fn linear_to_lora_layers(
   let scale = config.scale();
   let is_dora = config.is_dora();
   let keys = config.lora_parameters.keys.as_deref();
-  let num_layers = config.num_layers.max(0);
-  // The first adapted block index: blocks [num_blocks - num_layers, num_blocks).
-  let first_adapted = (num_blocks - num_layers).max(0);
+  // mlx-lm selects `model.layers[-max(num_layers, 0):]` (`tuner/utils.py:103`).
+  // Note the Python `-0` quirk: when `num_layers <= 0`, `max(num_layers, 0)` is
+  // `0` and `layers[-0:]` == `layers[0:]` == ALL blocks (so `num_layers: -1` —
+  // and `0` — selects every block, NOT none). For `num_layers > 0` it is the
+  // trailing `num_layers` blocks. Reproduce: a non-positive `num_layers` starts
+  // the window at block 0 (all blocks); a positive one at `num_blocks -
+  // num_layers`.
+  let first_adapted = if config.num_layers <= 0 {
+    0
+  } else {
+    (num_blocks - config.num_layers).max(0)
+  };
+
+  // Completeness tracking (the postcondition below): every adapter factor
+  // group MUST be applied to a base layer, and an explicit `keys` selection
+  // MUST find its factors — otherwise a path-prefix mismatch / missing tensor
+  // group / config drift would silently yield a partially- or un-adapted model.
+  let mut consumed: HashSet<&str> = HashSet::with_capacity(adapter_params.len());
+  // Targets the predicate selected but for which no factors were supplied —
+  // only an *error* when `keys` is explicit (with auto-discovery, an unmatched
+  // linear is expected — the adapter legitimately trains only a subset).
+  let mut selected_without_factors: Vec<&str> = Vec::new();
 
   for (key, weight) in weights {
     let Some(path) = key.strip_suffix(".weight") else {
@@ -1082,10 +1207,14 @@ pub fn linear_to_lora_layers(
       continue;
     }
 
-    // Only build a layer for a path we actually have factors for.
+    // `path` is now a SELECTED target (predicate-matched). Build a layer only
+    // when we actually have factors for it; record a missing-factor target so
+    // the postcondition can reject an incomplete explicit-`keys` selection.
     let Some(params) = adapter_params.get(path) else {
+      selected_without_factors.push(path);
       continue;
     };
+    consumed.insert(path);
 
     let base = build_base_linear(weights, path, weight, quant)?;
     let layer = if is_dora {
@@ -1096,7 +1225,91 @@ pub fn linear_to_lora_layers(
     out.insert(path.to_string(), layer);
   }
 
+  check_adapter_completeness(
+    &out,
+    adapter_params,
+    &consumed,
+    &selected_without_factors,
+    keys,
+  )?;
   Ok(out)
+}
+
+/// The adapter-completeness postcondition for [`linear_to_lora_layers`]:
+/// reject a result that would leave inference silently-wrong.
+///
+/// A base path matching the `keys`/`num_layers` predicate but carrying no
+/// [`AdapterParams`] used to be skipped silently — a path-prefix mismatch,
+/// missing tensor group, empty `adapters.safetensors`, or `adapter_config.json`
+/// drift would then return `Ok` with a partially- or un-adapted model. This
+/// catches all three failure modes:
+///
+/// - **(a) explicitly-selected target with no factors** — when `keys` is an
+///   explicit list, every `(key × in-window-block)` path is a target the
+///   adapter is expected to provide; a missing factor group is config drift.
+///   (With `keys: None` auto-discovery an unmatched linear is *expected* — the
+///   adapter trains only a subset — so this is not checked there.)
+/// - **(b) unused adapter factor group** — every path present in
+///   `adapter_params` (i.e. every `<path>.lora_a`/`lora_b` group in the
+///   safetensors) MUST have matched a base layer; one that matched nothing is a
+///   path-prefix mismatch. This is the analogue of swift's
+///   `model.update(parameters:, verify: .noUnusedKeys)` (`LoRAContainer.swift:152`).
+/// - **(c) empty result** — no layer adapted at all ⇒ the adapter did nothing.
+///
+/// Each violation is a recoverable [`Error::Backend`] naming the offending
+/// paths.
+fn check_adapter_completeness(
+  applied: &LoraLayers,
+  adapter_params: &HashMap<String, AdapterParams>,
+  consumed: &HashSet<&str>,
+  selected_without_factors: &[&str],
+  keys: Option<&[String]>,
+) -> Result<()> {
+  // (a) explicit `keys` selection that is missing factors.
+  if keys.is_some() && !selected_without_factors.is_empty() {
+    let mut missing: Vec<&str> = selected_without_factors.to_vec();
+    missing.sort_unstable();
+    return Err(Error::Backend {
+      message: format!(
+        "load_adapters: adapter is missing factors for {} explicitly-selected target(s): {:?}; \
+         the adapter_config.json `keys`/`num_layers` selection does not match the \
+         adapters.safetensors contents",
+        missing.len(),
+        missing
+      ),
+    });
+  }
+
+  // (b) adapter factor groups that matched no base layer (unused).
+  let mut unused: Vec<&str> = adapter_params
+    .keys()
+    .map(String::as_str)
+    .filter(|p| !consumed.contains(p))
+    .collect();
+  if !unused.is_empty() {
+    unused.sort_unstable();
+    return Err(Error::Backend {
+      message: format!(
+        "load_adapters: {} adapter factor group(s) match no base layer: {:?}; the \
+         adapters.safetensors paths do not line up with the base model weights (path-prefix \
+         mismatch or config drift)",
+        unused.len(),
+        unused
+      ),
+    });
+  }
+
+  // (c) nothing adapted at all.
+  if applied.is_empty() {
+    return Err(Error::Backend {
+      message: "load_adapters: no base layer was adapted — the adapter_config.json \
+                `keys`/`num_layers` selection matched nothing in the base model, or \
+                adapters.safetensors carried no factors"
+        .to_string(),
+    });
+  }
+
+  Ok(())
 }
 
 /// Build the [`BaseLinear`] for `path` from the weight map: a quantized base
@@ -1183,12 +1396,18 @@ fn parse_block_index(path: &str) -> Option<i32> {
 ///
 /// - Missing adapter dir / `adapter_config.json` / `adapters.safetensors`,
 ///   oversized / non-regular / non-UTF-8 config → [`Error::Backend`].
+/// - An `adapters.safetensors` that is not a regular file (FIFO / device /
+///   directory) or exceeds [`MAX_ADAPTER_SAFETENSORS_BYTES`] → [`Error::Backend`]
+///   (the file is stat-checked before mlx-c mmaps it).
 /// - `fine_tune_type: "full"` (a full-weight fine-tune, not an adapter — see
 ///   [`FineTuneType::Full`]) → [`Error::Backend`] (unsupported here).
 ///   An **unknown** `fine_tune_type` string is a serde parse error →
 ///   [`Error::Backend`] from [`LoraConfig::from_json`].
 /// - A target path with a magnitude-less DoRA factor, or factor shapes that
 ///   don't match the base → [`Error::ShapeMismatch`] / [`Error::Backend`].
+/// - The completeness postcondition of [`linear_to_lora_layers`]: an explicit
+///   `keys` selection missing factors, an unused adapter factor group, or an
+///   empty result → [`Error::Backend`].
 pub fn load_adapters(
   base_weights: &Weights,
   dir: &Path,
@@ -1222,8 +1441,13 @@ pub fn load_adapters(
     });
   }
 
-  // 2) adapters.safetensors → per-path AdapterParams.
+  // 2) adapters.safetensors → per-path AdapterParams. Stat the file FIRST
+  // (regular-file + size-budget) so an untrusted adapter dir cannot point us at
+  // a FIFO/device (hang/opaque error) or an oversized blob (OOM) — the
+  // safetensors path is otherwise handed straight to mlx-c, which would mmap
+  // whatever it is given.
   let st_path = dir.join("adapters.safetensors");
+  check_adapter_safetensors(&st_path)?;
   let adapter_arrays = crate::io::load_safetensors(&st_path).map_err(|e| Error::Backend {
     message: format!("load_adapters: cannot load {}: {e}", st_path.display()),
   })?;
@@ -1363,6 +1587,69 @@ fn read_bounded_adapter_config(dir: &Path) -> Result<String> {
   String::from_utf8(bytes).map_err(|e| Error::Backend {
     message: format!("load_adapters: {} is not valid UTF-8: {e}", path.display()),
   })
+}
+
+/// Stat `<dir>/adapters.safetensors` before it is handed to
+/// [`crate::io::load_safetensors`] (which mmaps whatever path it is given,
+/// performing no validation). Mirrors the regular-file discipline of
+/// [`read_bounded_adapter_config`] / [`crate::lm::load`]'s shard discovery:
+///
+/// - Open once with `O_NONBLOCK | O_CLOEXEC` on Unix so a planted **FIFO**
+///   returns immediately instead of blocking the caller (symlinks are followed
+///   — a cached-model layout may symlink the file — but the post-open `fstat`
+///   below checks the *resolved target*).
+/// - `fstat` the opened handle and require a **regular file**: a FIFO / device
+///   / directory / symlink-to-any-of-those is rejected before `load_safetensors`
+///   can mmap it.
+/// - Enforce the [`MAX_ADAPTER_SAFETENSORS_BYTES`] budget on the reported size
+///   so an oversized blob is a clear recoverable error, not an OOM.
+///
+/// Every violation (missing file, non-regular, oversized, unstattable) is a
+/// recoverable [`Error::Backend`]. The handle is closed on return; the
+/// subsequent [`crate::io::load_safetensors`] re-opens via mlx-c. (This leaves
+/// a narrow TOCTOU window between the check and mlx-c's open — acceptable here,
+/// matching `lm::load`'s shard discovery, since `load_safetensors` cannot be
+/// handed a pre-opened descriptor; the budget still bounds a same-size swap and
+/// `O_NONBLOCK` is moot once a regular file has been confirmed.)
+fn check_adapter_safetensors(path: &Path) -> Result<()> {
+  #[cfg(unix)]
+  let file = {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+      .read(true)
+      .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+      .open(path)
+      .map_err(|e| Error::Backend {
+        message: format!("load_adapters: cannot open {}: {e}", path.display()),
+      })?
+  };
+  #[cfg(not(unix))]
+  let file = std::fs::File::open(path).map_err(|e| Error::Backend {
+    message: format!("load_adapters: cannot open {}: {e}", path.display()),
+  })?;
+
+  let meta = file.metadata().map_err(|e| Error::Backend {
+    message: format!("load_adapters: cannot stat {}: {e}", path.display()),
+  })?;
+  if !meta.is_file() {
+    return Err(Error::Backend {
+      message: format!(
+        "load_adapters: {} is not a regular file; refusing to load",
+        path.display()
+      ),
+    });
+  }
+  if meta.len() > MAX_ADAPTER_SAFETENSORS_BYTES {
+    return Err(Error::Backend {
+      message: format!(
+        "load_adapters: {} is {} bytes, exceeding the {MAX_ADAPTER_SAFETENSORS_BYTES}-byte \
+         adapter budget; refusing to load",
+        path.display(),
+        meta.len()
+      ),
+    });
+  }
+  Ok(())
 }
 
 #[cfg(test)]
@@ -1759,8 +2046,17 @@ mod tests {
 
   /// Adapter params for every q_proj path in the toy map (4 blocks).
   fn toy_adapter_params() -> HashMap<String, AdapterParams> {
+    toy_adapter_params_for(&[0, 1, 2, 3])
+  }
+
+  /// Adapter params for the q_proj paths of the given block indices only.
+  /// Used to keep an adapter's factor set aligned with the `num_layers` window
+  /// under test — the completeness postcondition rejects factors for a path
+  /// outside the selection, so a windowed test must supply only in-window
+  /// factors.
+  fn toy_adapter_params_for(blocks: &[i32]) -> HashMap<String, AdapterParams> {
     let mut m = HashMap::new();
-    for b in 0..4 {
+    for &b in blocks {
       m.insert(format!("model.layers.{b}.self_attn.q_proj"), plain_params());
     }
     m
@@ -1769,8 +2065,11 @@ mod tests {
   #[test]
   fn lora_layers_keys_and_num_layers_window() {
     // keys=["self_attn.q_proj"], num_layers=2 ⇒ only blocks 2,3's q_proj wrap.
+    // The adapter supplies factors for exactly those two blocks (an adapter
+    // that also carried block-0/1 factors would now be a config mismatch — see
+    // `lora_layers_extra_factors_outside_window_is_err`).
     let weights = toy_weights();
-    let params = toy_adapter_params();
+    let params = toy_adapter_params_for(&[2, 3]);
     let cfg = LoraConfig {
       fine_tune_type: FineTuneType::Lora,
       num_layers: 2,
@@ -1973,5 +2272,557 @@ mod tests {
     let base = BaseLinear::dense(base_weight(), None).unwrap();
     let err = LoRALinear::new(base, params, 2.0).unwrap_err();
     assert!(matches!(err, Error::ShapeMismatch { .. }));
+  }
+
+  // ───────── Finding 5: lora_a input-dim cross-check ─────────
+
+  #[test]
+  fn lora_rejects_wrong_lora_a_input_dim_dense() {
+    // Dense base W is [output_dims=2, input_dims=3]; a lora_a with leading axis
+    // 2 (≠ input_dims 3) must be rejected at construction, not deferred to a
+    // mlx-c matmul failure on the first forward.
+    let bad_a = Array::from_slice::<f32>(&[1.0, 0.0, 0.0, 1.0], &(2, 2)).unwrap();
+    let params = AdapterParams {
+      lora_a: bad_a,
+      lora_b: lora_b(),
+      magnitude: None,
+    };
+    let base = BaseLinear::dense(base_weight(), None).unwrap();
+    let err = LoRALinear::new(base, params, 2.0).unwrap_err();
+    assert!(matches!(err, Error::ShapeMismatch { .. }));
+  }
+
+  #[test]
+  fn lora_rejects_wrong_lora_a_input_dim_quantized() {
+    // Quantized base: dense [2, 64] affine-quantized at 8 bits ⇒ packed [2, 16];
+    // base_input_dims recovers 16 * 32 / 8 = 64. A lora_a with leading axis 32
+    // (≠ 64) must be rejected at construction.
+    let input_dims = 64usize;
+    let mut wdata = vec![1.0f32; input_dims];
+    wdata.extend(vec![0.5f32; input_dims]);
+    let dense_w = Array::from_slice::<f32>(&wdata, &(2, input_dims)).unwrap();
+    let (w_q, scales, biases) = ops::quantized::quantize(&dense_w, 32, 8, "affine", None).unwrap();
+    let q_base =
+      BaseLinear::quantized(w_q, scales, biases, None, 32, 8, "affine".to_string()).unwrap();
+
+    // input_dims should be 64 — supply a wrong-width lora_a [32, 2].
+    let bad_a = Array::full::<f32>(&(32usize, 2usize), 0.01).unwrap();
+    let lb = Array::from_slice::<f32>(&[1.0, 0.0, 0.0, 1.0], &(2, 2)).unwrap();
+    let params = AdapterParams {
+      lora_a: bad_a,
+      lora_b: lb,
+      magnitude: None,
+    };
+    let err = LoRALinear::new(q_base, params, 2.0).unwrap_err();
+    assert!(matches!(err, Error::ShapeMismatch { .. }));
+  }
+
+  #[test]
+  fn lora_a_correct_input_dim_quantized_ok() {
+    // The positive companion: a correctly-sized lora_a [64, 2] over the same
+    // quantized base constructs cleanly (base_input_dims == 64 == lora_a[0]).
+    let input_dims = 64usize;
+    let mut wdata = vec![1.0f32; input_dims];
+    wdata.extend(vec![0.5f32; input_dims]);
+    let dense_w = Array::from_slice::<f32>(&wdata, &(2, input_dims)).unwrap();
+    let (w_q, scales, biases) = ops::quantized::quantize(&dense_w, 32, 8, "affine", None).unwrap();
+    let q_base =
+      BaseLinear::quantized(w_q, scales, biases, None, 32, 8, "affine".to_string()).unwrap();
+    let la = Array::full::<f32>(&(input_dims, 2usize), 0.01).unwrap();
+    let lb = Array::from_slice::<f32>(&[1.0, 0.0, 0.0, 1.0], &(2, 2)).unwrap();
+    let params = AdapterParams {
+      lora_a: la,
+      lora_b: lb,
+      magnitude: None,
+    };
+    assert!(LoRALinear::new(q_base, params, 2.0).is_ok());
+  }
+
+  // ───────── Finding 4: scale precedence (alpha wins) ─────────
+
+  #[test]
+  fn resolved_scale_alpha_only() {
+    // alpha present, no scale ⇒ alpha / rank.
+    let p = LoraParameters {
+      rank: 8,
+      scale: None,
+      alpha: Some(32.0),
+      keys: None,
+      dropout: None,
+    };
+    assert_eq!(p.resolved_scale(), 4.0);
+  }
+
+  #[test]
+  fn resolved_scale_scale_only() {
+    // scale present, no alpha ⇒ the literal scale.
+    let p = LoraParameters {
+      rank: 8,
+      scale: Some(7.5),
+      alpha: None,
+      keys: None,
+      dropout: None,
+    };
+    assert_eq!(p.resolved_scale(), 7.5);
+  }
+
+  #[test]
+  fn resolved_scale_alpha_wins_over_scale() {
+    // BOTH present ⇒ alpha / rank WINS over the literal scale (PEFT precedence).
+    // alpha=64, rank=16 ⇒ 4.0, NOT the literal 99.0.
+    let p = LoraParameters {
+      rank: 16,
+      scale: Some(99.0),
+      alpha: Some(64.0),
+      keys: None,
+      dropout: None,
+    };
+    assert_eq!(p.resolved_scale(), 4.0);
+  }
+
+  #[test]
+  fn resolved_scale_neither_is_default() {
+    // Neither present ⇒ DEFAULT_LORA_SCALE.
+    let p = LoraParameters {
+      rank: 8,
+      scale: None,
+      alpha: None,
+      keys: None,
+      dropout: None,
+    };
+    assert_eq!(p.resolved_scale(), DEFAULT_LORA_SCALE);
+  }
+
+  #[test]
+  fn resolved_scale_alpha_with_nonpositive_rank_falls_back() {
+    // Defensive floor: alpha present but rank <= 0 ⇒ `alpha / rank` is
+    // undefined ⇒ fall through to the literal scale, then the default.
+    let p = LoraParameters {
+      rank: 0,
+      scale: Some(5.0),
+      alpha: Some(32.0),
+      keys: None,
+      dropout: None,
+    };
+    assert_eq!(p.resolved_scale(), 5.0);
+    let p_no_scale = LoraParameters {
+      rank: -1,
+      scale: None,
+      alpha: Some(32.0),
+      keys: None,
+      dropout: None,
+    };
+    assert_eq!(p_no_scale.resolved_scale(), DEFAULT_LORA_SCALE);
+  }
+
+  #[test]
+  fn config_both_scale_and_alpha_alpha_wins() {
+    // adapter_config.json carrying BOTH scale and lora_alpha ⇒ alpha wins.
+    let json = r#"{
+      "fine_tune_type": "lora",
+      "lora_parameters": { "rank": 8, "scale": 50.0, "lora_alpha": 16.0 }
+    }"#;
+    let cfg = LoraConfig::from_json(json).unwrap();
+    assert_eq!(cfg.scale(), 2.0); // 16 / 8, not the literal 50.0
+  }
+
+  // ───────── Finding 1: num_layers <= 0 selects ALL blocks ─────────
+
+  #[test]
+  fn lora_layers_num_layers_negative_one_selects_all_blocks() {
+    // mlx-lm `model.layers[-max(-1,0):]` == `layers[-0:]` == `layers[0:]` ⇒
+    // num_layers: -1 adapts EVERY decoder block, not none.
+    let weights = toy_weights();
+    let params = toy_adapter_params(); // factors for all 4 q_proj blocks
+    let cfg = LoraConfig {
+      fine_tune_type: FineTuneType::Lora,
+      num_layers: -1,
+      lora_parameters: LoraParameters {
+        rank: 2,
+        scale: Some(2.0),
+        alpha: None,
+        keys: Some(vec!["self_attn.q_proj".to_string()]),
+        dropout: None,
+      },
+      use_dora: false,
+    };
+    let layers = linear_to_lora_layers(&weights, &cfg, &params, None, 4).unwrap();
+    assert_eq!(layers.len(), 4, "num_layers=-1 must adapt all 4 blocks");
+    for b in 0..4 {
+      assert!(layers.contains_key(&format!("model.layers.{b}.self_attn.q_proj")));
+    }
+  }
+
+  #[test]
+  fn lora_layers_num_layers_zero_selects_all_blocks() {
+    // num_layers: 0 ⇒ `max(0,0)=0` ⇒ `layers[-0:]` == all blocks too.
+    let weights = toy_weights();
+    let params = toy_adapter_params();
+    let cfg = LoraConfig {
+      fine_tune_type: FineTuneType::Lora,
+      num_layers: 0,
+      lora_parameters: LoraParameters {
+        rank: 2,
+        scale: Some(2.0),
+        alpha: None,
+        keys: Some(vec!["self_attn.q_proj".to_string()]),
+        dropout: None,
+      },
+      use_dora: false,
+    };
+    let layers = linear_to_lora_layers(&weights, &cfg, &params, None, 4).unwrap();
+    assert_eq!(layers.len(), 4, "num_layers=0 must adapt all 4 blocks");
+  }
+
+  // ───────── Finding 2: adapter-completeness postcondition ─────────
+
+  #[test]
+  fn lora_layers_explicit_key_missing_factors_is_err() {
+    // keys=["self_attn.q_proj"], num_layers covers all 4 blocks, but the
+    // adapter only supplies factors for blocks 0,1 ⇒ blocks 2,3 are selected
+    // targets with no factors ⇒ Err (case a).
+    let weights = toy_weights();
+    let params = toy_adapter_params_for(&[0, 1]);
+    let cfg = LoraConfig {
+      fine_tune_type: FineTuneType::Lora,
+      num_layers: 16,
+      lora_parameters: LoraParameters {
+        rank: 2,
+        scale: Some(2.0),
+        alpha: None,
+        keys: Some(vec!["self_attn.q_proj".to_string()]),
+        dropout: None,
+      },
+      use_dora: false,
+    };
+    let err = linear_to_lora_layers(&weights, &cfg, &params, None, 4).unwrap_err();
+    match err {
+      Error::Backend { message } => {
+        assert!(message.contains("missing factors"), "got: {message}");
+        assert!(
+          message.contains("model.layers.2.self_attn.q_proj"),
+          "got: {message}"
+        );
+      }
+      other => panic!("expected Backend, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn lora_layers_unused_adapter_factor_is_err() {
+    // The adapter carries a factor group for a path that exists in NO base
+    // weight (a path-prefix mismatch / config drift) ⇒ Err (case b).
+    let weights = toy_weights();
+    let mut params = toy_adapter_params(); // all 4 q_proj blocks (all match)
+    params.insert(
+      "model.layers.99.self_attn.q_proj".to_string(),
+      plain_params(),
+    );
+    let cfg = LoraConfig {
+      fine_tune_type: FineTuneType::Lora,
+      num_layers: 16,
+      lora_parameters: LoraParameters {
+        rank: 2,
+        scale: Some(2.0),
+        alpha: None,
+        keys: Some(vec!["self_attn.q_proj".to_string()]),
+        dropout: None,
+      },
+      use_dora: false,
+    };
+    let err = linear_to_lora_layers(&weights, &cfg, &params, None, 4).unwrap_err();
+    match err {
+      Error::Backend { message } => {
+        assert!(message.contains("match no base layer"), "got: {message}");
+        assert!(
+          message.contains("model.layers.99.self_attn.q_proj"),
+          "got: {message}"
+        );
+      }
+      other => panic!("expected Backend, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn lora_layers_empty_result_is_err() {
+    // keys names a projection that exists in NO base weight, and there are no
+    // factors ⇒ nothing adapted ⇒ Err (case c).
+    let weights = toy_weights();
+    let params: HashMap<String, AdapterParams> = HashMap::new();
+    let cfg = LoraConfig {
+      fine_tune_type: FineTuneType::Lora,
+      num_layers: 16,
+      lora_parameters: LoraParameters {
+        rank: 2,
+        scale: Some(2.0),
+        alpha: None,
+        keys: Some(vec!["self_attn.nonexistent_proj".to_string()]),
+        dropout: None,
+      },
+      use_dora: false,
+    };
+    let err = linear_to_lora_layers(&weights, &cfg, &params, None, 4).unwrap_err();
+    match err {
+      Error::Backend { message } => {
+        assert!(
+          message.contains("no base layer was adapted"),
+          "got: {message}"
+        );
+      }
+      other => panic!("expected Backend, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn lora_layers_autodiscovery_partial_factors_is_ok() {
+    // keys: None (auto-discovery) ⇒ a base linear without factors is EXPECTED
+    // (the adapter trains only a subset); only the unused-factor (b) and
+    // empty-result (c) checks apply. Factors for 2 of the 4 q_proj blocks ⇒ Ok.
+    let weights = toy_weights();
+    let params = toy_adapter_params_for(&[2, 3]);
+    let cfg = LoraConfig {
+      fine_tune_type: FineTuneType::Lora,
+      num_layers: 16,
+      lora_parameters: LoraParameters {
+        rank: 2,
+        scale: Some(2.0),
+        alpha: None,
+        keys: None,
+        dropout: None,
+      },
+      use_dora: false,
+    };
+    let layers = linear_to_lora_layers(&weights, &cfg, &params, None, 4).unwrap();
+    assert_eq!(layers.len(), 2);
+  }
+
+  #[test]
+  fn load_adapters_unused_factor_end_to_end_is_err() {
+    // End-to-end: an adapters.safetensors carrying a factor group for a path
+    // absent from the base model ⇒ load_adapters rejects it.
+    let tmp = std::env::temp_dir().join(format!("mlxrs_unused_test_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let config = r#"{
+      "fine_tune_type": "lora",
+      "num_layers": 16,
+      "lora_parameters": { "rank": 2, "scale": 2.0, "keys": ["self_attn.q_proj"] }
+    }"#;
+    std::fs::write(tmp.join("adapter_config.json"), config).unwrap();
+    let mut arrays: HashMap<String, Array> = HashMap::new();
+    for b in 0..4 {
+      let path = format!("model.layers.{b}.self_attn.q_proj");
+      arrays.insert(format!("{path}.lora_a"), lora_a());
+      arrays.insert(format!("{path}.lora_b"), lora_b());
+    }
+    // A factor group for a path that is NOT in toy_weights().
+    arrays.insert(
+      "model.layers.42.self_attn.q_proj.lora_a".to_string(),
+      lora_a(),
+    );
+    arrays.insert(
+      "model.layers.42.self_attn.q_proj.lora_b".to_string(),
+      lora_b(),
+    );
+    crate::io::save_safetensors(&tmp.join("adapters.safetensors"), &arrays).unwrap();
+
+    let weights = toy_weights();
+    let err = load_adapters(&weights, &tmp, None, 4).unwrap_err();
+    assert!(matches!(err, Error::Backend { .. }));
+    std::fs::remove_dir_all(&tmp).ok();
+  }
+
+  #[test]
+  fn load_adapters_empty_safetensors_is_err() {
+    // An empty adapters.safetensors (no factor groups at all) ⇒ nothing adapted
+    // ⇒ Err (case c), instead of a silently-unadapted Ok.
+    let tmp = std::env::temp_dir().join(format!("mlxrs_emptyst_test_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let config = r#"{
+      "fine_tune_type": "lora",
+      "num_layers": 16,
+      "lora_parameters": { "rank": 2, "scale": 2.0, "keys": ["self_attn.q_proj"] }
+    }"#;
+    std::fs::write(tmp.join("adapter_config.json"), config).unwrap();
+    let arrays: HashMap<String, Array> = HashMap::new();
+    crate::io::save_safetensors(&tmp.join("adapters.safetensors"), &arrays).unwrap();
+
+    let weights = toy_weights();
+    let err = load_adapters(&weights, &tmp, None, 4).unwrap_err();
+    assert!(matches!(err, Error::Backend { .. }));
+    std::fs::remove_dir_all(&tmp).ok();
+  }
+
+  // ───────── Finding 3: QDoRA forward via quantized_matmul ─────────
+
+  #[test]
+  fn qdora_forward_matches_dense_within_quant_error() {
+    // QDoRA (DoRA over a quantized base) + bias: the forward must match the
+    // dense DoRA forward within affine-quant error. By construction the
+    // quantized base output runs through quantized_matmul (base_output_no_bias),
+    // never a full dense-weight matmul — the dequantized weight is materialized
+    // only for the adapted-weight L2-norm.
+    let input_dims = 64usize;
+    let output_dims = 2usize;
+    let mut wdata = vec![1.0f32; input_dims];
+    wdata.extend(vec![0.5f32; input_dims]);
+    let dense_w = Array::from_slice::<f32>(&wdata, &(output_dims, input_dims)).unwrap();
+
+    let la = Array::full::<f32>(&(input_dims, 2usize), 0.01).unwrap();
+    let lb = Array::from_slice::<f32>(&[1.0, 0.0, 0.0, 1.0], &(2, 2)).unwrap();
+    // m = ‖adapted‖₂ row-wise of the DENSE adapted weight (so dense + quantized
+    // share the same magnitude vector — the renorm is identical).
+    let bias = Array::from_slice::<f32>(&[3.0, -1.0], &(output_dims,)).unwrap();
+
+    let dense_params = AdapterParams {
+      lora_a: la.try_clone().unwrap(),
+      lora_b: lb.try_clone().unwrap(),
+      magnitude: None,
+    };
+    // Build a DoRALinear over the dense base to read back its computed adapted
+    // norm via fuse? Simpler: pick m = norm of (dense_w + scale*delta).
+    let scale = 2.0f32;
+    let delta = lora_delta(&dense_params, scale).unwrap();
+    let adapted = dense_w.add(&delta).unwrap();
+    let m = ops::linalg_full::norm(&adapted, 2.0, &[1], false).unwrap();
+
+    let dense_base = BaseLinear::dense(
+      dense_w.try_clone().unwrap(),
+      Some(bias.try_clone().unwrap()),
+    )
+    .unwrap();
+    let dense_layer = DoRALinear::new(
+      dense_base,
+      AdapterParams {
+        lora_a: la.try_clone().unwrap(),
+        lora_b: lb.try_clone().unwrap(),
+        magnitude: Some(m.try_clone().unwrap()),
+      },
+      scale,
+    )
+    .unwrap();
+    let x = Array::full::<f32>(&(1usize, input_dims), 1.0).unwrap();
+    let mut dense_out = dense_layer.forward(&x).unwrap();
+
+    let (w_q, scales, biases) = ops::quantized::quantize(&dense_w, 32, 8, "affine", None).unwrap();
+    let q_base = BaseLinear::quantized(
+      w_q,
+      scales,
+      biases,
+      Some(bias.try_clone().unwrap()),
+      32,
+      8,
+      "affine".to_string(),
+    )
+    .unwrap();
+    let q_layer = DoRALinear::new(
+      q_base,
+      AdapterParams {
+        lora_a: la,
+        lora_b: lb,
+        magnitude: Some(m),
+      },
+      scale,
+    )
+    .unwrap();
+    let mut q_out = q_layer.forward(&x).unwrap();
+
+    approx_eq(
+      &q_out.to_vec::<f32>().unwrap(),
+      &dense_out.to_vec::<f32>().unwrap(),
+      2e-2,
+    );
+  }
+
+  #[test]
+  fn qdora_forward_matches_fuse() {
+    // QDoRA forward must equal its own fuse path within quant error — exercises
+    // the quantized_matmul base output against the fused (renormalized) weight.
+    let input_dims = 64usize;
+    let output_dims = 2usize;
+    let mut wdata = vec![1.0f32; input_dims];
+    wdata.extend(vec![0.5f32; input_dims]);
+    let dense_w = Array::from_slice::<f32>(&wdata, &(output_dims, input_dims)).unwrap();
+    let la = Array::full::<f32>(&(input_dims, 2usize), 0.01).unwrap();
+    let lb = Array::from_slice::<f32>(&[1.0, 0.0, 0.0, 1.0], &(2, 2)).unwrap();
+    let m = Array::from_slice::<f32>(&[1.5, 2.5], &(output_dims,)).unwrap();
+    let x = Array::full::<f32>(&(1usize, input_dims), 1.0).unwrap();
+
+    let (w_q, scales, biases) = ops::quantized::quantize(&dense_w, 32, 8, "affine", None).unwrap();
+    let q_base =
+      BaseLinear::quantized(w_q, scales, biases, None, 32, 8, "affine".to_string()).unwrap();
+    let q_layer = DoRALinear::new(
+      q_base,
+      AdapterParams {
+        lora_a: la,
+        lora_b: lb,
+        magnitude: Some(m),
+      },
+      2.0,
+    )
+    .unwrap();
+    let mut via_forward = q_layer.forward(&x).unwrap();
+    let fused = q_layer.fuse(true).unwrap();
+    let mut via_fused = fused.base_output(&x).unwrap();
+    approx_eq(
+      &via_fused.to_vec::<f32>().unwrap(),
+      &via_forward.to_vec::<f32>().unwrap(),
+      2e-2,
+    );
+  }
+
+  // ───────── Finding 6: adapters.safetensors hardening ─────────
+
+  #[test]
+  fn load_adapters_non_regular_safetensors_is_err() {
+    // A directory planted where adapters.safetensors should be is not a regular
+    // file ⇒ load_adapters rejects it before handing the path to mlx-c.
+    let tmp = std::env::temp_dir().join(format!("mlxrs_nonreg_test_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let config = r#"{
+      "fine_tune_type": "lora",
+      "num_layers": 16,
+      "lora_parameters": { "rank": 2, "scale": 2.0, "keys": ["self_attn.q_proj"] }
+    }"#;
+    std::fs::write(tmp.join("adapter_config.json"), config).unwrap();
+    // adapters.safetensors is a DIRECTORY, not a file.
+    std::fs::create_dir_all(tmp.join("adapters.safetensors")).unwrap();
+
+    let weights = toy_weights();
+    let err = load_adapters(&weights, &tmp, None, 4).unwrap_err();
+    match err {
+      Error::Backend { message } => {
+        assert!(message.contains("not a regular file"), "got: {message}");
+      }
+      other => panic!("expected Backend, got {other:?}"),
+    }
+    std::fs::remove_dir_all(&tmp).ok();
+  }
+
+  #[test]
+  fn load_adapters_oversized_safetensors_is_err() {
+    // A sparse file reporting a length beyond MAX_ADAPTER_SAFETENSORS_BYTES is
+    // rejected on the stat, before any mmap. set_len makes a sparse file on
+    // APFS/most filesystems — the on-disk footprint stays ~0.
+    let tmp = std::env::temp_dir().join(format!("mlxrs_oversize_test_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let config = r#"{
+      "fine_tune_type": "lora",
+      "num_layers": 16,
+      "lora_parameters": { "rank": 2, "scale": 2.0, "keys": ["self_attn.q_proj"] }
+    }"#;
+    std::fs::write(tmp.join("adapter_config.json"), config).unwrap();
+    let f = std::fs::File::create(tmp.join("adapters.safetensors")).unwrap();
+    f.set_len(MAX_ADAPTER_SAFETENSORS_BYTES + 1).unwrap();
+    drop(f);
+
+    let weights = toy_weights();
+    let err = load_adapters(&weights, &tmp, None, 4).unwrap_err();
+    match err {
+      Error::Backend { message } => {
+        assert!(message.contains("adapter budget"), "got: {message}");
+      }
+      other => panic!("expected Backend, got {other:?}"),
+    }
+    std::fs::remove_dir_all(&tmp).ok();
   }
 }
