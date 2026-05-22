@@ -43,25 +43,33 @@
 //! - **Keys are [`Key`], a normalized-string wrapper.** Python's
 //!   `_make_key` normalizes every source to a `str`; [`Key`] does the same
 //!   with three constructors mirroring the three Python branches —
-//!   [`Key::from_source`] (the `str` branch — path/URL used verbatim),
-//!   [`Key::from_sources`] (the `list` branch — `"|"`-joined), and
-//!   [`Key::from_bytes`] (the PIL branch — a content hash). [`Key`] holds
-//!   that string as an [`Arc<str>`](std::sync::Arc) (an implementation
-//!   detail — every public constructor / accessor has the same signature
-//!   and semantics it would with a `String` field); the cache stores
-//!   `Arc<str>` clones in both its containers, so the recency queue and the
-//!   entry map share one heap-allocated string and [`put`] never
-//!   heap-copies a key (see [`Key`]'s "Internal representation" note and
-//!   [`VisionFeatureCache`]'s "Key storage" note). `Arc` (not `Rc`) keeps
-//!   the public [`Key`] type `Send + Sync` — see [`Key`]'s "Internal
-//!   representation" note. Because
-//!   mlxrs has no PIL type and no crypto dependency, [`Key::from_bytes`]
-//!   uses the std [`DefaultHasher`](std::hash::DefaultHasher) (a fast
-//!   non-cryptographic hash) rather than `sha256`: this is a **cache
-//!   key**, collision-tolerant by construction and never a security
-//!   boundary, so a SipHash-class digest is the idiomatic Rust choice and
-//!   pulls no new crate. The `pil:` / `obj:` prefixes from the reference
-//!   are preserved so a hashed key can never alias a literal path.
+//!   [`Key::from_source`] (the `str` branch — path/URL), [`Key::from_sources`]
+//!   (the `list` branch — a multi-image source), and [`Key::from_bytes`]
+//!   (the PIL branch — a content hash). The encoded key is **namespaced and
+//!   unambiguous**, *not* the reference's bare normalized string: each
+//!   constructor prefixes a distinct variant tag (`s:` / `l:` / `b:`) and
+//!   the list variant length-prefixes its components. This is a deliberate
+//!   deviation — the reference's encoding *aliases* distinct image
+//!   identities (a `'|'`-joined list collides with a literal `'|'`-bearing
+//!   path; a `pil:`-hashed key collides with a literal `pil:…` path), which
+//!   would silently feed one image's cached embeddings to a different
+//!   image. The tag + length-prefix scheme makes both cross-variant and
+//!   within-list collision impossible by construction (see [`Key`]'s
+//!   "Internal representation — unambiguous encoding" note). [`Key`] holds
+//!   that encoded string as an [`Arc<str>`](std::sync::Arc) (an
+//!   implementation detail — every public constructor / accessor has the
+//!   same signature and semantics it would with a `String` field); the
+//!   cache stores `Arc<str>` clones in both its containers, so the recency
+//!   queue and the entry map share one heap-allocated string and [`put`]
+//!   never heap-copies a key (see [`Key`]'s "Internal representation" note
+//!   and [`VisionFeatureCache`]'s "Key storage" note). `Arc` (not `Rc`)
+//!   keeps the public [`Key`] type `Send + Sync` — see [`Key`]'s "Internal
+//!   representation" note. Because mlxrs has no PIL type and no crypto
+//!   dependency, [`Key::from_bytes`] uses the std
+//!   [`DefaultHasher`](std::hash::DefaultHasher) (a fast non-cryptographic
+//!   hash) rather than `sha256`: this is a **cache key**, collision-tolerant
+//!   by construction and never a security boundary, so a SipHash-class
+//!   digest is the idiomatic Rust choice and pulls no new crate.
 //! - **Bounded memory** — the reference is already bounded (`max_size`,
 //!   default 20); mlxrs keeps that exact cap and default. The constructor
 //!   rejects `max_size == 0` ([`Error::ShapeMismatch`]) rather than
@@ -98,20 +106,55 @@ pub const DEFAULT_MAX_SIZE: usize = 20;
 /// reduces every image source to a `str`. The three constructors map 1:1
 /// to the reference's three branches:
 ///
-/// | Python branch | constructor |
-/// |---|---|
-/// | `isinstance(image_source, str)` — path / URL used directly | [`Key::from_source`] |
-/// | `isinstance(image_source, list)` — `"\|".join(...)` | [`Key::from_sources`] |
-/// | PIL image — `sha256(tobytes())[:16]`, prefixed `pil:` | [`Key::from_bytes`] |
+/// | Python branch | constructor | encoded form |
+/// |---|---|---|
+/// | `isinstance(image_source, str)` — path / URL | [`Key::from_source`] | `s:<source>` |
+/// | `isinstance(image_source, list)` — multi-image | [`Key::from_sources`] | `l:` + length-prefixed components |
+/// | PIL image — `sha256(tobytes())[:16]` | [`Key::from_bytes`] | `b:<hexdigest>` |
 ///
-/// Two `Key`s are equal iff their normalized strings are equal, so
-/// distinct sources never collide and (matching the reference) **list
-/// order is significant** — `["a", "b"]` and `["b", "a"]` are different
-/// keys.
+/// Two `Key`s are equal iff their encoded strings are equal. **List order
+/// is significant** (matching the reference) — `["a", "b"]` and `["b", "a"]`
+/// are different keys.
 ///
-/// # Internal representation
+/// # Internal representation — unambiguous encoding
 ///
-/// The normalized string is held as an [`Arc<str>`](Arc), not a `String`.
+/// The key is **not** the reference's bare normalized string. The reference
+/// derives a `str` that *aliases* distinct image identities, and a cache
+/// hit on an aliased key returns the wrong stored features — silently
+/// feeding one image's embeddings to a different image/prompt. Two concrete
+/// aliasing bugs in the reference's scheme, and how mlxrs's encoding closes
+/// each:
+///
+/// - **Cross-variant aliasing.** The reference joins a list with `'|'` and
+///   hashes PIL bytes with a `pil:` prefix, but a single-source `str` is
+///   used verbatim — so a literal path `"a|b"` collides with the list
+///   `["a", "b"]`, and a literal path `"pil:deadbeef"` collides with a
+///   `from_bytes` digest. mlxrs prefixes each constructor with a **distinct
+///   variant tag**: `s:` for [`from_source`](Self::from_source), `l:` for
+///   [`from_sources`](Self::from_sources), `b:` for [`from_bytes`](Self::from_bytes).
+///   The tag is the first two bytes of every key, so two keys from
+///   *different* constructors can never be equal — regardless of what the
+///   user's source string contains. A source string of literally `"l:x"`
+///   encodes to `s:l:x` (an `s:` key); it cannot equal any `l:` key,
+///   because the tag is prepended to — never spoofable from within — the
+///   user's bytes.
+/// - **Within-list aliasing.** A bare `'|'`-join is not injective: a list
+///   *component* may itself contain `'|'`, so `["a|b"]` and `["a", "b"]`
+///   both join to `"a|b"`. [`from_sources`](Self::from_sources) instead
+///   **length-prefixes** every component — `<byte-len>:<component>` — so the
+///   decode boundaries are unambiguous whatever characters a component
+///   holds: `["a|b"]` encodes `l:3:a|b`, `["a", "b"]` encodes `l:1:a1:b`,
+///   and the two differ. The list encoding is injective.
+///
+/// Together the variant tag (kills cross-variant aliasing) and the
+/// length-prefixed list components (kill within-list aliasing) make the
+/// encoding **injective**: distinct image identities always produce
+/// distinct keys, so a cache hit can never return a different image's
+/// features. The encoded form is an internal cache key — [`as_str`](Self::as_str)
+/// exposes it for tests/introspection, but no caller parses it back into a
+/// source.
+///
+/// The encoded string is held as an [`Arc<str>`](Arc), not a `String`.
 /// This is an implementation detail — every public method
 /// ([`from_source`](Self::from_source), [`from_sources`](Self::from_sources),
 /// [`from_bytes`](Self::from_bytes), [`as_str`](Self::as_str), and the
@@ -163,27 +206,95 @@ impl Key {
   /// different query string) is a distinct key — exactly as in the
   /// reference, which does no path canonicalization.
   pub fn from_source(source: &str) -> Self {
-    // `Arc::from(&str)` allocates the shared string once, here in the
+    // The encoded key is `"s:" + raw`. The `s:` variant tag namespaces this
+    // constructor: a `from_source` key always starts `s:`, a `from_sources`
+    // key `l:`, a `from_bytes` key `b:` — so no two constructor variants can
+    // ever produce equal keys, *even* if the user's `source` string is
+    // literally `l:...` or `b:pil:...` (that just becomes `s:l:...` /
+    // `s:b:pil:...`, still uniquely an `s:` key). See the `Key` type's
+    // "Internal representation — unambiguous encoding" note.
+    //
+    // `Arc::from(String)` allocates the shared string once, here in the
     // constructor — the cache's `put` then only ever *moves* and refcount-
-    // clones this `Arc`, never re-allocates the key.
-    Self(Arc::from(source))
+    // clones this `Arc`, never re-allocates the key. `with_capacity` sizes
+    // the buffer exactly (`"s:"` + `source`) so the `push_str`es never
+    // reallocate.
+    let mut encoded = String::with_capacity(2 + source.len());
+    encoded.push_str("s:");
+    encoded.push_str(source);
+    Self(Arc::from(encoded))
   }
 
   /// Key for a multi-image source — the reference's
-  /// `isinstance(image_source, list)` branch (`vision_cache.py:44-45`):
-  /// the per-image keys joined with `'|'`.
+  /// `isinstance(image_source, list)` branch (`vision_cache.py:44-45`),
+  /// which `'|'`-joins the per-image source strings.
   ///
-  /// **Order is significant** (the reference joins in list order):
-  /// `from_sources(&["a", "b"])` differs from `from_sources(&["b", "a"])`.
-  /// An empty slice yields the empty-string key (the reference's
-  /// `"".join([])`), and a single-element slice equals
-  /// [`Key::from_source`] of that element — both faithful to `str.join`.
+  /// **Order is significant**: `from_sources(&["a", "b"])` differs from
+  /// `from_sources(&["b", "a"])`.
+  ///
+  /// # Encoding — length-prefixed, not delimiter-joined
+  ///
+  /// mlxrs does **not** use the reference's bare `'|'`-join. A plain join is
+  /// not injective: a component may itself contain the `'|'` delimiter, so
+  /// `["a|b"]` and `["a", "b"]` would both join to `"a|b"` and alias to the
+  /// same key — silently feeding one image-list's cached embeddings to a
+  /// *different* image list. Instead each component is **length-prefixed**:
+  /// the encoding is `"l:"` followed, per component, by `<byte-len> + ":" +
+  /// <component>`. The byte length is the component's UTF-8 length, so the
+  /// decoder boundary is unambiguous regardless of which characters
+  /// (including `'|'` or `':'`) the component contains — the list encoding
+  /// is injective. `["a|b"]` encodes `l:3:a|b`; `["a", "b"]` encodes
+  /// `l:1:a1:b`; they differ.
+  ///
+  /// The `l:` variant tag also namespaces this constructor against
+  /// [`from_source`](Self::from_source) (`s:`) and [`from_bytes`](Self::from_bytes)
+  /// (`b:`) — see the `Key` type's "Internal representation" note.
+  ///
+  /// An empty slice yields the bare tag `"l:"` (still distinct from every
+  /// other key); a single-element slice `["x"]` encodes `l:1:x`, which —
+  /// unlike the reference's `"|".join(["x"]) == "x"` — does **not** equal
+  /// [`from_source`](Self::from_source) of `"x"` (that is `s:x`). The
+  /// non-aliasing guarantee is strictly stronger than the reference here,
+  /// which is the intended fix.
   pub fn from_sources(sources: &[&str]) -> Self {
-    // `join` builds the `'|'`-joined `String`; `Arc::from` consumes it into
-    // the shared `Arc<str>` the cache stores (the transient `String` buffer
-    // is freed). The whole allocation cost is borne here in the
-    // constructor, not on the `put` hot path.
-    Self(Arc::from(sources.join("|")))
+    use std::fmt::Write as _;
+
+    // Pre-size the buffer exactly: the `l:` tag, then per component its
+    // decimal byte-length, a `':'` separator, and the component bytes. This
+    // exact `with_capacity` means the writes below never reallocate.
+    let mut cap = 2; // "l:"
+    for s in sources {
+      let len = s.len();
+      // Decimal digit count of `len`: `ilog10() + 1` for `len >= 1`; the
+      // `len == 0` component is one digit (`"0"`). `0.ilog10()` would panic,
+      // so the `== 0` arm is taken explicitly.
+      let digits = if len == 0 {
+        1
+      } else {
+        len.ilog10() as usize + 1
+      };
+      cap += digits + 1 + len; // <digits> + ':' + <component>
+    }
+    let mut encoded = String::with_capacity(cap);
+    encoded.push_str("l:");
+    for s in sources {
+      // Length-prefix each component: `<byte-len>:<component>`. `s.len()` is
+      // the UTF-8 byte length, so the next component begins exactly `len`
+      // bytes after the `':'` separator — the boundary is unambiguous even
+      // if `s` itself contains `'|'`, `':'`, or digits. That is what makes
+      // the list encoding injective: the reference's bare `'|'`-join was
+      // not (`["a|b"]` and `["a", "b"]` both joined to `"a|b"`).
+      //
+      // `write!` formats the `usize` length straight into `encoded` — no
+      // intermediate `String`. Writing to a `String` is infallible, so the
+      // `Result` is discarded (`let _`); the only `fmt::Error` source is a
+      // failing `Write` impl and `String`'s never fails.
+      let _ = write!(encoded, "{}:{}", s.len(), s);
+    }
+    // `Arc::from` consumes the buffer into the shared `Arc<str>` the cache
+    // stores; the whole allocation cost is borne here in the constructor,
+    // not on the `put` hot path.
+    Self(Arc::from(encoded))
   }
 
   /// Key for an in-memory image with no stable path — the reference's
@@ -193,21 +304,38 @@ impl Key {
   /// [`DefaultHasher`](std::hash::DefaultHasher) because this is a
   /// collision-tolerant **cache key**, never a security boundary, and a
   /// SipHash-class digest needs no extra crate (see the module-level
-  /// "Deviations" note). The result is prefixed `pil:` — identical to the
-  /// reference — so a content-hashed key can never alias a literal path
-  /// such as `"pil:photo.jpg"` would only collide with another hashed
-  /// key, never with a [`Key::from_source`] of a real file path unless
-  /// that path itself starts with `pil:`.
+  /// "Deviations" note).
+  ///
+  /// # Encoding
+  ///
+  /// The result is `"b:"` followed by the fixed-width hex digest. The `b:`
+  /// variant tag namespaces this constructor against
+  /// [`from_source`](Self::from_source) (`s:`) and
+  /// [`from_sources`](Self::from_sources) (`l:`). This is what makes
+  /// cross-variant aliasing **impossible by construction**: a `from_bytes`
+  /// key always starts `b:`, a `from_source` key always `s:`, so a literal
+  /// path source — even one named exactly `b:0123456789abcdef`, or the
+  /// reference's old `pil:`-prefixed shape — encodes to `s:b:...` /
+  /// `s:pil:...` and can never equal a real `from_bytes` key. (The earlier
+  /// `pil:`-prefix-only scheme guarded against a literal `pil:...` path but
+  /// *not* against a literal `b:<hexdigest>` path; the `s:`/`b:` tag pair
+  /// closes that hole — the tag is on the *outside* and the user's bytes
+  /// never reach it.)
   pub fn from_bytes(bytes: &[u8]) -> Self {
     let mut hasher = std::hash::DefaultHasher::new();
     bytes.hash(&mut hasher);
-    // `format!` builds the `pil:`-prefixed digest `String`; `Arc::from`
-    // consumes it into the shared `Arc<str>` (transient buffer freed).
-    Self(Arc::from(format!("pil:{:016x}", hasher.finish())))
+    // `format!` builds the `b:`-prefixed fixed-width hex digest `String`;
+    // `Arc::from` consumes it into the shared `Arc<str>` (transient buffer
+    // freed). The digest width is fixed (16 hex chars), so the encoded key
+    // is always exactly `"b:" + 16` chars.
+    Self(Arc::from(format!("b:{:016x}", hasher.finish())))
   }
 
-  /// The normalized key string. Exposed for tests / introspection; the
-  /// cache never needs the caller to read it.
+  /// The normalized key string — the internal, namespaced cache-key
+  /// encoding (a `s:` / `l:` / `b:` variant tag plus the variant's payload;
+  /// see the type-level "Internal representation" note). Exposed for tests
+  /// / introspection only; the cache never needs the caller to read it, and
+  /// no caller parses it — it is an opaque cache key, not the raw source.
   pub fn as_str(&self) -> &str {
     // `Arc<str>` derefs to `str`; `&self.0` coerces `&Arc<str>` to `&str`.
     &self.0
@@ -768,9 +896,11 @@ mod alloc_discipline_tests {
     // Pull the stored key's `Arc<str>` back out of the entry map and count
     // its strong references. `entries` holds one; `recency` holds the
     // other; they are the SAME allocation (`Arc::clone`d, not re-allocated).
+    // The map key is the *encoded* form, so probe with `Key::as_str()`
+    // (`from_source("shared")` encodes to `s:shared`), not the raw literal.
     let (key_arc, _) = cache
       .entries
-      .get_key_value("shared")
+      .get_key_value(Key::from_source("shared").as_str())
       .expect("the just-inserted key must be present");
     assert_eq!(
       Arc::strong_count(key_arc),
@@ -796,8 +926,10 @@ mod alloc_discipline_tests {
       .expect("initial put must succeed");
 
     // Sanity: freshly inserted, the key is shared by the two containers.
+    // The map key is the *encoded* form — probe with `Key::as_str()`.
+    let hot = Key::from_source("hot");
     {
-      let (arc, _) = cache.entries.get_key_value("hot").unwrap();
+      let (arc, _) = cache.entries.get_key_value(hot.as_str()).unwrap();
       assert_eq!(Arc::strong_count(arc), 2, "post-put: entries + recency");
     }
 
@@ -809,7 +941,7 @@ mod alloc_discipline_tests {
         cache.get(&Key::from_source("hot")).unwrap().is_some(),
         "the key must hit"
       );
-      let (arc, _) = cache.entries.get_key_value("hot").unwrap();
+      let (arc, _) = cache.entries.get_key_value(hot.as_str()).unwrap();
       assert_eq!(
         Arc::strong_count(arc),
         2,
@@ -835,7 +967,11 @@ mod alloc_discipline_tests {
       .put(Key::from_source("ow"), &features())
       .expect("overwrite put must succeed");
 
-    let (arc, _) = cache.entries.get_key_value("ow").unwrap();
+    // The map key is the *encoded* form — probe with `Key::as_str()`.
+    let (arc, _) = cache
+      .entries
+      .get_key_value(Key::from_source("ow").as_str())
+      .unwrap();
     assert_eq!(
       Arc::strong_count(arc),
       2,

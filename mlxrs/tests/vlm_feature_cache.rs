@@ -172,14 +172,184 @@ fn multi_image_key_order_matters() {
   );
 }
 
-/// A single-element `from_sources` equals `from_source` of that element
-/// (faithful to Python `"|".join(["x"]) == "x"`), and an empty slice is
-/// the empty-string key.
+/// `from_sources` is order-sensitive and produces a STABLE key (same input
+/// → same key). The encoding is namespaced (`l:` tag) + length-prefixed, so
+/// unlike the reference's bare `'|'`-join a single-element `["x"]` does NOT
+/// equal `from_source("x")` — see `key_encoding_non_aliasing` for the full
+/// non-aliasing matrix. Here we only pin the stability + order contract.
 #[test]
-fn from_sources_join_semantics() {
-  assert_eq!(Key::from_sources(&["x.jpg"]), Key::from_source("x.jpg"));
-  assert_eq!(Key::from_sources(&[]).as_str(), "");
-  assert_eq!(Key::from_sources(&["a", "b"]).as_str(), "a|b");
+fn from_sources_is_stable_and_order_sensitive() {
+  // Same input → same key (a cache lookup with a re-derived key hits).
+  assert_eq!(
+    Key::from_sources(&["a", "b"]),
+    Key::from_sources(&["a", "b"])
+  );
+  // Order is significant.
+  assert_ne!(
+    Key::from_sources(&["a", "b"]),
+    Key::from_sources(&["b", "a"])
+  );
+  // The empty slice is a valid, stable key (the bare `l:` tag).
+  assert_eq!(Key::from_sources(&[]), Key::from_sources(&[]));
+}
+
+/// **Codex review — key encoding must not alias distinct image identities.**
+///
+/// The previous encoding shared one raw-string namespace across all three
+/// constructors, so distinct image identities could collide and a cache hit
+/// would return a *different* image's features. The fix is a namespaced
+/// (`s:` / `l:` / `b:` variant tag) + length-prefixed encoding. This test
+/// pins every non-aliasing guarantee.
+#[test]
+fn key_encoding_non_aliasing() {
+  // ── cross-variant: `from_source` vs `from_sources` ──
+  // Old bug: `from_source("a|b")` == `from_sources(&["a","b"])` because the
+  // list was `'|'`-joined into the same raw namespace. The `s:`/`l:` tags
+  // make them unconditionally distinct.
+  assert_ne!(
+    Key::from_source("a|b"),
+    Key::from_sources(&["a", "b"]),
+    "a literal '|'-bearing path must NOT alias a 2-element list key"
+  );
+
+  // ── within-list: length-prefixing kills delimiter ambiguity ──
+  // Old bug: `from_sources(&["a|b"])` == `from_sources(&["a","b"])` — a bare
+  // '|'-join is not injective. Length-prefixed components (`l:3:a|b` vs
+  // `l:1:a1:b`) make the list encoding injective.
+  assert_ne!(
+    Key::from_sources(&["a|b"]),
+    Key::from_sources(&["a", "b"]),
+    "['a|b'] (one component) must NOT alias ['a','b'] (two components)"
+  );
+  // A few more length-prefix injectivity cases: any '|'-rearrangement of the
+  // joined text must stay distinct.
+  assert_ne!(
+    Key::from_sources(&["", "a|b"]),
+    Key::from_sources(&["", "a", "b"]),
+  );
+  assert_ne!(
+    Key::from_sources(&["a", "", "b"]),
+    Key::from_sources(&["a", "b"]),
+    "an empty component must not vanish (it is length-prefixed '0:')"
+  );
+
+  // ── cross-variant: `from_source` vs `from_bytes` ──
+  // `from_bytes` keys carry a `b:` tag; a literal source string — even one
+  // shaped exactly like a digest key — gets the `s:` tag, so it can never
+  // alias a real content-hash key. Probe against every possible digest by
+  // hashing several distinct byte strings.
+  for bytes in [
+    &b""[..],
+    &b"deadbeef"[..],
+    &b"\x00\x01\x02"[..],
+    &[0xffu8; 32][..],
+  ] {
+    let hashed = Key::from_bytes(bytes);
+    let digest = hashed.as_str(); // e.g. "b:0123456789abcdef"
+    // A literal path equal to the *encoded* digest must not alias it.
+    assert_ne!(
+      Key::from_source(digest),
+      hashed,
+      "a literal path == the encoded digest must not alias from_bytes"
+    );
+    // A literal path equal to the digest with the `b:` tag stripped (the
+    // old `pil:`-prefix-only scheme's collision shape) must not alias it.
+    let payload = digest
+      .strip_prefix("b:")
+      .expect("from_bytes key is b:-tagged");
+    assert_ne!(
+      Key::from_source(payload),
+      hashed,
+      "a literal path == the bare digest payload must not alias from_bytes"
+    );
+  }
+
+  // ── the variant tag is not user-spoofable ──
+  // A user source that literally starts with another variant's tag is still
+  // unambiguously an `s:` key (the tag is *prepended*, never matched from
+  // within the user's bytes).
+  assert_ne!(
+    Key::from_source("l:1:a"),
+    Key::from_sources(&["a"]),
+    "a source literally 'l:1:a' is an s: key, not the list key l:1:a"
+  );
+  assert_ne!(
+    Key::from_source("b:0000000000000000"),
+    Key::from_bytes(b"anything"),
+    "a source shaped like a b: key is an s: key, not a from_bytes key"
+  );
+  // `from_source("s:foo")` is `s:s:foo` — it cannot collide with any other
+  // variant (no other variant starts `s:`), nor with `from_source("foo")`.
+  assert_ne!(Key::from_source("s:foo"), Key::from_source("foo"));
+
+  // ── round-trip stability: same input → same key (cache hit works) ──
+  assert_eq!(Key::from_source("img.jpg"), Key::from_source("img.jpg"));
+  assert_eq!(Key::from_bytes(b"abc"), Key::from_bytes(b"abc"));
+  assert_eq!(
+    Key::from_sources(&["a|b", "c"]),
+    Key::from_sources(&["a|b", "c"])
+  );
+  // ── distinct inputs → distinct keys (no false hit) ──
+  assert_ne!(Key::from_source("x"), Key::from_source("y"));
+  assert_ne!(Key::from_bytes(b"abc"), Key::from_bytes(b"abd"));
+}
+
+/// The non-aliasing encoding holds *through the cache*: a `put` under one
+/// constructor's key must NOT be retrievable via an aliasing key from a
+/// different constructor. This is the functional consequence of
+/// `key_encoding_non_aliasing` — a wrong-image cache hit.
+#[test]
+fn cache_does_not_serve_aliased_keys() {
+  let mut cache = VisionFeatureCache::with_max_size(8).unwrap();
+
+  // Store under a `from_source` key that, pre-fix, aliased a list key.
+  cache
+    .put(Key::from_source("a|b"), &features(10, 64, 1.0))
+    .unwrap();
+  assert!(
+    cache
+      .get(&Key::from_sources(&["a", "b"]))
+      .unwrap()
+      .is_none(),
+    "the 2-element list key must MISS — it must not alias from_source('a|b')"
+  );
+
+  // Store under a list key; the within-list-aliasing partner must miss.
+  cache
+    .put(Key::from_sources(&["a|b"]), &features(10, 64, 2.0))
+    .unwrap();
+  assert!(
+    cache
+      .get(&Key::from_sources(&["a", "b"]))
+      .unwrap()
+      .is_none(),
+    "['a','b'] must MISS — it must not alias the stored ['a|b']"
+  );
+
+  // Store under a `from_bytes` key; a literal-path lookup of the digest
+  // (with and without the tag) must miss.
+  let f = features(10, 64, 3.0);
+  cache.put(Key::from_bytes(b"deadbeef"), &f).unwrap();
+  let digest = Key::from_bytes(b"deadbeef").as_str().to_owned();
+  assert!(
+    cache.get(&Key::from_source(&digest)).unwrap().is_none(),
+    "a literal path == the encoded digest must MISS"
+  );
+  let payload = digest.strip_prefix("b:").unwrap().to_owned();
+  assert!(
+    cache.get(&Key::from_source(&payload)).unwrap().is_none(),
+    "a literal path == the bare digest payload must MISS"
+  );
+
+  // Sanity: the correctly-keyed lookups still HIT (encoding is stable).
+  assert!(
+    cache.get(&Key::from_source("a|b")).unwrap().is_some(),
+    "the original from_source('a|b') key must still hit"
+  );
+  assert!(
+    cache.get(&Key::from_bytes(b"deadbeef")).unwrap().is_some(),
+    "the original from_bytes key must still hit"
+  );
 }
 
 // ─────────────────────────────── URL key ────────────────────────────────
@@ -199,7 +369,9 @@ fn url_key() {
 
 /// The PIL/content-hash branch (`Key::from_bytes`): identical bytes hash
 /// to the same key (hit), different bytes to different keys (no collision),
-/// and the key is `pil:`-prefixed so it can't alias a literal path.
+/// and the key carries the `b:` variant tag so it can't alias a literal
+/// path (cross-variant non-aliasing is exhaustively checked in
+/// `key_encoding_non_aliasing`).
 #[test]
 fn content_hash_key() {
   let mut cache = VisionFeatureCache::new();
@@ -219,8 +391,8 @@ fn content_hash_key() {
   );
   // Different bytes → different key → miss.
   assert!(cache.get(&Key::from_bytes(&img_b)).unwrap().is_none());
-  // Prefixed so it never aliases a real path.
-  assert!(Key::from_bytes(&img_a).as_str().starts_with("pil:"));
+  // `b:`-tagged so it never aliases a real path (an `s:` key).
+  assert!(Key::from_bytes(&img_a).as_str().starts_with("b:"));
 }
 
 // ──────────────────────────────── clear ─────────────────────────────────
