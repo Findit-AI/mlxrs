@@ -1086,30 +1086,38 @@ fn stream_generate_peak_memory_is_monotonic() {
 /// SKIPPED entirely — not just the `[V]` squeeze. The sampler reads raw
 /// post-processor logits, and `argmax(logits) == argmax(logits - lse)` so
 /// the sampled token is byte-identical to a `collect_logprobs == true`
-/// run. The observable proof is two-pronged:
-///   1. Behavioural: every `step.token` matches the `collect_logprobs ==
-///      true` run on byte-identical inputs (the gate did NOT change which
-///      token gets picked).
-///   2. Cost: `peak_memory_bytes` after the opt-out run is `<=` the
-///      `collect_logprobs == true` run on the same prompt + cache shape
-///      (the skipped logsumexp node didn't have to be allocated). A
-///      strict `<` is not asserted because the peak counter is
-///      process-global + monotonic — earlier tests may have already
-///      pushed it past either run's working set; the documented contract
-///      is "no extra cost when off", not "always strictly cheaper".
+/// run.
+///
+/// The "zero-cost" property — that the logsumexp graph node is never built
+/// on the opt-out path — is guaranteed STRUCTURALLY by the 3-way
+/// `match (needs_normalization, temp_stochastic)` in `generate.rs`, which
+/// only constructs the logsumexp node in the `(true, _)` arm. It is
+/// verified FUNCTIONALLY here by the `step.logprobs.is_none()` assertion on
+/// the opt-out path (a `None` logprobs is the observable signal that the
+/// normalization branch — the only producer of `Some(logprobs)` — did not
+/// run).
+///
+/// A peak-memory MAGNITUDE comparison (e.g. `peak(opt-out) <= peak(opt-in)`)
+/// is deliberately NOT asserted: [`mlxrs::memory::peak_memory`] wraps mlx-c's
+/// `mlx_get_peak_memory`, a process-global monotonic high-water mark that
+/// never decreases and is shared by every concurrently-running test. Under
+/// the default multi-threaded test harness, other tests allocate during this
+/// test's measurement window and inflate the global counter unpredictably, so
+/// an absolute cross-sub-run peak comparison is fundamentally unreliable. The
+/// structural + functional checks above prove the contract without reading a
+/// shared global counter.
 #[test]
-fn generate_step_default_skips_logsumexp_normalization() {
-  // Same prompt + model fixture for both runs, so any peak delta comes
-  // strictly from the L3 normalization gate.
+fn generate_step_default_skips_logprobs_node() {
+  // Same prompt + model fixture for both runs, so the only difference is
+  // the L3 normalization gate.
   let prompt = [1u32];
   let max_tokens = 8;
   let bias = [1.0_f32, 2.0, 5.0, 3.0, 4.0];
 
   // Run A: opt-in. Both the normalization AND the squeeze run; every
-  // step yields `Some([V])` logprobs. Force materialization of each
-  // logprobs Array via `to_vec` (which evaluates the lazy graph) so the
-  // logsumexp + subtract nodes are actually computed, not just built —
-  // the peak comparison must reflect the work, not just node count.
+  // step yields `Some([V])` logprobs. Materialize each logprobs Array via
+  // `to_vec` (which evaluates the lazy graph) so the logsumexp + subtract
+  // nodes are actually computed, not just built.
   let model_a = MockModel::with_bias(bias.to_vec());
   let cfg_a = GenConfig {
     max_tokens,
@@ -1117,19 +1125,19 @@ fn generate_step_default_skips_logsumexp_normalization() {
     collect_logprobs: true,
     ..GenConfig::default()
   };
-  let _ = mlxrs::memory::reset_peak_memory();
   let mut tokens_a: Vec<u32> = Vec::new();
   for step in generate_step(&model_a, &prompt, cache(1), cfg_a) {
     let s = step.unwrap();
     tokens_a.push(s.token);
+    // `collect_logprobs == true` ⇒ Some(Array): the normalization branch
+    // ran and produced logprobs. Evaluate to force the graph nodes.
     let mut lp = s.logprobs.expect("collect_logprobs=true ⇒ Some(Array)");
-    // Evaluate — forces the logsumexp + subtract nodes.
     let _ = lp.to_vec::<f32>().unwrap();
   }
-  let peak_a = mlxrs::memory::peak_memory().expect("peak_memory available in-process");
 
   // Run B: opt-out (default). The normalization is skipped, the squeeze
-  // is skipped, every step yields `None`.
+  // is skipped, every step yields `None` — the functional signal that the
+  // logsumexp node (the only producer of Some(logprobs)) was never built.
   let model_b = MockModel::with_bias(bias.to_vec());
   let cfg_b = GenConfig {
     max_tokens,
@@ -1137,20 +1145,18 @@ fn generate_step_default_skips_logsumexp_normalization() {
     // collect_logprobs: false (default)
     ..GenConfig::default()
   };
-  let _ = mlxrs::memory::reset_peak_memory();
   let mut tokens_b: Vec<u32> = Vec::new();
   for step in generate_step(&model_b, &prompt, cache(1), cfg_b) {
     let s = step.unwrap();
     assert!(
       s.logprobs.is_none(),
-      "collect_logprobs=false ⇒ GenStep.logprobs is None"
+      "collect_logprobs=false ⇒ GenStep.logprobs is None (logsumexp node skipped)"
     );
     tokens_b.push(s.token);
   }
-  let peak_b = mlxrs::memory::peak_memory().expect("peak_memory available in-process");
 
-  // (1) Behavioural: same tokens (argmax is shift-invariant; the gate did
-  // not change sampling). bias[2] == 5.0 ⇒ argmax == 2 every step.
+  // Behavioural: same tokens (argmax is shift-invariant; the gate did not
+  // change sampling). bias[2] == 5.0 ⇒ argmax == 2 every step.
   assert_eq!(tokens_a.len(), max_tokens);
   assert_eq!(tokens_b.len(), max_tokens);
   for (a, b) in tokens_a.iter().zip(tokens_b.iter()) {
@@ -1160,16 +1166,6 @@ fn generate_step_default_skips_logsumexp_normalization() {
     );
     assert_eq!(*a, 2, "argmax(bias) == 2 (bias[2] == 5.0)");
   }
-
-  // (2) Cost: opt-out peak must not exceed opt-in peak. The
-  // process-global counter is monotonic + earlier tests may have pushed
-  // it past either run, so this asserts `<=` (the documented "no extra
-  // cost when off" contract) rather than `<`.
-  assert!(
-    peak_b <= peak_a,
-    "opt-out peak ({peak_b}) must not exceed opt-in peak ({peak_a}) — \
-     the skipped logsumexp node should never cost MORE than running it"
-  );
 }
 
 /// L3 normalization gate respects `top_p` (the only sampler in
