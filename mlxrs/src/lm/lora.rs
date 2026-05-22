@@ -1023,16 +1023,16 @@ fn is_active_config_value(value: &serde_json::Value) -> bool {
 ///   at load. The benign `init_lora_weights` values are `true` / `false` /
 ///   `gaussian` / `eva` / `orthogonal`, plus the companion config blocks
 ///   `eva_config`, `corda_config`, `lora_ga_config`, `loftq_config` (carried,
-///   never read). **Exception — the base-weight-mutating modes are rejected:**
-///   `init_lora_weights ∈ { olora, pissa (incl. pissa_niter_<N>), corda,
-///   loftq, lora_ga }` each subtract a low-rank residual from the *base layer
-///   weight* at init (not a pure factor seed; see
-///   [`is_base_weight_mutating_init_mode`]), so a raw checkpoint saved with one
-///   pairs its factors with a modified base. These are handled as a REJECT
-///   before this allowlist is consulted (see
-///   [`reject_unknown_active_peft_fields`]); the bare `init_lora_weights` key
-///   is benign here only for the pure-seed values above. (PEFT's conversion
-///   path rewrites such adapters to `init_lora_weights = true`, which loads.)
+///   never read). **`init_lora_weights` string values are an allowlist:** only
+///   the pure factor seeds `gaussian` / `eva` / `orthogonal` (see
+///   [`is_factor_only_init_mode`]) load; every OTHER string is REJECTED before
+///   this allowlist is consulted (see [`reject_unknown_active_peft_fields`]).
+///   The base-weight-mutating modes `olora` / `pissa*` / `corda*` / `loftq` /
+///   `lora_ga` each subtract a low-rank residual from the *base layer weight*
+///   at init (so raw factors pair with a modified base), and any unknown/future
+///   mode rejects by default. The bare `init_lora_weights` key is benign here
+///   only for the booleans `true` / `false` (PEFT's conversion path rewrites
+///   converted adapters to `init_lora_weights = true`, which loads).
 /// - **Training-only / runtime knobs**: `megatron_config`, `megatron_core`
 ///   (Megatron parallel-linear construction at train time), `runtime_config`
 ///   (explicitly *not saved or restored* — `config.py`), `qalora_group_size`
@@ -1055,11 +1055,11 @@ fn is_benign_ignore_field(field: &str) -> bool {
       | "revision"
       | "inference_mode"
       // Factor-init strategies + their config blocks (train-time seed only;
-      // saved factors already reflect them). The base-weight-MUTATING modes
-      // (olora / pissa* / corda / loftq / lora_ga) are intercepted as a REJECT
-      // before this allowlist (see `reject_unknown_active_peft_fields` /
-      // `is_base_weight_mutating_init_mode`), so the bare key is benign only
-      // for the pure factor seeds (gaussian / eva / orthogonal / true / false).
+      // saved factors already reflect them). `init_lora_weights` STRING values
+      // are an allowlist (only gaussian / eva / orthogonal) enforced as a REJECT
+      // before this benign pass (see `reject_unknown_active_peft_fields` /
+      // `is_factor_only_init_mode`); the bare key is benign here only for the
+      // booleans true / false.
       | "init_lora_weights"
       | "eva_config"
       | "corda_config"
@@ -1074,34 +1074,36 @@ fn is_benign_ignore_field(field: &str) -> bool {
   )
 }
 
-/// Whether an `init_lora_weights` string names a PEFT init mode that **mutates
-/// the base layer weight at training time** — and is therefore *not* a benign
-/// factor seed.
+/// Whether an `init_lora_weights` **string** names a *pure factor seed* — an
+/// init mode that touches only the LoRA factors and leaves the base weight
+/// untouched, so the saved factors load correctly against this loader's
+/// **unmodified** base.
 ///
-/// These modes (peft `tuners/lora/layer.py`) subtract a low-rank residual from
-/// `base_layer.weight.data` when seeding the adapter, so the *raw* saved LoRA
-/// factors are paired with a **modified** base weight:
+/// This is an **allowlist** (closed set), deliberately the inverse of a
+/// reject-list. PEFT's `reset_lora_parameters` (peft `tuners/lora/layer.py`
+/// `:225-273`) dispatches init modes against a closed set and **raises on any
+/// unrecognized string**; within that set the base-*mutating* modes are
+/// `pissa`/`corda` (prefix-dispatched: `startswith("pissa")` `:225`,
+/// `startswith("corda")` `:228`), `olora` (`:231`), `loftq` (`:234`),
+/// `lora_ga` (`:242`) — each subtracts a low-rank residual from
+/// `base_layer.weight.data` (`olora_init:361`, `pissa_init:396`,
+/// `corda_init:477`, `loftq_init:499`, `lora_ga_init:631`). The *only* pure
+/// factor seeds are `eva` (`:237`, which PEFT then rewrites to
+/// `init_lora_weights = true`, `eva.py:526`), `orthogonal` (`:239`), and
+/// `gaussian` (`:273`).
 ///
-/// - `"olora"` — `olora_init` (`:361` `base_layer.weight.data = weight_tensor`).
-/// - `"pissa"` and `"pissa_niter_<N>"` — `pissa_init`
-///   (`:396` `get_base_layer().weight.data = weight`); the SVD-power-iteration
-///   variants share the `pissa` prefix.
-/// - `"corda"` — `corda_init` (`:477` `...weight.data = weight`).
-/// - `"loftq"` — `loftq_init` (`:499`); LoftQ additionally re-quantizes the base.
-/// - `"lora_ga"` — `lora_ga_init` (`:631` `...weight.data = weight_data`).
-///
-/// This loader applies adapters to the **unmodified** base, so a raw checkpoint
-/// saved with any of these modes would run at the wrong behavior — they are
-/// rejected (see [`reject_unknown_active_peft_fields`]). A checkpoint run
-/// through PEFT's conversion path instead reports `init_lora_weights = true`
-/// (e.g. `eva.py:526`) and loads fine, as do the pure factor seeds
-/// (`gaussian` / `eva` / `orthogonal` / `true` / `false`). Matching is
-/// case-insensitive (PEFT writes these lowercase, but be lenient on read).
-fn is_base_weight_mutating_init_mode(mode: &str) -> bool {
-  // `pissa` covers both `"pissa"` and the `"pissa_niter_<N>"` SVD-iteration
-  // variants; the rest are exact mode names.
-  let lower = mode.to_ascii_lowercase();
-  lower.starts_with("pissa") || matches!(lower.as_str(), "olora" | "corda" | "loftq" | "lora_ga")
+/// Returning `false` for **everything else** — the base-mutating modes, their
+/// prefixed variants (`pissa_niter_<N>`, any `corda*`), and any unknown/future
+/// string — means [`reject_unknown_active_peft_fields`] rejects them loudly
+/// with no code change, instead of silently running raw factors against the
+/// wrong base. (Booleans `true` / `false` are handled separately by the benign
+/// allowlist; a converted checkpoint reports `init_lora_weights = true`.)
+/// Matching is case-insensitive (PEFT writes these lowercase; be lenient).
+fn is_factor_only_init_mode(mode: &str) -> bool {
+  matches!(
+    mode.to_ascii_lowercase().as_str(),
+    "gaussian" | "eva" | "orthogonal"
+  )
 }
 
 /// The *reject-unknown-active* backstop for the **PEFT-flat** path: reject any
@@ -1129,39 +1131,47 @@ fn is_base_weight_mutating_init_mode(mode: &str) -> bool {
 /// default for its variant fields) are ignored, so a config that merely *carries*
 /// a defaulted future field still loads.
 ///
-/// The **base-weight-mutating** `init_lora_weights` modes are special-cased
-/// here as a hard reject: unlike the pure factor seeds (`gaussian` / `eva` /
-/// `orthogonal` / `true` / `false`), the modes `olora`, `pissa` (incl.
-/// `pissa_niter_<N>`), `corda`, `loftq`, and `lora_ga` subtract a low-rank
-/// residual from the base layer weight at init (see
-/// [`is_base_weight_mutating_init_mode`]), so a raw checkpoint trained with one
-/// is not interchangeable with a plain-LoRA load on the unmodified base.
+/// `init_lora_weights` string values are an **allowlist** ([`is_factor_only_init_mode`]):
+/// only the pure factor seeds (`gaussian` / `eva` / `orthogonal`) load; every
+/// other string is a hard reject here. The base-weight-mutating modes (`olora`,
+/// `pissa` incl. `pissa_niter_<N>`, `corda` incl. prefixed variants, `loftq`,
+/// `lora_ga`) subtract a low-rank residual from the base layer weight at init,
+/// so a raw checkpoint trained with one is not interchangeable with a plain-LoRA
+/// load on the unmodified base; unknown/future modes reject by default. The
+/// booleans `true` / `false` are not strings and stay benign.
 fn reject_unknown_active_peft_fields<E: serde::de::Error>(
   raw: &RawLoraConfig,
 ) -> std::result::Result<(), E> {
-  // Some `init_lora_weights` strings MUTATE the base layer weight at init —
-  // they subtract a low-rank residual from `base_layer.weight.data` so the
-  // raw saved factors are paired with a *modified* base (peft `lora/layer.py`:
-  // `olora_init` :361, `pissa_init` :396, `corda_init` :477, `loftq_init`
-  // :499, `lora_ga_init` :631). Applying those raw factors to the UNMODIFIED
-  // base — what this loader has — is silently wrong inference, so the mode
-  // strings are rejected here (naming the mode) before the benign allowlist
-  // pass (which otherwise treats the bare `init_lora_weights` key as benign).
-  // peft's CONVERSION path rewrites `init_lora_weights = True` for converted
-  // adapters (e.g. `eva.py:526`), so a converted checkpoint reports `true`
-  // and stays loadable — only the raw mode strings trip this.
+  // `init_lora_weights` may be a STRING naming an init mode. Only the pure
+  // factor seeds (`gaussian` / `eva` / `orthogonal`) leave the base weight
+  // untouched and are safe to load as plain LoRA — this is an ALLOWLIST
+  // ([`is_factor_only_init_mode`]). Every OTHER string is rejected: the
+  // base-weight-mutating modes (`olora`, `pissa*`, `corda*`, `loftq`,
+  // `lora_ga`) subtract a low-rank residual from `base_layer.weight.data` at
+  // init (peft `lora/layer.py`: `olora_init:361`, `pissa_init:396`,
+  // `corda_init:477`, `loftq_init:499`, `lora_ga_init:631`), so their raw saved
+  // factors are paired with a *modified* base — applying them to this loader's
+  // UNMODIFIED base is silently wrong inference; and any unknown/future mode is
+  // rejected by default (PEFT itself only accepts a closed set and raises on the
+  // rest, `reset_lora_parameters` `:225-273`). The allowlist means a new PEFT
+  // init mode fails loud here with NO code change — unlike a reject-list, which
+  // missed prefixed variants like `corda_v1`. (Booleans `true` / `false` are
+  // not strings, so they fall through to the benign allowlist; PEFT's CONVERSION
+  // path rewrites `init_lora_weights = True`, `eva.py:526`, so converted
+  // checkpoints report `true` and stay loadable.)
   if let Some(init) = raw.extra.get("init_lora_weights")
     && let Some(mode) = init.as_str()
-    && is_base_weight_mutating_init_mode(mode)
+    && !is_factor_only_init_mode(mode)
   {
     return Err(E::custom(format!(
-      "adapter_config.json sets `init_lora_weights: {mode:?}` — this PEFT init mode mutates the \
-       base model weight at training time (it subtracts a low-rank residual from \
-       `base_layer.weight`), so the raw saved LoRA factors are paired with a *modified* base. \
-       This loader applies adapters to the unmodified base, so loading such a raw checkpoint \
-       would be silently wrong; this loader does not implement it. (A checkpoint converted via \
-       PEFT's conversion path reports `init_lora_weights: true` and loads fine; the pure factor \
-       seeds gaussian / eva / orthogonal / true / false also load fine.)"
+      "adapter_config.json sets `init_lora_weights: {mode:?}` — this loader only supports the \
+       pure factor-seed init modes (`gaussian` / `eva` / `orthogonal`) and the booleans \
+       `true` / `false`. Other modes either mutate the base model weight at init (`olora`, \
+       `pissa` incl. `pissa_niter_<N>`, `corda` incl. prefixed variants, `loftq`, `lora_ga` — \
+       they subtract a low-rank residual from `base_layer.weight`, pairing the raw saved factors \
+       with a *modified* base) or are not understood; applying them to this loader's unmodified \
+       base would be silently wrong, so they are rejected. (A checkpoint converted via PEFT's \
+       conversion path reports `init_lora_weights: true` and loads fine.)"
     )));
   }
 
@@ -5129,23 +5139,29 @@ mod tests {
   }
 
   #[test]
-  fn peft_config_init_lora_weights_base_mutating_modes_are_err_seeds_ok() {
-    // The base-weight-MUTATING `init_lora_weights` modes subtract a low-rank
-    // residual from `base_layer.weight` at init (peft `lora/layer.py`:
+  fn peft_config_init_lora_weights_allowlist_rejects_non_factor_modes() {
+    // `init_lora_weights` is an ALLOWLIST: only the pure factor seeds
+    // (gaussian/eva/orthogonal + booleans) load; every other string rejects.
+    // The base-weight-MUTATING modes subtract a low-rank residual from
+    // `base_layer.weight` at init (peft `lora/layer.py`:
     // olora_init/pissa_init/corda_init/loftq_init/lora_ga_init), so a RAW
     // checkpoint saved with one pairs its factors with a modified base —
-    // applying them to the unmodified base is silently wrong. They must be
-    // rejected, with a message naming the offending mode (so the error is
-    // actionable). `pissa_niter_<N>` shares the `pissa` prefix and must reject
-    // too; matching is case-insensitive.
+    // applying them to the unmodified base is silently wrong. `pissa_niter_<N>`
+    // and prefixed `corda*` (PEFT dispatches BOTH via `startswith`, layer.py
+    // :225/:228) must reject, AND an unknown/future mode must reject by default
+    // — the allowlist's whole point, since a reject-list missed `corda_v1`. The
+    // message names the offending mode (actionable); matching is
+    // case-insensitive.
     for mode in [
       "pissa",
       "pissa_niter_4",
       "PISSA_NITER_16",
       "olora",
       "corda",
+      "corda_v1",
       "lora_ga",
       "loftq",
+      "some_future_init_mode",
     ] {
       let json = format!(
         r#"{{ "peft_type": "LORA", "r": 8, "lora_alpha": 16.0,
