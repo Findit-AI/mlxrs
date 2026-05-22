@@ -38,6 +38,17 @@ pub mod error;
 pub mod io;
 pub mod ops;
 pub mod shape;
+/// Hand-written `core::arch` SIMD kernels for the host-CPU numeric
+/// loops mlxrs runs itself (audio DSP / preprocessing) — *not* the
+/// MLX-delegated tensor math. Scalar reference + `aarch64` NEON
+/// backend behind a runtime-detection dispatcher.
+///
+/// The module is **always compiled** so feature-gated callers (e.g.
+/// `audio`) can rely on it. The `simd` cargo feature (default-on)
+/// toggles only whether the NEON backend is used: with the feature
+/// **off** the dispatchers route every call to the always-compiled
+/// scalar path.
+pub mod simd;
 pub mod stream;
 pub mod version;
 
