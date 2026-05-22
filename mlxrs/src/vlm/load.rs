@@ -834,14 +834,19 @@ impl VlmTypeRegistry {
 /// prompt assembly / video frame handling / tool-augmented chat
 /// formatting are per-usecase per the no-per-model-arch rule and are
 /// owned by the per-model processor's own (concrete-type) methods —
-/// downcast off this trait via the concrete type's
-/// `&dyn std::any::Any` upcast as needed by the caller. (Future per-model
-/// processor PRs may add more cross-model methods to this trait if a
-/// pattern shared by every VLM emerges.)
+/// recover the concrete type off this trait object by downcasting
+/// through [`as_any`](Processor::as_any) /
+/// [`as_any_mut`](Processor::as_any_mut) (e.g.
+/// `ctx.processor.as_any().downcast_ref::<Qwen2VLProcessor>()`) as
+/// needed by the caller. (Future per-model processor PRs may add more
+/// cross-model methods to this trait if a pattern shared by every VLM
+/// emerges.)
 ///
 /// `Send + Sync` for the same reason [`VlmModelConstructor`] is: a
-/// registry can be shared across threads.
-pub trait Processor: Send + Sync {
+/// registry can be shared across threads. `'static` so a constructed
+/// `Box<dyn Processor>` is `Any`-downcastable back to the concrete
+/// per-model processor.
+pub trait Processor: Send + Sync + 'static {
   /// The [`ImageProcessorConfig`] this processor's per-model encoder
   /// expects for [`crate::vlm::image::preprocess`] (mean / std / size /
   /// resize-filter / channel order). Mirrors how
@@ -851,6 +856,20 @@ pub trait Processor: Send + Sync {
   /// constructed (via the factory) does not have to also reach into
   /// the model for the preprocessing pipeline's parameters.
   fn image_processor_config(&self) -> ImageProcessorConfig;
+
+  /// Upcast to [`&dyn Any`](std::any::Any) so a caller holding the
+  /// erased [`Box<dyn Processor>`] (e.g. off
+  /// [`LoadedVlmContext::processor`]) can `downcast_ref` back to the
+  /// concrete per-model processor (`Qwen2VLProcessor` / `PixtralProcessor`
+  /// / …) to reach its concrete-only methods (multimodal prompt assembly
+  /// / video handling / tool+chat formatting). Each concrete impl returns
+  /// `self`.
+  fn as_any(&self) -> &dyn std::any::Any;
+
+  /// Mutable counterpart of [`as_any`](Processor::as_any) for callers that
+  /// need `downcast_mut` to mutate the concrete per-model processor in
+  /// place. Each concrete impl returns `self`.
+  fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 }
 
 /// A registered VLM processor constructor: assemble a
@@ -1330,6 +1349,14 @@ mod tests {
         resample: ResizeFilter::Bilinear,
         color_order: ColorOrder::Rgb,
       }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+      self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+      self
     }
   }
 
@@ -2997,5 +3024,90 @@ mod tests {
       msg.contains("preprocessor_config.json") && msg.contains("processor_config.json"),
       "error should name both candidate filenames, got: {msg}"
     );
+  }
+
+  /// A concrete processor with a method that is NOT on the [`Processor`]
+  /// trait — standing in for the per-model concrete-only surface
+  /// (multimodal prompt assembly / video handling / tool+chat
+  /// formatting) a real `Qwen2VLProcessor` / `PixtralProcessor` carries.
+  struct MockConcreteProcessor {
+    special: u32,
+  }
+
+  impl MockConcreteProcessor {
+    /// Concrete-only method unreachable through `dyn Processor` — only a
+    /// successful downcast to the concrete type can call it.
+    fn mock_special(&self) -> u32 {
+      self.special
+    }
+  }
+
+  impl Processor for MockConcreteProcessor {
+    fn image_processor_config(&self) -> ImageProcessorConfig {
+      ImageProcessorConfig {
+        size: (1, 1),
+        mean: [0.5, 0.5, 0.5],
+        std: [0.5, 0.5, 0.5],
+        rescale_factor: 1.0 / 255.0,
+        do_resize: true,
+        do_rescale: true,
+        do_normalize: true,
+        resample: ResizeFilter::Bilinear,
+        color_order: ColorOrder::Rgb,
+      }
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+      self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+      self
+    }
+  }
+
+  #[test]
+  fn loaded_processor_downcasts_to_concrete_per_model_type() {
+    // Codex review: `LoadedVlmContext.processor` is an erased
+    // `Box<dyn Processor>`, but a caller needs the CONCRETE per-model
+    // processor (`Qwen2VLProcessor` / `PixtralProcessor` / …) to reach
+    // its concrete-only methods (multimodal prompt assembly / video /
+    // tool+chat formatting). The trait now upcasts to `Any` via
+    // `as_any`, so the erased processor handed back by `load()` can be
+    // downcast to its concrete type end-to-end. Before the `as_any` +
+    // `'static` change there was no way to recover the concrete type off
+    // `load()`'s output, so the concrete-only API was unreachable; this
+    // proves the round-trip works.
+    let dir = fresh_dir("processor-downcast");
+    write_vlm_dir(
+      &dir,
+      "mockvlm",
+      "preprocessor_config.json",
+      "MockConcreteProc",
+      64,
+    );
+
+    let model_registry = VlmTypeRegistry::new().with("mockvlm", mock_vlm_constructor());
+    let processor_registry = VlmProcessorTypeRegistry::new().with(
+      "MockConcreteProc",
+      Box::new(
+        |_loaded: &LoadedProcessor<'_>| -> Result<Box<dyn Processor>> {
+          Ok(Box::new(MockConcreteProcessor { special: 4242 }))
+        },
+      ),
+    );
+    let configuration = VlmModelConfiguration::from_directory(&dir);
+
+    let ctx = load(&configuration, &model_registry, &processor_registry)
+      .expect("load should construct the concrete processor");
+
+    // Recover the concrete per-model processor off the erased
+    // `Box<dyn Processor>` and call its concrete-only method.
+    let concrete = ctx
+      .processor
+      .as_any()
+      .downcast_ref::<MockConcreteProcessor>()
+      .expect("loaded processor must downcast to its concrete per-model type");
+    assert_eq!(concrete.mock_special(), 4242);
   }
 }
