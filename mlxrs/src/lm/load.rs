@@ -618,11 +618,24 @@ pub type Shard<'a> = BTreeMap<&'a str, &'a Array>;
 /// (`max_file_size_bytes = max_file_size_gb << 30`, `utils.py:609`); at that
 /// point the current shard is flushed and a fresh one started. The check is
 /// `shard_size + v.nbytes > max_file_size_bytes` **before** the weight is
-/// added (`utils.py:613`), so — exactly as the reference — a single weight
-/// larger than the cap is flushed onto its own shard and still placed (the
-/// cap is never *enforced*, only used as a split point). The result is
-/// always non-empty: a final (possibly empty, if `weights` itself was empty)
-/// shard is always appended (`utils.py:618`).
+/// added (`utils.py:613`) — verbatim, with **no** empty-shard guard, exactly
+/// as the reference. Two edge cases follow directly from that and are
+/// reproduced faithfully (F6 is a faithful port — it matches mlx-lm even in
+/// the edge cases):
+///
+/// - A single weight larger than the cap is flushed onto its own shard and
+///   still placed (the cap is never *enforced*, only used as a split point).
+/// - When the **first** sorted weight already exceeds the cap (in
+///   particular for a `0` cap, where `0 + nbytes > 0` for every non-empty
+///   weight), the flush fires while the current `shard` is still **empty**,
+///   so the result begins with an **empty leading shard** — e.g. a `0` cap
+///   over weights `a, b, c, d` yields `[{}, {a}, {b}, {c}, {d}]`, and a `0`
+///   cap over a lone weight `solo` yields `[{}, {solo}]`. mlx-lm produces
+///   the same empty leading shard, so the shard list (and thus shard file
+///   names + index data) matches the reference.
+///
+/// The result is always non-empty: a final (possibly empty, if `weights`
+/// itself was empty) shard is always appended (`utils.py:618`).
 ///
 /// Python `dict` preserves insertion order, so `make_shards` is
 /// order-sensitive; a Rust [`HashMap`] is unordered, so this port iterates
@@ -636,9 +649,11 @@ pub type Shard<'a> = BTreeMap<&'a str, &'a Array>;
 /// (each shard is a partition, not a copy).
 ///
 /// `max_file_size_gb` is in gibibytes (the reference's "GB" = `1 << 30`); a
-/// `0` cap makes every weight flush onto its own shard (`0 + n > 0` for any
-/// non-empty weight). A weight whose dtype is unrecognized surfaces as a
-/// recoverable [`Error::Backend`] from `array_nbytes`.
+/// `0` cap puts every weight on its own shard (`0 + n > 0` for any non-empty
+/// weight triggers a flush each iteration) — with the very first flush
+/// emitting an empty leading shard, see above. A weight whose dtype is
+/// unrecognized surfaces as a recoverable [`Error::Backend`] from
+/// `array_nbytes`.
 pub fn make_shards(weights: &Weights, max_file_size_gb: u64) -> Result<Vec<Shard<'_>>> {
   // `gb << 30` in `u64` so there is no `usize` truncation on a 32-bit host;
   // `MAX_FILE_SIZE_GB` (5) << 30 is ~5.4e9, well within `u64`.
@@ -654,10 +669,15 @@ pub fn make_shards(weights: &Weights, max_file_size_gb: u64) -> Result<Vec<Shard
   for (k, v) in sorted {
     let nbytes = array_nbytes(v)? as u64;
     // mlx-lm `utils.py:613`: flush BEFORE adding when the running size plus
-    // the next weight would exceed the cap. `saturating_add` keeps a
+    // the next weight would exceed the cap. The split condition is verbatim
+    // `shard_size + v.nbytes > max_file_size_bytes` — the reference has NO
+    // empty-shard guard, so a `0` cap, or a first sorted weight already
+    // over the cap, flushes the *empty* leading `shard` before placing that
+    // weight. This port replicates that faithfully (a leading empty shard
+    // is part of mlx-lm's edge-case output). `saturating_add` keeps a
     // pathological multi-exabyte map from wrapping the comparison (it would
     // only ever push the sum *higher*, never spuriously under the cap).
-    if shard_size.saturating_add(nbytes) > max_file_size_bytes && !shard.is_empty() {
+    if shard_size.saturating_add(nbytes) > max_file_size_bytes {
       shards.push(std::mem::take(&mut shard));
       shard_size = 0;
     }
@@ -674,11 +694,16 @@ pub fn make_shards(weights: &Weights, max_file_size_gb: u64) -> Result<Vec<Shard
 /// `mlx_lm.utils.get_total_parameters` (`utils.py:196-207`).
 ///
 /// The reference walks the model's leaf `nn.Module`s: a **quantized** module
-/// (one carrying a `bits` attribute) contributes `bias.size + weight.size *
+/// (one carrying a `bits` attribute) contributes `m.bias.size + weight.size *
 /// 32 // bits` — the *logical* (unpacked) parameter count, since a quantized
 /// `weight` is a `uint32`-packed matrix holding `32 / bits` logical weights
 /// per element — while a dense module contributes the plain sum of its
-/// parameters' `.size`.
+/// parameters' `.size`. Note `m.bias` there is the quantized module's
+/// optional **real** bias (the `+ bias` of a biased linear), *not* its
+/// affine `scales`/`biases` buffers — those are never summed, since
+/// `get_total_parameters` reaches a quantized module through the special
+/// `hasattr(m, "bits")` branch and never falls into the dense
+/// `tree_flatten(m.parameters())` sum.
 ///
 /// mlxrs has no `nn.Module` tree, so this port walks the [`Weights`] **name
 /// map** (exactly as [`crate::lm::quant`] does). A quantized layer is
@@ -686,11 +711,13 @@ pub fn make_shards(weights: &Weights, max_file_size_gb: u64) -> Result<Vec<Shard
 /// very signal mlx-lm's own loader uses (`class_predicate`'s `f"{p}.scales"
 /// in weights`, `utils.py:354`). For such a layer the packed `<path>.weight`
 /// (a `uint32` matrix) contributes `weight.size * 32 / bits` logical
-/// parameters and `<path>.biases` — if present — contributes `bias.size`
-/// (`utils.py:203-204`); the `<path>.scales` array, like the reference, is
-/// **not** counted (it is quantization metadata, not a model parameter).
-/// Every other array contributes its plain `.size` (a dense `.weight`, a
-/// dense bias, norms, embeddings, …) — the dense `sum(v.size …)` branch.
+/// parameters; the `<path>.scales` **and** the `<path>.biases` arrays — both
+/// affine-quantization metadata (the `affine_quantize` scale + zero-point
+/// buffers, see [`crate::lm::quant`]), not model parameters — are, like the
+/// reference, **not** counted. Every other array contributes its plain
+/// `.size`: a dense `.weight`, a genuine module `.bias` (singular — a real
+/// linear bias, with no `.scales` sibling), norms, embeddings, … — the dense
+/// `sum(v.size …)` branch.
 ///
 /// `bits` per quantized layer is resolved through
 /// [`PerLayerQuantization::quantization_for`](crate::lm::quant::PerLayerQuantization::quantization_for)
@@ -732,16 +759,38 @@ pub fn get_total_parameters(
       }
     }
     // A `<path>.scales` for a quantized layer is metadata, not a parameter
-    // — the reference's quantized branch counts only `weight` and `bias`
-    // (`utils.py:203-204`). Skip a `.scales` whose `.weight` sibling exists.
+    // — the reference's quantized branch counts only the unpacked `weight`
+    // and a real module `bias` (`utils.py:203-204`). Skip a `.scales` whose
+    // `.weight` sibling exists.
     if let Some(path) = key.strip_suffix(".scales")
       && weights.contains_key(&format!("{path}.weight"))
     {
       continue;
     }
-    // Everything else — a dense `.weight`, any `.biases`, norms, embeddings
-    // — is a plain parameter counted by its element count (the dense
-    // `sum(v.size for _, v in tree_flatten(m.parameters()))` branch).
+    // A `<path>.biases` (note the trailing `s`) belonging to an affine
+    // quantization triple is ALSO metadata, not a model parameter — the
+    // affine `affine_quantize` zero-point array, sibling to `.scales`, not
+    // the `m.bias` the reference's quantized branch counts. mlx-lm's
+    // `get_total_parameters` reaches it only through the *module* tree
+    // where it is the quantized module's `scales`/`biases` buffers (never
+    // summed), so counting it here would inflate `total_parameters` and
+    // depress `compute_bits_per_weight`. Skip a `.biases` that has BOTH a
+    // `.weight` AND a `.scales` sibling — the exact affine-triple shape
+    // (`<path>.weight` + `<path>.scales` + `<path>.biases`, see
+    // [`crate::lm::quant`]). A genuine dense module bias is named `.bias`
+    // (singular, no `.scales` sibling) and still falls through to the
+    // dense count below.
+    if let Some(path) = key.strip_suffix(".biases")
+      && weights.contains_key(&format!("{path}.weight"))
+      && weights.contains_key(&format!("{path}.scales"))
+    {
+      continue;
+    }
+    // Everything else — a dense `.weight`, a real module `.bias`, the
+    // unpacked-bias of a quantized layer counted via its packed `.weight`
+    // above, norms, embeddings — is a plain parameter counted by its
+    // element count (the dense `sum(v.size for _, v in
+    // tree_flatten(m.parameters()))` branch).
     total = total.saturating_add(arr.size() as u64);
   }
   Ok(total)
@@ -1072,29 +1121,71 @@ mod save_tests {
     assert_eq!(one[0].len(), 4);
   }
 
-  /// Hand-traced split boundary. `make_shards`'s split point is
-  /// `shard_size + v.nbytes > cap` (`utils.py:613`); the `make_shards`
-  /// API expresses the cap only in **whole GiB** (the reference's
-  /// `max_file_size_gb`), so the tightest hand-computable boundary is a
-  /// `0`-GiB cap: for every non-empty weight `0 + nbytes > 0` holds, so
-  /// each weight (after the first, which lands on a still-empty shard the
-  /// `!shard.is_empty()` guard does not flush) flushes the prior shard.
-  /// Four 100-byte weights → exactly four single-weight shards, in sorted
-  /// key order `a, b, c, d`.
+  /// Hand-traced zero-cap split, matching mlx-lm `make_shards`
+  /// (`utils.py:598-619`) EXACTLY — including the empty leading shard the
+  /// reference's guard-free `shard_size + v.nbytes > cap` produces. With a
+  /// `0`-GiB cap, `0 + nbytes > 0` holds for every non-empty weight, so the
+  /// split fires every iteration — *including the first*, while `shard` is
+  /// still empty. Hand-trace over sorted weights `a, b, c, d` (100 bytes
+  /// each), exactly as `utils.py`: at `a`, `0 + 100 > 0` pushes the empty
+  /// `{}` and resets, then `shard = {a}`; at `b`, `100 + 100 > 0` pushes
+  /// `{a}`, then `shard = {b}`; `c` pushes `{b}`, `shard = {c}`; `d` pushes
+  /// `{c}`, `shard = {d}`; after the loop the trailing `{d}` is pushed —
+  /// giving `[{}, {a}, {b}, {c}, {d}]`, 5 shards with an empty leading one.
+  /// (Run `mlx_lm.utils.make_shards({"a":…,"b":…,"c":…,"d":…}, 0)` to
+  /// confirm.)
   #[test]
-  fn make_shards_zero_cap_one_weight_per_shard() {
+  fn make_shards_zero_cap_empty_leading_then_one_weight_per_shard() {
     let mut w: Weights = HashMap::new();
     for name in ["a", "b", "c", "d"] {
       w.insert(name.to_string(), f32_weight(25));
     }
     let shards = make_shards(&w, 0).unwrap();
-    assert_eq!(shards.len(), 4);
-    assert!(shards.iter().all(|s| s.len() == 1));
-    // Sorted-key order: a, b, c, d each in its own shard.
-    assert!(shards[0].contains_key("a"));
-    assert!(shards[1].contains_key("b"));
-    assert!(shards[2].contains_key("c"));
-    assert!(shards[3].contains_key("d"));
+    // 5 shards: an empty leading shard + one per weight (mlx-lm parity).
+    assert_eq!(shards.len(), 5);
+    assert!(
+      shards[0].is_empty(),
+      "guard-free split flushes an empty leading shard"
+    );
+    // Sorted-key order in the trailing single-weight shards.
+    assert!(shards[1].contains_key("a"));
+    assert!(shards[2].contains_key("b"));
+    assert!(shards[3].contains_key("c"));
+    assert!(shards[4].contains_key("d"));
+    assert!(shards[1..].iter().all(|s| s.len() == 1));
+  }
+
+  /// An over-cap **first** sorted tensor. mlx-lm `make_shards` has no
+  /// empty-shard guard, so when the first tensor already exceeds the cap
+  /// the split fires immediately, flushing the still-empty initial shard.
+  /// Hand-trace `make_shards({"big": 400-byte, "small": 4-byte}, cap=0)`
+  /// from `utils.py:611-618`: at `big`, `0 + 400 > 0` pushes the empty `{}`
+  /// and resets, then `shard = {big}`; at `small`, `400 + 4 > 0` pushes
+  /// `{big}` and resets, then `shard = {small}`; after the loop the
+  /// trailing `{small}` is pushed — giving `[{}, {big}, {small}]`: an empty
+  /// leading shard, then the over-cap tensor on its own shard, then the
+  /// remainder. This port must produce the identical sequence (same shard
+  /// filenames + index data).
+  #[test]
+  fn make_shards_over_cap_first_tensor_empty_leading_shard() {
+    let mut w: Weights = HashMap::new();
+    w.insert("big".to_string(), f32_weight(100)); // 400 bytes — over a 0 cap
+    w.insert("small".to_string(), f32_weight(1)); // 4 bytes
+    let shards = make_shards(&w, 0).unwrap();
+    assert_eq!(
+      shards.len(),
+      3,
+      "empty leading + over-cap tensor + remainder"
+    );
+    assert!(
+      shards[0].is_empty(),
+      "over-cap first tensor flushes an empty leading shard"
+    );
+    // Sorted key order: `big` < `small`.
+    assert_eq!(shards[1].len(), 1);
+    assert!(shards[1].contains_key("big"));
+    assert_eq!(shards[2].len(), 1);
+    assert!(shards[2].contains_key("small"));
   }
 
   /// An empty weight map still yields exactly one (empty) shard — mlx-lm's
@@ -1107,15 +1198,15 @@ mod save_tests {
     assert!(shards[0].is_empty());
   }
 
-  /// A single weight on its own — one shard holding it, regardless of cap.
+  /// A single weight under an ample cap — one shard holding it. (For the
+  /// `0`-cap / over-cap edge case, where a lone weight yields an empty
+  /// leading shard `[{}, {solo}]`, see
+  /// [`make_shards_over_cap_first_tensor_empty_leading_shard`].)
   #[test]
   fn make_shards_single_weight_one_shard() {
     let mut w: Weights = HashMap::new();
     w.insert("solo".to_string(), f32_weight(7));
-    // Even a 0-GiB cap: the loop never flushes a still-empty `shard`
-    // (`!shard.is_empty()` guard), so the lone weight lands on the single
-    // trailing shard.
-    let shards = make_shards(&w, 0).unwrap();
+    let shards = make_shards(&w, MAX_FILE_SIZE_GB).unwrap();
     assert_eq!(shards.len(), 1);
     assert_eq!(shards[0].len(), 1);
     assert!(shards[0].contains_key("solo"));
@@ -1134,14 +1225,18 @@ mod save_tests {
     assert_eq!(total, 32);
   }
 
-  /// Quantized layer: a `<path>.weight` (`uint32` packed) with a
+  /// Quantized affine layer: a `<path>.weight` (`uint32` packed) with a
   /// `<path>.scales` sibling counts as `weight.size * 32 / bits` logical
-  /// params; `.scales` itself is NOT counted; `.biases` IS. Hand-trace:
-  /// packed `.weight` = 16 `u32` elems, `bits = 4` → `16 * 32 / 4 = 128`
-  /// logical weights; `.biases` = 2 elems → +2; `.scales` (2 elems) → +0.
-  /// Plus a dense `model.norm.weight` of 7 → +7. Total = 128 + 2 + 7 = 137.
+  /// params. Both affine-quantization metadata buffers — `<path>.scales`
+  /// AND `<path>.biases` (the zero-point array, NOT a real module bias) —
+  /// are NOT counted, matching mlx-lm `get_total_parameters`'s quantized
+  /// branch (`m.weight.size * 32 // m.bits` plus only a genuine `m.bias`,
+  /// `utils.py:203-204`). Hand-trace: packed `.weight` = 16 `u32` elems,
+  /// `bits = 4` → `16 * 32 / 4 = 128` logical weights; `.scales` (2 elems)
+  /// → +0; `.biases` (2 elems) → +0 (quantization metadata, skipped). Plus
+  /// a dense `model.norm.weight` of 7 → +7. Total = 128 + 7 = 135.
   #[test]
-  fn get_total_parameters_quantized_unpacks_weight_skips_scales() {
+  fn get_total_parameters_quantized_unpacks_weight_skips_scales_and_biases() {
     let mut w: Weights = HashMap::new();
     let packed = Array::from_slice::<u32>(&[0u32; 16], &(2usize, 8)).unwrap();
     w.insert("model.layers.0.q_proj.weight".to_string(), packed);
@@ -1157,7 +1252,37 @@ mod save_tests {
 
     let quant = PerLayerQuantization::from_global(Quantization::affine(64, 4));
     let total = get_total_parameters(&w, &quant).unwrap();
-    assert_eq!(total, 128 + 2 + 7);
+    assert_eq!(total, 128 + 7);
+  }
+
+  /// A genuine module bias (`.bias`, singular, with NO `.scales` sibling)
+  /// is a real model parameter and IS counted — only an affine
+  /// quantization `.biases` (plural, sibling to a `.weight` + `.scales`
+  /// triple) is skipped as metadata. Hand-trace: dense `model.fc.weight`
+  /// of 5 → +5; `model.fc.bias` of 3 → +3 (no `model.fc.scales`, so it is
+  /// a plain parameter). Total = 8.
+  #[test]
+  fn get_total_parameters_counts_genuine_module_bias() {
+    let mut w: Weights = HashMap::new();
+    w.insert("model.fc.weight".to_string(), f32_weight(5));
+    w.insert("model.fc.bias".to_string(), f32_weight(3));
+    let total = get_total_parameters(&w, &PerLayerQuantization::default()).unwrap();
+    assert_eq!(total, 8);
+  }
+
+  /// An orphan `.biases` (plural) with a `.weight` sibling but NO `.scales`
+  /// sibling is not a valid affine triple, so it must NOT be skipped — it
+  /// falls through to the dense count. (mlx-lm never produces this shape;
+  /// the skip is gated on BOTH a `.weight` and a `.scales` sibling so a
+  /// stray `.biases` is still accounted for.) Hand-trace: `model.x.weight`
+  /// of 4 → +4; `model.x.biases` of 2, no `model.x.scales` → +2. Total = 6.
+  #[test]
+  fn get_total_parameters_orphan_biases_without_scales_is_counted() {
+    let mut w: Weights = HashMap::new();
+    w.insert("model.x.weight".to_string(), f32_weight(4));
+    w.insert("model.x.biases".to_string(), f32_weight(2));
+    let total = get_total_parameters(&w, &PerLayerQuantization::default()).unwrap();
+    assert_eq!(total, 6);
   }
 
   /// A quantized triple (`.scales` present) with no resolvable
@@ -1191,11 +1316,15 @@ mod save_tests {
     assert!((bpw - 32.0).abs() < 1e-9, "expected 32.0, got {bpw}");
   }
 
-  /// Quantized: `model_bytes` sums EVERY array (`scales`/`biases` too),
-  /// `model_params` is the unpacked count. Hand-trace: packed `.weight`
-  /// 16 `u32` = 64 bytes; `.scales` 2 `f32` = 8 bytes; `.biases` 2 `f32`
-  /// = 8 bytes → `model_bytes = 80`. `model_params = 16 * 32 / 4 = 128`
-  /// (+0 for scales) `+ 2` biases `= 130`. `bpw = 80 * 8 / 130 ≈ 4.923`.
+  /// Quantized: `model_bytes` sums EVERY array (`scales`/`biases` too —
+  /// the reference's `tree_reduce` over `model`, `utils.py:211-213`), but
+  /// `model_params` is the *unpacked* count with the affine `scales` AND
+  /// `biases` excluded as metadata. Hand-trace: packed `.weight` 16 `u32`
+  /// = 64 bytes; `.scales` 2 `f32` = 8 bytes; `.biases` 2 `f32` = 8 bytes
+  /// → `model_bytes = 80`. `model_params = packed_weight.size * 32 / bits`
+  /// `= 16 * 32 / 4 = 128` (the affine `.scales` AND `.biases` are NOT in
+  /// the denominator — they are quantization metadata). `bpw = 80 * 8 /
+  /// 128 = 5.0`.
   #[test]
   fn compute_bits_per_weight_quantized_includes_scale_overhead() {
     let mut w: Weights = HashMap::new();
@@ -1213,7 +1342,9 @@ mod save_tests {
     );
     let quant = PerLayerQuantization::from_global(Quantization::affine(64, 4));
     let bpw = compute_bits_per_weight(&w, &quant).unwrap();
-    let expected = 80.0 * 8.0 / 130.0;
+    // model_bytes * 8 / (packed_weight.size * 32 / bits)  — `.biases` is
+    // no longer in the denominator.
+    let expected = 80.0 * 8.0 / 128.0;
     assert!(
       (bpw - expected).abs() < 1e-9,
       "expected {expected}, got {bpw}"
