@@ -530,6 +530,51 @@ fn load_audio_decodes_flac() {
 }
 
 #[test]
+fn load_audio_flac_decodes_exact_streaminfo_sample_count() {
+  // Fix 2 (FLAC exact-count): FLAC's STREAMINFO carries an EXACT total
+  // sample count, which symphonia surfaces as the track's `num_frames`.
+  // `load_audio` now treats FLAC-with-a-declared-total like WAV (an
+  // exact-count format) and applies the strict post-decode equality
+  // cross-check — so the intact fixture must decode to EXACTLY its
+  // declared 2000 samples (not merely a tolerance band). If this drifts
+  // off 2000, either the fixture or the exact-count gate changed.
+  let path = temp_path("flac_exact", "flac");
+  write_fixture(&path, FIXTURE_FLAC);
+  let (samples, sr) = load_audio(&path).unwrap();
+  assert_eq!(sr, FIXTURE_SR, "flac: sample rate mismatch");
+  assert_eq!(
+    samples.len(),
+    FIXTURE_NOMINAL_SAMPLES,
+    "flac: exact STREAMINFO total must decode to exactly {FIXTURE_NOMINAL_SAMPLES} samples"
+  );
+  let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn load_audio_rejects_truncated_flac() {
+  // Fix 2 (FLAC exact-count): a FLAC truncated mid-stream declares (via
+  // STREAMINFO) more samples than survive in the truncated byte buffer.
+  // Symphonia can hit a clean EOF after the partial frames; the old
+  // WAV-only gate would then return `Ok` with missing audio (silent
+  // corruption). With FLAC promoted to an exact-count format, the
+  // post-decode `out.len() == declared` cross-check (or an earlier decode
+  // error) must surface `Error::Backend` instead.
+  //
+  // We truncate to the first half of the fixture bytes, which keeps the
+  // STREAMINFO header (so `num_frames` = 2000 is known) but drops the
+  // tail audio frames.
+  let path = temp_path("flac_truncated", "flac");
+  let cut = FIXTURE_FLAC.len() / 2;
+  write_fixture(&path, &FIXTURE_FLAC[..cut]);
+  let r = load_audio(&path);
+  assert!(
+    matches!(r, Err(mlxrs::Error::Backend { .. })),
+    "truncated FLAC must be rejected (count mismatch / corruption), got {r:?}"
+  );
+  let _ = fs::remove_file(&path);
+}
+
+#[test]
 fn load_audio_decodes_ogg_vorbis() {
   // Decode a real mono OGG/Vorbis fixture — proves BOTH the `ogg`
   // (container demux) AND `vorbis` (audio codec) symphonia features are
