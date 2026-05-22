@@ -90,6 +90,25 @@ const MAX_FBANK_WORK: usize = 64 * 1024 * 1024;
 /// padded-extent and slice-count work bounded.
 const MAX_DELTA_WIN_LENGTH: usize = 1024;
 
+/// Hard ceiling on [`compute_deltas_kaldi`]'s **total accumulation work**:
+/// `num_features * time * (win_length - 1)`. The padded-buffer cap
+/// ([`MAX_FBANK_WORK`]) only bounds the buffer *size* `num_features *
+/// (time + 2n)`, but the delta accumulation loop runs `win_length - 1`
+/// full-width slice / multiply / add passes over `num_features * time`
+/// elements — so the actual element-op count is `num_features * time *
+/// (win_length - 1)`, the `(win_length - 1)` multiplier the size cap
+/// ignores. A `(1-D length = MAX_FBANK_WORK - 1022, win_length = 1023)`
+/// input passes both the original and the padded size caps yet schedules
+/// ~1022 passes over ~64 Mi elements ≈ tens of billions of element-ops —
+/// a CPU / GPU stall despite the size cap (Codex review). This is the
+/// delta analogue of [`crate::audio::dsp`]'s `MAX_LOUDNESS_WORK` (a
+/// sample-visit cap distinct from its `MAX_LOUDNESS_BLOCK_BYTES` byte
+/// cap). `512 Mi` element-ops is a generous ceiling — the default
+/// `win_length = 5` over a 64 Mi-element spectrogram is only `4 * 64 Mi =
+/// 256 Mi` ops, comfortably under the bound, while a pathological wide
+/// window on a large input is rejected in microseconds before the loop.
+const MAX_DELTA_WORK: usize = 512 * 1024 * 1024;
+
 /// Convert Hz to the Kaldi mel scale: `1127 * ln(1 + hz / 700)`.
 ///
 /// Faithful port of `mlx_audio.dsp.mel_scale_kaldi` (`dsp.py:762`). Unlike
@@ -510,6 +529,9 @@ fn reverse_1d(a: &Array) -> Result<Array> {
 /// # Errors
 /// - [`Error::Backend`] when:
 ///   - `waveform` is not 1-D,
+///   - the reflect-padded buffer's element count exceeds the internal
+///     `MAX_FBANK_WORK` cap (the reflect bookends roughly double the
+///     waveform's memory — checked BEFORE the `concatenate` materializes it),
 ///   - the reflect bookends require indices outside the signal (e.g.
 ///     `pad + 1 > n`, i.e. not enough samples to reflect `pad` on a side),
 ///   - the strided read would exceed the padded-buffer length (degenerate
@@ -542,6 +564,50 @@ fn strided_frames_no_snip_edges(
   // `pad = win_size/2 - win_inc/2` (the reference's signed pad). `i64` so the
   // signed subtraction can't wrap; both operands are <= MAX_DECODED_SAMPLES.
   let pad_i64 = (win_size as i64) / 2 - (win_inc as i64) / 2;
+
+  // Cap the reflect-padded buffer's element count BEFORE the `concatenate`
+  // that materializes it (Codex review). The `compute_fbank_kaldi` caps
+  // (`frame_work` / `out_elems` / `output_elems`) bound the *framed* matrix
+  // `num_frames * n_fft_padded`, NOT this intermediate reflected buffer: a
+  // `(samples_len = MAX_FBANK_WORK, win_len = 2, win_inc = 4)` input gives a
+  // tiny `num_frames` (so the framing caps pass), yet the `pad <= 0` branch
+  // below concatenates `wf[|pad| ..]` (`n - |pad|` samples) + `reverse(wf)`
+  // (`n` samples) ≈ `2 * MAX_FBANK_WORK` elements — defeating the 64 Mi
+  // budget by ~2×. Compute the exact `padded` length each branch will build
+  // and reject (recoverable `Error`) when it exceeds the cap, BEFORE any
+  // slice/reverse/concatenate alloc — consistent with the other fbank caps.
+  //   - `pad > 0`:  `pad_left` (`pad`) ++ `waveform` (`n`) ++ `pad_right`
+  //     (`pad` when `pad > 1`, else `n - 1`) ⇒ `n + 2*pad` (pad>1) or `2n`
+  //     (pad==1). `n + 2*pad` is the conservative upper bound for both.
+  //   - `pad <= 0`: `head` (`n - |pad|`) ++ `reverse(wf)` (`n`) ⇒ `2n - |pad|`,
+  //     bounded above by `2n`.
+  let reflected_len = if pad_i64 > 0 {
+    let pad = pad_i64 as usize;
+    pad
+      .checked_mul(2)
+      .and_then(|two_pad| two_pad.checked_add(n))
+      .ok_or_else(|| Error::Backend {
+        message: format!(
+          "strided_frames_no_snip_edges: reflect-padded length n + 2*pad overflows usize \
+           (n={n}, pad={pad})"
+        ),
+      })?
+  } else {
+    n.checked_mul(2).ok_or_else(|| Error::Backend {
+      message: format!(
+        "strided_frames_no_snip_edges: reflect-padded length 2*n overflows usize (n={n})"
+      ),
+    })?
+  };
+  if reflected_len > MAX_FBANK_WORK {
+    return Err(Error::Backend {
+      message: format!(
+        "strided_frames_no_snip_edges: reflect-padded buffer length {reflected_len} \
+         (waveform len={n}, pad={pad_i64}) exceeds the {MAX_FBANK_WORK} work cap; the \
+         snip_edges=false reflect bookends would more than double the waveform's memory"
+      ),
+    });
+  }
 
   // Build the reflect-padded waveform exactly as the reference does.
   let padded = if pad_i64 > 0 {
@@ -1138,8 +1204,9 @@ pub enum DeltaPadMode {
 /// `win_length` shifted, weight-scaled slices of the padded spectrogram
 /// (`d += k * padded[.., n + k : n + k + time]` for `k in -n..=n`). This is
 /// `win_length` cheap strided slices (default `win_length = 5`) with no large
-/// 3-D intermediate — numerically identical to the loop, bounded by the same
-/// element budget as the input.
+/// 3-D intermediate — numerically identical to the loop. The cumulative
+/// element-op count `total * (win_length - 1)` is bounded by a dedicated
+/// `MAX_DELTA_WORK` cap (distinct from the input / padded-buffer size caps).
 ///
 /// # Errors
 /// - [`Error::Backend`] when:
@@ -1157,6 +1224,11 @@ pub enum DeltaPadMode {
 ///     `MAX_FBANK_WORK` cap (~64 Mi elements) — the padded count is checked
 ///     BEFORE any pad / broadcast / concatenate so a tiny input with a large
 ///     `win_length` cannot allocate the bookends first,
+///   - the cumulative accumulation work `total * (win_length - 1)` (the
+///     `win_length - 1` full-width slice / multiply / add passes the delta
+///     loop performs) exceeds the internal `MAX_DELTA_WORK` budget — a
+///     separate cap from the buffer-size caps, checked BEFORE the loop so a
+///     wide window on a large input cannot stall the CPU / GPU,
 ///   - the padded time extent `time + 2n` overflows `usize` / `i32`.
 /// - Propagates errors from the underlying slice / pad / concatenate ops.
 pub fn compute_deltas_kaldi(
@@ -1256,6 +1328,36 @@ pub fn compute_deltas_kaldi(
       message: format!(
         "compute_deltas_kaldi: padded element count {padded_work} (num_features={num_features} \
          * (time + 2n)={padded_time}) exceeds the {MAX_FBANK_WORK} work cap"
+      ),
+    });
+  }
+  // Cap the CUMULATIVE accumulation work, distinct from the buffer-size caps
+  // above (Codex review). The `total` and `padded_work` caps bound buffer
+  // *sizes* (`num_features * time` and `num_features * (time + 2n)`), but the
+  // accumulation loop below runs `win_length - 1` (`== 2n`) full-width
+  // slice / multiply / add passes over `num_features * time` elements — so the
+  // real element-op count is `total * (win_length - 1)`, the multiplier the
+  // size caps ignore. A `(1-D length = MAX_FBANK_WORK - 1022, win_length =
+  // 1023)` input passes BOTH size caps yet schedules ~1022 passes over ~64 Mi
+  // elements ≈ tens of billions of ops. Reject against the dedicated
+  // `MAX_DELTA_WORK` budget BEFORE entering the per-offset loop — the delta
+  // analogue of `dsp.rs`'s `MAX_LOUDNESS_WORK` visit cap. `win_length >= 3`
+  // here, so `win_length - 1 >= 2`.
+  let delta_work = total
+    .checked_mul(win_length - 1)
+    .ok_or_else(|| Error::Backend {
+      message: format!(
+        "compute_deltas_kaldi: accumulation work total * (win_length - 1) overflows usize \
+         (total={total}, win_length={win_length})"
+      ),
+    })?;
+  if delta_work > MAX_DELTA_WORK {
+    return Err(Error::Backend {
+      message: format!(
+        "compute_deltas_kaldi: accumulation work {delta_work} (element count {total} * \
+         (win_length - 1)={}) exceeds the {MAX_DELTA_WORK} work cap; the delta loop runs \
+         win_length - 1 full-width passes over the spectrogram",
+        win_length - 1
       ),
     });
   }
@@ -2350,6 +2452,94 @@ mod tests {
     );
   }
 
+  /// Codex review: `snip_edges=false` reflect-buffer cap. `compute_fbank_kaldi`
+  /// caps the FRAMED matrix (`frame_work` / `out_elems` / `output_elems`)
+  /// BEFORE `strided_frames_no_snip_edges`, but that helper then builds a
+  /// reflected `padded` waveform by concatenating ≈ `2 * waveform_len`
+  /// elements — an intermediate NONE of those caps constrain. With
+  /// `samples_len = MAX_FBANK_WORK` (= 64 Mi, exactly the `MAX_DECODED_SAMPLES`
+  /// bound, so the samples cap passes), `win_len = 2`, `win_inc = 4`,
+  /// `num_mels = 4`: `pad = 2/2 - 4/2 = -1` → the `pad <= 0` branch
+  /// concatenates `wf[1..]` (`n - 1`) + `reverse(wf)` (`n`) ≈ `2 * 64 Mi`
+  /// elements (512 MiB of f32) — ~2× the 64 Mi budget. The new pre-`concatenate`
+  /// reflect-buffer cap MUST reject this BEFORE the doubling alloc.
+  #[test]
+  fn compute_fbank_kaldi_snip_edges_false_reflect_buffer_cap_rejects_doubled_waveform() {
+    // The framing caps that run before `strided_frames_no_snip_edges` all
+    // pass for these params (`n_fft_padded = next_power_of_2(2) = 2`):
+    //   num_frames  = (64Mi + 4/2) / 4 ≈ 16 Mi
+    //   frame_work  = 16Mi * 2  = 32 Mi  <= 64 Mi cap   (ok)
+    //   out_elems   = 16Mi * (2/2+1) = 32 Mi <= cap     (ok)
+    //   output_elems= 16Mi * 4  = 64 Mi  <= 64 Mi cap   (ok, at-cap)
+    //   mel_padded  = 4 * (2/2+1) = 8     <= cap         (ok)
+    // Only the reflect-buffer cap (≈ 2 * 64 Mi = 128 Mi > 64 Mi) can stop it.
+    // `Array::zeros` is lazy (no host buffer); the cap rejects before any
+    // `contiguous` eval or `concatenate` materializes the doubled waveform.
+    let samples_len = MAX_FBANK_WORK; // 64 Mi == MAX_DECODED_SAMPLES (samples cap passes)
+    let len_i32 = i32::try_from(samples_len).unwrap();
+    let x = Array::zeros::<f32>(&[len_i32]).unwrap();
+    let err = compute_fbank_kaldi(
+      &x,
+      16_000,
+      2, // win_len = 2  → n_fft_padded = 2
+      4, // win_inc = 4  → pad = 1 - 2 = -1 (the `pad <= 0` branch)
+      4, // num_mels = 4
+      KaldiWindow::Rectangular,
+      0.0,
+      0.0,
+      false, // snip_edges = false → reflect-bookend framing
+      0.0,
+      0.0,
+      None,
+    )
+    .expect_err(
+      "expected the reflect-buffer cap to reject a 64 Mi snip_edges=false \
+       waveform BEFORE the reflect bookends double it to ~128 Mi",
+    );
+    let msg = format!("{err:?}");
+    assert!(
+      msg.contains("reflect-padded buffer length") && msg.contains("work cap"),
+      "expected error to mention the reflect-padded buffer cap, got: {msg}"
+    );
+  }
+
+  /// Same reflect-buffer cap exercised directly on the module-private
+  /// `strided_frames_no_snip_edges` (the `pad <= 0` branch). A 64 Mi waveform
+  /// with `win_size = 2`, `win_inc = 4` (→ `pad = -1`) would concatenate
+  /// `head` (`n - 1`) + `reverse(wf)` (`n`) ≈ `2n` elements; the cap rejects
+  /// the buffer before the `concatenate`. A normal small framing still works.
+  #[test]
+  fn strided_no_snip_edges_rejects_oversized_reflect_buffer() {
+    // `Array::zeros` is lazy — no 256 MiB host buffer is materialized; the
+    // element-count cap engages on the shape alone before any concatenate.
+    let n = MAX_FBANK_WORK; // 64 Mi → reflected ≈ 2n = 128 Mi > 64 Mi cap
+    let n_i32 = i32::try_from(n).unwrap();
+    let huge = Array::zeros::<f32>(&[n_i32]).unwrap();
+    // num_frames here is irrelevant to the cap (the cap is checked before the
+    // strided-read bound); use the centered count `(n + win_inc/2)/win_inc`.
+    let num_frames = (n + 4 / 2) / 4;
+    let err = strided_frames_no_snip_edges(&huge, 2, 4, num_frames)
+      .expect_err("expected the reflect-buffer cap to reject a doubled 64 Mi waveform");
+    let msg = format!("{err:?}");
+    assert!(
+      msg.contains("reflect-padded buffer length"),
+      "expected a reflect-padded buffer cap error, got: {msg}"
+    );
+
+    // A normal small input (well under the cap) still frames fine: len 10,
+    // win_size=4, win_inc=2 → pad=1, reflected = 2*10 = 20 elements.
+    // `m = (n + win_inc/2) / win_inc` (the centered frame count) = 5.
+    let wf: Vec<f32> = (0..10).map(|v| v as f32).collect();
+    let x = Array::from_slice::<f32>(&wf, &[10]).unwrap();
+    let m = (10 + 2 / 2) / 2; // 5
+    let ok = strided_frames_no_snip_edges(&x, 4, 2, m).unwrap();
+    assert_eq!(
+      ok.shape(),
+      vec![5, 4],
+      "normal snip_edges=false framing still works"
+    );
+  }
+
   // ---- compute_deltas_kaldi (hand-traced vs numpy reference) -------------
 
   /// Reshape `(rows, cols)` row-major `Vec<f32>` helper for 2-D assertions.
@@ -2513,6 +2703,73 @@ mod tests {
         Err(Error::Backend { .. })
       ),
       "padded work exceeding the cap must be rejected before allocating"
+    );
+  }
+
+  /// Codex review: the delta CUMULATIVE-work cap (`MAX_DELTA_WORK`), distinct
+  /// from the buffer-size caps. `total` (`num_features * time`) and
+  /// `padded_work` (`num_features * (time + 2n)`) only bound buffer *sizes*,
+  /// but the accumulation loop runs `win_length - 1` full-width slice /
+  /// multiply / add passes over `total` elements — so the real element-op
+  /// count is `total * (win_length - 1)`. Construct the doc-comment witness:
+  /// a 1-D input of length `MAX_FBANK_WORK - 1022` with `win_length = 1023`
+  /// (`n = 511`). It passes BOTH size caps yet the loop schedules ~1022
+  /// passes over ~64 Mi elements:
+  ///   total       = 64 Mi - 1022                  <= 64 Mi cap   (ok)
+  ///   num_features= 1 (1-D)
+  ///   padded_time = (64 Mi - 1022) + 2*511 = 64 Mi
+  ///   padded_work = 1 * 64 Mi = 64 Mi             <= 64 Mi cap   (ok, at-cap)
+  ///   delta_work  = (64 Mi - 1022) * 1022 ≈ 68 Gi  > 512 Mi cap  (REJECT)
+  /// Only the new `MAX_DELTA_WORK` cap can stop it, and it must do so BEFORE
+  /// the per-offset loop. `Array::zeros` is lazy (no host buffer), so the cap
+  /// engages on the shape alone — no multi-GB allocation.
+  #[test]
+  fn compute_deltas_kaldi_rejects_cumulative_work_over_cap() {
+    // 1-D input: num_features == 1, time == len. len = MAX_FBANK_WORK - 1022
+    // so padded_time = len + 2n = MAX_FBANK_WORK exactly (padded-work cap is
+    // at-cap and PASSES — only the cumulative-work cap can reject).
+    let win_length = 1023_usize; // odd, <= MAX_DELTA_WIN_LENGTH (1024); n = 511
+    let n = (win_length - 1) / 2; // 511
+    let len = MAX_FBANK_WORK - 2 * n; // 64 Mi - 1022
+    assert!(!win_length.is_multiple_of(2), "win_length must be odd");
+    assert!(
+      win_length <= MAX_DELTA_WIN_LENGTH,
+      "win_length must clear the win_length cap so the cumulative cap is reached"
+    );
+    // Cross-check the cap interplay: size caps pass, cumulative cap fails.
+    assert!(len <= MAX_FBANK_WORK, "total must pass the total cap");
+    assert_eq!(
+      len + 2 * n,
+      MAX_FBANK_WORK,
+      "padded_work is at-cap (passes)"
+    );
+    assert!(
+      len.checked_mul(win_length - 1).unwrap() > MAX_DELTA_WORK,
+      "delta_work must exceed the cumulative-work cap"
+    );
+    let len_i32 = i32::try_from(len).unwrap();
+    let x = Array::zeros::<f32>(&[len_i32]).unwrap();
+    let err = compute_deltas_kaldi(&x, win_length, DeltaPadMode::Edge).expect_err(
+      "expected the cumulative-work cap to reject total * (win_length - 1) \
+       BEFORE the per-offset accumulation loop",
+    );
+    let msg = format!("{err:?}");
+    assert!(
+      msg.contains("accumulation work") && msg.contains("work cap"),
+      "expected the cumulative accumulation-work cap error, got: {msg}"
+    );
+
+    // A normal win_length = 5 on a small input still works (the cumulative cap
+    // is generous): total = 2*5 = 10, delta_work = 10 * 4 = 40 << 512 Mi.
+    let small =
+      Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 0.0, 0.0, 1.0, 0.0, 0.0], &[2, 5])
+        .unwrap();
+    let ok = compute_deltas_kaldi(&small, 5, DeltaPadMode::Edge)
+      .expect("a normal win_length=5 must pass the cumulative-work cap");
+    assert_eq!(
+      ok.shape(),
+      vec![2, 5],
+      "normal win_length=5 deltas still work"
     );
   }
 
