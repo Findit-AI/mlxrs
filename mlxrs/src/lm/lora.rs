@@ -642,23 +642,48 @@ pub enum AdapterSelection {
 /// On the mlx-lm-native path the scale is the single `LoraParameters`-resolved
 /// value (`alpha / rank`, or the literal `scale`).
 ///
-/// # Training-only PEFT fields — accept-and-ignore
+/// # Training-only PEFT fields — accept-and-ignore (an explicit allowlist)
 ///
-/// A real PEFT `LoraConfig` carries training-only fields with **no** inference
-/// effect: `init_lora_weights`, `loftq_config`, `eva_config`, `corda_config`,
-/// `lora_ga_config`, `task_type`, `layer_replication`, `target_parameters`,
-/// `megatron_config`, `megatron_core`, `runtime_config`, … The `Deserialize`
-/// does **not** `deny_unknown_fields`, so these parse cleanly and are dropped —
-/// they affect only how an adapter was *trained*, never how it runs.
-/// (`modules_to_save` and `bias`, by contrast, *do* carry inference-affecting
-/// tensors and are **rejected** — see below.)
+/// A real PEFT `LoraConfig` carries training-only / metadata fields with **no**
+/// inference effect on already-saved factors: `init_lora_weights` (a factor
+/// *seed* — except `"loftq"`, which re-quantizes base weights and is rejected),
+/// `loftq_config`, `eva_config`, `corda_config`, `lora_ga_config`, `task_type`
+/// and the other inherited `PeftConfig` metadata (`auto_mapping`,
+/// `base_model_name_or_path`, `revision`, `inference_mode`, `peft_version`),
+/// `megatron_config`, `megatron_core`, `runtime_config`, `qalora_group_size`,
+/// `ensure_weight_tying`, … These are accepted and ignored even when set — see
+/// the **explicit allowlist** `is_benign_ignore_field`. (`modules_to_save` and
+/// `bias`, by contrast, *do* carry inference-affecting tensors and are
+/// **rejected** — see below.)
+///
+/// # Reject-unknown-active — the structural backstop (PEFT-flat)
+///
+/// PEFT's `LoraConfig` is a 75-field, ever-growing dataclass; many fields switch
+/// the inference forward (`resolve_lora_variant`, `lora/layer.py`). Rather than
+/// chase each new variant with a reactive reject-list (whack-a-mole — a new PEFT
+/// release can add a forward-switching field this loader would then silently run
+/// as vanilla LoRA), the PEFT-flat `Deserialize` takes a **reject-unknown-active**
+/// posture: it captures *every* top-level key (`#[serde(flatten)]` into the
+/// private `RawLoraConfig::extra` catch-all) and rejects any key that is neither
+/// modeled nor on the benign allowlist and is set to an **active** value
+/// (anything other than `null` / `false` — PEFT's "off" default for its variant
+/// fields; see the private `reject_unknown_active_peft_fields` /
+/// `is_active_config_value`). So a
+/// *future* unmodeled variant fails loudly with **no per-field code change**,
+/// while a config that merely carries a defaulted (`null` / `false`) future
+/// field still loads. This is the backstop that catches forward-switching fields
+/// not enumerated below — e.g. `arrow_config`, `use_bdlora`, `layer_replication`,
+/// `trainable_token_indices`, `target_parameters`. (The mlx-lm-native nested
+/// shape is our own small, well-defined format and keeps its existing
+/// accept-and-ignore behavior — the rule applies to the PEFT-flat branch only.)
 ///
 /// # Rejected PEFT fields — bias, `modules_to_save`, and the exotic LoRA variants
 ///
 /// Some PEFT fields, when set, change an adapter's **inference** forward — so
 /// they cannot be silently dropped like the training-only fields above. The
-/// `Deserialize` rejects each with a clear, recoverable error rather than
-/// loading the adapter at the wrong behavior:
+/// `Deserialize` rejects each with a clear, recoverable error (the explicit ones
+/// keep a tailored message; everything else is caught by the structural backstop
+/// above) rather than loading the adapter at the wrong behavior:
 ///
 /// - **`lora_bias: true`** — ships a bias on the `lora_B` projection that PEFT
 ///   adds (scaled) in the forward. mlxrs's [`LoRALinear`] is a faithful port of
@@ -696,15 +721,21 @@ pub enum AdapterSelection {
 ///   dropout is the identity), `fan_in_fan_out`, `use_rslora`, `use_dora`,
 ///   `target_modules`, `exclude_modules`, `layers_to_transform`,
 ///   `layers_pattern`, `rank_pattern`, `alpha_pattern`, `peft_type`.
-/// - **Accepted and ignored** (training/init-only, no inference effect):
-///   `megatron_config`/`megatron_core`, `loftq_config`, `eva_config`,
-///   `corda_config`, `lora_ga_config`, `init_lora_weights`, `task_type`,
-///   `trainable_token_indices`, `layer_replication`, `target_parameters`,
-///   `runtime_config`, … — parsed (no `deny_unknown_fields`) then dropped.
-/// - **Rejected loudly** (set values that *do* change inference):
-///   `lora_bias`, `bias` (`!= "none"`), `modules_to_save` (non-empty), and the
-///   exotic variants `use_qalora`, `alora_invocation_tokens`, `velora_config`,
-///   `monteclora_config`.
+/// - **Accepted and ignored** (training/init-only / metadata, no inference
+///   effect on saved factors) — the **explicit allowlist** in the private
+///   `is_benign_ignore_field`: `megatron_config`/`megatron_core`,
+///   `loftq_config`, `eva_config`, `corda_config`, `lora_ga_config`,
+///   `init_lora_weights` (except `"loftq"`), `task_type`, `auto_mapping`,
+///   `base_model_name_or_path`, `revision`, `inference_mode`, `peft_version`,
+///   `runtime_config`, `qalora_group_size`, `ensure_weight_tying`.
+/// - **Rejected loudly** (set values that *do* change inference / model
+///   structure): the explicitly-named `lora_bias`, `bias` (`!= "none"`),
+///   `modules_to_save` (non-empty), and the exotic variants `use_qalora`,
+///   `alora_invocation_tokens`, `velora_config`, `monteclora_config`; **plus**,
+///   via the structural backstop, any *other* un-modeled non-benign field set to
+///   an active value — including `init_lora_weights: "loftq"`, `arrow_config`,
+///   `use_bdlora`, `layer_replication`, `trainable_token_indices`,
+///   `target_parameters`, and any future forward-switching field.
 #[derive(Debug, Clone)]
 pub struct LoraConfig {
   /// `lora` / `dora` / `full` (mlx-lm `fine_tune_type`). Defaults to
@@ -740,13 +771,18 @@ fn default_num_layers() -> i32 {
 /// This is the "permissive deserialize then normalize" step: serde cannot
 /// branch on which keys are present from a `#[derive]`, so the raw form
 /// captures *all* keys non-fatally and the normalization picks the shape.
-/// Training-only PEFT fields (`init_lora_weights`, `loftq_config`, `task_type`,
-/// `modules_to_save`, `megatron_*`, …) are simply *not listed* here — with no
-/// `deny_unknown_fields` they parse and are dropped (accept-and-ignore). The
-/// **exotic LoRA variants** (`use_qalora`, `alora_invocation_tokens`,
-/// `velora_config`, `monteclora_config`), by contrast, *are* listed — not to
-/// honor them, but so the `Deserialize` can **reject** an adapter that sets
-/// them (each changes the inference forward; see [`LoraConfig`]).
+/// Training-only / metadata PEFT fields (`init_lora_weights`, `loftq_config`,
+/// `task_type`, `megatron_*`, …) are *not* listed as named fields — they fall
+/// into the [`extra`](Self::extra) `#[serde(flatten)]` catch-all, where the
+/// PEFT-flat normalization either accepts-and-ignores them (if benign — see
+/// [`is_benign_ignore_field`]) or, under the **reject-unknown-active** rule,
+/// rejects them when set to an active value (see
+/// [`reject_unknown_active_peft_fields`]). The **exotic LoRA variants**
+/// (`use_qalora`, `alora_invocation_tokens`, `velora_config`,
+/// `monteclora_config`) *are* listed as named fields — not to honor them, but so
+/// the shape-independent [`reject_exotic_variants`] guard can **reject** an
+/// adapter that sets them with a tailored message (each changes the inference
+/// forward; see [`LoraConfig`]).
 #[derive(serde::Deserialize)]
 struct RawLoraConfig {
   /// mlx-lm `fine_tune_type` (`"lora"` / `"dora"` / `"full"`). Absent in PEFT
@@ -861,6 +897,19 @@ struct RawLoraConfig {
   /// so a non-`None` value is rejected by the `Deserialize`.
   #[serde(default)]
   monteclora_config: Option<serde_json::Value>,
+  /// **Every remaining top-level key**, captured verbatim (`#[serde(flatten)]`)
+  /// rather than dropped. This is the backstop for the *reject-unknown-active*
+  /// posture: PEFT's `LoraConfig` is a 75-field, ever-growing zoo, and any field
+  /// not explicitly modeled above lands here. On the PEFT-flat path the
+  /// `Deserialize` walks this map and **rejects** any key that is neither
+  /// modeled nor on the [`benign-ignore`](is_benign_ignore_field) allowlist and
+  /// is set to an [`active`](is_active_config_value) value (anything other than
+  /// `null` / `false`), so a *future* forward-switching variant fails loudly
+  /// instead of silently running as vanilla LoRA — without a code change per new
+  /// field. The modeled fields above are consumed by serde first, so they never
+  /// appear here; only un-modeled keys do.
+  #[serde(flatten)]
+  extra: HashMap<String, serde_json::Value>,
 }
 
 /// A PEFT field that is **either** a single string **or** a list of strings
@@ -927,6 +976,158 @@ fn module_matcher_from<E: serde::de::Error>(
       Ok(ModuleMatcher::Regex(Box::new(re)))
     }
   }
+}
+
+/// Whether a JSON value for an *un-modeled* PEFT config field counts as
+/// **active** — i.e. it might switch the inference forward and so must be
+/// rejected rather than silently dropped.
+///
+/// PEFT's variant-gating fields default to `None` (serde → JSON `null`) or
+/// `False` when *off*; `resolve_lora_variant` (`peft` `lora/layer.py`) only
+/// dispatches a variant when such a field is non-`None` / truthy. So a `null`
+/// or `false` value for an un-modeled field is provably the inactive default and
+/// is safe to ignore; **anything else** (a number, a string, a non-empty list,
+/// an object, `true`) is treated as active and rejected. An empty list / empty
+/// object is conservatively treated as active too — it is not a PEFT default for
+/// any forward-switching field, so a real config never carries one, and erring
+/// toward rejection keeps the backstop loud.
+fn is_active_config_value(value: &serde_json::Value) -> bool {
+  !matches!(
+    value,
+    serde_json::Value::Null | serde_json::Value::Bool(false)
+  )
+}
+
+/// Whether `field` is a PEFT `LoraConfig` (or inherited `PeftConfig`) key that
+/// is **safe to accept and ignore even when set** — metadata, training-only, or
+/// factor-initialization-only fields that never change how *already-saved* LoRA
+/// factors run at inference.
+///
+/// This is the allowlist half of the *reject-unknown-active* rule: a key that is
+/// neither modeled (a `RawLoraConfig` struct field) nor on this list is unknown,
+/// and an unknown key set to an [`active`](is_active_config_value) value is
+/// rejected (see [`reject_unknown_active_peft_fields`]). Grounded in
+/// `config.py` docstrings and whether `lora/layer.py`'s forward /
+/// `resolve_lora_variant` consults the field:
+///
+/// - **Inherited `PeftConfig` metadata** (`config.py` parent): `task_type`,
+///   `auto_mapping`, `peft_version`, `base_model_name_or_path`, `revision`,
+///   `inference_mode` — provenance / bookkeeping, never read in the forward.
+/// - **Factor-initialization strategies** — applied *at training time* to seed
+///   the LoRA factors; the saved factors already embody them, so they are no-ops
+///   at load. `init_lora_weights` (`true` / `false` / `gaussian` / `pissa` /
+///   `olora` / `eva` / `corda` / `orthogonal`, …) and its companions
+///   `eva_config`, `corda_config`, `lora_ga_config`, `loftq_config`.
+///   **Exception:** `init_lora_weights == "loftq"` *re-quantizes the base
+///   weights* (not a pure factor seed), so it is handled as a REJECT before this
+///   allowlist is consulted (see [`reject_unknown_active_peft_fields`]); the
+///   bare `init_lora_weights` key is benign here for every *other* value.
+/// - **Training-only / runtime knobs**: `megatron_config`, `megatron_core`
+///   (Megatron parallel-linear construction at train time), `runtime_config`
+///   (explicitly *not saved or restored* — `config.py`), `qalora_group_size`
+///   (meaningful only with `use_qalora`, itself rejected), `ensure_weight_tying`
+///   (re-ties weights for `modules_to_save` / `target_modules` — both rejected
+///   when active; tying alone does not change a pure-LoRA forward on saved
+///   factors).
+///
+/// Fields that *do* switch inference (`arrow_config`, `use_bdlora`,
+/// `layer_replication`, `trainable_token_indices`, `target_parameters`, …) are
+/// deliberately **absent** so the generic rule rejects them when active.
+fn is_benign_ignore_field(field: &str) -> bool {
+  matches!(
+    field,
+    // Inherited PeftConfig metadata (config.py parent).
+    "task_type"
+      | "auto_mapping"
+      | "peft_version"
+      | "base_model_name_or_path"
+      | "revision"
+      | "inference_mode"
+      // Factor-init strategies + their config blocks (train-time seed only;
+      // saved factors already reflect them). `init_lora_weights == "loftq"` is
+      // intercepted as a REJECT before this allowlist (it re-quantizes base
+      // weights), so the bare key is benign for all other values.
+      | "init_lora_weights"
+      | "eva_config"
+      | "corda_config"
+      | "lora_ga_config"
+      | "loftq_config"
+      // Training-only / runtime knobs (no inference effect on saved factors).
+      | "megatron_config"
+      | "megatron_core"
+      | "runtime_config"
+      | "qalora_group_size"
+      | "ensure_weight_tying"
+  )
+}
+
+/// The *reject-unknown-active* backstop for the **PEFT-flat** path: reject any
+/// top-level key that is neither modeled nor [`benign`](is_benign_ignore_field)
+/// and is set to an [`active`](is_active_config_value) value.
+///
+/// # Why this exists
+///
+/// PEFT's `LoraConfig` is a 75-field, forever-growing dataclass; many fields
+/// switch the inference forward (`resolve_lora_variant`, `lora/layer.py`). A
+/// reactive *reject-list* (name each unsupported variant) is whack-a-mole —
+/// every new PEFT release can add a forward-switching field that this loader
+/// would then silently run as **vanilla LoRA**, at the wrong behavior. This rule
+/// flips the posture: anything not explicitly understood, when set to an active
+/// value, fails loudly. New unmodeled variants are caught with *no code change*.
+///
+/// # The rule
+///
+/// `extra` ([`RawLoraConfig::extra`], a `#[serde(flatten)]` catch-all) holds
+/// exactly the keys serde did **not** bind to a modeled struct field. For each
+/// such key: if it is on the benign allowlist, skip it; otherwise, if its value
+/// is active (not `null` / `false`), return [`Error::Backend`](crate::Error)
+/// (via the deserializer's error type) naming the field as an unsupported /
+/// unmodeled PEFT field. Inactive unknowns (`null` / `false` — PEFT's "off"
+/// default for its variant fields) are ignored, so a config that merely *carries*
+/// a defaulted future field still loads.
+///
+/// `init_lora_weights == "loftq"` is special-cased here as a hard reject:
+/// unlike every other init strategy (a pure factor seed), LoftQ *re-quantizes
+/// the base weights*, so a checkpoint trained with it is not interchangeable
+/// with a plain-LoRA load.
+fn reject_unknown_active_peft_fields<E: serde::de::Error>(
+  raw: &RawLoraConfig,
+) -> std::result::Result<(), E> {
+  // `init_lora_weights: "loftq"` re-quantizes the BASE weights (not just a
+  // factor seed), so it cannot be treated as the benign init-only field it
+  // otherwise is. Reject it explicitly before the generic allowlist pass.
+  if let Some(init) = raw.extra.get("init_lora_weights")
+    && init
+      .as_str()
+      .is_some_and(|s| s.eq_ignore_ascii_case("loftq"))
+  {
+    return Err(E::custom(
+      "adapter_config.json sets `init_lora_weights: \"loftq\"` — LoftQ re-quantizes the base \
+       model weights (not just the LoRA factor seed), so a LoftQ checkpoint is not \
+       interchangeable with a plain-LoRA load; this loader does not implement it (loading it as \
+       plain LoRA would be wrong). Other `init_lora_weights` values (gaussian / pissa / olora / \
+       eva / corda / orthogonal / true / false) are factor-initialization only and load fine.",
+    ));
+  }
+
+  // Generic backstop: every key serde could not bind to a modeled field is in
+  // `extra`. Reject any that is neither benign nor inactive.
+  for (field, value) in &raw.extra {
+    if is_benign_ignore_field(field) {
+      continue;
+    }
+    if is_active_config_value(value) {
+      return Err(E::custom(format!(
+        "adapter_config.json sets the unsupported / unmodeled PEFT field {field:?} to an active \
+         value; this loader models only a known subset of PEFT `LoraConfig` and rejects any \
+         other field that is set (not `null` / `false`), so a future forward-switching variant \
+         fails loudly instead of silently running as vanilla LoRA. If {field:?} does not affect \
+         inference, it must be added to the benign-ignore allowlist; otherwise it needs explicit \
+         support."
+      )));
+    }
+  }
+  Ok(())
 }
 
 /// Reject any PEFT *exotic LoRA variant* that is set to a non-default — the
@@ -1130,6 +1331,17 @@ impl<'de> serde::Deserialize<'de> for LoraConfig {
            supported (it would silently drop the saved module weights)",
         ));
       }
+      // ── reject-unknown-active backstop (PEFT-flat only) ──
+      // The explicit named rejects above keep their clearer messages, but PEFT's
+      // `LoraConfig` is a 75-field, ever-growing zoo: any forward-switching field
+      // NOT modeled above would otherwise be silently dropped and the adapter run
+      // as vanilla LoRA. This generic rule rejects ANY un-modeled, non-benign key
+      // that is set to an active value (and `init_lora_weights: "loftq"`), so a
+      // future variant fails loudly without a per-field code change. Scope is the
+      // PEFT-flat branch — the mlx-lm-native nested shape (handled by the
+      // `lora_parameters` early return) is our own small, well-defined format and
+      // keeps its existing accept-and-ignore behavior.
+      reject_unknown_active_peft_fields::<D::Error>(&raw)?;
 
       let target_modules = match raw.target_modules {
         None => None,
@@ -2757,6 +2969,26 @@ fn translate_peft_keys(arrays: HashMap<String, Array>) -> Result<HashMap<String,
     {
       // DoRA magnitude — [out_features] in both schemes, no transpose.
       out.insert(format!("{path}.m"), arr);
+    } else if rest.contains(".lora_embedding_A") || rest.contains(".lora_embedding_B") {
+      // Embedding LoRA — PEFT's `LoraLayer.adapter_layer_names`
+      // (`lora/layer.py:105`) registers `lora_embedding_A` / `lora_embedding_B`
+      // ParameterDicts for `nn.Embedding` targets; `utils/save_and_load.py`
+      // saves them (key matches `"lora_" in k`) as
+      // `base_model.model.<path>.lora_embedding_A` (optionally `.weight`).
+      // These ARE legitimate low-rank factors, NOT a `bias` / `modules_to_save`
+      // tensor — so they must NOT fall through to the generic message below
+      // (which would misclassify them). Embedding-LoRA *application* is not
+      // implemented (deferred), so reject with a precise, distinct error rather
+      // than load it wrong. (`.contains` rather than `.strip_suffix` because the
+      // suffix may be bare or carry a trailing `.weight`.)
+      return Err(Error::Backend {
+        message: format!(
+          "load_adapters: PEFT adapter tensor {key:?} is an embedding LoRA factor \
+           (`lora_embedding_A` / `lora_embedding_B`); embedding LoRA is not supported by this \
+           loader (only linear-layer `lora_A` / `lora_B` low-rank factors are applied), so it \
+           cannot be loaded"
+        ),
+      });
     } else {
       // A PEFT-prefixed tensor that is NOT a low-rank factor — a `.bias`
       // (PEFT `bias != "none"`) or a `modules_to_save` full-module weight. Both
@@ -4475,8 +4707,13 @@ mod tests {
 
   #[test]
   fn peft_config_accepts_and_ignores_training_only_fields() {
-    // A real PEFT `LoraConfig` carries training-only fields with no inference
-    // effect — they must parse cleanly (accept-and-ignore), not error.
+    // A real PEFT `LoraConfig` carries training-only / metadata fields with no
+    // inference effect on already-saved factors — these BENIGN fields must parse
+    // cleanly (accept-and-ignore), not error, even when set to real values.
+    // (`layer_replication` / `trainable_token_indices` / `target_parameters` —
+    // formerly in this list — are forward/structure-switching and are now
+    // rejected by the reject-unknown-active backstop; see
+    // `peft_config_structural_reject_examples_*`.)
     let json = r#"{
       "peft_type": "LORA",
       "r": 8,
@@ -4487,7 +4724,6 @@ mod tests {
       "eva_config": null,
       "corda_config": null,
       "task_type": "CAUSAL_LM",
-      "layer_replication": [[0, 4]],
       "megatron_config": null,
       "megatron_core": "megatron.core",
       "revision": null,
@@ -4709,6 +4945,326 @@ mod tests {
       LoraConfig::from_json(mlx).is_ok(),
       "exotic defaults on an mlx-lm-shaped config must not trip the guard"
     );
+  }
+
+  // ───────── reject-unknown-active: the structural backstop (PEFT-flat) ─────────
+
+  #[test]
+  fn peft_config_arrow_config_is_err() {
+    // `arrow_config` switches the forward (PEFT `resolve_lora_variant` returns
+    // an `ArrowLinearVariant`); it is NOT a modeled field, so the structural
+    // backstop must reject it when set to an object — BEFORE any tensor
+    // translation. (Caught generically, no per-field code.)
+    let json = r#"{
+      "peft_type": "LORA", "r": 8, "lora_alpha": 16.0, "target_modules": ["q_proj"],
+      "arrow_config": { "top_k": 3 }
+    }"#;
+    let err = LoraConfig::from_json(json)
+      .expect_err("`arrow_config` set must be rejected (forward variant)");
+    match err {
+      Error::Backend { message } => assert!(
+        message.contains("arrow_config"),
+        "the rejection should name `arrow_config`; got: {message}"
+      ),
+      other => panic!("expected Error::Backend, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn peft_config_use_bdlora_is_err() {
+    // `use_bdlora` switches the forward (PEFT `resolve_lora_variant` returns a
+    // `BdLoraLinearVariant`); un-modeled, so the structural backstop rejects an
+    // object value.
+    let json = r#"{
+      "peft_type": "LORA", "r": 8, "lora_alpha": 16.0, "target_modules": ["q_proj"],
+      "use_bdlora": { "nblocks": 2 }
+    }"#;
+    let err = LoraConfig::from_json(json).expect_err("`use_bdlora` set must be rejected");
+    match err {
+      Error::Backend { message } => assert!(
+        message.contains("use_bdlora"),
+        "the rejection should name `use_bdlora`; got: {message}"
+      ),
+      other => panic!("expected Error::Backend, got {other:?}"),
+    }
+  }
+
+  #[test]
+  fn peft_config_invented_unknown_active_field_is_err() {
+    // The whole point of the structural posture: a field that does not exist in
+    // *today's* PEFT, set to an active value, must be rejected by name with NO
+    // code change. Proves the backstop catches genuinely NEW fields (object and
+    // scalar forms both).
+    for (field, value) in [
+      ("some_future_variant", r#"{ "k": 1 }"#),
+      ("another_future_knob", "7"),
+      ("yet_another_variant", "true"),
+      ("a_future_string_variant", r#""enabled""#),
+    ] {
+      let json = format!(
+        r#"{{ "peft_type": "LORA", "r": 8, "lora_alpha": 16.0,
+           "target_modules": ["q_proj"], {field:?}: {value} }}"#
+      );
+      let err = LoraConfig::from_json(&json).expect_err(&format!(
+        "an active unknown field `{field}` must be rejected by the structural backstop"
+      ));
+      match err {
+        Error::Backend { message } => assert!(
+          message.contains(field),
+          "the rejection for `{field}` should name the field; got: {message}"
+        ),
+        other => panic!("expected Error::Backend for `{field}`, got {other:?}"),
+      }
+    }
+  }
+
+  #[test]
+  fn peft_config_unknown_field_inactive_value_is_accepted() {
+    // PEFT's variant-gating fields default to None (→ JSON null) or False when
+    // off. An unknown field set to `null` or `false` is provably the inactive
+    // default, so it must be IGNORED (loads fine) — otherwise merely carrying a
+    // defaulted future field would spuriously fail.
+    for value in ["null", "false"] {
+      let json = format!(
+        r#"{{ "peft_type": "LORA", "r": 8, "lora_alpha": 16.0,
+           "target_modules": ["q_proj"], "some_future_variant": {value} }}"#
+      );
+      let cfg = LoraConfig::from_json(&json).unwrap_or_else(|e| {
+        panic!("an inactive (`{value}`) unknown field must be ignored, got: {e:?}")
+      });
+      assert_eq!(cfg.rank(), 8);
+    }
+    // Several inactive unknowns at once — still fine.
+    let json = r#"{ "peft_type": "LORA", "r": 8, "lora_alpha": 16.0,
+      "target_modules": ["q_proj"],
+      "future_a": null, "future_b": false, "future_c": null }"#;
+    assert!(
+      LoraConfig::from_json(json).is_ok(),
+      "multiple inactive unknown fields must all be ignored"
+    );
+  }
+
+  #[test]
+  fn peft_config_benign_fields_with_real_values_are_accepted() {
+    // BENIGN-IGNORE fields carry metadata / training-only info with no effect on
+    // already-saved factors at inference. Set to real (active) values they must
+    // still load — they are on the explicit allowlist, not unknown.
+    let json = r#"{
+      "peft_type": "LORA", "r": 8, "lora_alpha": 16.0, "target_modules": ["q_proj"],
+      "task_type": "CAUSAL_LM",
+      "revision": "main",
+      "base_model_name_or_path": "meta-llama/Llama-3-8B",
+      "auto_mapping": { "base_model_class": "LlamaForCausalLM" },
+      "inference_mode": true,
+      "peft_version": "0.19.2.dev0",
+      "megatron_core": "megatron.core",
+      "megatron_config": { "tensor_model_parallel_size": 1 },
+      "runtime_config": { "ephemeral_gpu_offload": true },
+      "eva_config": { "rho": 2.0 },
+      "corda_config": { "corda_method": "ipm" },
+      "lora_ga_config": { "scale": "stable" },
+      "loftq_config": { "loftq_bits": 4 },
+      "qalora_group_size": 16,
+      "ensure_weight_tying": true
+    }"#;
+    let cfg = LoraConfig::from_json(json)
+      .expect("benign metadata / training-only fields must load even when set");
+    assert_eq!(cfg.rank(), 8);
+    assert_eq!(cfg.lora_parameters.alpha, Some(16.0));
+  }
+
+  #[test]
+  fn peft_config_init_lora_weights_loftq_is_err_others_ok() {
+    // `init_lora_weights` is a factor-init *seed* — benign for every value
+    // EXCEPT "loftq", which re-quantizes the BASE weights (a LoftQ checkpoint is
+    // not interchangeable with a plain-LoRA load).
+    let loftq = r#"{
+      "peft_type": "LORA", "r": 8, "lora_alpha": 16.0, "target_modules": ["q_proj"],
+      "init_lora_weights": "loftq", "loftq_config": { "loftq_bits": 4 }
+    }"#;
+    let err = LoraConfig::from_json(loftq)
+      .expect_err("`init_lora_weights: \"loftq\"` must be rejected (re-quantizes base weights)");
+    match err {
+      Error::Backend { message } => assert!(
+        message.contains("loftq") || message.contains("LoftQ"),
+        "the rejection should mention loftq; got: {message}"
+      ),
+      other => panic!("expected Error::Backend, got {other:?}"),
+    }
+    // Every other init strategy is a pure factor seed and loads fine.
+    for init in [
+      "\"pissa\"",
+      "\"gaussian\"",
+      "\"olora\"",
+      "\"eva\"",
+      "\"corda\"",
+      "\"orthogonal\"",
+      "true",
+      "false",
+    ] {
+      let json = format!(
+        r#"{{ "peft_type": "LORA", "r": 8, "lora_alpha": 16.0,
+           "target_modules": ["q_proj"], "init_lora_weights": {init} }}"#
+      );
+      assert!(
+        LoraConfig::from_json(&json).is_ok(),
+        "`init_lora_weights: {init}` is factor-init only and must load"
+      );
+    }
+  }
+
+  #[test]
+  fn peft_config_structural_reject_examples_layer_replication_and_token_indices() {
+    // These forward/structure-switching fields are deliberately NOT on the
+    // benign allowlist, so the structural backstop rejects them when active —
+    // even though there is no per-field check for them.
+    let cases = [
+      (
+        "layer_replication",
+        r#"{ "peft_type": "LORA", "r": 8, "lora_alpha": 16.0,
+          "target_modules": ["q_proj"], "layer_replication": [[0, 4], [2, 5]] }"#,
+      ),
+      (
+        "trainable_token_indices",
+        r#"{ "peft_type": "LORA", "r": 8, "lora_alpha": 16.0,
+          "target_modules": ["q_proj"], "trainable_token_indices": [0, 1, 2] }"#,
+      ),
+      (
+        "target_parameters",
+        r#"{ "peft_type": "LORA", "r": 8, "lora_alpha": 16.0,
+          "target_modules": [], "target_parameters": ["feed_forward.experts.gate_up_proj"] }"#,
+      ),
+    ];
+    for (field, json) in cases {
+      match LoraConfig::from_json(json) {
+        Ok(_) => panic!("`{field}` set must be rejected by the structural backstop"),
+        Err(Error::Backend { message }) => assert!(
+          message.contains(field),
+          "the rejection should name `{field}`; got: {message}"
+        ),
+        Err(other) => panic!("expected Error::Backend for `{field}`, got {other:?}"),
+      }
+    }
+  }
+
+  #[test]
+  fn peft_config_valid_flat_fixture_still_loads() {
+    // Regression: a realistic, fully-populated PEFT-flat config — exactly the
+    // shape `LoraConfig.save_pretrained` writes, where EVERY field is serialized
+    // including the forward-switching ones at their inactive (`null` / `false`)
+    // defaults — must still load after the structural rule. The reject-if-active
+    // fields below (`layer_replication`, `trainable_token_indices`,
+    // `target_parameters`, `use_bdlora`, `arrow_config`, …) are present but
+    // inactive, so the backstop must ignore them; the rule must not regress this
+    // common case.
+    let json = r#"{
+      "peft_type": "LORA",
+      "task_type": "CAUSAL_LM",
+      "auto_mapping": null,
+      "peft_version": "0.19.2.dev0",
+      "base_model_name_or_path": "meta-llama/Llama-3-8B",
+      "revision": null,
+      "inference_mode": true,
+      "r": 16,
+      "lora_alpha": 32.0,
+      "lora_dropout": 0.05,
+      "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+      "exclude_modules": null,
+      "bias": "none",
+      "use_rslora": false,
+      "use_dora": false,
+      "fan_in_fan_out": false,
+      "lora_bias": false,
+      "modules_to_save": null,
+      "init_lora_weights": true,
+      "layers_to_transform": null,
+      "layers_pattern": null,
+      "rank_pattern": {},
+      "alpha_pattern": {},
+      "megatron_config": null,
+      "megatron_core": "megatron.core",
+      "use_qalora": false,
+      "qalora_group_size": 16,
+      "alora_invocation_tokens": null,
+      "loftq_config": {},
+      "eva_config": null,
+      "corda_config": null,
+      "lora_ga_config": null,
+      "velora_config": null,
+      "monteclora_config": null,
+      "layer_replication": null,
+      "trainable_token_indices": null,
+      "target_parameters": null,
+      "use_bdlora": null,
+      "arrow_config": null,
+      "ensure_weight_tying": false,
+      "runtime_config": {"ephemeral_gpu_offload": false}
+    }"#;
+    let cfg = LoraConfig::from_json(json).expect("a realistic PEFT-flat config must still load");
+    assert_eq!(cfg.rank(), 16);
+    assert_eq!(cfg.lora_parameters.alpha, Some(32.0));
+    assert_eq!(cfg.scale_for("model.layers.0.self_attn.q_proj"), 2.0); // 32/16
+    let peft = cfg.peft().expect("PEFT selection");
+    assert!(matches!(&peft.target_modules, Some(ModuleMatcher::List(_))));
+  }
+
+  #[test]
+  fn mlx_lm_native_fixture_still_loads_with_unknown_keys() {
+    // Regression + scope: the mlx-lm-NATIVE nested shape keeps its existing
+    // accept-and-ignore behavior — the reject-unknown-active rule applies to the
+    // PEFT-flat branch ONLY. An mlx-lm-native config (the `lora_parameters`
+    // early return) with an extra unknown key still loads.
+    let json = r#"{
+      "fine_tune_type": "lora",
+      "num_layers": 8,
+      "lora_parameters": { "rank": 8, "scale": 20.0, "dropout": 0.0, "keys": ["q_proj"] },
+      "some_native_extra_key": { "whatever": 1 }
+    }"#;
+    let cfg = LoraConfig::from_json(json)
+      .expect("mlx-lm-native shape must keep accept-and-ignore for unknown keys");
+    assert_eq!(cfg.rank(), 8);
+    assert!(matches!(
+      cfg.selection,
+      AdapterSelection::MlxLm { num_layers: 8 }
+    ));
+  }
+
+  #[test]
+  fn peft_key_translation_embedding_lora_precise_reject() {
+    // PEFT embedding-LoRA saves `lora_embedding_A` / `lora_embedding_B` factors
+    // (`adapter_layer_names`, `lora/layer.py:105`). These ARE legitimate
+    // low-rank factors, NOT a bias / modules_to_save tensor — so the translation
+    // must reject them with a PRECISE "embedding" message, not the generic
+    // bias/modules_to_save one (which would misclassify them). Embedding-LoRA
+    // application is deferred, so reject (don't load) — but correctly named.
+    for suffix in [
+      ".lora_embedding_A",
+      ".lora_embedding_B",
+      ".lora_embedding_A.weight",
+      ".lora_embedding_B.weight",
+    ] {
+      let key = format!("base_model.model.model.embed_tokens{suffix}");
+      let mut arrays: HashMap<String, Array> = HashMap::new();
+      arrays.insert(key.clone(), Array::zeros::<f32>(&(2, 3)).unwrap());
+      match translate_peft_keys(arrays) {
+        Ok(_) => panic!("embedding-LoRA key {key:?} must be rejected, not accepted"),
+        Err(Error::Backend { message }) => {
+          assert!(
+            message.to_lowercase().contains("embedding"),
+            "the rejection must mention embedding; got: {message}"
+          );
+          assert!(
+            !message.contains("bias") && !message.contains("modules_to_save"),
+            "embedding-LoRA must NOT be misclassified as bias/modules_to_save; got: {message}"
+          );
+          assert!(
+            message.contains(&key),
+            "the rejection should name the key; got: {message}"
+          );
+        }
+        Err(other) => panic!("expected Error::Backend, got {other:?}"),
+      }
+    }
   }
 
   #[test]
