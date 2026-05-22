@@ -5,11 +5,10 @@
 //!
 //! Faithful 1:1 port of the corresponding `mlx_audio.dsp` core
 //! (`hanning`, `hamming`, `blackman`, `bartlett`, `STR_TO_WINDOW_FN`, `stft`,
-//! `istft`, `mel_filters`, `lfilter`, `integrated_loudness`,
-//! `normalize_loudness`) at <https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/dsp.py>.
-//! Out of scope for this PR: the `ISTFTCache` batched/cached overlap-add
-//! helper, Kaldi-style features, `normalize_peak`, dither — see
-//! [`crate::audio`] for the scope fence.
+//! `istft`, `ISTFTCache`, `mel_filters`, `lfilter`, `integrated_loudness`,
+//! `normalize_loudness`, `normalize_peak`) at
+//! <https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/dsp.py>.
+//! Kaldi-style features live in the sibling [`crate::audio::features`] module.
 //!
 //! ## API conventions
 //! - Window construction is **symmetric** (`periodic=False` in `mlx-audio`):
@@ -94,7 +93,7 @@ const MAX_OLA_WORK: usize = 64 * 1024 * 1024;
 /// arithmetic) to BOTH the strided-frame element count `num_frames * n_fft`
 /// (the windowed-frame matrix the rfft consumes) AND the one-sided output
 /// element count `num_frames * (n_fft / 2 + 1)`, BEFORE any frame view,
-/// window multiply, or rfft is built. Mirrors [`MAX_OLA_WORK`] on the inverse
+/// window multiply, or rfft is built. Mirrors `MAX_OLA_WORK` on the inverse
 /// side: the public-input *sample* length is already capped at
 /// [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES), but a
 /// *lazily-shaped* huge input (e.g. a 64 Mi-sample array with `n_fft = 1024,
@@ -153,7 +152,7 @@ const COVERAGE_EPS: f32 = 1e-10;
 /// `mlx-audio-swift` has no `win_length` (the window is always `n_fft`), so
 /// it corresponds to `win_length == n_fft`, which both variants handle the
 /// same way (and both invert).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum WindowPad {
   /// `[w, zeros]` right-padded in `n_fft` (mlx-audio / mlxrs `stft`). The
   /// default: keeps [`stft`]'s short-window output byte-identical to
@@ -1501,6 +1500,381 @@ pub fn istft(spectrum: &Spectrum, length: Option<usize>) -> Result<Array> {
 
   // Final trim to the requested region (same bounds the coverage guard used).
   ops::indexing::slice(&reconstructed, &[start_i32], &[stop_i32], &[1])
+}
+
+/// Key for [`ISTFTCache`]'s overlap-add position-index cache: the framing
+/// geometry `(num_frames, frame_width, hop_length)` that fully determines the
+/// flattened scatter-index buffer `indices[m, j] = m * hop + j`. `frame_width`
+/// is `n_fft` (every frame is `n_fft` wide after window placement), so two
+/// [`Spectrum`]s with the same `(num_frames, n_fft, hop)` share one index
+/// buffer regardless of `win_length` / `window_pad`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PositionKey {
+  num_frames: usize,
+  frame_width: usize,
+  hop_length: usize,
+}
+
+/// Key for [`ISTFTCache`]'s normalization-buffer cache. The scattered
+/// `Σ w²` overlap-add divisor depends on the *full* synthesis-window geometry
+/// (`n_fft`, `win_length`, `window_pad` — which together fix the placed
+/// `n_fft`-wide window) plus the framing (`hop_length`, `num_frames`). The
+/// reference keys on `(n_fft, hop, win_length, hash(window), num_frames)`; here
+/// the window is fully determined by `(win_length, n_fft, window_pad)` (the
+/// shared `frame_window`), so `window_pad` replaces the window hash — there is
+/// no free-form window to hash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct NormKey {
+  n_fft: usize,
+  hop_length: usize,
+  win_length: usize,
+  window_pad: WindowPad,
+  num_frames: usize,
+}
+
+/// Cached / batched overlap-add helper for [`istft`] — the mlxrs port of
+/// `mlx_audio.dsp.ISTFTCache`.
+///
+/// Faithful adaptation of `mlx_audio.dsp.ISTFTCache` (`dsp.py:575`) to mlxrs's
+/// typed [`Spectrum`] API. The reference caches, across repeated `istft` calls
+/// with the same geometry, two derived buffers that are otherwise rebuilt every
+/// call:
+/// - the **flattened scatter-index buffer** `indices[m, j] = m * hop + j`
+///   (keyed by `(num_frames, frame_width, hop)` — `get_positions`), and
+/// - the **scattered `Σ w²` normalization buffer** of overlap-add length `t`,
+///   floored at `COVERAGE_EPS` (keyed by the full window + framing geometry —
+///   `get_norm_buffer`).
+///
+/// For a streaming decoder that inverts many same-shaped frame blocks (the
+/// reference's stated use case — "streaming"), this skips the per-call CPU
+/// index `Vec` build and the per-call scatter-add that produces the window-sum.
+///
+/// ## Relationship to the free [`istft`] function
+/// [`ISTFTCache::istft`] is **numerically identical** to the free [`istft`] for
+/// every supported [`Spectrum`]: it builds the same `Σ w²` divisor, performs the
+/// same `irfft` → window → overlap-add → divide, and applies the same
+/// center-trim / `length` slicing. The only difference is that the index buffer
+/// and the (floored) norm buffer are memoized. It enforces the same invariants:
+/// [`WindowPad::Right`] short-window inversion (`win_length != n_fft`) is
+/// rejected up front (not a faithful inverse — see [`istft`]).
+///
+/// **Difference from the free [`istft`]'s coverage guard.** The free [`istft`]
+/// runs a *coverage guard* — it reads back the minimum window-sum of the
+/// requested region and errors if any requested sample got negligible window
+/// energy. `ISTFTCache` instead **floors the cached norm buffer at
+/// `COVERAGE_EPS`** (the reference's `mx.maximum(norm_buffer, 1e-10)`), so a
+/// zero-coverage sample is divided by the floor rather than flagged. For the
+/// supported configurations ([`WindowPad::Center`] any `win_length`, or
+/// [`WindowPad::Right`] with `win_length == n_fft`) every requested sample has
+/// full COLA coverage, so the floor never actually engages on a returned sample
+/// and the two paths agree. The floor is a deliberate, reference-faithful
+/// choice (`ISTFTCache` is the *fast streaming* path; the free [`istft`] is the
+/// *guarded* path).
+///
+/// ## Bounded memory
+/// Each cached entry is bounded by the same `MAX_OLA_WORK` /
+/// [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES) caps the free
+/// [`istft`] enforces (the scatter work `num_frames * n_fft` and the OLA length
+/// `t`). The number of *distinct* cache entries is bounded by the number of
+/// distinct geometries the caller feeds in; [`ISTFTCache::clear`] drops them
+/// all, and [`ISTFTCache::len`] reports the count for a caller that wants to
+/// bound it explicitly.
+///
+/// ```ignore
+/// let mut cache = ISTFTCache::new();
+/// for block in stream {
+///   let spectrum = stft(&block, 1024, 256, None, WindowPad::Center)?;
+///   let audio = cache.istft(&spectrum, None)?; // index/norm buffers reused
+/// }
+/// ```
+#[derive(Debug, Default)]
+pub struct ISTFTCache {
+  /// Memoized flattened scatter-index buffers, keyed by framing geometry.
+  position_cache: std::collections::HashMap<PositionKey, Array>,
+  /// Memoized scattered `Σ w²` norm buffers (floored at `COVERAGE_EPS`),
+  /// keyed by the full window + framing geometry.
+  norm_buffer_cache: std::collections::HashMap<NormKey, Array>,
+}
+
+impl ISTFTCache {
+  /// A fresh, empty cache. Equivalent to [`ISTFTCache::default`].
+  pub fn new() -> ISTFTCache {
+    ISTFTCache {
+      position_cache: std::collections::HashMap::new(),
+      norm_buffer_cache: std::collections::HashMap::new(),
+    }
+  }
+
+  /// The total number of cached buffers (position-index + norm-buffer
+  /// entries). Mirrors the reference's `cache_info()["total_cached_items"]`.
+  /// A caller that wants a hard memory bound can watch this and call
+  /// [`ISTFTCache::clear`] when it grows past a chosen threshold.
+  pub fn len(&self) -> usize {
+    self.position_cache.len() + self.norm_buffer_cache.len()
+  }
+
+  /// Whether the cache holds no buffers at all.
+  pub fn is_empty(&self) -> bool {
+    self.position_cache.is_empty() && self.norm_buffer_cache.is_empty()
+  }
+
+  /// Drop every cached buffer, freeing the memory. Mirrors the reference's
+  /// `clear_cache()`. Safe to call between streams with different geometries.
+  pub fn clear(&mut self) {
+    self.position_cache.clear();
+    self.norm_buffer_cache.clear();
+  }
+
+  /// Cached / batched inverse STFT of `spectrum` — the [`ISTFTCache`] analogue
+  /// of the free [`istft`].
+  ///
+  /// Builds the reconstruction exactly as [`istft`] does (`irfft` → synthesis
+  /// window → overlap-add → divide by `Σ w²`), but reuses the flattened
+  /// scatter-index buffer and the floored `Σ w²` norm buffer from the cache
+  /// when a [`Spectrum`] with the same geometry was seen before. The result is
+  /// the reconstructed 1-D real signal (`Dtype::F32`), identical to
+  /// `istft(spectrum, length)` for every supported [`Spectrum`].
+  ///
+  /// `length` has the same meaning as in [`istft`]: with `center = true` the
+  /// `n_fft / 2` reflect prefix is dropped first, then `length` (if any) keeps
+  /// the leading real samples; with `center = false` it slices `[0 .. length]`.
+  ///
+  /// # Errors
+  /// Same error surface as [`istft`] **except the coverage guard** (this path
+  /// floors the norm buffer at `COVERAGE_EPS` instead — see the
+  /// [`ISTFTCache`] type docs):
+  /// - [`Error::Backend`] when the [`Spectrum`]'s `window_pad` is
+  ///   [`WindowPad::Right`] and `win_length != n_fft` (short-window right-pad
+  ///   inversion is not a faithful inverse — rejected up front),
+  /// - [`Error::Backend`] when a derived size overflows `usize` / `i32`, the
+  ///   OLA length `t` exceeds the
+  ///   [`MAX_DECODED_SAMPLES`](crate::audio::io::MAX_DECODED_SAMPLES) cap, or
+  ///   the scatter work `num_frames * n_fft` exceeds `MAX_OLA_WORK`,
+  /// - [`Error::Backend`] when the `length` trim is out of range,
+  /// - propagates window-construction errors from the shared `frame_window`.
+  pub fn istft(&mut self, spectrum: &Spectrum, length: Option<usize>) -> Result<Array> {
+    // Every transform parameter is read straight off the typed `Spectrum` (its
+    // invariants — even n_fft, n_freqs == n_fft/2 + 1, 1 <= win_length <=
+    // n_fft, hop >= 1, num_frames >= 1, Complex64 data — were enforced at
+    // construction by `stft` / `Spectrum::from_parts`).
+    let x = spectrum.data();
+    let n_fft = spectrum.n_fft();
+    let hop_length = spectrum.hop_length();
+    let win_length = spectrum.win_length();
+    let window_pad = spectrum.window_pad();
+    let center = spectrum.center();
+    let num_frames = spectrum.num_frames();
+
+    // Right-pad short-window inversion is not a faithful inverse — reject the
+    // whole surface up front, exactly as the free `istft` does (see its body
+    // for the full rationale). The forward `stft` keeps Right padding; only
+    // the inverse restricts Right to `win_length == n_fft`.
+    if matches!(window_pad, WindowPad::Right) && win_length != n_fft {
+      return Err(Error::Backend {
+        message: format!(
+          "ISTFTCache::istft: WindowPad::Right supports only win_length == n_fft \
+           (got win_length={win_length}, n_fft={n_fft}); right-pad short-window \
+           inversion is not a faithful inverse — use WindowPad::Center for \
+           short-window (win_length < n_fft) inversion"
+        ),
+      });
+    }
+
+    // Every frame is `n_fft` wide (the `win_length` window is placed into the
+    // `n_fft` frame), so the overlap-add stride / frame width is `n_fft`.
+    let frame_width = n_fft;
+
+    // OLA output / norm-buffer length `t = (num_frames - 1) * hop + n_fft`,
+    // capped at MAX_DECODED_SAMPLES (same as the free `istft`).
+    let t = (num_frames - 1)
+      .checked_mul(hop_length)
+      .and_then(|v| v.checked_add(frame_width))
+      .ok_or_else(|| Error::Backend {
+        message: format!(
+          "ISTFTCache::istft: OLA length (num_frames-1)*hop + n_fft overflows usize \
+           (num_frames={num_frames}, hop={hop_length}, n_fft={n_fft})"
+        ),
+      })?;
+    if t > crate::audio::io::MAX_DECODED_SAMPLES {
+      return Err(Error::Backend {
+        message: format!(
+          "ISTFTCache::istft: OLA length {t} exceeds the {} cap",
+          crate::audio::io::MAX_DECODED_SAMPLES
+        ),
+      });
+    }
+    let t_i32 = i32::try_from(t).map_err(|_| Error::Backend {
+      message: format!("ISTFTCache::istft: OLA length {t} exceeds i32::MAX"),
+    })?;
+    let n_fft_i32 = i32::try_from(n_fft).map_err(|_| Error::Backend {
+      message: format!("ISTFTCache::istft: n_fft {n_fft} exceeds i32::MAX"),
+    })?;
+
+    // Scatter-work cap on `num_frames * frame_width`, checked BEFORE any
+    // allocation / cache insertion (the `t` cap bounds the output but small
+    // hops drive the scatter far past `t` — same guard the free `istft` uses).
+    let idx_len = num_frames
+      .checked_mul(frame_width)
+      .ok_or_else(|| Error::Backend {
+        message: format!(
+          "ISTFTCache::istft: scatter work count num_frames * n_fft overflows usize \
+           (num_frames={num_frames}, n_fft={n_fft})"
+        ),
+      })?;
+    if idx_len > MAX_OLA_WORK {
+      return Err(Error::Backend {
+        message: format!(
+          "ISTFTCache::istft: scatter work count {idx_len} (num_frames={num_frames} * \
+           n_fft={n_fft}) exceeds the {MAX_OLA_WORK} work cap"
+        ),
+      });
+    }
+    let idx_len_i32 = i32::try_from(idx_len).map_err(|_| Error::Backend {
+      message: format!("ISTFTCache::istft: scatter work count {idx_len} exceeds i32::MAX"),
+    })?;
+
+    // ---- cached flattened scatter-index buffer --------------------------
+    // `indices[m, j] = m * hop + j`, flattened. Depends only on the framing
+    // geometry `(num_frames, frame_width, hop)`. All caps above already
+    // bounded `idx_len`; build (once per geometry) and memoize.
+    let pos_key = PositionKey {
+      num_frames,
+      frame_width,
+      hop_length,
+    };
+    // `entry`-based fallible memoization: build the index buffer only on a cache
+    // miss, then read it back as a shared reference for the rest of the call.
+    // (Can't use `or_insert_with` — the build is fallible.)
+    if let std::collections::hash_map::Entry::Vacant(slot) = self.position_cache.entry(pos_key) {
+      let mut idx_buf: Vec<i32> = Vec::new();
+      idx_buf
+        .try_reserve_exact(idx_len)
+        .map_err(|e| Error::Backend {
+          message: format!(
+            "ISTFTCache::istft: index reservation for {idx_len} elements failed: {e}"
+          ),
+        })?;
+      let frame_width_i32 = i32::try_from(frame_width).map_err(|_| Error::Backend {
+        message: format!("ISTFTCache::istft: n_fft {frame_width} exceeds i32::MAX"),
+      })?;
+      for m in 0..num_frames {
+        // `m * hop < t <= i32::MAX` and `+ j` stays `< t`, so every index
+        // fits i32 (same bound the free `istft` relies on).
+        let off = (m * hop_length) as i32;
+        for j in 0..frame_width_i32 {
+          idx_buf.push(off + j);
+        }
+      }
+      let indices = Array::from_slice::<i32>(&idx_buf, &[idx_len_i32])?;
+      slot.insert(indices);
+    }
+
+    // ---- cached scattered `Σ w²` norm buffer ----------------------------
+    // The reference (`get_norm_buffer`) scatters the tiled squared window into
+    // a zero buffer of OLA length, then `mx.maximum(., 1e-10)`-floors it. The
+    // floored buffer is the divisor. Keyed by the full window + framing
+    // geometry. Built once via the shared `frame_window` (so the synthesis
+    // window matches the forward `stft` exactly).
+    let norm_key = NormKey {
+      n_fft,
+      hop_length,
+      win_length,
+      window_pad,
+      num_frames,
+    };
+    if !self.norm_buffer_cache.contains_key(&norm_key) {
+      // Synthesis window via the SHARED `frame_window` — symmetric Hann of
+      // `win_length` placed into the `n_fft` frame per `window_pad`, the EXACT
+      // same call the forward `stft` made (no drift possible). Always `n_fft`
+      // wide.
+      let window = frame_window(win_length, n_fft, window_pad)?;
+      let window_norm = ops::arithmetic::multiply(&window, &window)?;
+      // tile(window_norm, num_frames) via reshape + broadcast (mlxrs has no
+      // `tile` op; the free `istft` uses the same idiom).
+      let window_norm_row = ops::shape::reshape(&window_norm, &(1usize, frame_width))?;
+      let window_norm_tiled =
+        ops::shape::broadcast_to(&window_norm_row, &(num_frames, frame_width))?;
+      let updates_window = ops::shape::flatten(&window_norm_tiled, 0, -1)?;
+      // `position_cache` was just populated for `pos_key` above.
+      let indices = self
+        .position_cache
+        .get(&pos_key)
+        .expect("position_cache populated for pos_key above");
+      let zeros_wsum = Array::zeros::<f32>(&[t_i32])?;
+      let window_sum = ops::indexing::scatter_add_axis(&zeros_wsum, indices, &updates_window, 0)?;
+      // Floor at COVERAGE_EPS — the reference's `mx.maximum(norm_buffer,
+      // 1e-10)`. For the supported configs every requested sample has full
+      // COLA coverage, so the floor never engages on a returned sample.
+      let floor = Array::full::<f32>(&[0i32; 0], COVERAGE_EPS)?;
+      let norm_buffer = ops::arithmetic::maximum(&window_sum, &floor)?;
+      self.norm_buffer_cache.insert(norm_key, norm_buffer);
+    }
+
+    // ---- reconstruction (cached buffers in hand) ------------------------
+    // irfft every frame along the frequency axis: (num_frames, n_freqs)
+    // complex → (num_frames, n_fft) real.
+    let frames_time = fft::irfft(x, n_fft_i32, 1, FftNorm::Backward)?;
+    // updates_reconstructed = (frames_time * w).flatten(); `w` broadcasts
+    // across the frame axis. The synthesis window is rebuilt here (cheap,
+    // bounded) so the reconstruction multiply matches the cached norm buffer.
+    let window = frame_window(win_length, n_fft, window_pad)?;
+    let windowed = ops::arithmetic::multiply(&frames_time, &window)?;
+    let updates_reconstructed = ops::shape::flatten(&windowed, 0, -1)?;
+
+    let indices = self
+      .position_cache
+      .get(&pos_key)
+      .expect("position_cache populated for pos_key above");
+    let norm_buffer = self
+      .norm_buffer_cache
+      .get(&norm_key)
+      .expect("norm_buffer_cache populated for norm_key above");
+
+    let zeros_recon = Array::zeros::<f32>(&[t_i32])?;
+    let reconstructed =
+      ops::indexing::scatter_add_axis(&zeros_recon, indices, &updates_reconstructed, 0)?;
+    // Divide by the floored `Σ w²` norm buffer (no `where`: the floor already
+    // guarantees a finite divisor everywhere — the reference divides directly).
+    let reconstructed = ops::arithmetic::divide(&reconstructed, norm_buffer)?;
+
+    // ---- center-trim + `length` (same ordering as the free `istft`) -----
+    let pad = n_fft / 2;
+    let (start_usize, stop_usize) = match (center, length) {
+      (true, Some(len)) => {
+        let end = pad.checked_add(len).ok_or_else(|| Error::Backend {
+          message: format!("ISTFTCache::istft: center offset {pad} + length {len} overflows usize"),
+        })?;
+        if end > t {
+          return Err(Error::Backend {
+            message: format!(
+              "ISTFTCache::istft: center offset {pad} + length {len} = {end} exceeds \
+               reconstruction length {t}"
+            ),
+          });
+        }
+        (pad, end)
+      }
+      (true, None) => (pad, t - pad),
+      (false, Some(len)) => {
+        if len > t {
+          return Err(Error::Backend {
+            message: format!(
+              "ISTFTCache::istft: requested length {len} exceeds reconstruction length {t}"
+            ),
+          });
+        }
+        (0usize, len)
+      }
+      (false, None) => (0usize, t),
+    };
+    let start_i32 = i32::try_from(start_usize).map_err(|_| Error::Backend {
+      message: format!("ISTFTCache::istft: trim start {start_usize} exceeds i32::MAX"),
+    })?;
+    let stop_i32 = i32::try_from(stop_usize).map_err(|_| Error::Backend {
+      message: format!("ISTFTCache::istft: trim stop {stop_usize} exceeds i32::MAX"),
+    })?;
+    ops::indexing::slice(&reconstructed, &[start_i32], &[stop_i32], &[1])
+  }
 }
 
 /// HTK mel scale: `mel = 2595 * log10(1 + hz / 700)`.
@@ -2928,6 +3302,80 @@ pub fn normalize_loudness(
   // mlx multiply.
   let gain_f64 = 10.0_f64.powf(delta / 20.0);
   let gain = gain_f64 as f32;
+  let gain_arr = Array::full::<f32>(&[0i32; 0], gain)?;
+  ops::arithmetic::multiply(data, &gain_arr)
+}
+
+/// Peak-normalize `data` so its loudest sample sits at `target_peak_db` dBFS.
+///
+/// Faithful port of `mlx_audio.dsp.normalize_peak(data, target_peak_db)`
+/// (`dsp.py:356`). The signal is scaled by
+/// `gain = 10^(target_peak_db / 20) / current_peak`, where
+/// `current_peak = max(|data|)`. After scaling, the loudest sample's magnitude
+/// is exactly `10^(target_peak_db / 20)` (the linear amplitude for the
+/// requested dBFS peak): e.g. `target_peak_db = 0.0` brings the peak to `1.0`
+/// (full scale), `target_peak_db = -6.0` to `≈ 0.501`.
+///
+/// **The target is in dBFS, not a raw linear amplitude** — this mirrors the
+/// reference's `target_peak_db` parameter exactly. For a linear target `a`,
+/// pass `20 * log10(a)`.
+///
+/// Like [`normalize_loudness`], the reference's `np.warn("Possible clipped
+/// samples in output.")` is not mirrored (Rust has no `warnings` module);
+/// with `target_peak_db <= 0.0` the output never exceeds full scale anyway.
+///
+/// The output's shape and dtype match `data` (1-D or 2-D `Dtype::F32` for the
+/// mlxrs audio surface).
+///
+/// # Errors
+/// - [`Error::Backend`] when:
+///   - `target_peak_db` is non-finite (`NaN` / `±inf` — would yield a
+///     non-finite gain, silently corrupting the output),
+///   - `data` is empty (`max` over an empty array is undefined),
+///   - the current peak `max(|data|)` is `0.0` (an all-silence input cannot be
+///     peak-normalized — the gain would divide by zero) or non-finite (a
+///     `NaN` / `inf` sample in the input),
+///   - the underlying `abs` / `max` / multiply propagates a backend error.
+///
+/// This reads back one scalar (the current peak) via an explicit `eval`.
+pub fn normalize_peak(data: &Array, target_peak_db: f64) -> Result<Array> {
+  if !target_peak_db.is_finite() {
+    return Err(Error::Backend {
+      message: format!("normalize_peak: target_peak_db must be finite (got {target_peak_db})"),
+    });
+  }
+  if data.size() == 0 {
+    return Err(Error::Backend {
+      message: "normalize_peak: data must be non-empty (max over an empty array is undefined)"
+        .into(),
+    });
+  }
+  // current_peak = max(|data|). One explicit scalar readback.
+  let abs_data = data.abs()?;
+  let mut peak_arr = ops::reduction::max(&abs_data, false)?;
+  let current_peak = peak_arr.item::<f32>()?;
+  if !current_peak.is_finite() {
+    return Err(Error::Backend {
+      message: format!(
+        "normalize_peak: current peak max(|data|) is non-finite ({current_peak}) — \
+         the input contains a NaN or infinite sample"
+      ),
+    });
+  }
+  // `current_peak` is `max(|.|)`, so it is always `>= 0.0`; `== 0.0` means an
+  // all-silence (or all-zero) input, which cannot be peak-normalized.
+  if current_peak == 0.0 {
+    return Err(Error::Backend {
+      message: "normalize_peak: current peak max(|data|) is 0.0 — an all-silence input \
+                cannot be peak-normalized (the gain would divide by zero)"
+        .into(),
+    });
+  }
+  // `gain = 10^(target_peak_db / 20) / current_peak`. Reference:
+  // `np.power(10.0, target_peak_db / 20.0) / current_peak`. Compute the
+  // numerator in f64 (matches the reference) and the division in f32.
+  let target_linear = 10.0_f64.powf(target_peak_db / 20.0) as f32;
+  let gain = target_linear / current_peak;
   let gain_arr = Array::full::<f32>(&[0i32; 0], gain)?;
   ops::arithmetic::multiply(data, &gain_arr)
 }
@@ -4444,5 +4892,171 @@ mod tests {
       "high-pass a[0] must normalize to 1.0, got {}",
       a[0]
     );
+  }
+
+  // ---- ISTFTCache (streaming == one-shot, hand-traced) ------------------
+
+  #[test]
+  fn istft_cache_matches_free_istft_win_eq_nfft() {
+    // The cached path must be numerically identical to the free `istft` for a
+    // supported spectrum. win_length == n_fft (Right and Center both invert),
+    // n_fft=8, hop=4, 16 samples (centered region == 16 with length=None).
+    let buf = signal_16();
+    let x = Array::from_slice::<f32>(&buf, &[16i32]).unwrap();
+    for mode in [WindowPad::Center, WindowPad::Right] {
+      // stft signature: (samples, n_fft, hop, win_length, pad).
+      let spec = stft(&x, 8, 4, Some(8), mode).unwrap();
+      let one_shot = to_vec(&istft(&spec, None).unwrap());
+      let mut cache = ISTFTCache::new();
+      let cached = to_vec(&cache.istft(&spec, None).unwrap());
+      assert_eq!(one_shot.len(), cached.len(), "length mismatch ({mode:?})");
+      for (i, (a, b)) in one_shot.iter().zip(cached.iter()).enumerate() {
+        assert!(
+          (a - b).abs() < 1e-6,
+          "ISTFTCache vs istft[{i}] ({mode:?}): {a} vs {b}"
+        );
+      }
+      // The cache populated one position entry + one norm entry.
+      assert_eq!(cache.len(), 2, "expected 2 cached buffers after one call");
+    }
+  }
+
+  #[test]
+  fn istft_cache_center_short_window_round_trips() {
+    // WindowPad::Center inverts short windows (win_length < n_fft); the cached
+    // path must recover the original signal too. n_fft=8, win=4, hop=2.
+    let buf = signal_16();
+    let x = Array::from_slice::<f32>(&buf, &[16i32]).unwrap();
+    let spec = stft(&x, 8, 2, Some(4), WindowPad::Center).unwrap();
+    let mut cache = ISTFTCache::new();
+    let rec = to_vec(&cache.istft(&spec, Some(16)).unwrap());
+    assert_eq!(rec.len(), 16);
+    for (i, (g, e)) in rec.iter().zip(buf.iter()).enumerate() {
+      assert!(
+        (g - e).abs() < 1e-5,
+        "ISTFTCache short-window round-trip[{i}]: got {g}, want {e}"
+      );
+    }
+  }
+
+  #[test]
+  fn istft_cache_reuses_buffers_across_same_geometry_spectra() {
+    // Two DIFFERENT signals with the SAME framing geometry must reuse the
+    // cached index + norm buffers (cache size stays 2), and each result must
+    // still match the free `istft` of its own spectrum. This is the streaming
+    // use case: many same-shaped blocks, buffers built once.
+    let buf_a = signal_16();
+    let mut buf_b = signal_16();
+    buf_b.reverse(); // a different signal, same length/geometry
+    let xa = Array::from_slice::<f32>(&buf_a, &[16i32]).unwrap();
+    let xb = Array::from_slice::<f32>(&buf_b, &[16i32]).unwrap();
+    let spec_a = stft(&xa, 8, 4, Some(8), WindowPad::Center).unwrap();
+    let spec_b = stft(&xb, 8, 4, Some(8), WindowPad::Center).unwrap();
+
+    let mut cache = ISTFTCache::new();
+    let ca = to_vec(&cache.istft(&spec_a, None).unwrap());
+    assert_eq!(cache.len(), 2, "first call should populate 2 buffers");
+    let cb = to_vec(&cache.istft(&spec_b, None).unwrap());
+    assert_eq!(
+      cache.len(),
+      2,
+      "same-geometry second call must REUSE buffers (no new entries)"
+    );
+
+    let fa = to_vec(&istft(&spec_a, None).unwrap());
+    let fb = to_vec(&istft(&spec_b, None).unwrap());
+    for (i, (g, e)) in ca.iter().zip(fa.iter()).enumerate() {
+      assert!((g - e).abs() < 1e-6, "cache A[{i}]: {g} vs {e}");
+    }
+    for (i, (g, e)) in cb.iter().zip(fb.iter()).enumerate() {
+      assert!((g - e).abs() < 1e-6, "cache B[{i}]: {g} vs {e}");
+    }
+  }
+
+  #[test]
+  fn istft_cache_clear_empties_and_rejects_right_short_window() {
+    let buf = signal_16();
+    let x = Array::from_slice::<f32>(&buf, &[16i32]).unwrap();
+    let spec = stft(&x, 8, 4, Some(8), WindowPad::Center).unwrap();
+    let mut cache = ISTFTCache::new();
+    assert!(cache.is_empty());
+    let _ = cache.istft(&spec, None).unwrap();
+    assert!(!cache.is_empty());
+    cache.clear();
+    assert!(cache.is_empty(), "clear() must drop all cached buffers");
+
+    // Right-pad short-window inversion is rejected (same as the free `istft`).
+    let spec_short = stft(&x, 8, 2, Some(4), WindowPad::Right).unwrap();
+    let mut cache2 = ISTFTCache::new();
+    assert!(matches!(
+      cache2.istft(&spec_short, None),
+      Err(Error::Backend { .. })
+    ));
+  }
+
+  // ---- normalize_peak (hand-traced vs reference) ------------------------
+
+  #[test]
+  fn normalize_peak_brings_peak_to_target_dbfs() {
+    // data = [0.5, -0.25, 0.1], current_peak = 0.5.
+    //   target 0 dBFS  → gain = 1.0 / 0.5 = 2.0   → max|.| == 1.0.
+    //   target -6 dBFS → 10^(-6/20)/0.5 ≈ 1.00237 → max|.| ≈ 0.50119.
+    let data = Array::from_slice::<f32>(&[0.5, -0.25, 0.1], &[3]).unwrap();
+
+    let out0 = normalize_peak(&data, 0.0).unwrap();
+    let v0 = to_vec(&out0);
+    let peak0 = v0.iter().map(|x| x.abs()).fold(0.0_f32, f32::max);
+    assert!(
+      (peak0 - 1.0).abs() < 1e-6,
+      "0 dBFS peak: got {peak0}, want 1.0"
+    );
+    // Exact scaled values (gain == 2.0).
+    for (g, e) in v0.iter().zip([1.0_f32, -0.5, 0.2].iter()) {
+      assert!((g - e).abs() < 1e-6, "0 dBFS value: got {g}, want {e}");
+    }
+
+    let out6 = normalize_peak(&data, -6.0).unwrap();
+    let v6 = to_vec(&out6);
+    let peak6 = v6.iter().map(|x| x.abs()).fold(0.0_f32, f32::max);
+    let want6 = 10.0_f32.powf(-6.0 / 20.0);
+    assert!(
+      (peak6 - want6).abs() < 1e-5,
+      "-6 dBFS peak: got {peak6}, want {want6}"
+    );
+  }
+
+  #[test]
+  fn normalize_peak_2d_input_uses_global_peak() {
+    // The peak is the GLOBAL max over the whole array (matches np.max(np.abs)).
+    // 2x2 with global peak 0.8 → target 0 dBFS scales by 1/0.8.
+    let data = Array::from_slice::<f32>(&[0.2, -0.8, 0.4, 0.1], &[2, 2]).unwrap();
+    let out = normalize_peak(&data, 0.0).unwrap();
+    assert_eq!(out.shape(), vec![2, 2], "shape must be preserved");
+    let v = to_vec(&out);
+    let peak = v.iter().map(|x| x.abs()).fold(0.0_f32, f32::max);
+    assert!(
+      (peak - 1.0).abs() < 1e-6,
+      "global peak should hit 1.0, got {peak}"
+    );
+  }
+
+  #[test]
+  fn normalize_peak_rejects_silence_and_nonfinite() {
+    // All-zero input: current_peak == 0.0 → reject (would divide by zero).
+    let silence = Array::from_slice::<f32>(&[0.0, 0.0, 0.0], &[3]).unwrap();
+    assert!(matches!(
+      normalize_peak(&silence, 0.0),
+      Err(Error::Backend { .. })
+    ));
+    // Non-finite target_peak_db.
+    let data = Array::from_slice::<f32>(&[0.5, 0.1], &[2]).unwrap();
+    assert!(matches!(
+      normalize_peak(&data, f64::NAN),
+      Err(Error::Backend { .. })
+    ));
+    assert!(matches!(
+      normalize_peak(&data, f64::INFINITY),
+      Err(Error::Backend { .. })
+    ));
   }
 }

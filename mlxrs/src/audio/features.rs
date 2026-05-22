@@ -30,14 +30,17 @@
 //!   out of scope per the M5 plan (the `feedback_roundtrip_real_functions_typed_metadata`
 //!   rule says invertibility ports get a dedicated round-trip-via-public-funcs
 //!   PR; we are not introducing an `inverse_fbank_kaldi` here).
-//! - **`snip_edges=true` only.** The reference's `snip_edges=false` branch in
-//!   `_get_strided_kaldi` uses negative-stride python slicing with edge cases
-//!   (`pad <= 0`, asymmetric reflect bookends) that are non-trivial to map to
-//!   mlx-c `slice`+`concatenate` without independently re-deriving the
-//!   reference's semantics. The standard ASR pipelines (kaldi-asr, torchaudio,
-//!   ESPnet defaults) all use `snip_edges=true`, so we ship that path first
-//!   and defer `snip_edges=false` (and Povey-DC-removal-after-window
-//!   variants) to a follow-up.
+//! - **`snip_edges` both paths.** `snip_edges=true` drops partial edge frames
+//!   (the standard kaldi-asr / torchaudio / ESPnet default); `snip_edges=false`
+//!   reflect-pads the signal so frames are centered on the sample positions.
+//!   Both port `_get_strided_kaldi` (`dsp.py:777`) — see
+//!   [`crate::audio::features::compute_fbank_kaldi`]. The reference's
+//!   `snip_edges=false` calls `mx.as_strided` with no bounds check and reads
+//!   out of bounds for degenerate `win_len`-vs-signal-length inputs (UB it
+//!   gets away with only because numpy/mlx over-allocate); mlxrs reproduces the
+//!   reflect-bookend framing bit-identically in the safe regime and returns a
+//!   recoverable error in the degenerate regime instead of reproducing that UB.
+//!   (Povey-DC-removal-after-window variants remain a follow-up.)
 //! - **Explicit RNG key.** The reference uses an implicit `mx.random.normal`
 //!   default key; mlxrs's [`crate::ops::random`] is JAX-style split-key by
 //!   design, so [`compute_fbank_kaldi`] takes an explicit
@@ -418,6 +421,219 @@ fn strided_frames_snip_edges(
   unsafe { ops::shape::as_strided(waveform, &shape, &[win_inc_i64, 1], 0) }
 }
 
+/// Fully reverse a 1-D array (`a[::-1]`).
+///
+/// Built from a single negative-stride [`ops::indexing::slice`] using the
+/// `-(len + 1)` post-normalize-to-`-1` sentinel (the same idiom
+/// `crate::audio::dsp`'s `reflect_pad_1d` uses for its boundary case): mlx
+/// pre-normalizes a negative `stop` by `+ len` BEFORE the per-stride logic, so
+/// the "position left of index 0" sentinel is `stop = -(len + 1)`, which makes
+/// the traversal `len-1, len-2, …, 0` (inclusive of 0).
+///
+/// # Errors
+/// - [`Error::Backend`] if `a` is not 1-D, is empty, or `len`/`len + 1`
+///   exceeds `i32::MAX`.
+fn reverse_1d(a: &Array) -> Result<Array> {
+  let shape = a.shape();
+  if shape.len() != 1 {
+    return Err(Error::Backend {
+      message: format!("reverse_1d: expected 1-D input, got {}-D", shape.len()),
+    });
+  }
+  let len = shape[0];
+  if len == 0 {
+    return Err(Error::Backend {
+      message: "reverse_1d: cannot reverse an empty array".into(),
+    });
+  }
+  let len_i32 = i32::try_from(len).map_err(|_| Error::Backend {
+    message: format!("reverse_1d: len {len} exceeds i32::MAX"),
+  })?;
+  // `stop = -(len + 1)` post-normalizes (via `+ len`) to `-1`, the
+  // "left of index 0" sentinel, so the descending traversal includes index 0.
+  // Compute in i64 to avoid overflow when `len == i32::MAX`.
+  let sentinel_i64 = -(i64::from(len_i32) + 1);
+  let stop = i32::try_from(sentinel_i64).map_err(|_| Error::Backend {
+    message: format!("reverse_1d: reverse sentinel -(len + 1) = {sentinel_i64} overflows i32"),
+  })?;
+  ops::indexing::slice(a, &[len_i32 - 1], &[stop], &[-1])
+}
+
+/// Strided framing matching the reference's `_get_strided_kaldi` with
+/// `snip_edges=false` (`mlx_audio.dsp.py:787`) — the reflect-bookend path.
+///
+/// The reference (for a 1-D `waveform` of length `n`) computes
+/// `m = (n + win_inc/2) / win_inc` frames and reflect-pads the signal by
+/// `pad = win_size/2 - win_inc/2` on each side so frames are *centered* on the
+/// sample positions (Kaldi `snip_edges=false`), then takes the
+/// `(m, win_size)`-strided view with stride `(win_inc, 1)`. The reflect
+/// bookends are (the left is edge-EXCLUSIVE and the right edge-INCLUSIVE — this
+/// asymmetry is the reference's exact behavior, not a symmetric reflect):
+/// - `pad > 1`: `pad_left = reverse(wf[1 .. pad+1])` (excludes wf[0]),
+///   `pad_right = reverse(wf[n-pad .. n])` (the reference's
+///   `waveform[-1:-pad-1:-1]`, includes wf[n-1]).
+/// - `pad == 1`: `pad_left = reverse(wf[1 .. 2])` (one sample),
+///   `pad_right = reverse(wf[1 .. n])` — the reference's `waveform[-1:0:-1]`,
+///   which yields `n-1` (not `1`) samples; only the first sample of this
+///   bookend is ever read by the strided view, so the over-long tail is inert.
+/// - `pad <= 0`: `padded = concat(wf[|pad| ..], reverse(wf))` (the reference's
+///   `concat(waveform[-pad:], waveform[::-1])`).
+///
+/// **Memory-safe deviation from the reference.** The reference calls
+/// `mx.as_strided` with NO bounds check; for degenerate inputs (a `win_size`
+/// large relative to `n`, e.g. `n < win_size`) the strided view's last read
+/// index `(m-1)*win_inc + win_size` exceeds the padded-buffer length, so the
+/// reference reads past the buffer (silent out-of-bounds — undefined behavior
+/// it gets away with only because numpy/mlx over-allocate). mlxrs's
+/// [`ops::shape::as_strided`] is bounds-checked; rather than reproduce that UB,
+/// this function asserts `last_index <= padded_len` and returns a recoverable
+/// [`Error::Backend`] for the degenerate regime (where there is not enough
+/// signal to reflect-pad a full centered window). Every realistic ASR config
+/// — a multi-frame signal whose padded length covers the strided read — is
+/// reproduced **bit-identically** to the reference. (The padded buffer is built
+/// row-contiguous by construction here, so the [`ops::shape::as_strided`]
+/// safety pre-condition is met.)
+///
+/// Returns the `(m, win_size)` strided frame view, or a `(0, 0)` empty array
+/// when `m == 0` (vanishingly short input).
+///
+/// # Errors
+/// - [`Error::Backend`] when:
+///   - `waveform` is not 1-D,
+///   - the reflect bookends require indices outside the signal (e.g.
+///     `pad + 1 > n`, i.e. not enough samples to reflect `pad` on a side),
+///   - the strided read would exceed the padded-buffer length (degenerate
+///     `win_size`-vs-`n` regime — see the memory-safe deviation above),
+///   - any size overflows `usize` / `i32` / `i64`.
+/// - Propagates slice / concatenate / `as_strided` errors.
+fn strided_frames_no_snip_edges(
+  waveform: &Array,
+  win_size: usize,
+  win_inc: usize,
+  num_frames: usize,
+) -> Result<Array> {
+  let shape = waveform.shape();
+  if shape.len() != 1 {
+    return Err(Error::Backend {
+      message: format!(
+        "strided_frames_no_snip_edges: expected 1-D waveform, got {}-D",
+        shape.len()
+      ),
+    });
+  }
+  let n = shape[0];
+  let n_i32 = i32::try_from(n).map_err(|_| Error::Backend {
+    message: format!("strided_frames_no_snip_edges: waveform len {n} exceeds i32::MAX"),
+  })?;
+  if num_frames == 0 {
+    return Array::zeros::<f32>(&[0_i32, 0_i32]);
+  }
+
+  // `pad = win_size/2 - win_inc/2` (the reference's signed pad). `i64` so the
+  // signed subtraction can't wrap; both operands are <= MAX_DECODED_SAMPLES.
+  let pad_i64 = (win_size as i64) / 2 - (win_inc as i64) / 2;
+
+  // Build the reflect-padded waveform exactly as the reference does.
+  let padded = if pad_i64 > 0 {
+    let pad = pad_i64 as usize;
+    // Need `wf[1 .. pad+1]` and (for pad>1) `wf[n-pad-1 .. n-1]` to exist —
+    // i.e. `n >= pad + 1`. (For pad==1 the right bookend is `wf[1 .. n]`, also
+    // needing `n >= 2 == pad + 1`.)
+    if n < pad + 1 {
+      return Err(Error::Backend {
+        message: format!(
+          "strided_frames_no_snip_edges: waveform len {n} too short to reflect-pad {pad} \
+           samples per side (need len >= pad + 1); the win_size/win_inc imply more \
+           reflection than the signal supports"
+        ),
+      });
+    }
+    let pad_i32 = i32::try_from(pad).map_err(|_| Error::Backend {
+      message: format!("strided_frames_no_snip_edges: pad {pad} exceeds i32::MAX"),
+    })?;
+    // pad_left = reverse(wf[1 .. pad+1]) — the reference's `waveform[1:pad+1][::-1]`,
+    // an edge-EXCLUSIVE type-1 reflect on the left (excludes wf[0]).
+    let left_seg = ops::indexing::slice(waveform, &[1_i32], &[pad_i32 + 1], &[1_i32])?;
+    let pad_left = reverse_1d(&left_seg)?;
+    // pad_right (note the asymmetry vs the left — this is the reference's exact
+    // behavior, NOT a symmetric reflect):
+    //  - pad > 1: `waveform[-1:-pad-1:-1]` = indices n-1, n-2, …, n-pad =
+    //    reverse(wf[n-pad .. n]) — edge-INCLUSIVE (includes wf[n-1]).
+    //  - pad == 1: `waveform[-1:0:-1]` = reverse(wf[1 .. n]) (n-1 samples; only
+    //    the first is read by the strided view, so the over-long tail is inert).
+    let pad_right = if pad > 1 {
+      let right_seg = ops::indexing::slice(waveform, &[n_i32 - pad_i32], &[n_i32], &[1_i32])?;
+      reverse_1d(&right_seg)?
+    } else {
+      let right_seg = ops::indexing::slice(waveform, &[1_i32], &[n_i32], &[1_i32])?;
+      reverse_1d(&right_seg)?
+    };
+    ops::shape::concatenate(&[&pad_left, waveform, &pad_right], 0)?
+  } else {
+    // pad <= 0: padded = concat(wf[|pad| ..], reverse(wf)).
+    // `wf[|pad|:]` keeps `n - |pad|` samples; `|pad| <= n` is guaranteed for
+    // any realistic config (|pad| <= win_size/2 <= n when win_size <= ~2n),
+    // but assert it so a degenerate `win_inc >> win_size` can't underflow.
+    let abs_pad = (-pad_i64) as usize;
+    if abs_pad > n {
+      return Err(Error::Backend {
+        message: format!(
+          "strided_frames_no_snip_edges: |pad| {abs_pad} exceeds waveform len {n} \
+           (win_inc too large relative to win_size); cannot build the snip_edges=false buffer"
+        ),
+      });
+    }
+    let abs_pad_i32 = i32::try_from(abs_pad).map_err(|_| Error::Backend {
+      message: format!("strided_frames_no_snip_edges: |pad| {abs_pad} exceeds i32::MAX"),
+    })?;
+    let head = ops::indexing::slice(waveform, &[abs_pad_i32], &[n_i32], &[1_i32])?;
+    let rev = reverse_1d(waveform)?;
+    ops::shape::concatenate(&[&head, &rev], 0)?
+  };
+
+  // Bounds-check the strided read: last index `(m-1)*win_inc + win_size` must
+  // lie within the padded buffer. Reject the degenerate overread regime
+  // (memory-safe deviation; see the doc comment) rather than reproduce UB.
+  let padded_len = padded.shape()[0];
+  let last_index = (num_frames - 1)
+    .checked_mul(win_inc)
+    .and_then(|v| v.checked_add(win_size))
+    .ok_or_else(|| Error::Backend {
+      message: format!(
+        "strided_frames_no_snip_edges: reachable element range overflows usize \
+         (num_frames={num_frames}, win_inc={win_inc}, win_size={win_size})"
+      ),
+    })?;
+  if last_index > padded_len {
+    return Err(Error::Backend {
+      message: format!(
+        "strided_frames_no_snip_edges: strided read end {last_index} exceeds reflect-padded \
+         length {padded_len} (num_frames={num_frames}, win_inc={win_inc}, win_size={win_size}, \
+         waveform len={n}); the win_size is too large relative to the signal length for a \
+         centered snip_edges=false framing — the reference would read out of bounds here"
+      ),
+    });
+  }
+
+  // The padded buffer is freshly built by `concatenate`, so it is row-
+  // contiguous; the strided view's reachable indices are all `< padded_len`
+  // (asserted above), and `offset = 0`.
+  let num_frames_i32 = i32::try_from(num_frames).map_err(|_| Error::Backend {
+    message: format!("strided_frames_no_snip_edges: num_frames {num_frames} exceeds i32::MAX"),
+  })?;
+  let win_size_i32 = i32::try_from(win_size).map_err(|_| Error::Backend {
+    message: format!("strided_frames_no_snip_edges: win_size {win_size} exceeds i32::MAX"),
+  })?;
+  let win_inc_i64 = i64::try_from(win_inc).map_err(|_| Error::Backend {
+    message: format!("strided_frames_no_snip_edges: win_inc {win_inc} exceeds i64::MAX"),
+  })?;
+  let view_shape: &[i32] = &[num_frames_i32, win_size_i32];
+  // SAFETY: `padded` is row-contiguous (built by `concatenate` into a fresh
+  // buffer); we asserted `last_index <= padded_len` so every reachable index
+  // `i*win_inc + j` is in `[0, padded_len)`; `offset = 0`.
+  unsafe { ops::shape::as_strided(&padded, &view_shape, &[win_inc_i64, 1], 0) }
+}
+
 /// Compute Kaldi-compatible log-mel-filterbank features.
 ///
 /// Faithful port of `mlx_audio.dsp.compute_fbank_kaldi` (`dsp.py:853`) —
@@ -427,10 +643,12 @@ fn strided_frames_snip_edges(
 /// (`1127 * ln(1 + hz / 700)`, see [`mel_scale_kaldi`]).
 ///
 /// ## Pipeline (mirrors `compute_fbank_kaldi`)
-/// 1. **Frame** the input via `snip_edges=true` (see the module docs for the
-///    scope fence on `snip_edges=false`). The waveform is routed through
-///    [`ops::shape::contiguous`] first so a sliced / broadcasted 1-D input
-///    is materialized to row-major storage before the strided framing view.
+/// 1. **Frame** the input. `snip_edges = true` drops partial edge frames
+///    (`m = 1 + (n - win)/inc`); `snip_edges = false` reflect-pads the signal
+///    so frames are *centered* (`m = (n + inc/2)/inc`) — both paths port
+///    `_get_strided_kaldi` (`dsp.py:777`). The waveform is routed through
+///    [`ops::shape::contiguous`] first so a sliced / broadcasted 1-D input is
+///    materialized to row-major storage before the strided framing view.
 /// 2. **Dither** (additive Gaussian noise with std `dither`) — pass `dither = 0.0`
 ///    or `dither_key = None` to skip; both routes return identical output.
 /// 3. **Remove DC offset** (subtract per-frame mean).
@@ -462,7 +680,10 @@ fn strided_frames_snip_edges(
 ///   - `dither < 0.0` or non-finite,
 ///   - `preemphasis` is not in `[0.0, 1.0]` (the reference accepts any float
 ///     but the standard range is `[0.0, 1.0]`),
-///   - `snip_edges == false` (not yet implemented — see module docs),
+///   - `snip_edges == false` and the signal is too short to reflect-pad a
+///     centered window (the degenerate `win_len`-vs-`samples_len` regime where
+///     the reference would read out of bounds — see
+///     `strided_frames_no_snip_edges`),
 ///   - `dither != 0.0 && dither_key.is_none()` (deterministic-by-default rule),
 ///   - `samples_len = waveform.shape()[0]` exceeds
 ///     [`crate::audio::io::MAX_DECODED_SAMPLES`] — checked BEFORE materializing
@@ -535,14 +756,6 @@ pub fn compute_fbank_kaldi(
       ),
     });
   }
-  if !snip_edges {
-    return Err(Error::Backend {
-      message: "compute_fbank_kaldi: snip_edges=false is not yet implemented — \
-                pass snip_edges=true (the standard kaldi-asr / torchaudio default). \
-                A reflect-padded snip_edges=false port is planned as a follow-up."
-        .into(),
-    });
-  }
   if dither != 0.0 && dither_key.is_none() {
     return Err(Error::Backend {
       message: "compute_fbank_kaldi: dither != 0.0 requires an explicit dither_key \
@@ -580,17 +793,31 @@ pub fn compute_fbank_kaldi(
     });
   }
 
-  // ---- framing (snip_edges=true) --------------------------------------
-  // `dsp.py:786`: snip_edges branch — `m = 1 + (n - win)/inc` if `n >= win`,
-  // else return shape `(0, 0)`. We surface "no frames" as a `(0, num_mels)`
-  // empty array (matching the reference's `dsp.py:900`).
+  // ---- framing (snip_edges true / false) -------------------------------
+  // `dsp.py:783-799` (`_get_strided_kaldi`):
+  //  - snip_edges=true:  `m = 1 + (n - win)/inc` if `n >= win`, else `(0, 0)`.
+  //    We surface "no frames" as a `(0, num_mels)` empty array (`dsp.py:900`).
+  //  - snip_edges=false: `m = (n + win_inc/2) / win_inc` with reflect-bookend
+  //    padding (the centered framing). The reference does NOT short-circuit on
+  //    `n < win`; it reflect-pads and frames anyway (see
+  //    `strided_frames_no_snip_edges`).
   let num_mels_i32 = i32::try_from(num_mels).map_err(|_| Error::Backend {
     message: format!("compute_fbank_kaldi: num_mels {num_mels} exceeds i32::MAX"),
   })?;
-  if samples_len < win_len {
-    return Array::zeros::<f32>(&[0_i32, num_mels_i32]);
-  }
-  let num_frames = 1 + (samples_len - win_len) / win_inc;
+  let num_frames = if snip_edges {
+    if samples_len < win_len {
+      return Array::zeros::<f32>(&[0_i32, num_mels_i32]);
+    }
+    1 + (samples_len - win_len) / win_inc
+  } else {
+    // `m = (n + win_inc/2) / win_inc` (`dsp.py:788`). `win_inc >= 1` (checked),
+    // so the division is well-defined; for `n == 0` this is `0` frames.
+    let m = (samples_len + win_inc / 2) / win_inc;
+    if m == 0 {
+      return Array::zeros::<f32>(&[0_i32, num_mels_i32]);
+    }
+    m
+  };
 
   // ---- size / work caps (mirror the dsp.rs `MAX_STFT_WORK` pattern) ----
   // `n_fft_padded` is the FFT length the rfft consumes; bound the windowed
@@ -700,8 +927,8 @@ pub fn compute_fbank_kaldi(
   })?;
 
   // ---- 1. frame ---------------------------------------------------------
-  // `strided_frames_snip_edges` reads `waveform` through `unsafe ops::shape::as_strided`,
-  // which assumes ROW-CONTIGUOUS backing storage with at least `waveform_len`
+  // Both framing helpers read through `unsafe ops::shape::as_strided`, which
+  // assumes ROW-CONTIGUOUS backing storage with at least `waveform_len`
   // elements reachable from the data pointer. Public callers may legitimately
   // hand us a 1-D slice/view (`waveform.slice(0, 100, 200)`) or a broadcasted
   // scalar — these pass the rank-1 check but their flattened storage is
@@ -709,9 +936,15 @@ pub fn compute_fbank_kaldi(
   // would read out-of-bounds. Materialize via `ops::shape::contiguous` first;
   // it's a no-op refcount bump when the input is already row-contiguous and
   // an honest copy otherwise. This is the same idiom mlx-swift's `MLX.contiguous`
-  // documents for the same case.
+  // documents for the same case. The `snip_edges=false` helper additionally
+  // builds its reflect-bookend buffer via `concatenate` (also row-contiguous)
+  // before its own strided view.
   let waveform_contig = ops::shape::contiguous(waveform, false)?;
-  let strided = strided_frames_snip_edges(&waveform_contig, win_len, win_inc, num_frames)?;
+  let strided = if snip_edges {
+    strided_frames_snip_edges(&waveform_contig, win_len, win_inc, num_frames)?
+  } else {
+    strided_frames_no_snip_edges(&waveform_contig, win_len, win_inc, num_frames)?
+  };
 
   // ---- 2. dither (additive Gaussian) -----------------------------------
   // Only run the FFI random call when both `dither > 0.0` and a key is
@@ -842,6 +1075,207 @@ pub fn compute_fbank_kaldi(
   let floor = Array::full::<f32>(&[0_i32; 0], KALDI_FBANK_LOG_FLOOR)?;
   let floored = ops::arithmetic::maximum(&mel_features, &floor)?;
   floored.log()
+}
+
+/// Boundary-padding mode for [`compute_deltas_kaldi`]. Mirrors the `mode`
+/// string argument of `mlx_audio.dsp.compute_deltas_kaldi` (`dsp.py:716`).
+///
+/// The delta at time `t` reads `c[t-n .. t+n]`; near the edges those indices
+/// fall outside `[0, time)`, so the spectrogram is padded by `n` frames on each
+/// side of the time axis first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeltaPadMode {
+  /// **Edge replication** (the reference default): the first / last time frame
+  /// is repeated `n` times on the left / right (`mx.repeat(specgram[:, 0:1], n,
+  /// axis=1)` / `[:, -1:]`). Matches kaldi-asr's delta-window edge handling.
+  #[default]
+  Edge,
+  /// **Zero padding**: `n` zero frames on each side (`mx.pad(specgram, [(0, 0),
+  /// (n, n)])`). Matches the reference's `else` branch.
+  Constant,
+}
+
+/// Compute Kaldi-compatible delta (velocity / acceleration) coefficients of a
+/// spectrogram along its **last (time) axis**.
+///
+/// Faithful port of `mlx_audio.dsp.compute_deltas_kaldi(specgram, win_length=5,
+/// mode="edge")` (`dsp.py:715`). The delta at time `t` is the
+/// regression-weighted finite difference
+///
+/// ```text
+///         Σ_{k=-n}^{n}  k * c[t + k]
+/// d[t] = ───────────────────────────── ,   n = (win_length - 1) / 2
+///         Σ_{k=-n}^{n}  k²  =  n(n+1)(2n+1)/3
+/// ```
+///
+/// (the reference computes the denominator as `n*(n+1)*(2n+1)/3`, i.e. the
+/// `mx.arange(-n, n+1)²` sum; note this is `2 * Σ_{k=1}^{n} k²`, NOT the
+/// docstring's `2 * Σ k²` — the code's `denom` is the parity-faithful value and
+/// is what we reproduce). Apply twice for delta-deltas (acceleration):
+/// `compute_deltas_kaldi(&compute_deltas_kaldi(&x, w, m)?, w, m)`.
+///
+/// ## Shape
+/// Input `(.., time)` of any rank `>= 1`; output has the **same shape**. The
+/// reference flattens to `(num_features, time)`, pads the time axis by `n` per
+/// [`DeltaPadMode`], computes deltas, then restores the original shape — we do
+/// the same. (A common pairing is the `(num_frames, num_mels)` output of
+/// [`compute_fbank_kaldi`] **transposed** to `(num_mels, num_frames)` so time
+/// is last; deltas are along time either way — the function only ever touches
+/// the last axis.)
+///
+/// ## Vectorization
+/// Rather than the reference's per-timestep python loop, we accumulate the
+/// `win_length` shifted, weight-scaled slices of the padded spectrogram
+/// (`d += k * padded[.., n + k : n + k + time]` for `k in -n..=n`). This is
+/// `win_length` cheap strided slices (default `win_length = 5`) with no large
+/// 3-D intermediate — numerically identical to the loop, bounded by the same
+/// element budget as the input.
+///
+/// # Errors
+/// - [`Error::Backend`] when:
+///   - `specgram` has rank `0` (no time axis),
+///   - `win_length < 3` (the reference raises `ValueError`),
+///   - `win_length` is even (a symmetric `[-n, n]` window needs an odd length;
+///     the reference's `n = (win_length - 1) // 2` silently truncates an even
+///     `win_length` to the next-lower odd window, which we reject rather than
+///     silently reinterpret),
+///   - the flattened feature count `total / time` or the element count
+///     `total` exceeds the internal `MAX_FBANK_WORK` cap (~64 Mi elements),
+///   - the padded time extent `time + 2n` overflows `usize` / `i32`.
+/// - Propagates errors from the underlying slice / pad / concatenate ops.
+pub fn compute_deltas_kaldi(
+  specgram: &Array,
+  win_length: usize,
+  mode: DeltaPadMode,
+) -> Result<Array> {
+  if win_length < 3 {
+    return Err(Error::Backend {
+      message: format!("compute_deltas_kaldi: win_length must be >= 3 (got {win_length})"),
+    });
+  }
+  // The reference's `n = (win_length - 1) // 2` silently truncates an even
+  // `win_length` (e.g. 4 → n=1 → an effective window of 3). Reject even
+  // lengths so the caller's intent is unambiguous.
+  if win_length.is_multiple_of(2) {
+    return Err(Error::Backend {
+      message: format!(
+        "compute_deltas_kaldi: win_length must be odd (got {win_length}); an even \
+         win_length would silently truncate to the next-lower odd window"
+      ),
+    });
+  }
+  let orig_shape = specgram.shape();
+  if orig_shape.is_empty() {
+    return Err(Error::Backend {
+      message: "compute_deltas_kaldi: specgram must have rank >= 1 (a time axis)".into(),
+    });
+  }
+  let time = orig_shape[orig_shape.len() - 1];
+  // `num_features = product(orig_shape[..-1])` (1 for a 1-D input). Computed
+  // with checked arithmetic; the total element count is then `num_features *
+  // time == specgram.size()`.
+  let total = specgram.size();
+  // `time == 0` ⇒ `total == 0`; the output is the same empty shape (no deltas
+  // to compute). Reshape-to-2-D below would divide by `time`, so short-circuit.
+  if total == 0 {
+    return Array::zeros::<f32>(&orig_shape.as_slice());
+  }
+  // Bound the work: `total` (== num_features * time) against the shared cap.
+  if total > MAX_FBANK_WORK {
+    return Err(Error::Backend {
+      message: format!(
+        "compute_deltas_kaldi: element count {total} exceeds the {MAX_FBANK_WORK} work cap"
+      ),
+    });
+  }
+  // `time > 0` here, so the integer division is exact and `num_features >= 1`.
+  let num_features = total / time;
+
+  let n = (win_length - 1) / 2;
+  // denom = n*(n+1)*(2n+1)/3 == Σ_{k=-n}^{n} k² (the reference's `denom`).
+  // `win_length <= total <= MAX_FBANK_WORK` (~64 Mi) ⇒ `n <= 32 Mi`, so the
+  // product `n*(n+1)*(2n+1)` fits comfortably in u64 / f64 without overflow.
+  let denom = (n as f64 * (n + 1) as f64 * (2 * n + 1) as f64) / 3.0;
+  let denom_f32 = denom as f32;
+
+  // Flatten to `(num_features, time)` (the reference's `reshape(-1, time)`).
+  let num_features_i32 = i32::try_from(num_features).map_err(|_| Error::Backend {
+    message: format!("compute_deltas_kaldi: num_features {num_features} exceeds i32::MAX"),
+  })?;
+  let time_i32 = i32::try_from(time).map_err(|_| Error::Backend {
+    message: format!("compute_deltas_kaldi: time {time} exceeds i32::MAX"),
+  })?;
+  let flat = ops::shape::reshape(specgram, &(num_features, time))?;
+
+  // Pad the time axis by `n` on each side per `mode`.
+  let n_i32 = i32::try_from(n).map_err(|_| Error::Backend {
+    message: format!("compute_deltas_kaldi: pad extent n={n} exceeds i32::MAX"),
+  })?;
+  let padded = match mode {
+    DeltaPadMode::Constant => {
+      let pad_value = Array::zeros::<f32>(&[0_i32; 0])?;
+      ops::shape::pad(&flat, &[1_i32], &[n_i32], &[n_i32], &pad_value, c"constant")?
+    }
+    DeltaPadMode::Edge => {
+      // Edge replication: repeat the first / last column `n` times. mlxrs's
+      // `pad` only supports "constant", and there is no `repeat` op, so build
+      // the bookends via slice → broadcast_to → concatenate (the reference's
+      // `mx.repeat(specgram[:, 0:1], n, axis=1)` / `[:, -1:]`).
+      let first_col = ops::indexing::slice(
+        &flat,
+        &[0_i32, 0_i32],
+        &[num_features_i32, 1_i32],
+        &[1_i32, 1_i32],
+      )?;
+      let last_col = ops::indexing::slice(
+        &flat,
+        &[0_i32, time_i32 - 1],
+        &[num_features_i32, time_i32],
+        &[1_i32, 1_i32],
+      )?;
+      let pad_left = ops::shape::broadcast_to(&first_col, &(num_features, n))?;
+      let pad_right = ops::shape::broadcast_to(&last_col, &(num_features, n))?;
+      ops::shape::concatenate(&[&pad_left, &flat, &pad_right], 1)?
+    }
+  };
+
+  // Padded time extent `time + 2n`, used as the slice bound. Checked so a
+  // (capped but still large) input near i32::MAX can't wrap.
+  let padded_time = time.checked_add(2 * n).ok_or_else(|| Error::Backend {
+    message: format!(
+      "compute_deltas_kaldi: padded time time + 2n overflows usize (time={time}, n={n})"
+    ),
+  })?;
+  let _padded_time_i32 = i32::try_from(padded_time).map_err(|_| Error::Backend {
+    message: format!("compute_deltas_kaldi: padded time {padded_time} exceeds i32::MAX"),
+  })?;
+
+  // Accumulate `d += k * padded[:, n + k : n + k + time]` for k in -n..=n.
+  // `k = 0` contributes nothing (weight 0), so skip it. The shifted slice for
+  // offset `k` starts at column `n + k` (>= 0 since `k >= -n`) and spans
+  // `time` columns (ending at `n + k + time <= 2n + time = padded_time`).
+  let mut acc = Array::zeros::<f32>(&[num_features_i32, time_i32])?;
+  for k in -(n as isize)..=(n as isize) {
+    if k == 0 {
+      continue;
+    }
+    let start = (n as isize + k) as i32; // n + k, in [0, 2n]
+    let stop = start + time_i32; // n + k + time, in [time, padded_time]
+    let shifted = ops::indexing::slice(
+      &padded,
+      &[0_i32, start],
+      &[num_features_i32, stop],
+      &[1_i32, 1_i32],
+    )?;
+    let weight = Array::full::<f32>(&[0_i32; 0], k as f32)?;
+    let weighted = ops::arithmetic::multiply(&shifted, &weight)?;
+    acc = ops::arithmetic::add(&acc, &weighted)?;
+  }
+  let denom_arr = Array::full::<f32>(&[0_i32; 0], denom_f32)?;
+  let deltas = ops::arithmetic::divide(&acc, &denom_arr)?;
+
+  // Restore the original shape (the reference's `reshape(original_shape)`).
+  ops::shape::reshape(&deltas, &orig_shape.as_slice())
 }
 
 #[cfg(test)]
@@ -1013,6 +1447,47 @@ mod tests {
     .unwrap();
     assert_eq!(out.shape(), vec![98, 40]);
     assert_eq!(out.dtype().unwrap(), Dtype::F32);
+  }
+
+  #[test]
+  fn compute_fbank_kaldi_snip_edges_false_frame_count_and_finite() {
+    // Public-function (`compute_fbank_kaldi`) parity for the snip_edges=false
+    // centered framing. Same input as the shape test (16000 samples, win=400,
+    // inc=160):
+    //   snip_edges=true:  m = 1 + (16000 - 400)/160     = 98 frames.
+    //   snip_edges=false: m = (16000 + 160/2)/160 = (16000+80)/160 = 100.
+    // So snip_edges=false yields 2 MORE frames (the reflect-padded edges).
+    let samples = sine_wave(1000.0, 16_000, 16_000);
+    let x = Array::from_slice::<f32>(&samples, &[16_000_i32]).unwrap();
+    let out_false = compute_fbank_kaldi(
+      &x,
+      16_000,
+      400,
+      160,
+      40,
+      KaldiWindow::Hamming,
+      0.97,
+      0.0,
+      false, // snip_edges = false (reflect-bookend framing)
+      20.0,
+      0.0,
+      None,
+    )
+    .unwrap();
+    let m_false: usize = (16_000 + 160 / 2) / 160; // 100
+    assert_eq!(
+      out_false.shape(),
+      vec![m_false, 40],
+      "snip_edges=false frame count"
+    );
+    // Two extra frames vs snip_edges=true (98).
+    assert_eq!(m_false, 100);
+    // The log-mel features must be finite (the reflect bookends don't blow up).
+    let v = to_vec(&out_false);
+    assert!(
+      v.iter().all(|x| x.is_finite()),
+      "snip_edges=false features must all be finite"
+    );
   }
 
   #[test]
@@ -1275,24 +1750,9 @@ mod tests {
       Err(Error::Backend { .. })
     ));
 
-    // snip_edges=false.
-    assert!(matches!(
-      compute_fbank_kaldi(
-        &x,
-        16_000,
-        400,
-        160,
-        40,
-        KaldiWindow::Hamming,
-        0.97,
-        0.0,
-        false,
-        20.0,
-        0.0,
-        None
-      ),
-      Err(Error::Backend { .. })
-    ));
+    // (snip_edges=false is now a supported path — see
+    // `compute_fbank_kaldi_snip_edges_false_frame_count_and_finite` — so it is
+    // no longer in the rejection set.)
 
     // preemphasis out of [0, 1].
     assert!(matches!(
@@ -1833,6 +2293,232 @@ mod tests {
     assert!(
       msg.contains("padded mel-bank element count"),
       "expected error to mention the padded mel-bank cap, got: {msg}"
+    );
+  }
+
+  // ---- compute_deltas_kaldi (hand-traced vs numpy reference) -------------
+
+  /// Reshape `(rows, cols)` row-major `Vec<f32>` helper for 2-D assertions.
+  /// Materializes via `contiguous` first so an overlapping `as_strided` frame
+  /// view (which is non-contiguous) can be read back element-major.
+  fn to_vec_2d(a: &Array, rows: usize, cols: usize) -> Vec<Vec<f32>> {
+    let contig = ops::shape::contiguous(a, false).unwrap();
+    let flat = to_vec(&contig);
+    assert_eq!(flat.len(), rows * cols, "to_vec_2d shape mismatch");
+    (0..rows)
+      .map(|r| flat[r * cols..(r + 1) * cols].to_vec())
+      .collect()
+  }
+
+  #[test]
+  fn compute_deltas_kaldi_win5_edge_matches_reference() {
+    // Input `[[1,2,3,4,5],[0,0,1,0,0]]`, win=5, mode=edge (n=2, denom=10).
+    // Reference (numpy replica of `compute_deltas_kaldi`):
+    //   row0: [0.5, 0.8, 1.0, 0.8, 0.5]   (unit-slope ramp → 1.0 interior)
+    //   row1: [0.2, 0.1, 0.0, -0.1, -0.2] (odd impulse → odd derivative)
+    let x = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 0.0, 0.0, 1.0, 0.0, 0.0], &[2, 5])
+      .unwrap();
+    let d = compute_deltas_kaldi(&x, 5, DeltaPadMode::Edge).unwrap();
+    assert_eq!(d.shape(), vec![2, 5]);
+    let got = to_vec_2d(&d, 2, 5);
+    let want = [[0.5_f32, 0.8, 1.0, 0.8, 0.5], [0.2, 0.1, 0.0, -0.1, -0.2]];
+    for r in 0..2 {
+      for c in 0..5 {
+        assert!(
+          (got[r][c] - want[r][c]).abs() < F32_TOL,
+          "delta[{r}][{c}]: got {}, want {}",
+          got[r][c],
+          want[r][c]
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn compute_deltas_kaldi_win3_constant_matches_reference() {
+    // win=3, mode=constant (n=1, denom=2). Zero-pad edges.
+    // Reference:
+    //   row0 [1,2,3,4,5]: [1.0, 1.0, 1.0, 1.0, -2.0]
+    //     (last: (0 - 4)/2 = -2.0 — the zero pad pulls the trailing delta down)
+    //   row1 [0,0,1,0,0]: [0.0, 0.5, 0.0, -0.5, 0.0]
+    let x = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0, 5.0, 0.0, 0.0, 1.0, 0.0, 0.0], &[2, 5])
+      .unwrap();
+    let d = compute_deltas_kaldi(&x, 3, DeltaPadMode::Constant).unwrap();
+    let got = to_vec_2d(&d, 2, 5);
+    let want = [[1.0_f32, 1.0, 1.0, 1.0, -2.0], [0.0, 0.5, 0.0, -0.5, 0.0]];
+    for r in 0..2 {
+      for c in 0..5 {
+        assert!(
+          (got[r][c] - want[r][c]).abs() < F32_TOL,
+          "delta[{r}][{c}]: got {}, want {}",
+          got[r][c],
+          want[r][c]
+        );
+      }
+    }
+  }
+
+  #[test]
+  fn compute_deltas_kaldi_1d_ramp_interior_is_unit_slope() {
+    // A unit-slope 1-D ramp has a constant first derivative of 1.0 in the
+    // interior (the regression-delta of `c[t] = t` is exactly 1.0 where the
+    // window does not touch a padded edge). Output keeps the 1-D shape.
+    let ramp: Vec<f32> = (0..8).map(|n| n as f32).collect();
+    let x = Array::from_slice::<f32>(&ramp, &[8]).unwrap();
+    let d = compute_deltas_kaldi(&x, 5, DeltaPadMode::Edge).unwrap();
+    assert_eq!(d.shape(), vec![8]);
+    let got = to_vec(&d);
+    // Interior indices 2..=5 are unaffected by the edge replication (n=2).
+    for (i, &g) in got.iter().enumerate().take(6).skip(2) {
+      assert!(
+        (g - 1.0).abs() < F32_TOL,
+        "ramp delta[{i}]: got {g}, want 1.0"
+      );
+    }
+  }
+
+  #[test]
+  fn compute_deltas_kaldi_delta_delta_is_zero_for_ramp_interior() {
+    // Delta of a unit-slope ramp is ~constant (1.0), so the delta-of-delta
+    // (acceleration) is ~0 in the deep interior — applying the function twice.
+    let ramp: Vec<f32> = (0..12).map(|n| n as f32).collect();
+    let x = Array::from_slice::<f32>(&ramp, &[12]).unwrap();
+    let d = compute_deltas_kaldi(&x, 3, DeltaPadMode::Edge).unwrap();
+    let dd = compute_deltas_kaldi(&d, 3, DeltaPadMode::Edge).unwrap();
+    let got = to_vec(&dd);
+    // n=1 each pass → indices 2..=9 are clear of both edge replications.
+    for (i, &g) in got.iter().enumerate().take(10).skip(2) {
+      assert!(g.abs() < F32_TOL, "ramp delta-delta[{i}]: got {g}, want ~0");
+    }
+  }
+
+  #[test]
+  fn compute_deltas_kaldi_rejects_invalid_win_length() {
+    let x = Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &[1, 4]).unwrap();
+    // win_length < 3.
+    assert!(matches!(
+      compute_deltas_kaldi(&x, 2, DeltaPadMode::Edge),
+      Err(Error::Backend { .. })
+    ));
+    // even win_length (would silently truncate to next-lower odd).
+    assert!(matches!(
+      compute_deltas_kaldi(&x, 4, DeltaPadMode::Edge),
+      Err(Error::Backend { .. })
+    ));
+  }
+
+  // ---- strided_frames_no_snip_edges (boundary values, hand-traced) ------
+  //
+  // These exercise the module-private `snip_edges=false` reflect-bookend
+  // framing directly (it is a forward-only framing primitive, not an
+  // invertible pair, so a focused unit test is the right granularity — the
+  // public `compute_fbank_kaldi` `snip_edges=false` frame-count parity is
+  // covered in tests/audio_dsp.rs). Expected values are the numpy replica of
+  // the reference `_get_strided_kaldi(..., snip_edges=False)`.
+
+  #[test]
+  fn strided_no_snip_edges_win4_shift2_boundary_values() {
+    // waveform = [0..9], win_size=4, win_inc=2 → pad = 4/2 - 2/2 = 1.
+    //   m = (10 + 1) / 2 = 5. Reference padded buffer (read region):
+    //     [1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, ...]
+    //   frames:
+    //     [1,0,1,2] [1,2,3,4] [3,4,5,6] [5,6,7,8] [7,8,9,9]
+    let wf: Vec<f32> = (0..10).map(|n| n as f32).collect();
+    let x = Array::from_slice::<f32>(&wf, &[10]).unwrap();
+    let m = (10 + 2 / 2) / 2; // 5
+    let frames = strided_frames_no_snip_edges(&x, 4, 2, m).unwrap();
+    assert_eq!(frames.shape(), vec![5, 4]);
+    let got = to_vec_2d(&frames, 5, 4);
+    let want = [
+      [1.0_f32, 0.0, 1.0, 2.0],
+      [1.0, 2.0, 3.0, 4.0],
+      [3.0, 4.0, 5.0, 6.0],
+      [5.0, 6.0, 7.0, 8.0],
+      [7.0, 8.0, 9.0, 9.0],
+    ];
+    assert_eq!(got, want, "snip_edges=false win4 shift2 frames mismatch");
+  }
+
+  #[test]
+  fn strided_no_snip_edges_win6_shift2_left_reflect_bookend() {
+    // waveform = [0..9], win_size=6, win_inc=2 → pad = 3 - 1 = 2 (pad>1 path).
+    //   pad_left = reverse(wf[1..3]) = [2, 1]; pad_right = reverse(wf[7..9]) = [9, 8].
+    //   padded = [2,1,0,1,2,3,4,5,6,7,8,9,9,8]; m = (10+1)/2 = 5.
+    //   first frame [2,1,0,1,2,3], last frame [6,7,8,9,9,8].
+    let wf: Vec<f32> = (0..10).map(|n| n as f32).collect();
+    let x = Array::from_slice::<f32>(&wf, &[10]).unwrap();
+    let frames = strided_frames_no_snip_edges(&x, 6, 2, 5).unwrap();
+    assert_eq!(frames.shape(), vec![5, 6]);
+    let got = to_vec_2d(&frames, 5, 6);
+    assert_eq!(
+      got[0],
+      vec![2.0, 1.0, 0.0, 1.0, 2.0, 3.0],
+      "left reflect bookend (pad=2) mismatch"
+    );
+    assert_eq!(
+      got[4],
+      vec![6.0, 7.0, 8.0, 9.0, 9.0, 8.0],
+      "right reflect bookend (pad=2) mismatch"
+    );
+  }
+
+  #[test]
+  fn strided_no_snip_edges_pad_zero_path() {
+    // win_size=4, win_inc=4 → pad = 2 - 2 = 0 (the `pad <= 0` branch:
+    // padded = concat(wf[0..], reverse(wf))). waveform=[0..9]:
+    //   padded = [0,1,2,3,4,5,6,7,8,9, 9,8,7,6,5,4,3,2,1,0]; m = (10+2)/4 = 3.
+    //   frames: [0,1,2,3] [4,5,6,7] [8,9,9,8].
+    let wf: Vec<f32> = (0..10).map(|n| n as f32).collect();
+    let x = Array::from_slice::<f32>(&wf, &[10]).unwrap();
+    let m = (10 + 4 / 2) / 4; // 3
+    let frames = strided_frames_no_snip_edges(&x, 4, 4, m).unwrap();
+    assert_eq!(frames.shape(), vec![3, 4]);
+    let got = to_vec_2d(&frames, 3, 4);
+    let want = [
+      [0.0_f32, 1.0, 2.0, 3.0],
+      [4.0, 5.0, 6.0, 7.0],
+      [8.0, 9.0, 9.0, 8.0],
+    ];
+    assert_eq!(got, want, "snip_edges=false pad<=0 path frames mismatch");
+  }
+
+  #[test]
+  fn strided_no_snip_edges_produces_extra_frame_vs_snip_true() {
+    // The defining property of snip_edges=false: it keeps centered frames at
+    // the edges that snip_edges=true drops, so for the same (win, inc) it
+    // yields MORE frames. waveform len 10, win_size=4, win_inc=2:
+    //   snip_edges=true:  m = 1 + (10 - 4)/2 = 4 frames.
+    //   snip_edges=false: m = (10 + 1)/2     = 5 frames (one extra).
+    let wf: Vec<f32> = (0..10).map(|n| n as f32).collect();
+    let x = Array::from_slice::<f32>(&wf, &[10]).unwrap();
+    let m_true = 1 + (10 - 4) / 2; // 4
+    let m_false = (10 + 2 / 2) / 2; // 5
+    assert_eq!(
+      m_false,
+      m_true + 1,
+      "snip=false should yield one extra frame"
+    );
+    let f_true = strided_frames_snip_edges(&x, 4, 2, m_true).unwrap();
+    let f_false = strided_frames_no_snip_edges(&x, 4, 2, m_false).unwrap();
+    assert_eq!(f_true.shape(), vec![4, 4]);
+    assert_eq!(f_false.shape(), vec![5, 4]);
+  }
+
+  #[test]
+  fn strided_no_snip_edges_rejects_degenerate_overread() {
+    // A win_size large relative to the signal forces the strided read past the
+    // reflect-padded buffer (the regime where the reference reads OOB). We
+    // reject it with a recoverable error rather than reproduce that UB.
+    // waveform len 5, win_size=8, win_inc=2 → pad=3, m=(5+1)/2=3,
+    //   padded_len = 3 + 5 + 3 = 11, needed = (3-1)*2 + 8 = 12 > 11.
+    let wf: Vec<f32> = (0..5).map(|n| n as f32).collect();
+    let x = Array::from_slice::<f32>(&wf, &[5]).unwrap();
+    let err = strided_frames_no_snip_edges(&x, 8, 2, 3)
+      .expect_err("expected degenerate overread to be rejected");
+    let msg = format!("{err:?}");
+    assert!(
+      msg.contains("exceeds reflect-padded length") || msg.contains("too short to reflect-pad"),
+      "expected an overread/short-signal error, got: {msg}"
     );
   }
 }
