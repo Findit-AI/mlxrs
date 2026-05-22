@@ -801,7 +801,31 @@ fn walk_shards(
         continue;
       }
     };
-    if meta.is_dir() {
+    // Dispatch on the two independent axes — does the FILENAME match the
+    // `model*.safetensors` predicate, and what is the (symlink-resolved) target
+    // kind. The name-match arms are decided FIRST, before directory descent,
+    // because `glob`'s `model*.safetensors` match is name-based: a dirent NAMED
+    // like a shard whose target is anything but a regular file (a directory, a
+    // symlink-to-dir, a FIFO, a device) is a path `glob` would yield and
+    // `load_safetensors` would then reject — it must fail the load loudly, not
+    // be descended-into or skipped. Descending a `model.safetensors`-named
+    // directory would silently drop the canonical shard name into a stale
+    // `weight*.safetensors` fallback.
+    if name_matches && !meta.is_file() {
+      // A `model*.safetensors`-named entry whose target is non-regular (a
+      // directory, a symlink-to-dir, a FIFO, a device, a socket) — fail loudly
+      // rather than descend-into or silently skip, for the same reason a
+      // dangling symlink does: the canonical shard name must not vanish into a
+      // stale `weight*.safetensors` fallback.
+      return Err(Error::Backend {
+        message: format!(
+          "weight shard {} is a model*.safetensors-named non-regular entry \
+           (directory / FIFO / device / socket); refusing to load",
+          path.display()
+        ),
+      });
+    }
+    if !name_matches && meta.is_dir() {
       // Cycle guard (recursion-stack): descend a directory (real or symlinked)
       // unless its real path is already on the CURRENT descent stack — i.e. it
       // is an ancestor, a true symlink cycle. `canonicalize` resolves symlinks +
@@ -828,22 +852,11 @@ fn walk_shards(
       continue;
     }
     if !name_matches {
-      // A non-shard-named file — irrelevant to `model*.safetensors`, skip.
+      // A non-shard-named, non-directory entry — irrelevant to
+      // `model*.safetensors`, skip.
       continue;
     }
-    if !meta.is_file() {
-      // A `model*.safetensors`-named entry whose target is non-regular (FIFO /
-      // device / socket / directory) — fail loudly rather than silently skip,
-      // for the same reason a dangling symlink does: the canonical shard name
-      // must not vanish into a stale `weight*.safetensors` fallback.
-      return Err(Error::Backend {
-        message: format!(
-          "weight shard {} is not a regular file (FIFO / device / directory); \
-           refusing to load",
-          path.display()
-        ),
-      });
-    }
+    // `name_matches && meta.is_file()` — a genuine shard.
     // mlx-embeddings: `folder_name = Path(wf).parent.name` and apply the prefix
     // iff `Path(wf).parent != model_path`. The immediate parent's name
     // (`a/b/model.safetensors` → `b`), never the full relative path.
@@ -2218,6 +2231,67 @@ mod tests {
     assert!(
       msg.contains("model.safetensors"),
       "the error must name the broken shard; got: {msg}"
+    );
+  }
+
+  #[test]
+  fn load_weights_model_named_directory_fails_not_falls_back() {
+    // A `model.safetensors` that is a real DIRECTORY, next to a legacy root
+    // `weights.safetensors`. The walk must REJECT the `model*.safetensors`-named
+    // non-regular entry (a directory is non-regular) BEFORE descending into it —
+    // descending an (empty) `model.safetensors/` directory would discover no
+    // shard there, the canonical shard name would vanish, and `load_weights`
+    // would silently degrade to the stale legacy `weight*.safetensors` snapshot.
+    let dir = fresh_dir("model-named-dir");
+    // The legacy root shard the buggy fallback would have loaded instead.
+    write_one_tensor(&dir.join("weights.safetensors"), "stale.weight");
+    // `model.safetensors` is a real directory, not a file.
+    std::fs::create_dir_all(dir.join("model.safetensors")).unwrap();
+
+    let result = load_weights(&dir);
+    let Err(err) = result else {
+      panic!(
+        "a `model.safetensors` DIRECTORY must fail the load, not be descended \
+         and fall back to the stale `weight*.safetensors`"
+      );
+    };
+    assert!(
+      matches!(err, Error::Backend { .. }),
+      "expected a recoverable Backend error; got {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+      msg.contains("model.safetensors"),
+      "the error must name the offending entry; got: {msg}"
+    );
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn load_weights_model_named_symlink_to_directory_fails() {
+    // A `model.safetensors` that is a SYMLINK-TO-DIRECTORY — `fs::metadata`
+    // dereferences it, so `meta.is_dir()` is true. Like a real directory, this
+    // `model*.safetensors`-named non-regular entry must be rejected BEFORE the
+    // directory-descent branch, not silently walked.
+    let dir = fresh_dir("model-named-symlink-dir");
+    write_one_tensor(&dir.join("weights.safetensors"), "stale.weight");
+    // A real directory elsewhere, then a `model.safetensors` symlink to it.
+    let real = dir.join("real_dir");
+    std::fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real, dir.join("model.safetensors")).unwrap();
+
+    let result = load_weights(&dir);
+    let Err(err) = result else {
+      panic!("a `model.safetensors` symlink-to-directory must fail the load");
+    };
+    assert!(
+      matches!(err, Error::Backend { .. }),
+      "expected a recoverable Backend error; got {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+      msg.contains("model.safetensors"),
+      "the error must name the offending entry; got: {msg}"
     );
   }
 
