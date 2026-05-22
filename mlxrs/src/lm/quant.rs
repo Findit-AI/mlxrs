@@ -443,20 +443,31 @@ enum TripleClass {
   /// A structurally valid already-quantized triple. mlx-lm
   /// `class_predicate` (`utils.py:349-355`) gates on `f"{p}.scales" in
   /// weights` as the signal that the checkpoint already pre-quantized
-  /// this layer; on top of that signal, this validates the layout
+  /// this layer; on top of that signal, this validates the FULL layout
   /// mlx's `quantize` actually produces
   /// (`mlx/mlx/ops.cpp:4789-4798,4893-4904`):
   ///
   /// - `.weight` dtype is `uint32` (packed quantized — both `affine`
   ///   and the `fp` modes write a `uint32` packed matrix; a float
   ///   `.weight` next to a `.scales` is the orphan case).
+  /// - `.weight` rank ≥ 2 (mlx `quantize` requires rank ≥ 2 inputs,
+  ///   `mlx/ops.cpp:4925-4929`; a rank-0/1 `.weight` next to a
+  ///   `.scales` cannot be a real quantized triple).
   /// - `.scales` rank equals `.weight` rank, and the leading dims (all
   ///   but the last) match — mlx preserves the leading shape across
   ///   `quantize`.
+  /// - `.scales` last-axis equals
+  ///   `packed_last * (32 / bits) / group_size` — mlx's invariant
+  ///   `w.shape(-1) * 32 / bits == scales.shape(-1) * group_size`
+  ///   (`mlx/ops.cpp:107`). The unpack factor `32 / bits` is the
+  ///   number of bits-wide elements packed per `uint32` lane
+  ///   (`mlx/backend/metal/kernels/quantized.h:705`,
+  ///   `mlx/backend/cpu/quantized.cpp:249`).
   /// - If `.biases` is present (affine), it has the same shape and
   ///   dtype as `.scales` — `affine_quantize` writes `scales` and
   ///   `biases` from the same template (`mlx/mlx/ops.cpp:4780-4786`,
-  ///   `4793-4798`).
+  ///   `4793-4798`); the `.biases` last-axis check is therefore
+  ///   subsumed by the shape-equality check.
   ///
   /// Pass-through unchanged.
   Valid,
@@ -474,11 +485,36 @@ enum TripleClass {
 /// [`Invalid`](TripleClass::Invalid) (orphan / shape / dtype mismatch).
 ///
 /// `layer_weight` is the `<layer_path>.weight` array (the caller has
-/// already stripped the suffix). See [`TripleClass`] for the exact
-/// invariants enforced, and the module-level
-/// [Sibling-name reservation](self#sibling-name-reservation) section for
-/// the surrounding contract.
-fn classify_triple(weights: &Weights, layer_path: &str, layer_weight: &Array) -> TripleClass {
+/// already stripped the suffix); `cfg` carries the global +
+/// per-layer-override [`Quantization`] parameters this triple must
+/// match (the [`Quantization::bits`] / [`Quantization::group_size`] for
+/// the layer determine the expected `.scales` last-axis, see below).
+///
+/// **Precondition.** `cfg` must carry a usable [`Quantization`] for
+/// `layer_path` whenever a triple is present: either via the global
+/// `cfg.quantization` (the common case — Fix 2 enforces that any parsed
+/// `"quantization"` block contains `group_size` + `bits`) or via a
+/// per-layer [`QuantizationOption::Quantize`] override. A per-layer
+/// [`QuantizationOption::Skip`] for `layer_path` means the layer was
+/// intentionally not quantized — any sibling `.scales` / `.biases` at
+/// that path is therefore a stale collision (returned as
+/// [`Invalid`](TripleClass::Invalid), not [`Valid`](TripleClass::Valid)).
+/// A `cfg.quantization == None` with no per-layer override leaves no
+/// way to resolve the expected `.scales` shape; this should not arise
+/// in production (it would mean `quantize_weights` was called without
+/// any quantization params at all, in which case there is nothing for
+/// it to do), but it is treated as [`Invalid`](TripleClass::Invalid)
+/// defensively.
+///
+/// See [`TripleClass`] for the exact invariants enforced, and the
+/// module-level [Sibling-name reservation](self#sibling-name-reservation)
+/// section for the surrounding contract.
+fn classify_triple(
+  weights: &Weights,
+  layer_path: &str,
+  layer_weight: &Array,
+  cfg: &PerLayerQuantization,
+) -> TripleClass {
   let scales_key = format!("{layer_path}{SCALES_SUFFIX}");
   let biases_key = format!("{layer_path}{BIASES_SUFFIX}");
   let scales = weights.get(&scales_key);
@@ -504,6 +540,34 @@ fn classify_triple(weights: &Weights, layer_path: &str, layer_weight: &Array) ->
     // an orphan `.scales` next to a dense weight, or a corrupted
     // shape/dtype mismatch.
     (Some(s), b_opt) => {
+      // Resolve the per-layer `Quantization` for this path. A per-layer
+      // `Skip` (or a missing global default with no override) leaves no
+      // valid quantization params for the layer; a pre-existing triple
+      // at that path is therefore a stale collision — Invalid, not
+      // Valid (see the function-level "Precondition" doc above).
+      let q = match cfg.per_layer.get(layer_path) {
+        Some(QuantizationOption::Skip) => {
+          return TripleClass::Invalid(format!(
+            "quantize_weights: layer {layer_path}: input carries `{scales_key}` \
+             but the per-layer config marks this layer as `Skip` (not \
+             quantized) — refusing to silently treat the stale triple as a \
+             valid already-quantized layer"
+          ));
+        }
+        Some(QuantizationOption::Quantize(q)) => *q,
+        None => match cfg.quantization {
+          Some(q) => q,
+          None => {
+            return TripleClass::Invalid(format!(
+              "quantize_weights: layer {layer_path}: input carries \
+               `{scales_key}` but `cfg` has no global `Quantization` and no \
+               per-layer override for this layer — cannot resolve expected \
+               `.scales` shape (this should not arise in production: any \
+               parsed `quantization` block carries `group_size` + `bits`)"
+            ));
+          }
+        },
+      };
       // `.weight` dtype must be `uint32` — both `affine_quantize`
       // (`mlx/ops.cpp:4795`) and `fp_quantize` (`mlx/ops.cpp:4900`)
       // write a `uint32` packed matrix. A float `.weight` means this
@@ -525,10 +589,25 @@ fn classify_triple(weights: &Weights, layer_path: &str, layer_weight: &Array) ->
            next to a dense `.weight`, not a valid already-quantized triple"
         ));
       }
+      // `.weight` rank must be ≥ 2 — mlx `quantize` requires rank ≥ 2
+      // inputs (`mlx/ops.cpp:4925-4929`), so a rank-0/1 `.weight` next
+      // to a `.scales` cannot be a real quantized triple even when the
+      // dtype is `uint32` and the leading dims happen to match.
+      let w_shape = layer_weight.shape();
+      if w_shape.len() < 2 {
+        return TripleClass::Invalid(format!(
+          "quantize_weights: layer {layer_path}: `.weight` has rank {} \
+           (shape {:?}), but mlx `quantize` requires rank ≥ 2 inputs \
+           (`mlx/ops.cpp:4925-4929`); this is a malformed triple (a \
+           uint32 1-D / scalar `.weight` next to a `.scales` is not a \
+           layout mlx's `quantize` can have produced)",
+          w_shape.len(),
+          w_shape
+        ));
+      }
       // `.scales` rank == `.weight` rank, and the leading dims (all
       // but the last) match — mlx `quantize` preserves the leading
       // shape (`mlx/ops.cpp:4789-4798`).
-      let w_shape = layer_weight.shape();
       let s_shape = s.shape();
       if s_shape.len() != w_shape.len() {
         return TripleClass::Invalid(format!(
@@ -540,15 +619,10 @@ fn classify_triple(weights: &Weights, layer_path: &str, layer_weight: &Array) ->
           w_shape.len()
         ));
       }
-      // Compare leading dims (all but the last axis) iff both have rank
-      // ≥ 1. Mlx `quantize` requires rank ≥ 2 inputs (`mlx/ops.cpp:4925-4929`),
-      // so a rank-0 `.weight` already isn't a real quantized triple — but
-      // the rank-equality check above subsumes that case; here we just
-      // guard the slice index.
-      if !w_shape.is_empty()
-        && !s_shape.is_empty()
-        && s_shape[..s_shape.len() - 1] != w_shape[..w_shape.len() - 1]
-      {
+      // Leading dims (all but the last) must match. Rank ≥ 2 is
+      // already enforced above, so both slices are non-empty and the
+      // index is safe.
+      if s_shape[..s_shape.len() - 1] != w_shape[..w_shape.len() - 1] {
         return TripleClass::Invalid(format!(
           "quantize_weights: layer {layer_path}: `{scales_key}` leading dims \
            {:?} do not match `.weight` leading dims {:?} — mlx `quantize` \
@@ -557,9 +631,63 @@ fn classify_triple(weights: &Weights, layer_path: &str, layer_weight: &Array) ->
           &w_shape[..w_shape.len() - 1],
         ));
       }
+      // `.scales` last-axis must match the mlx invariant
+      // `w.shape(-1) * 32 / bits == scales.shape(-1) * group_size`
+      // (`mlx/ops.cpp:107`). Rearranged: the expected `.scales`
+      // last-axis is `(packed_last * 32 / bits) / group_size`. The
+      // unpack factor `32 / bits` is the elements-per-uint32 packing
+      // mlx applies (`mlx/backend/metal/kernels/quantized.h:705`,
+      // `mlx/backend/cpu/quantized.cpp:249`).
+      if q.bits <= 0 || q.group_size <= 0 {
+        return TripleClass::Invalid(format!(
+          "quantize_weights: layer {layer_path}: per-layer `Quantization` \
+           has non-positive `bits` ({}) or `group_size` ({}); cannot resolve \
+           expected `.scales` last-axis",
+          q.bits, q.group_size
+        ));
+      }
+      let bits = q.bits as usize;
+      let group_size = q.group_size as usize;
+      let packed_last = *w_shape.last().expect("rank >= 2");
+      // `bits` is positive (checked above); but it might not divide 32
+      // cleanly for an exotic value. mlx only accepts bits ∈ {2,3,4,6,8}
+      // (`mlx/ops.cpp:4815` etc.), all of which divide 32, but defensively
+      // refuse the case where `32 % bits != 0` rather than truncating.
+      if !32_usize.is_multiple_of(bits) {
+        return TripleClass::Invalid(format!(
+          "quantize_weights: layer {layer_path}: `bits` ({bits}) does not \
+           divide 32 evenly; mlx-supported bit widths are {{2,3,4,6,8}} — \
+           cannot resolve expected `.scales` last-axis"
+        ));
+      }
+      let unpacked_last = packed_last * (32 / bits);
+      if !unpacked_last.is_multiple_of(group_size) {
+        return TripleClass::Invalid(format!(
+          "quantize_weights: layer {layer_path}: unpacked `.weight` last-axis \
+           ({unpacked_last} = packed {packed_last} * 32 / {bits}) is not \
+           divisible by group_size ({group_size}); mlx's invariant \
+           `w.shape(-1) * 32 / bits == scales.shape(-1) * group_size` \
+           (`mlx/ops.cpp:107`) cannot hold for this `.weight` under \
+           `bits={bits}`, `group_size={group_size}`"
+        ));
+      }
+      let expected_scales_last = unpacked_last / group_size;
+      let actual_scales_last = *s_shape.last().expect("rank >= 2");
+      if actual_scales_last != expected_scales_last {
+        return TripleClass::Invalid(format!(
+          "quantize_weights: layer {layer_path}: `{scales_key}` last-axis \
+           ({actual_scales_last}) does not match the expected last-axis \
+           ({expected_scales_last} = packed-`.weight`-last \
+           {packed_last} * 32 / {bits} / {group_size}) under `bits={bits}`, \
+           `group_size={group_size}` — mlx invariant \
+           `w.shape(-1) * 32 / bits == scales.shape(-1) * group_size` \
+           (`mlx/ops.cpp:107`)"
+        ));
+      }
       // `.biases` (if present): same shape and dtype as `.scales` —
       // `affine_quantize` writes them from the same template
-      // (`mlx/ops.cpp:4780-4786`, `4793-4798`).
+      // (`mlx/ops.cpp:4780-4786`, `4793-4798`). The shape-equality
+      // check subsumes the `.biases` last-axis check.
       if let Some(b) = b_opt {
         let b_shape = b.shape();
         if b_shape != s_shape {
@@ -695,8 +823,12 @@ pub fn quantize_weights(
     // — see [`TripleClass`] for the exact invariants). The
     // `is_already_quantized` presence-only gate (mlx-lm
     // `utils.py:349-355`) is subsumed by the
-    // [`Valid`](TripleClass::Valid) branch.
-    match classify_triple(&weights, layer_path, arr) {
+    // [`Valid`](TripleClass::Valid) branch. `cfg` is passed in so the
+    // expected `.scales` last-axis can be computed from the per-layer
+    // (`bits`, `group_size`) — mlx's invariant
+    // `w.shape(-1) * 32 / bits == scales.shape(-1) * group_size`
+    // (`mlx/ops.cpp:107`).
+    match classify_triple(&weights, layer_path, arr, cfg) {
       TripleClass::Absent => {}
       TripleClass::Valid => continue,
       TripleClass::Invalid(message) => return Err(Error::Backend { message }),
@@ -1449,6 +1581,163 @@ mod tests {
         assert!(
           message.contains("dtype"),
           "error should explain the `.biases` / `.scales` dtype mismatch, got: {message}"
+        );
+      }
+      other => panic!("expected Error::Backend, got: {other:?}"),
+    }
+  }
+
+  // ──────────────── Fix 5 (this PR): full mlx layout validation ────────────────
+
+  /// Fix 5: a uint32 rank-1 `.weight` next to a uint32 rank-1 `.scales`
+  /// (rank-equal, even leading-dim-equal trivially since both have only
+  /// a last axis). Pre-fix `classify_triple` would have classified this
+  /// as [`TripleClass::Valid`] (dtype `uint32` + ranks equal + no
+  /// rank ≥ 2 check). The fix rejects it because mlx `quantize` requires
+  /// rank ≥ 2 inputs (`mlx/ops.cpp:4925-4929`).
+  #[test]
+  fn quantize_weights_rank1_uint32_triple_errors() {
+    // Both `.weight` and `.scales` are rank-1 uint32 — would slip past
+    // the dtype + rank-equality check, but mlx never emits a rank-1
+    // quantized triple.
+    let w = arr_u32(&[0_u32, 0, 0, 0], &[4]);
+    let scales = arr_u32(&[1_u32], &[1]);
+    let mut weights: Weights = HashMap::new();
+    weights.insert("model.bad.weight".to_string(), w);
+    weights.insert("model.bad.scales".to_string(), scales);
+
+    let cfg = PerLayerQuantization::from_global(Quantization::affine(64, 4));
+    let err = quantize_weights(weights, &cfg, &default_eligible).unwrap_err();
+    match err {
+      Error::Backend { message } => {
+        assert!(
+          message.contains("model.bad"),
+          "error should name the malformed layer, got: {message}"
+        );
+        assert!(
+          message.contains("rank"),
+          "error should call out the `.weight` rank, got: {message}"
+        );
+      }
+      other => panic!("expected Error::Backend, got: {other:?}"),
+    }
+  }
+
+  /// Fix 5: a `.weight` `[2, 8]` packed at `bits=4, group_size=64` with
+  /// a `.scales` `[2, 2]`. Leading dims match (`[2] == [2]`) and rank
+  /// matches (2 == 2) — would slip past the pre-fix check. But mlx's
+  /// invariant says `expected_scales_last = packed_last * 32 / bits
+  /// / group_size = 8 * 8 / 64 = 1`, not 2; the actual `.scales`
+  /// last-axis (2) does not match.
+  #[test]
+  fn quantize_weights_mismatched_scales_last_axis_errors() {
+    let n_rows = 2_usize;
+    // Packed `.weight`: [N=2, 8] uint32 — under bits=4, this unpacks
+    // to [N=2, 64], so expected `.scales` last-axis = 64 / 64 = 1.
+    let w = arr_u32(&vec![0_u32; n_rows * 8], &[n_rows, 8]);
+    // BAD `.scales` last-axis: 2 instead of the expected 1.
+    let scales = arr_f32(&vec![1.0_f32; n_rows * 2], &[n_rows, 2]);
+    let mut weights: Weights = HashMap::new();
+    weights.insert("model.foo.weight".to_string(), w);
+    weights.insert("model.foo.scales".to_string(), scales);
+
+    let cfg = PerLayerQuantization::from_global(Quantization::affine(64, 4));
+    let err = quantize_weights(weights, &cfg, &default_eligible).unwrap_err();
+    match err {
+      Error::Backend { message } => {
+        assert!(
+          message.contains("model.foo"),
+          "error should name the layer, got: {message}"
+        );
+        assert!(
+          message.contains("last-axis"),
+          "error should call out the `.scales` last-axis, got: {message}"
+        );
+        // Should name both expected and actual values.
+        assert!(
+          message.contains("1") && message.contains("2"),
+          "error should name expected (1) and actual (2) last-axis, got: {message}"
+        );
+      }
+      other => panic!("expected Error::Backend, got: {other:?}"),
+    }
+  }
+
+  /// Fix 5 regression: a CORRECT `.weight` `[2, 8]` packed at
+  /// `bits=4, group_size=64` with `.scales` `[2, 1]`. The tightened
+  /// last-axis check must not regress this valid layout
+  /// (`expected = 8 * 32 / 4 / 64 = 1` = actual).
+  #[test]
+  fn quantize_weights_valid_triple_with_correct_last_axis_skipped() {
+    let n_rows = 2_usize;
+    let w = arr_u32(&vec![0_u32; n_rows * 8], &[n_rows, 8]);
+    let scales = arr_f32(&vec![1.0_f32; n_rows], &[n_rows, 1]);
+    let mut weights: Weights = HashMap::new();
+    weights.insert("model.foo.weight".to_string(), w);
+    weights.insert("model.foo.scales".to_string(), scales);
+
+    let cfg = PerLayerQuantization::from_global(Quantization::affine(64, 4));
+    let out =
+      quantize_weights(weights, &cfg, &default_eligible).expect("valid triple passes through");
+    let w_out = out.get("model.foo.weight").expect(".weight");
+    assert_eq!(w_out.shape(), vec![n_rows, 8]);
+    assert_eq!(w_out.dtype().unwrap(), crate::dtype::Dtype::U32);
+    let s_out = out.get("model.foo.scales").expect(".scales");
+    assert_eq!(s_out.shape(), vec![n_rows, 1]);
+  }
+
+  /// Fix 5 regression on a different shape: `.weight` `[2, 16]` packed
+  /// at `bits=4, group_size=64` with `.scales` `[2, 2]`
+  /// (`expected = 16 * 32 / 4 / 64 = 2` = actual). Confirms the formula
+  /// matches multiple shapes, not just the minimal one.
+  #[test]
+  fn quantize_weights_valid_triple_multi_group_passes() {
+    let n_rows = 2_usize;
+    // Packed [N=2, 16]: under bits=4, unpacks to [N=2, 128] = two
+    // group_size=64 groups along the last axis → scales last-axis = 2.
+    let w = arr_u32(&vec![0_u32; n_rows * 16], &[n_rows, 16]);
+    let scales = arr_f32(&vec![1.0_f32; n_rows * 2], &[n_rows, 2]);
+    let mut weights: Weights = HashMap::new();
+    weights.insert("model.foo.weight".to_string(), w);
+    weights.insert("model.foo.scales".to_string(), scales);
+
+    let cfg = PerLayerQuantization::from_global(Quantization::affine(64, 4));
+    let out =
+      quantize_weights(weights, &cfg, &default_eligible).expect("valid multi-group triple passes");
+    let s_out = out.get("model.foo.scales").expect(".scales");
+    assert_eq!(s_out.shape(), vec![n_rows, 2]);
+  }
+
+  /// Fix 5: a triple at a path that the per-layer config marks as
+  /// `Skip`. The layer was intentionally not quantized — a pre-existing
+  /// triple at that path is a stale collision. Classified as
+  /// [`TripleClass::Invalid`] (the doc-level "Precondition" branch).
+  #[test]
+  fn quantize_weights_triple_on_skip_path_errors() {
+    let n_rows = 2_usize;
+    let w = arr_u32(&vec![0_u32; n_rows * 8], &[n_rows, 8]);
+    let scales = arr_f32(&vec![1.0_f32; n_rows], &[n_rows, 1]);
+    let mut weights: Weights = HashMap::new();
+    weights.insert("model.embed_tokens.weight".to_string(), w);
+    weights.insert("model.embed_tokens.scales".to_string(), scales);
+
+    let mut per_layer = HashMap::new();
+    per_layer.insert("model.embed_tokens".to_string(), QuantizationOption::Skip);
+    let cfg = PerLayerQuantization {
+      quantization: Some(Quantization::affine(64, 4)),
+      per_layer,
+    };
+
+    let err = quantize_weights(weights, &cfg, &default_eligible).unwrap_err();
+    match err {
+      Error::Backend { message } => {
+        assert!(
+          message.contains("model.embed_tokens"),
+          "error should name the Skip layer, got: {message}"
+        );
+        assert!(
+          message.contains("Skip"),
+          "error should call out the Skip override, got: {message}"
         );
       }
       other => panic!("expected Error::Backend, got: {other:?}"),
