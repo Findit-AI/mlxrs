@@ -26,21 +26,30 @@
 //! ## Predicate (which weight keys get quantized)
 //!
 //! A faithful adaptation of `mlx_lm.utils.py`'s `wrapped_predicate`
-//! (`utils.py:823-835`), translated from the module tree to the weight map:
+//! (`utils.py:823-835`), translated from the module tree to the weight map.
+//! Pass 1 is the caller-supplied **eligibility** check (the structural
+//! analogue of `hasattr(module, "to_quantized")` — see [`quantize_weights`]
+//! for the closure signature); passes 2–4 are the secondary structural
+//! guards mlx-lm runs after `to_quantized`:
 //!
-//! 1. The key ends in `.weight` — mlx's `Linear` / `Embedding` /
+//! 1. The architecture-supplied [`Eligible`] closure returns `true`
+//!    (the analogue of `hasattr(module, "to_quantized")` —
+//!    `utils.py:824`). mlx-lm uses python-class membership; mlxrs has no
+//!    module tree, so the caller's closure is the source of truth for which
+//!    weight paths are quantization targets. For the historical "every
+//!    `.weight` is a candidate" behavior, pass [`default_eligible`].
+//! 2. The key ends in `.weight` — mlx's `Linear` / `Embedding` /
 //!    `SwitchLinear` all store the dense matrix as the module's `weight`
-//!    parameter, so the weight-map suffix `.weight` is the analogue of
-//!    `hasattr(module, "to_quantized")`. The layer **path** is the key with
-//!    the `.weight` suffix stripped (mlx-lm passes
+//!    parameter. The layer **path** is the key with the `.weight` suffix
+//!    stripped (mlx-lm passes
 //!    `path = "model.layers.0.self_attn.q_proj"` to the predicate; the
 //!    weight lives at `"model.layers.0.self_attn.q_proj.weight"`).
-//! 2. The array has rank ≥ 2 (mlx-lm `module.weight.shape[-1]` indexes the
+//! 3. The array has rank ≥ 2 (mlx-lm `module.weight.shape[-1]` indexes the
 //!    last axis; a scalar or 1-D bias is not quantizable).
-//! 3. The last axis is divisible by `group_size` (mlx-lm `if
+//! 4. The last axis is divisible by `group_size` (mlx-lm `if
 //!    module.weight.shape[-1] % group_size != 0: return False`,
 //!    `utils.py:826-827`).
-//! 4. The per-layer override (if any) is consulted (mlx-lm
+//! 5. The per-layer override (if any) is consulted (mlx-lm
 //!    `quant_predicate(path, module)`, `utils.py:829-830`): a
 //!    [`QuantizationOption::Skip`] turns this weight off; a
 //!    [`QuantizationOption::Quantize`] overrides the global `group_size` /
@@ -269,30 +278,39 @@ impl<'de> Deserialize<'de> for PerLayerQuantization {
     ];
     let is_reserved = |k: &str| RESERVED.contains(&k);
 
-    // 1) Parse the global `Quantization` from the same level. The block is
-    //    only a *global* quantization if it carries `group_size` + `bits`
-    //    (mlx-lm `_quantize` reads them unconditionally; swift's
-    //    `Quantization(from: decoder)` requires the keys — and `bits` /
-    //    `group_size` are not `Optional` in the swift struct). A bare
-    //    `false` for a layer with no global keys is allowed: the per-layer
-    //    map is populated below and `quantization` stays `None`.
-    let quantization = if map.contains_key("group_size") && map.contains_key("bits") {
-      // Build a stripped object that contains ONLY the global keys, so
-      // serde_json's `Quantization` deserializer doesn't choke on per-layer
-      // keys it doesn't expect (the swift `Quantization(from: decoder)` only
-      // reads its own three keys via `CodingKeys`).
-      let mut globals = serde_json::Map::new();
-      for k in ["group_size", "bits", "mode"] {
-        if let Some(v) = map.get(k) {
-          globals.insert(k.to_string(), v.clone());
-        }
+    // 1) Parse the global `Quantization` from the same level. Mirroring
+    //    swift `QuantizationContainer.init(from:)` which calls
+    //    `Quantization(from: decoder)` unconditionally and lets it throw if
+    //    the keys are missing (`BaseConfiguration.swift:141`; `bits` /
+    //    `group_size` are `let` non-optional in the swift struct,
+    //    `BaseConfiguration.swift:34-37`), both keys are REQUIRED at the
+    //    top level of any `"quantization"` block — a missing key here is a
+    //    deserialize error, not a silent `None`. Per-layer-only configs
+    //    without a global default are simply not a valid swift /
+    //    mlx-checkpoint shape.
+    if !map.contains_key("group_size") {
+      return Err(D::Error::custom(
+        "`quantization` block is missing required key `group_size`",
+      ));
+    }
+    if !map.contains_key("bits") {
+      return Err(D::Error::custom(
+        "`quantization` block is missing required key `bits`",
+      ));
+    }
+    // Build a stripped object that contains ONLY the global keys, so
+    // serde_json's `Quantization` deserializer doesn't choke on per-layer
+    // keys it doesn't expect (the swift `Quantization(from: decoder)` only
+    // reads its own three keys via `CodingKeys`).
+    let mut globals = serde_json::Map::new();
+    for k in ["group_size", "bits", "mode"] {
+      if let Some(v) = map.get(k) {
+        globals.insert(k.to_string(), v.clone());
       }
-      Some(
-        serde_json::from_value::<Quantization>(Value::Object(globals)).map_err(D::Error::custom)?,
-      )
-    } else {
-      None
-    };
+    }
+    let quantization = Some(
+      serde_json::from_value::<Quantization>(Value::Object(globals)).map_err(D::Error::custom)?,
+    );
 
     // 2) Per-layer keys: everything that is not reserved.
     let mut per_layer: HashMap<String, QuantizationOption> = HashMap::new();
@@ -370,6 +388,44 @@ pub fn parse_quantization(config_json: &str) -> Result<Option<PerLayerQuantizati
 /// override is keyed by (mlx-lm's `path` arg to `class_predicate(path,
 /// module)`, `utils.py:349`).
 const WEIGHT_SUFFIX: &str = ".weight";
+const SCALES_SUFFIX: &str = ".scales";
+const BIASES_SUFFIX: &str = ".biases";
+
+/// The architecture-supplied eligibility predicate
+/// [`quantize_weights`] consults to decide which weight paths are
+/// quantization targets — the structural analogue of mlx-lm's
+/// `hasattr(module, "to_quantized")` check (`utils.py:824`).
+///
+/// Called with `(layer_path, weight_array)` for every key ending in
+/// `.weight` (the layer path is the key with the `.weight` suffix
+/// stripped). Returning `false` makes that weight pass through
+/// unchanged — even if its shape / `group_size` / per-layer override
+/// would otherwise make it eligible. mlxrs has no module tree to
+/// consult, so this caller-supplied predicate is the source of truth
+/// for which weights belong to a quantizable module class
+/// (Linear / Embedding / SwitchLinear in mlx-lm).
+///
+/// See [`default_eligible`] for the unconditional-true fallback that
+/// reproduces the historical "every `.weight` is a candidate" behavior.
+pub type Eligible<'a> = dyn Fn(&str, &Array) -> bool + 'a;
+
+/// The "every `.weight` is a candidate" eligibility predicate — the
+/// pre-Codex-fix default behavior. Pass this to [`quantize_weights`]
+/// when the caller does not have an architecture-specific allowlist
+/// and wants every weight that passes the structural guards
+/// (suffix / rank ≥ 2 / `last_dim % group_size == 0`) to be quantized.
+///
+/// Prefer a tighter caller-supplied closure when one is available;
+/// mlx-lm's `wrapped_predicate` (`utils.py:823`) only returns true
+/// for modules that expose `to_quantized` (the Linear / Embedding /
+/// SwitchLinear set), so any future architecture weight named
+/// `*.weight` that is not in that module class will be quantized
+/// anyway under this default — producing a checkpoint no dense layer
+/// can load. Use the explicit allowlist whenever the architecture is
+/// known.
+pub fn default_eligible(_path: &str, _weight: &Array) -> bool {
+  true
+}
 
 /// Whether `weights` already carries a quantized triple for `layer_path` —
 /// `<layer_path>.scales` is present. mlx-lm `class_predicate`
@@ -377,9 +433,9 @@ const WEIGHT_SUFFIX: &str = ".weight";
 /// that the checkpoint already pre-quantized this layer; an
 /// already-quantized weight is left untouched (no double-quantize).
 fn is_already_quantized(weights: &Weights, layer_path: &str) -> bool {
-  let mut key = String::with_capacity(layer_path.len() + ".scales".len());
+  let mut key = String::with_capacity(layer_path.len() + SCALES_SUFFIX.len());
   key.push_str(layer_path);
-  key.push_str(".scales");
+  key.push_str(SCALES_SUFFIX);
   weights.contains_key(&key)
 }
 
@@ -399,6 +455,20 @@ fn is_already_quantized(weights: &Weights, layer_path: &str) -> bool {
 /// same `<path>.weight` / `<path>.scales` / `<path>.biases` names mlx's
 /// `QuantizedLinear` uses (`mlx/python/mlx/nn/layers/quantized.py:134-137`).
 ///
+/// ## Eligibility predicate
+///
+/// `eligible` is the caller-supplied architecture allowlist — the
+/// structural analogue of mlx-lm's `hasattr(module, "to_quantized")`
+/// check (`utils.py:824`). mlxrs has no module tree, so the caller's
+/// closure is the source of truth for which weight paths are
+/// quantization targets. Use [`default_eligible`] to reproduce the
+/// historical "every `.weight` is a candidate" behavior; prefer a
+/// tighter architecture-specific closure when available (the historical
+/// default may quantize a future `.weight` that is not a Linear /
+/// Embedding / SwitchLinear target, producing a checkpoint no dense
+/// layer can load — mirroring mlx-lm's wrapped_predicate is the
+/// recommended pattern).
+///
 /// Per-layer overrides: a [`QuantizationOption::Skip`] passes that
 /// weight through unchanged; a [`QuantizationOption::Quantize`]
 /// substitutes its own `group_size` / `bits` / `mode` for the global
@@ -409,11 +479,27 @@ fn is_already_quantized(weights: &Weights, layer_path: &str) -> bool {
 /// `f"{p}.scales" in weights`, `utils.py:349-355`); their existing
 /// `.scales` / `.biases` siblings are preserved by the verbatim map copy.
 ///
+/// ## Sibling-name reservation
+///
+/// When a path `P` is selected for quantization, the generated triple
+/// (`P.weight` / `P.scales` / `P.biases`) reserves those names. A
+/// stale orphan `P.biases` (with no matching `P.scales` — therefore
+/// NOT a valid already-quantized triple) is a collision that would
+/// non-deterministically either overwrite or be overwritten by the
+/// generated bias depending on HashMap iteration order; this returns a
+/// recoverable [`Error::Backend`] naming the conflict instead. The
+/// already-quantized triple skip (`<path>.scales` present in input) is
+/// unchanged and still passes through verbatim.
+///
 /// **Failure handling.** Every quantization op is fallible
 /// ([`crate::ops::quantized::quantize`] propagates mlx-c's error); a
 /// failure mid-walk drops the partially-built result map and returns
 /// `Err` — the input `weights` is consumed but no partial output escapes.
-pub fn quantize_weights(weights: Weights, cfg: &PerLayerQuantization) -> Result<Weights> {
+pub fn quantize_weights(
+  weights: Weights,
+  cfg: &PerLayerQuantization,
+  eligible: &Eligible<'_>,
+) -> Result<Weights> {
   // Out-map sized for "at most everything got quantized" (adds up to one
   // `.scales` + one `.biases` per `.weight` quantized, i.e. ≤ 3× the input
   // — a conservative upper bound).
@@ -430,6 +516,13 @@ pub fn quantize_weights(weights: Weights, cfg: &PerLayerQuantization) -> Result<
     let Some(layer_path) = key.strip_suffix(WEIGHT_SUFFIX) else {
       continue;
     };
+    // Caller-supplied eligibility — the structural analogue of mlx-lm's
+    // `hasattr(module, "to_quantized")` (`utils.py:824`). Pass 1 of the
+    // wrapped_predicate translation; fails the rest of the chain
+    // immediately and the weight passes through unchanged.
+    if !eligible(layer_path, arr) {
+      continue;
+    }
     // mlx-lm `utils.py:349-355`: skip when the checkpoint already shipped
     // a `<path>.scales` for this layer (already-quantized).
     if is_already_quantized(&weights, layer_path) {
@@ -457,17 +550,49 @@ pub fn quantize_weights(weights: Weights, cfg: &PerLayerQuantization) -> Result<
     if gs == 0 || last % gs != 0 {
       continue;
     }
+    // Sibling-name reservation. We're about to write `P.weight` /
+    // `P.scales` / `P.biases`; an orphan `P.biases` (without `P.scales`,
+    // so not a valid already-quantized triple — that case was already
+    // filtered above) in the input collides with the generated bias
+    // non-deterministically (HashMap iteration order). REJECT rather
+    // than silently corrupt the output. An orphan `P.scales` would have
+    // tripped `is_already_quantized` already, so we don't need to
+    // re-check it here — but be defensive: if BOTH siblings somehow
+    // arrive without a `.weight` having been skipped, also reject.
+    let scales_key = format!("{layer_path}{SCALES_SUFFIX}");
+    let biases_key = format!("{layer_path}{BIASES_SUFFIX}");
+    if weights.contains_key(&biases_key) {
+      return Err(Error::Backend {
+        message: format!(
+          "quantize_weights: layer {layer_path}: input has a stale `{biases_key}` \
+           with no matching `{scales_key}` (not a valid already-quantized triple); \
+           refusing to silently overwrite the generated bias"
+        ),
+      });
+    }
+    if weights.contains_key(&scales_key) {
+      // Defensive — `is_already_quantized` above should have caught
+      // this, but if some future refactor changes that gate, this
+      // keeps the invariant ("we never overwrite a stale sibling")
+      // independent of the earlier check.
+      return Err(Error::Backend {
+        message: format!(
+          "quantize_weights: layer {layer_path}: input has a `{scales_key}` \
+           that was not classified as already-quantized; refusing to silently \
+           overwrite the generated scales"
+        ),
+      });
+    }
     to_quantize.push((layer_path.to_string(), q));
   }
 
   let quantize_set: HashMap<String, Quantization> = to_quantize.into_iter().collect();
 
   // Pass 2: walk again, quantize the chosen ones, copy everything else
-  // verbatim. The iteration order doesn't matter because the output keys
-  // are unique (`<path>.weight` / `<path>.scales` / `<path>.biases` are
-  // disjoint with anything else in the input — a hostile checkpoint that
-  // ships a stray `<path>.biases` for a not-already-quantized layer is the
-  // ONLY way to clash, and the `is_already_quantized` gate covers it).
+  // verbatim. Generated triple names (`<path>.weight` / `<path>.scales` /
+  // `<path>.biases` for each path in `quantize_set`) were reserved by the
+  // sibling-collision check in pass 1, so there is no input key that can
+  // collide with them.
   for (key, arr) in weights {
     let layer_path = key.strip_suffix(WEIGHT_SUFFIX);
     let quant_match = layer_path.and_then(|p| quantize_set.get(p).map(|q| (p, *q)));
@@ -479,10 +604,10 @@ pub fn quantize_weights(weights: Weights, cfg: &PerLayerQuantization) -> Result<
       // the biases at `<path>.biases` —
       // `mlx/python/mlx/nn/layers/quantized.py:134-137`. Preserve the
       // names so the resulting map round-trips with mlx-lm's saved layout.
-      out.insert(format!("{path}.weight"), w_q);
-      out.insert(format!("{path}.scales"), scales);
+      out.insert(format!("{path}{WEIGHT_SUFFIX}"), w_q);
+      out.insert(format!("{path}{SCALES_SUFFIX}"), scales);
       if let Some(b) = biases {
-        out.insert(format!("{path}.biases"), b);
+        out.insert(format!("{path}{BIASES_SUFFIX}"), b);
       }
     } else {
       out.insert(key, arr);
@@ -742,7 +867,7 @@ mod tests {
     weights.insert("model.norm.gamma".to_string(), other);
     let cfg = PerLayerQuantization::from_global(Quantization::affine(group_size as i32, 4));
 
-    let out = quantize_weights(weights, &cfg).expect("quantize");
+    let out = quantize_weights(weights, &cfg, &default_eligible).expect("quantize");
 
     // Eligible weights: replaced with quantized triples (.weight + .scales
     // + .biases for affine).
@@ -805,7 +930,7 @@ mod tests {
 
     let cfg = PerLayerQuantization::from_global(Quantization::affine(group_size as i32, 4));
 
-    let quantized = quantize_weights(weights, &cfg).unwrap();
+    let quantized = quantize_weights(weights, &cfg, &default_eligible).unwrap();
     let dequantized = dequantize_weights(quantized, &cfg).unwrap();
 
     let mut deq = dequantized
@@ -848,7 +973,7 @@ mod tests {
       per_layer,
     };
 
-    let out = quantize_weights(weights, &cfg).unwrap();
+    let out = quantize_weights(weights, &cfg, &default_eligible).unwrap();
     let pass = out.get("model.embed_tokens.weight").expect(".weight");
     assert_eq!(pass.shape(), vec![n_rows, group_size]);
     assert_eq!(pass.dtype().unwrap(), crate::dtype::Dtype::F32);
@@ -877,7 +1002,7 @@ mod tests {
       per_layer,
     };
 
-    let out = quantize_weights(weights, &cfg).unwrap();
+    let out = quantize_weights(weights, &cfg, &default_eligible).unwrap();
     // Quantized at group_size 32: scales / biases have one group per row
     // (last / group_size = 32 / 32 = 1).
     let scales = out.get("model.embed_tokens.scales").expect(".scales");
@@ -885,5 +1010,163 @@ mod tests {
     let w_q = out.get("model.embed_tokens.weight").expect(".weight");
     // bits=4 packs 8 elements per uint32 → last axis is 32 / 8 = 4.
     assert_eq!(w_q.shape(), vec![n_rows, 4]);
+  }
+
+  // ──────────────── new Codex-review fixtures ────────────────
+
+  /// Fix 1: a weight whose key ends in `.weight` AND meets every
+  /// structural guard (rank ≥ 2, last-axis divisible by group_size) but
+  /// the caller-supplied eligibility predicate rejects → passes through
+  /// unchanged (no `.scales` / `.biases` emitted). Mirrors mlx-lm's
+  /// `wrapped_predicate` returning `False` for a non-Linear /
+  /// Embedding / SwitchLinear module (`utils.py:824`).
+  #[test]
+  fn quantize_weights_predicate_rejected_passes_through() {
+    let group_size = 64_usize;
+    let n_rows = 2_usize;
+    let w = arr_f32(&vec![0.5_f32; n_rows * group_size], &[n_rows, group_size]);
+    let mut weights: Weights = HashMap::new();
+    weights.insert("model.some_future_module.weight".to_string(), w);
+
+    let cfg = PerLayerQuantization::from_global(Quantization::affine(group_size as i32, 4));
+    // Predicate that rejects this specific architecture's "future" module.
+    let reject_all: &Eligible<'_> = &|_path: &str, _arr: &Array| false;
+
+    let out = quantize_weights(weights, &cfg, reject_all).unwrap();
+    let pass = out.get("model.some_future_module.weight").expect(".weight");
+    assert_eq!(pass.shape(), vec![n_rows, group_size]);
+    assert_eq!(pass.dtype().unwrap(), crate::dtype::Dtype::F32);
+    assert!(!out.contains_key("model.some_future_module.scales"));
+    assert!(!out.contains_key("model.some_future_module.biases"));
+  }
+
+  /// Fix 1: a predicate that selects a SPECIFIC path AND every other
+  /// structural guard passes → that path IS quantized (.weight replaced,
+  /// .scales / .biases emitted), while a sibling path the predicate
+  /// rejects passes through unchanged. Confirms the predicate is the
+  /// PRIMARY filter and the structural guards run after.
+  #[test]
+  fn quantize_weights_predicate_approved_quantizes() {
+    let group_size = 64_usize;
+    let n_rows = 2_usize;
+    let w_yes = arr_f32(&vec![0.5_f32; n_rows * group_size], &[n_rows, group_size]);
+    let w_no = arr_f32(&vec![0.5_f32; n_rows * group_size], &[n_rows, group_size]);
+    let mut weights: Weights = HashMap::new();
+    weights.insert("model.linear_class.weight".to_string(), w_yes);
+    weights.insert("model.other_class.weight".to_string(), w_no);
+
+    let cfg = PerLayerQuantization::from_global(Quantization::affine(group_size as i32, 4));
+    let only_linear: &Eligible<'_> = &|path: &str, _arr: &Array| path == "model.linear_class";
+
+    let out = quantize_weights(weights, &cfg, only_linear).unwrap();
+    // Selected: quantized triple.
+    assert_eq!(
+      out
+        .get("model.linear_class.scales")
+        .expect("scales for approved layer")
+        .shape(),
+      vec![n_rows, 1]
+    );
+    // Rejected: pass-through (no .scales emitted).
+    assert_eq!(
+      out
+        .get("model.other_class.weight")
+        .expect("rejected layer .weight kept")
+        .shape(),
+      vec![n_rows, group_size]
+    );
+    assert!(!out.contains_key("model.other_class.scales"));
+    assert!(!out.contains_key("model.other_class.biases"));
+  }
+
+  // Fix 2: schema-required keys.
+
+  #[test]
+  fn quantization_missing_bits_errors() {
+    let cfg_json = r#"{ "quantization": { "group_size": 64 } }"#;
+    let err = parse_quantization(cfg_json).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+      msg.contains("bits"),
+      "error should mention the missing `bits` key, got: {msg}"
+    );
+  }
+
+  #[test]
+  fn quantization_missing_group_size_errors() {
+    let cfg_json = r#"{ "quantization": { "bits": 4 } }"#;
+    let err = parse_quantization(cfg_json).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+      msg.contains("group_size"),
+      "error should mention the missing `group_size` key, got: {msg}"
+    );
+  }
+
+  #[test]
+  fn quantization_both_present_ok() {
+    let cfg_json = r#"{ "quantization": { "group_size": 32, "bits": 4 } }"#;
+    let plq = parse_quantization(cfg_json).unwrap().unwrap();
+    let q = plq.quantization.expect("global quant present");
+    assert_eq!(q.group_size, 32);
+    assert_eq!(q.bits, 4);
+  }
+
+  // Fix 3: stale sibling collision.
+
+  #[test]
+  fn quantize_weights_orphan_biases_collision_errors() {
+    let group_size = 64_usize;
+    let n_rows = 2_usize;
+    let w = arr_f32(&vec![0.5_f32; n_rows * group_size], &[n_rows, group_size]);
+    // Orphan biases — NO matching `.scales`, so not a valid
+    // already-quantized triple. The predicate selects this path → the
+    // sibling-collision guard fires.
+    let stale_biases = arr_f32(&vec![0.0_f32; n_rows], &[n_rows, 1]);
+    let mut weights: Weights = HashMap::new();
+    weights.insert("model.foo.weight".to_string(), w);
+    weights.insert("model.foo.biases".to_string(), stale_biases);
+
+    let cfg = PerLayerQuantization::from_global(Quantization::affine(group_size as i32, 4));
+    let err = quantize_weights(weights, &cfg, &default_eligible).unwrap_err();
+    match err {
+      Error::Backend { message } => {
+        assert!(
+          message.contains("model.foo"),
+          "error should name the colliding layer, got: {message}"
+        );
+        assert!(
+          message.contains(".biases"),
+          "error should name the colliding sibling, got: {message}"
+        );
+      }
+      other => panic!("expected Error::Backend, got: {other:?}"),
+    }
+  }
+
+  /// Fix 3: a VALID already-quantized triple (`.weight` + `.scales`
+  /// (+ `.biases`)) STILL passes through unchanged. The collision guard
+  /// must not regress the already-quantized skip.
+  #[test]
+  fn quantize_weights_valid_existing_triple_still_skipped() {
+    let group_size = 64_usize;
+    let n_rows = 2_usize;
+    let w = arr_f32(&vec![0.0_f32; n_rows * group_size], &[n_rows, group_size]);
+    let scales = arr_f32(&vec![1.0_f32; n_rows], &[n_rows, 1]);
+    let biases = arr_f32(&vec![0.0_f32; n_rows], &[n_rows, 1]);
+    let mut weights: Weights = HashMap::new();
+    weights.insert("model.already.weight".to_string(), w);
+    weights.insert("model.already.scales".to_string(), scales);
+    weights.insert("model.already.biases".to_string(), biases);
+
+    let cfg = PerLayerQuantization::from_global(Quantization::affine(group_size as i32, 4));
+    let out = quantize_weights(weights, &cfg, &default_eligible).expect("valid triple passes");
+    // `.weight` still dense-shape (not the packed [N, 8] of quantized at 4 bits).
+    assert_eq!(
+      out.get("model.already.weight").unwrap().shape(),
+      vec![n_rows, group_size]
+    );
+    assert!(out.contains_key("model.already.scales"));
+    assert!(out.contains_key("model.already.biases"));
   }
 }
