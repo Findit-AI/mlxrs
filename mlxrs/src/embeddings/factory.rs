@@ -546,7 +546,12 @@ const MAX_WEIGHT_DIR_DEPTH: usize = 64;
 /// 2. **Back-compat `weight*.safetensors` (root only):** if there is no
 ///    `model*.safetensors` anywhere, mlx-embeddings `load_model` retries
 ///    `glob(model_path / "weight*.safetensors")` — the legacy layout, **not**
-///    recursive (no `**`) — and so does this loader.
+///    recursive (no `**`) — and so does this loader. The fallback fires only on
+///    a genuinely empty `model*.safetensors` match: a `model*.safetensors`
+///    dirent that exists but is broken (dangling symlink / non-regular target)
+///    makes [`collect_shards_recursive`] **error**, so a corrupt primary shard
+///    fails the load loudly rather than silently degrading to a stale legacy
+///    snapshot.
 ///
 /// **Nested-shard key prefixing (mlx-embeddings parity):** a shard found in a
 /// *child* directory has every tensor key rewritten to `<folder>.<key>` before
@@ -662,8 +667,13 @@ fn collect_shards_root(dir: &Path, pred: impl Fn(&str) -> bool) -> Result<Vec<Di
 ///    `scandir` it cannot read; an unreadable subdirectory is **skipped** and
 ///    the rest of the walk continues, rather than failing the whole load (a
 ///    single unreadable nested dir must not abort a model with valid shards
-///    elsewhere). The same suppression covers a dirent whose type / target
-///    cannot be resolved (e.g. a dangling symlink).
+///    elsewhere). This suppression is for unreadable *directories* and for
+///    entries whose name does **not** match `pred` (irrelevant non-shard
+///    files/dirs) only — a dirent **named** like a shard whose target cannot be
+///    resolved (a dangling symlink, or a non-regular target) is **not**
+///    suppressed: it is a recoverable [`Error`] so a broken `model.safetensors`
+///    fails the load loudly instead of silently vanishing (which would let
+///    `load_weights` fall back to a stale `weight*.safetensors`).
 /// 2. **Hidden path components are excluded.** With `include_hidden=False`
 ///    (`glob`'s default), `**` does not match any path component whose name
 ///    starts with `.`. We therefore skip every dot-prefixed entry — both
@@ -674,17 +684,27 @@ fn collect_shards_root(dir: &Path, pred: impl Fn(&str) -> bool) -> Result<Vec<Di
 /// 3. **Symlinked directories are followed**, with cycle protection. `**`
 ///    follows directory symlinks, so we resolve each entry via `fs::metadata`
 ///    (which dereferences symlinks) and descend symlink-to-dir entries too —
-///    guarding against symlink loops with a visited-set of **canonicalized**
-///    directory paths ([`std::fs::canonicalize`]): a directory whose real path
-///    was already walked is skipped, so a symlink cycle terminates instead of
-///    recursing forever. [`MAX_WEIGHT_DIR_DEPTH`] remains a secondary, constant
-///    stack bound for a (symlink-free) pathologically deep tree.
+///    guarding against symlink loops with a **recursion-stack** set of
+///    **canonicalized** directory paths ([`std::fs::canonicalize`]): a directory
+///    whose real path is already on the current descent stack (a true cycle —
+///    the canonical path is an *ancestor*) is skipped, so a symlink cycle
+///    terminates instead of recursing forever. The canonical path is **removed
+///    from the stack after** the recursive call returns, so two distinct walked
+///    paths that alias the **same** real directory (`real_text_model/` itself
+///    plus a sibling `text_model -> real_text_model`, or two component symlinks
+///    sharing one target) are **each** walked with their own as-walked prefix —
+///    a global never-removed visited-set would instead drop whichever alias
+///    `read_dir` reached second, losing required tensors with a
+///    filesystem-iteration-order-dependent surviving prefix.
+///    [`MAX_WEIGHT_DIR_DEPTH`] remains a secondary, constant stack bound for a
+///    (symlink-free) pathologically deep tree.
 ///
 /// A matched file is still gated on its resolved target being a **regular file**
-/// (a hostile dir could name a FIFO / device / directory `model.safetensors`, on
-/// which the IO loader would fail opaquely; HF Hub snapshots store shards as
-/// symlinks into `blobs/<hash>`, which this follows). For each match the prefix
-/// is `Some(parent.name)` when the file's immediate parent (as **walked** — the
+/// — but, per (1), a hostile dir naming a FIFO / device / directory / dangling
+/// symlink `model.safetensors` fails the load with a recoverable [`Error`]
+/// rather than being silently skipped (HF Hub snapshots store shards as symlinks
+/// into `blobs/<hash>`, which this follows). For each match the prefix is
+/// `Some(parent.name)` when the file's immediate parent (as **walked** — the
 /// symlink name, not its canonicalized target, matching `glob`'s returned path)
 /// is **not** `root`, else `None` (mlx-embeddings' `Path(wf).parent != model_path`
 /// test using `Path(wf).parent.name`).
@@ -693,15 +713,17 @@ fn collect_shards_recursive(
   pred: impl Fn(&str) -> bool,
 ) -> Result<Vec<DiscoveredShard>> {
   let mut out = Vec::new();
-  // Seed the cycle-guard with `root`'s real path so a symlink pointing straight
-  // back to the model root is caught on first encounter. If `root` itself cannot
-  // be canonicalized the per-directory inserts below still catch every other
-  // cycle (a symlink to any *descended* ancestor).
-  let mut visited: HashSet<PathBuf> = HashSet::new();
+  // Recursion-stack cycle-guard: the canonicalized paths of the directories
+  // currently being descended (root + every ancestor of `dir`). Seed it with
+  // `root`'s real path so a symlink pointing straight back to the model root is
+  // caught as a cycle on first encounter. If `root` itself cannot be
+  // canonicalized the per-directory inserts below still catch every other cycle
+  // (a symlink to any *descended* ancestor).
+  let mut stack: HashSet<PathBuf> = HashSet::new();
   if let Ok(canon_root) = std::fs::canonicalize(root) {
-    visited.insert(canon_root);
+    stack.insert(canon_root);
   }
-  walk_shards(root, root, &pred, 0, &mut visited, &mut out)?;
+  walk_shards(root, root, &pred, 0, &mut stack, &mut out)?;
   out.sort_by(|a, b| a.path.cmp(&b.path));
   Ok(out)
 }
@@ -709,14 +731,16 @@ fn collect_shards_recursive(
 /// One directory level of [`collect_shards_recursive`]'s walk. `root` is the
 /// model directory (for the prefix decision); `dir` is the directory currently
 /// being read (the path **as walked**, so a symlinked component keeps its link
-/// name); `visited` is the cycle-guard of canonicalized directory paths already
-/// descended; `depth` is the level below `root`.
+/// name); `stack` is the recursion-stack cycle-guard — the canonicalized paths
+/// of `root` and every directory currently being descended (inserted before a
+/// recursive call, removed after it returns); `depth` is the level below
+/// `root`.
 fn walk_shards(
   root: &Path,
   dir: &Path,
   pred: &impl Fn(&str) -> bool,
   depth: usize,
-  visited: &mut HashSet<PathBuf>,
+  stack: &mut HashSet<PathBuf>,
   out: &mut Vec<DiscoveredShard>,
 ) -> Result<()> {
   if depth > MAX_WEIGHT_DIR_DEPTH {
@@ -747,38 +771,78 @@ fn walk_shards(
       continue;
     }
     let path = entry.path();
+    let name_matches = pred(name);
     // Resolve the dirent through symlinks (`fs::metadata` dereferences) so a
     // symlink-to-dir is descended and a symlink-to-file is gated as a file —
-    // matching `glob`'s `**`, which follows directory symlinks. A resolution
-    // error (e.g. a dangling symlink) is suppressed, like a scan error.
-    let Ok(meta) = std::fs::metadata(&path) else {
-      continue;
+    // matching `glob`'s `**`, which follows directory symlinks.
+    //
+    // Suppression of a resolution failure is gated on the FILENAME predicate,
+    // because `glob`'s `model*.safetensors` match is name-based: a dirent NAMED
+    // like a shard whose target is unresolvable (a dangling symlink) or
+    // non-regular must NOT vanish — that would let `load_weights` silently fall
+    // back to a stale root `weight*.safetensors`. A non-shard-named entry whose
+    // target can't be resolved is irrelevant and IS skipped (it can't be a
+    // descend target or a match either way).
+    let meta = match std::fs::metadata(&path) {
+      Ok(meta) => meta,
+      Err(e) => {
+        if name_matches {
+          // A `model*.safetensors`-named dirent that is a dangling symlink (or
+          // otherwise unresolvable) — fail the load loudly with a recoverable
+          // error, like `glob` yielding a path `load_safetensors` then rejects.
+          return Err(Error::Backend {
+            message: format!(
+              "weight shard {} cannot be resolved (broken symlink / unreadable target): {e}",
+              path.display()
+            ),
+          });
+        }
+        // A non-shard entry whose target can't be resolved — irrelevant, skip.
+        continue;
+      }
     };
     if meta.is_dir() {
-      // Cycle guard: descend a directory (real or symlinked) only once per real
-      // path. `canonicalize` resolves symlinks + `..`; if it fails (e.g. a
-      // freshly-broken link mid-walk) the dir is skipped rather than risking an
-      // unguarded descent. `insert` returns false when the canonical path was
-      // already walked → a symlink loop terminates here.
+      // Cycle guard (recursion-stack): descend a directory (real or symlinked)
+      // unless its real path is already on the CURRENT descent stack — i.e. it
+      // is an ancestor, a true symlink cycle. `canonicalize` resolves symlinks +
+      // `..`; if it fails (e.g. a freshly-broken link mid-walk) the dir is
+      // skipped rather than risking an unguarded descent. `insert` returns false
+      // when the canonical path is already on the stack → a symlink loop
+      // terminates here. The canonical path is REMOVED after the recursive call
+      // so a sibling alias to the SAME real directory is still walked (each with
+      // its own as-walked prefix) — only an ancestor blocks descent.
       let Ok(canon) = std::fs::canonicalize(&path) else {
         continue;
       };
-      if !visited.insert(canon) {
+      if !stack.insert(canon.clone()) {
         continue;
       }
       // Descend with the path AS WALKED (`path`, keeping any symlink name) so a
       // shard's immediate-parent prefix is the link name, matching `glob`'s
       // returned path; the canonical form is only the cycle-guard key.
-      walk_shards(root, &path, pred, depth + 1, visited, out)?;
+      let res = walk_shards(root, &path, pred, depth + 1, stack, out);
+      // Pop this directory off the recursion stack whether the descent
+      // succeeded or errored, so the guard reflects only live ancestors.
+      stack.remove(&canon);
+      res?;
+      continue;
+    }
+    if !name_matches {
+      // A non-shard-named file — irrelevant to `model*.safetensors`, skip.
       continue;
     }
     if !meta.is_file() {
-      // A non-regular target (FIFO / device / socket) named like a shard is
-      // skipped — the IO loader would only fail opaquely on it.
-      continue;
-    }
-    if !pred(name) {
-      continue;
+      // A `model*.safetensors`-named entry whose target is non-regular (FIFO /
+      // device / socket / directory) — fail loudly rather than silently skip,
+      // for the same reason a dangling symlink does: the canonical shard name
+      // must not vanish into a stale `weight*.safetensors` fallback.
+      return Err(Error::Backend {
+        message: format!(
+          "weight shard {} is not a regular file (FIFO / device / directory); \
+           refusing to load",
+          path.display()
+        ),
+      });
     }
     // mlx-embeddings: `folder_name = Path(wf).parent.name` and apply the prefix
     // iff `Path(wf).parent != model_path`. The immediate parent's name
@@ -2078,6 +2142,83 @@ mod tests {
     assert!(weights.contains_key("root.weight"));
     assert!(weights.contains_key("sub.nested.weight"));
     assert_eq!(weights.len(), 2);
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn load_weights_walks_both_aliases_to_one_real_directory() {
+    // Two DISTINCT walked component directories alias the SAME real directory:
+    // a symlink `text_model -> real_text_model` sitting next to `real_text_model`
+    // itself, both directly under the model root. `glob`'s `**` walks EACH path
+    // with its own returned prefix, so BOTH `text_model.<key>` and
+    // `real_text_model.<key>` must appear. A global, never-removed visited-set
+    // would canonicalize-dedup the second alias `read_dir` reached, silently
+    // dropping a whole component's tensors with a filesystem-iteration-order
+    // -dependent surviving prefix. The recursion-stack guard (insert-before /
+    // remove-after) only blocks an ANCESTOR, so two siblings aliasing one target
+    // are each walked.
+    let dir = fresh_dir("alias-dirs");
+    write_one_tensor(&dir.join("model.safetensors"), "root.weight");
+    // The real component directory, directly under the model root.
+    let real_text = dir.join("real_text_model");
+    std::fs::create_dir_all(&real_text).unwrap();
+    write_one_tensor(&real_text.join("model.safetensors"), "encoder.weight");
+    // A sibling symlink to it — a second, distinct path to the same real dir.
+    std::os::unix::fs::symlink(&real_text, dir.join("text_model")).unwrap();
+
+    let weights = load_weights(&dir).expect("aliased component dirs must both load");
+    assert!(weights.contains_key("root.weight"));
+    assert!(
+      weights.contains_key("real_text_model.encoder.weight"),
+      "the real directory alias must be walked; got {:?}",
+      weights.keys().collect::<Vec<_>>()
+    );
+    assert!(
+      weights.contains_key("text_model.encoder.weight"),
+      "the symlink alias to the SAME real dir must ALSO be walked (each path \
+       keeps its own prefix); got {:?}",
+      weights.keys().collect::<Vec<_>>()
+    );
+    // root + the two aliased shards' prefixed keys — neither alias dropped.
+    assert_eq!(weights.len(), 3);
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn load_weights_dangling_model_shard_fails_not_falls_back() {
+    // A `model.safetensors` that is a DANGLING symlink, next to a real
+    // `weight*.safetensors`. `glob`'s name-based match yields the broken
+    // `model*.safetensors` path → the load FAILS loudly. The walker must NOT
+    // silently skip the unresolvable shard and degrade to the stale legacy
+    // `weight*.safetensors` snapshot.
+    let dir = fresh_dir("dangling-shard");
+    // A legacy root shard that the buggy fallback would have loaded instead.
+    write_one_tensor(&dir.join("weights.safetensors"), "stale.weight");
+    // `model.safetensors` -> a nonexistent target: a dangling symlink.
+    std::os::unix::fs::symlink(
+      dir.join("does-not-exist.safetensors"),
+      dir.join("model.safetensors"),
+    )
+    .unwrap();
+
+    let result = load_weights(&dir);
+    let Err(err) = result else {
+      panic!(
+        "a dangling `model.safetensors` must fail the load, not fall back to \
+         the stale `weight*.safetensors`"
+      );
+    };
+    // A recoverable discovery error — must mention the broken shard, NOT be a
+    // success that loaded `stale.weight`.
+    assert!(
+      matches!(err, Error::Backend { .. }),
+      "expected a recoverable Backend error; got {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+      msg.contains("model.safetensors"),
+      "the error must name the broken shard; got: {msg}"
+    );
   }
 
   #[cfg(unix)]
