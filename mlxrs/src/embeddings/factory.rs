@@ -671,24 +671,46 @@ fn load_weights(dir: &Path) -> Result<EmbeddingWeights> {
 /// snapshots store shards as symlinks into `blobs/<hash>`; a *valid* such
 /// symlink resolves to a regular file and passes.)
 ///
-/// **Non-UTF-8 paths.** `glob_with` takes a `&str` pattern and internally
-/// `unwrap()`s `Path::to_str()` on it, so a model directory whose path is not
-/// valid UTF-8 would *panic* inside the crate. That is rejected up front here
-/// with a recoverable [`Error::Backend`]. A non-UTF-8 *descendant* name is
-/// distinct: with `require_literal_leading_dot: false` `glob` no longer runs its
-/// `to_str().unwrap()` hidden-filter over directory children, so a non-UTF-8
-/// sibling on a mounted NFS/exFAT/case-sensitive volume no longer panics the
-/// walk — it simply does not match the ASCII `model*.safetensors` pattern and is
-/// skipped. One non-UTF-8 case *is* still reachable, because the match is
-/// name-based: a legitimately-named (ASCII) `model*.safetensors` shard sitting
-/// in a *child directory whose folder name is non-UTF-8* is yielded by the
-/// pattern, yet its non-UTF-8 immediate-parent name cannot become the `String`
-/// key prefix — that shard is rejected with a recoverable [`Error::Backend`]
-/// naming its path (rather than silently mis-merging its keys as if it were a
-/// root shard). The literal `dir` portion of the pattern is
-/// [`glob::Pattern::escape`]d so a real directory name containing a glob
-/// metacharacter (`*`, `?`, `[`, `]`) is matched literally, not interpreted —
-/// only the `pattern_suffix` carries pattern metacharacters.
+/// **Non-UTF-8 paths — fully closed by a byte-level preflight.** Every path
+/// component (the model dir, an intermediate directory, an immediate parent
+/// folder, or the shard's own leaf file name) that is not valid UTF-8 is either
+/// handled or produces a clean [`Error::Backend`] *before* a stale fallback can
+/// fire:
+///
+/// - **Model dir path:** `glob_with` takes a `&str` pattern and internally
+///   `unwrap()`s `Path::to_str()` on it, so a model directory whose own path is
+///   not valid UTF-8 would *panic* inside the crate. It is rejected up front
+///   here with a recoverable [`Error::Backend`].
+/// - **Immediate parent folder:** the match is name-based, so a legitimately
+///   -named (ASCII) `model*.safetensors` shard sitting in a *child directory
+///   whose folder name is non-UTF-8* is yielded by the pattern, yet that
+///   non-UTF-8 immediate-parent name cannot become the `String` key prefix —
+///   that shard is rejected with a recoverable [`Error::Backend`] naming its
+///   path (rather than silently mis-merging its keys as if it were a root
+///   shard) by the prefix-derivation step below.
+/// - **Shard leaf file name:** `glob 0.3.3` matches a non-recursive pattern
+///   component via `file_name().and_then(|s| s.to_str())` and `continue`s on
+///   `None` (`glob-0.3.3/src/lib.rs:463-467`, `// FIXME (#9639)`). So a
+///   directory entry whose own leaf name is *not* valid UTF-8 — e.g. Unix bytes
+///   `model\xff.safetensors` — is **never yielded** by `glob`, even though it
+///   matches the `model*.safetensors` shard predicate. Left unchecked, such a
+///   primary shard is silently dropped and [`load_weights`] degrades to a stale
+///   `weight*.safetensors` fallback with no error. To close that hole,
+///   [`collect_glob_shards`] runs a [`scan_non_utf8_shards`] **byte-level
+///   preflight** alongside the `glob` pass: it inspects every entry's leaf name
+///   at the `OsStr`/byte level (no `to_str`), and if any non-UTF-8 leaf matches
+///   a shard pattern it returns an [`Error::Backend`] naming the path before
+///   any weights are merged.
+///
+/// A non-UTF-8 *descendant* name that does **not** match a shard pattern is
+/// simply skipped: with `require_literal_leading_dot: false` `glob` no longer
+/// runs its `to_str().unwrap()` hidden-filter over directory children, so a
+/// non-UTF-8 sibling on a mounted NFS/exFAT/case-sensitive volume no longer
+/// panics the walk — it just does not match the ASCII pattern. The literal
+/// `dir` portion of the pattern is [`glob::Pattern::escape`]d so a real
+/// directory name containing a glob metacharacter (`*`, `?`, `[`, `]`) is
+/// matched literally, not interpreted — only the `pattern_suffix` carries
+/// pattern metacharacters.
 ///
 /// A malformed *pattern* (a [`glob::PatternError`]) would be a bug in this
 /// fixed, escaped pattern, not untrusted input, and maps to [`Error::Backend`].
@@ -755,6 +777,18 @@ fn collect_glob_shards(dir: &Path, pattern_suffix: &str) -> Result<Vec<Discovere
       dir.display()
     ),
   })?;
+
+  // Byte-level preflight: `glob 0.3.3` matches a leaf component via
+  // `file_name().and_then(|s| s.to_str())` and silently `continue`s on `None`
+  // (`glob-0.3.3/src/lib.rs:463-467`) — so a directory entry whose OWN leaf
+  // name is not valid UTF-8 (e.g. `model\xff.safetensors`) is never yielded by
+  // `glob`, even though it matches the shard predicate. Were it merely skipped,
+  // a non-UTF-8-named primary shard would vanish and `load_weights` would
+  // degrade to a stale `weight*.safetensors` fallback with no error. The
+  // preflight scans for exactly that case at the `OsStr`/byte level and fails
+  // loudly *before* the merge — closing the last non-UTF-8 discovery hole. The
+  // `glob` path below is unchanged for valid-UTF-8 shards.
+  scan_non_utf8_shards(dir, pattern_suffix)?;
 
   // The literal model-dir prefix is escaped so a metacharacter in a real
   // directory name (`*`, `?`, `[`, `]`) is matched verbatim; only
@@ -863,6 +897,154 @@ fn collect_glob_shards(dir: &Path, pattern_suffix: &str) -> Result<Vec<Discovere
   // deterministic-merge contract does not silently depend on that.
   out.sort_by(|a, b| a.path.cmp(&b.path));
   Ok(out)
+}
+
+/// `true` if the OS string `name`'s **bytes** start with `prefix` and end with
+/// `suffix` — the byte-level form of the `glob` shard predicate (`model*` /
+/// `weight*` ... `*.safetensors`), evaluated with **no UTF-8 conversion** so a
+/// non-UTF-8 leaf file name can be tested without a `to_str` (which `glob`'s
+/// own matcher would drop on `None`).
+///
+/// On Unix the raw bytes are read via [`OsStrExt::as_bytes`]; elsewhere a lossy
+/// view is used (non-Unix has no byte accessor, and a lossy view still cannot
+/// panic — the ASCII `model`/`weight`/`.safetensors` literals survive any lossy
+/// conversion intact, so a non-Unix host never mis-classifies a real shard).
+fn name_bytes_match(name: &std::ffi::OsStr, prefix: &[u8], suffix: &[u8]) -> bool {
+  #[cfg(unix)]
+  let bytes: &[u8] = {
+    use std::os::unix::ffi::OsStrExt;
+    name.as_bytes()
+  };
+  #[cfg(not(unix))]
+  let lossy = name.to_string_lossy();
+  #[cfg(not(unix))]
+  let bytes: &[u8] = lossy.as_bytes();
+
+  bytes.len() >= prefix.len() + suffix.len() && bytes.starts_with(prefix) && bytes.ends_with(suffix)
+}
+
+/// Byte-level **preflight** for [`collect_glob_shards`]: detect any directory
+/// entry whose **leaf file name is not valid UTF-8** yet matches a shard
+/// pattern, and fail loudly with an [`Error::Backend`] naming it — *before* the
+/// `glob` pass and the weight merge.
+///
+/// This is the structural backstop for `glob 0.3.3`'s non-recursive leaf match,
+/// which reads `file_name().and_then(|s| s.to_str())` and silently `continue`s
+/// on `None` (`glob-0.3.3/src/lib.rs:463-467`, `// FIXME (#9639)`). A non-UTF-8
+/// -named `model*.safetensors` primary shard would therefore never be yielded
+/// by `glob`, and [`load_weights`] would silently degrade to a stale
+/// `weight*.safetensors` fallback. Detecting it here turns that silent
+/// mis-load into a clean, recoverable error.
+///
+/// The scan **mirrors the two `glob` passes** [`collect_glob_shards`] runs,
+/// dispatching on `pattern_suffix`:
+///
+/// - `"**/model*.safetensors"` → match a leaf whose bytes start with `b"model"`
+///   and end with `b".safetensors"`, searched **recursively** (like the `**`
+///   glob), descending every subdirectory.
+/// - `"weight*.safetensors"` → match a leaf whose bytes start with `b"weight"`
+///   and end with `b".safetensors"`, at the **root only** (the legacy fallback
+///   glob has no `**`).
+///
+/// The SAME hidden-component exclusion the `glob` path applies
+/// ([`path_has_hidden_component`] / [`starts_with_dot`]) is honoured: a
+/// `.`-prefixed directory is *not* descended and a `.`-prefixed entry is *not*
+/// flagged, so the preflight never errors on a path the `glob` pass would
+/// itself skip (a non-UTF-8 leaf can never *itself* be hidden — it does not
+/// begin with an ASCII `.` — but it may sit under a hidden ancestor). Recursion
+/// uses [`std::fs::read_dir`] (no new crate dependency).
+///
+/// An **IO error is suppressed**, exactly as the `glob` pass suppresses a
+/// `scandir` `OSError` (Python `glob` does likewise, and `collect_glob_shards`
+/// `continue`s past a per-entry `GlobError`): a `read_dir` that fails — an
+/// unreadable subdirectory, or even an unreadable model root — makes the
+/// preflight skip that subtree rather than error. This keeps "one unreadable
+/// nested directory must not abort a load whose real shards live elsewhere"
+/// intact; and an unreadable directory's entries cannot be enumerated by `glob`
+/// either, so there is no hidden non-UTF-8 shard to mis-load there. The
+/// preflight changes behavior in exactly one way: a non-UTF-8 leaf that `glob`
+/// *could* see (its parent is readable) but silently drops now errors.
+///
+/// The preflight only needs to **detect-and-error**: it does not replicate the
+/// `glob` crate's sort order, symlink-cycle termination, or
+/// regular-file/`stat` gate — those remain the `glob` pass's job for the
+/// valid-UTF-8 shards it does yield. Entry **type is intentionally not
+/// inspected**: a non-UTF-8 *directory* named `model\xff.safetensors` would
+/// equally be yielded by `glob`'s name-based match (and rejected by the stat
+/// gate); flagging any non-UTF-8 shard-named entry, file or not, keeps the
+/// fail-loud contract complete.
+fn scan_non_utf8_shards(dir: &Path, pattern_suffix: &str) -> Result<()> {
+  // Dispatch on the exact `pattern_suffix` strings `collect_glob_shards` is
+  // called with. `(prefix, suffix, recursive)` is the byte-level transcription
+  // of the `glob` pattern; an unrecognized suffix is a caller bug, not
+  // untrusted input — be conservative and scan nothing rather than guess.
+  let (prefix, suffix, recursive): (&[u8], &[u8], bool) = match pattern_suffix {
+    "**/model*.safetensors" => (b"model", b".safetensors", true),
+    "weight*.safetensors" => (b"weight", b".safetensors", false),
+    _ => return Ok(()),
+  };
+
+  // An unreadable directory is SKIPPED, mirroring `glob`'s `scandir` `OSError`
+  // suppression (and `collect_glob_shards`' per-entry `GlobError` `continue`):
+  // one unreadable subtree — or even an unreadable model root — must not abort
+  // a load whose real shards live elsewhere. An unreadable directory's children
+  // are invisible to `glob` too, so no non-UTF-8 shard is silently mis-loaded.
+  let Ok(entries) = std::fs::read_dir(dir) else {
+    return Ok(());
+  };
+
+  for entry in entries {
+    // A per-entry enumeration error is likewise skipped (same `glob`-parity
+    // suppression); it cannot have yielded a name to inspect anyway.
+    let Ok(entry) = entry else { continue };
+    let name = entry.file_name();
+
+    // `include_hidden=False` parity: a `.`-prefixed entry is neither flagged
+    // nor descended — exactly what the `glob` pass + `path_has_hidden_component`
+    // do. (Checked byte-level, so a non-UTF-8 name never panics here.)
+    if starts_with_dot(&name) {
+      continue;
+    }
+
+    // A non-UTF-8 leaf that matches the shard predicate is the silent-skip hole
+    // `glob` leaves open — fail loudly, naming the path (lossy display).
+    if name.to_str().is_none() && name_bytes_match(&name, prefix, suffix) {
+      let path = entry.path();
+      return Err(Error::Backend {
+        message: format!(
+          "weight shard {} has a non-UTF-8 file name matching the `{}*{}` shard pattern; \
+           `glob` silently skips it (glob 0.3.3 leaf match drops non-UTF-8 names), which would \
+           let the load fall back to stale weights — refusing to load",
+          path.display(),
+          String::from_utf8_lossy(prefix),
+          String::from_utf8_lossy(suffix),
+        ),
+      });
+    }
+
+    // Recurse into subdirectories for the `**/model*.safetensors` pass only —
+    // the legacy `weight*.safetensors` glob is root-only. `file_type()` avoids
+    // an extra `stat`; on its (rare) failure fall back to `Path::is_dir`.
+    if recursive {
+      let is_dir = match entry.file_type() {
+        Ok(ft) => ft.is_dir(),
+        Err(_) => entry.path().is_dir(),
+      };
+      if is_dir {
+        // A symlinked component directory is descended (matching `glob`, which
+        // follows directory symlinks); `read_dir` does not itself recurse, so
+        // a symlink cycle cannot loop here without re-entering this call —
+        // which it does only through real subdirectory names, and the bounded
+        // model-directory trees this loads make that a non-concern (the
+        // accepted no-DoS-hardening scope decision). A non-UTF-8-named
+        // directory is descended too: its own `model.safetensors` child is
+        // matched by the recursive scan, and `collect_glob_shards`' non-UTF-8
+        // -parent reject covers the prefix.
+        scan_non_utf8_shards(&entry.path(), pattern_suffix)?;
+      }
+    }
+  }
+  Ok(())
 }
 
 /// Read `<dir>/config.json` **once**, returning the canonicalized
@@ -1937,6 +2119,85 @@ mod tests {
     // A valid number AS the matched value is still rejected (model_type must be
     // a string) — this is the existing non-string-value contract, unchanged.
     assert!(extract_string_field(r#"{"model_type": 1.0}"#, "model_type").is_err());
+  }
+
+  // ───────────── name_bytes_match unit tests ─────────────
+  //
+  // `name_bytes_match` is the byte-level shard predicate the non-UTF-8
+  // preflight (`scan_non_utf8_shards`) uses in place of a `to_str` match — it
+  // must classify a leaf name purely from its raw bytes, including names that
+  // are NOT valid UTF-8 (the case `glob` itself silently drops). These run on
+  // every host, unlike the filesystem-fixture tests which skip on a
+  // UTF-8-enforcing volume.
+
+  #[cfg(unix)]
+  #[test]
+  fn name_bytes_match_classifies_shard_names_at_byte_level() {
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+    let model_pat = (b"model".as_slice(), b".safetensors".as_slice());
+    let weight_pat = (b"weight".as_slice(), b".safetensors".as_slice());
+
+    // Plain ASCII shard names match their pattern.
+    let os = |b: &[u8]| OsString::from_vec(b.to_vec());
+    assert!(name_bytes_match(
+      &os(b"model.safetensors"),
+      model_pat.0,
+      model_pat.1
+    ));
+    assert!(name_bytes_match(
+      &os(b"model-00001-of-00002.safetensors"),
+      model_pat.0,
+      model_pat.1
+    ));
+    assert!(name_bytes_match(
+      &os(b"weights.safetensors"),
+      weight_pat.0,
+      weight_pat.1
+    ));
+
+    // A NON-UTF-8 leaf still matches purely on its bytes — the whole point of
+    // the preflight (`glob` would drop this on a `to_str()` `None`).
+    let mut bad = b"model".to_vec();
+    bad.push(0xFF);
+    bad.extend_from_slice(b".safetensors");
+    assert!(
+      name_bytes_match(&os(&bad), model_pat.0, model_pat.1),
+      "a non-UTF-8 `model\\xff.safetensors` leaf must match the model shard pattern"
+    );
+    assert!(
+      OsString::from_vec(bad.clone()).to_str().is_none(),
+      "fixture precondition: the leaf must be non-UTF-8"
+    );
+
+    // Non-matches: wrong prefix, wrong suffix, and a name too short to carry
+    // both prefix and suffix.
+    assert!(!name_bytes_match(
+      &os(b"tokenizer.json"),
+      model_pat.0,
+      model_pat.1
+    ));
+    assert!(!name_bytes_match(
+      &os(b"model.bin"),
+      model_pat.0,
+      model_pat.1
+    ));
+    assert!(!name_bytes_match(
+      &os(b"model.safetensors"),
+      weight_pat.0,
+      weight_pat.1
+    ));
+    assert!(!name_bytes_match(
+      &os(b".safetensors"),
+      model_pat.0,
+      model_pat.1
+    ));
+    // A non-UTF-8 name that does NOT match the pattern must not be flagged.
+    assert!(!name_bytes_match(
+      &os(&[b'x', 0xFF]),
+      model_pat.0,
+      model_pat.1
+    ));
   }
 
   // ───────────── recursive nested-shard load tests ─────────────

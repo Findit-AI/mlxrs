@@ -195,3 +195,172 @@ fn separator_normalization_via_public_remap() {
   .unwrap();
   assert_eq!(ctx.model_type, "xlm_roberta");
 }
+
+// ───────────────── non-UTF-8 shard-leaf rejection (Unix) ─────────────────
+//
+// `glob 0.3.3` matches a non-recursive pattern component via
+// `file_name().and_then(|s| s.to_str())` and silently `continue`s on `None`
+// (`glob-0.3.3/src/lib.rs:463-467`, `// FIXME (#9639)`): a directory entry whose
+// own LEAF file name is not valid UTF-8 (e.g. Unix bytes `model\xff.safetensors`)
+// is never returned by `glob`, even though it matches the `model*.safetensors`
+// shard pattern. Without a backstop the primary shard is silently dropped and
+// the loader falls through to a stale `weight*.safetensors` root fallback. The
+// `collect_glob_shards` byte-level preflight closes that hole: a non-UTF-8 leaf
+// matching a shard pattern now produces a clean `Error::Backend` naming the
+// path. These tests drive the PUBLIC `load()` so the fix is verified end-to-end.
+//
+// macOS/APFS enforces UTF-8 file names and rejects creating the non-UTF-8 entry;
+// each test then `return`s cleanly — the error code path (not this fixture) is
+// the deliverable, and on a mounted NFS/exFAT/case-sensitive volume the entry
+// creates and the rejection is exercised for real. Same skip pattern as the
+// in-crate `load_weights_non_utf8_*` tests.
+
+/// Write a minimal single-tensor `model.safetensors`-shaped weights file at an
+/// arbitrary `path` (which may be non-UTF-8). Returns `false` if the filesystem
+/// rejected the (non-UTF-8) name, so the caller can skip cleanly.
+#[cfg(unix)]
+fn try_write_one_tensor(path: &Path, key: &str) -> bool {
+  let mut weights: HashMap<String, Array> = HashMap::new();
+  weights.insert(
+    key.to_owned(),
+    Array::from_slice::<f32>(&[1.0, 2.0], &(2usize,)).unwrap(),
+  );
+  io::save_safetensors(path, &weights).is_ok()
+}
+
+#[cfg(unix)]
+#[test]
+fn load_non_utf8_leaf_model_shard_is_recoverable_error() {
+  // A UTF-8 model directory containing a `model<0xFF>.safetensors` shard whose
+  // LEAF name is not valid UTF-8. `glob` silently skips it; the preflight must
+  // reject it with an `Error::Backend` naming the path — no panic.
+  use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+  let dir = temp_dir("nonutf8-leaf");
+  fs::write(dir.join("config.json"), config_json("bert")).unwrap();
+  // `model` + invalid byte 0xFF + `.safetensors` — matches the byte-level shard
+  // predicate (`b"model"` ... `b".safetensors"`) but is not valid UTF-8.
+  let mut raw = b"model".to_vec();
+  raw.push(0xFF);
+  raw.extend_from_slice(b".safetensors");
+  let bad_leaf = OsString::from_vec(raw);
+  if !try_write_one_tensor(&dir.join(&bad_leaf), "mock.weight") {
+    return; // UTF-8-enforcing filesystem (e.g. APFS) — skip cleanly.
+  }
+
+  let registry = EmbeddingModelTypeRegistry::new().with("bert", mock_constructor());
+  let Err(err) = load(
+    &EmbeddingModelConfiguration::from_directory(&dir),
+    &registry,
+  ) else {
+    panic!("a non-UTF-8 model*.safetensors leaf must be a recoverable error, not a panic");
+  };
+  assert!(
+    matches!(err, Error::Backend { .. }),
+    "expected a recoverable Backend error; got {err:?}"
+  );
+  let msg = err.to_string();
+  assert!(
+    msg.contains("non-UTF-8 file name") && msg.contains("shard pattern"),
+    "the error should explain the non-UTF-8 shard-name rejection; got: {msg}"
+  );
+  assert!(
+    msg.contains(&dir.display().to_string()),
+    "the error should name the offending shard path; got: {msg}"
+  );
+}
+
+#[cfg(unix)]
+#[test]
+fn load_non_utf8_leaf_shard_wins_over_stale_weight_fallback() {
+  // THE DANGEROUS CASE: a model dir with BOTH a non-UTF-8-named
+  // `model<0xFF>.safetensors` primary shard AND a valid legacy
+  // `weights.safetensors` fallback. `glob` silently drops the non-UTF-8 primary
+  // shard, so without the preflight the loader would fall through to the legacy
+  // `weight*.safetensors` and load STALE/WRONG weights with no error. The
+  // preflight must make the load FAIL with the clean non-UTF-8 error instead —
+  // it must NOT silently load the `weights.safetensors` fallback.
+  use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+  let dir = temp_dir("nonutf8-stale");
+  fs::write(dir.join("config.json"), config_json("bert")).unwrap();
+  // The non-UTF-8 primary shard.
+  let mut raw = b"model".to_vec();
+  raw.push(0xFF);
+  raw.extend_from_slice(b".safetensors");
+  let bad_leaf = OsString::from_vec(raw);
+  if !try_write_one_tensor(&dir.join(&bad_leaf), "primary.weight") {
+    return; // UTF-8-enforcing filesystem — skip cleanly.
+  }
+  // A VALID legacy root-level `weight*.safetensors` fallback sitting alongside.
+  assert!(
+    try_write_one_tensor(&dir.join("weights.safetensors"), "stale.weight"),
+    "the legacy fallback shard must write on any filesystem"
+  );
+
+  let registry = EmbeddingModelTypeRegistry::new().with("bert", mock_constructor());
+  let Err(err) = load(
+    &EmbeddingModelConfiguration::from_directory(&dir),
+    &registry,
+  ) else {
+    panic!(
+      "a non-UTF-8 model*.safetensors primary shard must fail the load, NOT silently fall \
+       back to the stale weight*.safetensors snapshot"
+    );
+  };
+  assert!(
+    matches!(err, Error::Backend { .. }),
+    "expected a recoverable Backend error; got {err:?}"
+  );
+  let msg = err.to_string();
+  // The error must be the non-UTF-8 shard rejection, proving the preflight
+  // fired BEFORE the legacy fallback could load the stale snapshot.
+  assert!(
+    msg.contains("non-UTF-8 file name") && msg.contains("shard pattern"),
+    "the load must fail with the non-UTF-8 shard error, not silently load the stale \
+     weight*.safetensors fallback; got: {msg}"
+  );
+}
+
+#[cfg(unix)]
+#[test]
+fn load_non_utf8_leaf_shard_nested_under_subfolder_is_recoverable_error() {
+  // A non-UTF-8 leaf shard `text_model/model<0xFF>.safetensors` NESTED one level
+  // down. The `**/model*.safetensors` glob recurses, and `glob` silently skips
+  // the non-UTF-8 leaf at any depth — so the preflight's recursive scan must
+  // also catch it nested, not only at the root, and error cleanly.
+  use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+  let dir = temp_dir("nonutf8-nested-leaf");
+  fs::write(dir.join("config.json"), config_json("bert")).unwrap();
+  let nested = dir.join("text_model");
+  fs::create_dir_all(&nested).unwrap();
+  let mut raw = b"model".to_vec();
+  raw.push(0xFF);
+  raw.extend_from_slice(b".safetensors");
+  let bad_leaf = OsString::from_vec(raw);
+  if !try_write_one_tensor(&nested.join(&bad_leaf), "encoder.weight") {
+    return; // UTF-8-enforcing filesystem — skip cleanly.
+  }
+
+  let registry = EmbeddingModelTypeRegistry::new().with("bert", mock_constructor());
+  let Err(err) = load(
+    &EmbeddingModelConfiguration::from_directory(&dir),
+    &registry,
+  ) else {
+    panic!("a non-UTF-8 leaf shard nested under a subfolder must be a recoverable error");
+  };
+  assert!(
+    matches!(err, Error::Backend { .. }),
+    "expected a recoverable Backend error; got {err:?}"
+  );
+  let msg = err.to_string();
+  assert!(
+    msg.contains("non-UTF-8 file name") && msg.contains("shard pattern"),
+    "the error should explain the non-UTF-8 shard-name rejection; got: {msg}"
+  );
+  assert!(
+    msg.contains(&nested.display().to_string()),
+    "the error should name the offending nested shard path; got: {msg}"
+  );
+}
