@@ -657,9 +657,12 @@ pub struct LoadedVlmModel {
 /// [`config`](Self::config) is the VLM base config (`model_type` /
 /// `eos_token_id` / `quantization`); a processor that needs model-specific
 /// fields beyond those reads them off the verbatim model `config.json`
-/// itself (handed to the *model* constructor as
-/// [`LoadedVlmModel::config_json`]) — the swift processor-construction
-/// signature receives the same `BaseConfiguration` + `Tokenizer` pair. The
+/// carried here as [`config_json`](Self::config_json) — the SAME
+/// single-read body the *model* constructor received as
+/// [`LoadedVlmModel::config_json`], NOT a re-read — so the processor and
+/// model share one TOCTOU-consistent config view. The swift
+/// processor-construction signature likewise receives the same
+/// `BaseConfiguration` + raw config `Data` + `Tokenizer` triple. The
 /// [`processor_class`](Self::processor_class) is the registry key the
 /// constructor was dispatched on (after any
 /// `processor_class_override`); the
@@ -685,6 +688,21 @@ pub struct LoadedProcessor<'a> {
   /// SAME parsed config, mirroring `VLMModelFactory.swift:333-339`'s
   /// single `baseConfig` decode shared by both creator calls).
   pub config: &'a VlmBaseConfig,
+  /// The verbatim model `config.json` body — the SAME single-read body
+  /// the [`VlmModelConstructor`] received as
+  /// [`LoadedVlmModel::config_json`] (NOT a re-read). A concrete
+  /// processor whose downcast-only methods need arch fields that live
+  /// only in `config.json` (e.g. a `hidden_size` / `image_token_index`
+  /// not duplicated into the processor configs) reads them off this
+  /// string, reusing the loader's single TOCTOU-consistent read instead
+  /// of re-opening the file. The typed [`config`](Self::config) exposes
+  /// only the registry-dispatch + tokenizer subset of these bytes;
+  /// everything model-specific is decoded off this verbatim body, the
+  /// analogue of mlx-swift-lm handing the raw config `Data` to both the
+  /// model and processor `Codable` inits at `VLMModelFactory.swift:
+  /// 343-344` / `405-407`. `config.json` is required for a model, so
+  /// this is always present (`&str`, not `Option`).
+  pub config_json: &'a str,
   /// The registry key this processor was looked up under (after any
   /// `processor_class_override`) — useful for diagnostics and for a
   /// constructor that wants to assert it was dispatched correctly.
@@ -1157,6 +1175,11 @@ pub fn load(
   let processor = {
     let loaded_proc = LoadedProcessor {
       config: &loaded.config,
+      // SAME single-read body the model constructor received above as
+      // `loaded.config_json` — NOT a re-read (preserves the loader's
+      // TOCTOU consistency for a processor needing `config.json`-only
+      // arch fields).
+      config_json: &loaded.config_json,
       processor_class: &processor_class,
       preprocessor_config_json: preprocessor_config_json.as_deref(),
       processor_config_json: processor_config_json.as_deref(),
@@ -3109,5 +3132,87 @@ mod tests {
       .downcast_ref::<MockConcreteProcessor>()
       .expect("loaded processor must downcast to its concrete per-model type");
     assert_eq!(concrete.mock_special(), 4242);
+  }
+
+  #[test]
+  fn loaded_processor_reads_model_config_json_only_arch_field() {
+    // Codex review (Finding 2): a concrete per-model processor's
+    // downcast-only methods may need an arch field that lives ONLY in the
+    // model `config.json` (e.g. a `hidden_size` / `image_token_index`
+    // nested under `text_config`), NOT in either processor-config body.
+    // Before this fix `LoadedProcessor` exposed only the processor configs
+    // + the typed `VlmBaseConfig` subset, so such a processor had to
+    // re-open `config.json` itself — losing the single-read TOCTOU
+    // consistency the loader provides. `LoadedProcessor.config_json` now
+    // carries the SAME body the model constructor received, so the
+    // processor reads the field off the loader's single read.
+    let dir = fresh_dir("processor-reads-model-config-json");
+    // `config.json`: nested-shaped, carries `text_config.hidden_size = 8`
+    // — an arch field present ONLY here (the processor configs below do
+    // NOT carry it).
+    std::fs::write(dir.join("config.json"), mock_nested_config_json("mockvlm")).unwrap();
+    // The processor config carries `mock_image_size = 999` — DELIBERATELY
+    // different from `text_config.hidden_size = 8`. The constructor below
+    // ignores `mock_image_size` and instead drives `image_size` from the
+    // `config.json`-only `hidden_size`, so a passing `(8, 8)` assertion
+    // proves the value came from `config_json`, not the processor config.
+    std::fs::write(
+      dir.join("preprocessor_config.json"),
+      mock_preprocessor_config_json("MockProc", 999),
+    )
+    .unwrap();
+    let mut weights: Weights = HashMap::new();
+    weights.insert(
+      "mock.weight".to_owned(),
+      Array::from_slice::<f32>(&[1.0], &(1usize,)).unwrap(),
+    );
+    crate::io::save_safetensors(&dir.join("model.safetensors"), &weights).unwrap();
+    write_tokenizer(&dir);
+
+    let config_reading_ctor: ProcessorConstructor = Box::new(
+      |loaded: &LoadedProcessor<'_>| -> Result<Box<dyn Processor>> {
+        // Read the arch field off `LoadedProcessor.config_json` — the
+        // SAME single-read body the model constructor saw. It is NOT in
+        // either processor-config body.
+        let cfg: serde_json::Value =
+          serde_json::from_str(loaded.config_json).map_err(|e| Error::Backend {
+            message: format!("processor ctor: bad model config_json: {e}"),
+          })?;
+        let hidden_size = cfg
+          .get("text_config")
+          .and_then(|t| t.get("hidden_size"))
+          .and_then(serde_json::Value::as_u64)
+          .and_then(|x| u32::try_from(x).ok())
+          .ok_or_else(|| Error::Backend {
+            message: "processor ctor: text_config.hidden_size must be readable off \
+                      LoadedProcessor.config_json (config.json-only arch field)"
+              .into(),
+          })?;
+        // Drive `image_size` from the config.json-only field (NOT the
+        // processor config's `mock_image_size`) so the test can assert
+        // the value round-tripped from `config_json`.
+        Ok(Box::new(MockVlmProcessor {
+          processor_class: loaded.processor_class.to_owned(),
+          image_size: hidden_size,
+        }))
+      },
+    );
+
+    let model_registry = VlmTypeRegistry::new().with("mockvlm", mock_vlm_constructor());
+    let processor_registry = VlmProcessorTypeRegistry::new().with("MockProc", config_reading_ctor);
+    let configuration = VlmModelConfiguration::from_directory(&dir);
+
+    let ctx = load(&configuration, &model_registry, &processor_registry)
+      .expect("load must surface the model config.json to the processor constructor");
+
+    // `text_config.hidden_size = 8` round-tripped through
+    // `LoadedProcessor.config_json` into the processor — NOT the
+    // processor config's `mock_image_size = 999`.
+    assert_eq!(
+      ctx.processor.image_processor_config().size,
+      (8, 8),
+      "processor must have read hidden_size=8 off LoadedProcessor.config_json, \
+       not mock_image_size=999 off the processor config"
+    );
   }
 }

@@ -66,7 +66,7 @@ fn gradient_image(width: u32, height: u32) -> ::image::DynamicImage {
 #[test]
 fn resize_changes_shape_preserves_dtype() {
   let img = synthetic_image(8, 6);
-  let out = resize(&img, (16, 32), ResizeFilter::Bicubic);
+  let out = resize(&img, (16, 32), ResizeFilter::Bicubic).unwrap();
   // image::imageops::resize(image, nwidth, nheight, ...) so target.1=w, target.0=h.
   assert_eq!(out.width(), 32, "width = target.1");
   assert_eq!(out.height(), 16, "height = target.0");
@@ -81,8 +81,76 @@ fn resize_filters_all_succeed() {
     ResizeFilter::Bicubic,
     ResizeFilter::Lanczos3,
   ] {
-    let out = resize(&img, (4, 4), f);
+    let out = resize(&img, (4, 4), f).unwrap();
     assert_eq!((out.width(), out.height()), (4, 4), "filter {:?}", f);
+  }
+}
+
+#[test]
+fn resize_rejects_zero_target_dimension() {
+  // Regression for Codex Finding 1 (high): `ImageProcessorConfig::size`
+  // now flows from an UNTRUSTED loaded processor config. A zero target
+  // dimension must be rejected as a recoverable `Error::ShapeMismatch`
+  // BEFORE the `to_rgba8()` / `fast_image_resize::Image::new` allocs,
+  // not silently produce a degenerate / panicking allocation. The
+  // source fixture is a normal small image; only the (untrusted)
+  // target is degenerate.
+  let img = synthetic_image(8, 6);
+  for target in [(0, 16), (16, 0), (0, 0)] {
+    let err = resize(&img, target, ResizeFilter::Bilinear)
+      .expect_err("zero target dimension must be rejected");
+    match err {
+      Error::ShapeMismatch { message } => assert!(
+        message.contains("resize") && message.contains("non-zero"),
+        "expected ShapeMismatch naming the zero dim; got: {message}"
+      ),
+      other => panic!("expected ShapeMismatch, got {other:?}"),
+    }
+  }
+}
+
+#[test]
+fn resize_rejects_oversized_target() {
+  // Regression for Codex Finding 1 (high): a hostile/malformed loaded
+  // config with an enormous `size` would drive
+  // `fast_image_resize::Image::new(width, height, U8x4)` to allocate
+  // `height * width * 4` bytes and panic-abort the process, taking down
+  // image + video preprocessing on the first request. The target-byte
+  // guard must surface this as a recoverable `Error::ShapeMismatch`,
+  // bounded by `MAX_DECODED_IMAGE_BYTES` (the same 512 MiB ceiling
+  // `pad_to_square` and `load_image` enforce).
+  //
+  // The source fixture is a tiny 8x6 image (~144 bytes); only the
+  // would-be resize destination (100_000² × 4 ≈ 37 GiB) trips the cap,
+  // so CI never actually allocates the oversized buffer.
+  let img = synthetic_image(8, 6);
+  let err = resize(&img, (100_000, 100_000), ResizeFilter::Bicubic)
+    .expect_err("oversized resize target must be rejected");
+  match err {
+    Error::ShapeMismatch { message } => assert!(
+      message.contains("resize") && message.contains("MAX_DECODED_IMAGE_BYTES"),
+      "expected ShapeMismatch mentioning the budget; got: {message}"
+    ),
+    other => panic!("expected ShapeMismatch, got {other:?}"),
+  }
+}
+
+#[test]
+fn resize_rejects_overflowing_target_product() {
+  // Regression for Codex Finding 1 (high): the byte-budget guard
+  // computes `height * width * 4` via `u64::checked_mul`. A target whose
+  // product overflows u64 (`u32::MAX` on both axes) must surface as a
+  // recoverable `Error::ShapeMismatch` (overflow branch) rather than
+  // wrapping to a small valid-looking byte count that bypasses the cap.
+  let img = synthetic_image(8, 6);
+  let err = resize(&img, (u32::MAX, u32::MAX), ResizeFilter::Bilinear)
+    .expect_err("overflowing target product must be rejected");
+  match err {
+    Error::ShapeMismatch { message } => assert!(
+      message.contains("resize") && message.contains("overflow"),
+      "expected ShapeMismatch naming the overflow; got: {message}"
+    ),
+    other => panic!("expected ShapeMismatch, got {other:?}"),
   }
 }
 
@@ -649,7 +717,7 @@ fn resize_lanczos_target_dimensions() {
   // (target_h, target_w) matching the python image-processor
   // convention; output width/height must match exactly.
   let img = synthetic_image(8, 6);
-  let out = resize_lanczos(&img, 16, 32);
+  let out = resize_lanczos(&img, 16, 32).unwrap();
   assert_eq!(out.width(), 32);
   assert_eq!(out.height(), 16);
 }
@@ -660,8 +728,8 @@ fn resize_lanczos_equivalent_to_resize_with_lanczos3_filter() {
   // resize(..., Lanczos3) — byte-for-byte output equality is the
   // strongest assertion of that contract.
   let img = synthetic_image(12, 10);
-  let a = resize_lanczos(&img, 8, 16);
-  let b = resize(&img, (8, 16), ResizeFilter::Lanczos3);
+  let a = resize_lanczos(&img, 8, 16).unwrap();
+  let b = resize(&img, (8, 16), ResizeFilter::Lanczos3).unwrap();
   assert_eq!(a.to_rgba8().into_raw(), b.to_rgba8().into_raw());
 }
 
@@ -679,7 +747,7 @@ fn resize_lanczos_smooth_on_constant_input_preserves_value() {
     }
   }
   let img = ::image::DynamicImage::ImageRgb8(buf);
-  let out = resize_lanczos(&img, 4, 4);
+  let out = resize_lanczos(&img, 4, 4).unwrap();
   assert_eq!(out.width(), 4);
   assert_eq!(out.height(), 4);
   // Every output pixel should land within 1 LSB of the source value

@@ -88,9 +88,12 @@
 //! flag (round-5 finding):
 //!
 //! - **Bounded-memory:** an upper bound on the allocation's byte
-//!   count is enforced before it runs — either by
-//!   [`MAX_DECODED_IMAGE_BYTES`] (load-time decoder cap, 512 MiB) or
-//!   by trusted [`ImageProcessorConfig::size`] (model JSON config).
+//!   count is enforced before it runs — by [`MAX_DECODED_IMAGE_BYTES`]
+//!   (load-time decoder cap, 512 MiB), applied to BOTH source-scale
+//!   allocations and the [`resize`] destination ([`ImageProcessorConfig::size`]
+//!   is now LOADED from an untrusted on-disk config, so [`resize`]
+//!   validates its target against the same 512 MiB ceiling before
+//!   allocating — see [`resize`]'s target-dimension guard).
 //!   "Y" guarantees the call cannot trigger quadratic / unbounded
 //!   allocation from hostile input.
 //! - **Recoverable-OOM:** an allocator failure surfaces as a typed
@@ -108,8 +111,8 @@
 //! | `apply_orientation_fallible` u8 variants (Rotate90/270/+FlipH on Luma8/LumaA8/Rgb8/Rgba8) | source pixels | `load_image` →`Result` | Y (`MAX_DECODED_IMAGE_BYTES`) | **Y** | **FIXED (R5):** manual rotate over `try_reserve_exact`-backed buffer — no second alloc, no probe race |
 //! | `apply_orientation_fallible` non-u8 variants (Luma16/LumaA16/Rgb16/Rgba16/Rgb32F/Rgba32F + rotates) | source pixels | `load_image` →`Result` | Y (`MAX_DECODED_IMAGE_BYTES`) | **Y** | **FIXED (R6):** covered by manual generic rotate via `try_reserve_exact` over `T: Copy` — 16-bit PNGs (`Luma16`/`LumaA16`/`Rgb16`/`Rgba16` per image-rs PNG decoder) and 32-bit-float `DynamicImage` inputs (`Rgb32F`/`Rgba32F`) now route through the same fallible per-element-type buffer path as u8 |
 //! | `apply_orientation_fallible` (NoTransforms/Flip/Rot180, all variants) | in-place      | `load_image` →`Result`   | Y (in-place)   | Y (no alloc)    | Upstream `*_in_place` path — zero allocation |
-//! | `img.to_rgba8()` (in `resize`)                | source pixels | `resize` →`DynamicImage` | Y (`MAX_DECODED_IMAGE_BYTES` via `load_image`) | N (image-rs infallible clone) | OUT-OF-SCOPE: `-> DynamicImage` by reference parity (swift `resampleBicubic` / python `Image.resize`); see [`resize`] doc for the bounded-not-recoverable contract |
-//! | `fast_image_resize::images::Image::new` (in `resize`) | target pixels (trusted config) | `resize` →`DynamicImage` | Y (trusted `ImageProcessorConfig::size`) | N (fast_image_resize infallible alloc) | OUT-OF-SCOPE: matches reference signatures; bounded by trusted JSON config |
+//! | `img.to_rgba8()` (in `resize`)                | source pixels | `resize` →`Result<DynamicImage>` | Y (`MAX_DECODED_IMAGE_BYTES` via `load_image`) | N (image-rs infallible clone) | RESIDUAL: source-sized clone is an image-crate-internal `Vec::clone`; byte count bounded by the decoder cap, abort only at a true ≤512 MiB system OOM |
+//! | `fast_image_resize::images::Image::new` (in `resize`) | target pixels (untrusted loaded config) | `resize` →`Result<DynamicImage>` | Y (`MAX_DECODED_IMAGE_BYTES` via `resize`'s target guard) | N (fast_image_resize infallible alloc) | **GUARDED (Codex review):** `resize` now validates the untrusted loaded-config target (`height*width*4` ≤ 512 MiB, non-zero, no overflow) BEFORE this alloc and returns `Err` instead of aborting; residual abort only at a true ≤512 MiB system OOM |
 //! | `img.clone()` (early-return in `center_crop`) | source pixels | `center_crop` →`DynamicImage` | Y (via `load_image` cap) | N (image-rs infallible `Vec::clone`) | OUT-OF-SCOPE: `-> DynamicImage` by reference parity |
 //! | `img.crop_imm(...)` (in `center_crop`)        | min(source, target) | `center_crop` →`DynamicImage` | Y (≤ source bound) | N | OUT-OF-SCOPE: same parity rationale |
 //! | `Vec::<u8>::try_reserve_exact` canvas (in `pad_to_square`) | target square (bounded) | `pad_to_square` →`Result` | Y (`MAX_DECODED_IMAGE_BYTES`) | Y (`try_reserve_exact` + `Error::OutOfMemory`) | FALLIBLE (R3) |
@@ -117,29 +120,33 @@
 //! | `dynamic_image_rgb_pixel` per-pixel `get_pixel` | none (stack `Rgba<u8>` only) | shared helper | Y (zero alloc) | Y (no alloc) | OK — no full-image intermediate alloc |
 //! | mlx `Array` ops (rescale/normalize/patchify/preprocess) | output array | each `-> Result<Array>` | Y (output-shape) | Y (mlx backend `Result`) | OK — mlx backend allocator errors surface via `Array::*` `Result` |
 //!
-//! **Class closure invariant (round-6).** This module guarantees
+//! **Class closure invariant.** This module guarantees
 //! **bounded-memory** end-to-end — every source-scale allocation is
-//! capped by [`MAX_DECODED_IMAGE_BYTES`] (512 MiB) or trusted
-//! [`ImageProcessorConfig::size`]; no quadratic or unbounded growth is
-//! possible from hostile input. **Recoverable-OOM** is guaranteed for
-//! every allocation under our direct control: [`pad_to_square`]'s
-//! canvas, [`image_to_array`]'s f32 buffer, and the rotate buffer for
-//! every `DynamicImage` element type (u8 / u16 / f32) in
-//! `apply_orientation_fallible` (private helper called by
-//! [`load_image`]) — the round-6 generic-rotate path covers
+//! capped by [`MAX_DECODED_IMAGE_BYTES`] (512 MiB), and the [`resize`]
+//! destination (driven by the now-untrusted loaded
+//! [`ImageProcessorConfig::size`]) is capped against the same ceiling
+//! by [`resize`]'s target-dimension guard; no quadratic or unbounded
+//! growth is possible from hostile input OR hostile config.
+//! **Recoverable-OOM** is guaranteed for every allocation under our
+//! direct control: [`pad_to_square`]'s canvas, [`image_to_array`]'s
+//! f32 buffer, and the rotate buffer for every `DynamicImage` element
+//! type (u8 / u16 / f32) in `apply_orientation_fallible` (private
+//! helper called by [`load_image`]) — the generic-rotate path covers
 //! 16-bit-PNG-derived `Luma16`/`LumaA16`/`Rgb16`/`Rgba16` (image-rs
 //! 0.25's PNG decoder emits 16-bit variants for `BitDepth::Sixteen`
-//! PNG inputs) and caller-supplied `Rgb32F`/`Rgba32F` inputs. The
-//! remaining sites (image-crate-internal `to_rgba8` / `Vec::clone`
-//! and `fast_image_resize::Image::new`) are
-//! bounded-but-not-recoverable because changing their signatures
-//! would diverge from the swift / python reference contracts
-//! (`-> DynamicImage`, infallible) per
-//! `feedback_match_official_binding_design`. Under extreme allocator
-//! pressure those calls may abort the process; this is documented in
-//! each function's public docstring so callers see the contract
-//! explicitly rather than inferring fallibility from the `Result`
-//! return.
+//! PNG inputs) and caller-supplied `Rgb32F`/`Rgba32F` inputs.
+//! [`resize`] additionally rejects an over-budget / zero / overflowing
+//! target as a typed [`Error::ShapeMismatch`] BEFORE allocating
+//! (Codex review: its target now flows from an untrusted on-disk
+//! config). The remaining sites (image-crate-internal `to_rgba8` /
+//! `Vec::clone` and `fast_image_resize::Image::new`) keep an
+//! infallible `Vec` allocator that aborts on allocator pressure, but
+//! their byte counts are now ALL bounded ≤512 MiB (source by the
+//! decoder cap, destination by the `resize` guard), so the only abort
+//! path left is a genuine system-wide OOM at a ≤512 MiB request —
+//! their public docstrings document this residual contract. Their
+//! signatures stay `-> DynamicImage` per
+//! `feedback_match_official_binding_design`.
 
 use crate::{
   Dtype,
@@ -823,52 +830,87 @@ fn rotate_buf<T: Copy + Default>(
 /// concern and is intentionally not exposed here. Callers that need it
 /// can compute the target tuple themselves before calling `resize`.
 ///
-/// **Return type — infallible by parity:** the function signature is
-/// `-> DynamicImage` (not `Result<...>`) because both reference
-/// implementations are infallible: swift `resampleBicubic(_, to:)
-/// -> CIImage` (line 110-132; the `outputImage!` unwrap is an
-/// explicit panic on bad input), and python `Image.resize(new_size)
-/// -> Image` (no `Result`). `ImageProcessorConfig.size` is model
-/// metadata loaded from a trusted JSON, not arbitrary user input;
-/// callers that need to validate untrusted size values should clamp
-/// or reject them before constructing the config. A pathological
-/// target dimension (`u32::MAX` etc.) will panic-allocate inside
-/// `image::imageops::resize` exactly as the swift `CIFilter.bicubic
-/// ScaleTransform.outputImage!` and python `Image.resize` would; the
-/// faithful-port contract preserves that behavior.
+/// **Return type — fallible target-dimension guard (Codex review).**
+/// The signature is `-> Result<DynamicImage>` rather than the
+/// infallible `-> DynamicImage` of the swift `resampleBicubic(_,
+/// to:) -> CIImage` (line 110-132) / python `Image.resize(new_size)
+/// -> Image` references. The earlier faithful-port rationale assumed
+/// `target` came from a TRUSTED `ImageProcessorConfig::size` (model
+/// metadata baked into the binary or a trusted JSON), so a
+/// pathological dimension was a caller bug. That assumption no longer
+/// holds: [`ImageProcessorConfig::size`] is now populated from a
+/// LOADED `preprocessor_config.json` / `processor_config.json` (see
+/// [`crate::vlm::load`]), which is UNTRUSTED on-disk input. A
+/// hostile/malformed config with an enormous `size` would otherwise
+/// drive the `img.to_rgba8()` clone and the
+/// `fast_image_resize::images::Image::new(width, height, U8x4)`
+/// destination alloc to panic-abort the process — taking down image
+/// AND video preprocessing on the first request. We therefore
+/// validate the target dimensions BEFORE either allocation and
+/// surface an over-budget / zero / overflow target as a recoverable
+/// `Err` instead of an abort.
 ///
-/// **Allocation contract (Codex round-5 finding).** This function is
-/// **bounded-memory but NOT recoverable-OOM** — the internal
-/// `img.to_rgba8()` clone (infallible `Vec::clone` on the source
-/// buffer) and the `fast_image_resize::images::Image::new(width,
-/// height, U8x4)` destination alloc (infallible `Vec::new` of
-/// `width * height * 4` bytes) both ABORT the process on allocator
-/// failure. Byte counts ARE bounded: the source is bounded by
-/// [`MAX_DECODED_IMAGE_BYTES`] via [`load_image`]'s decoder cap, and
-/// the destination by the trusted `target` argument (model JSON
-/// config). The function therefore guarantees no quadratic /
-/// unbounded growth from hostile input, but cannot recover an
-/// allocator failure as a typed `Err`. See the module-level audit
-/// table for the contract summary; the [`preprocess`] composer
-/// inherits the same contract on its `resize` step. To recover OOM
-/// inside this path, callers must either (a) pre-validate
-/// dimensions and reject before calling, or (b) replace `resize`
-/// with a manual fallible widen + resize at the call site —
-/// rejected here on faithful-parity grounds.
-// NOTE (Codex finding, round 4): an adversarial-review concern asked
-// for `resize` to return `Result<DynamicImage>` with explicit
-// byte-budget validation. Rejected on faithful-parity grounds — both
-// the swift and python references are infallible at this entry point
-// and treat the size argument as trusted-config input. Wrapping in
-// `Result` would diverge from both reference signatures and force a
-// behavioral change on every per-model caller. Untrusted-size
-// callers can bound the input before calling.
+/// **Allocation contract.** Byte counts are bounded on both ends: the
+/// source is bounded by [`MAX_DECODED_IMAGE_BYTES`] via [`load_image`]'s
+/// decoder cap, and the destination is now bounded by the same
+/// [`MAX_DECODED_IMAGE_BYTES`] ceiling enforced on `height * width * 4`
+/// by the guard below (mirroring [`pad_to_square`]'s canvas gate). The
+/// two `image` / `fast_image_resize`-internal allocations
+/// (`to_rgba8` clone, `Image::new` destination) are still infallible
+/// `Vec` allocators that abort on allocator pressure, but the byte
+/// count they see can no longer be driven past 512 MiB by a hostile
+/// config — so the only abort path left is a genuine system-wide OOM
+/// at a ≤512 MiB request (the same residual contract the module-doc
+/// table records for the `image`-crate clone sites). The [`preprocess`]
+/// and [`crate::vlm::video::process_frames`] composers inherit this
+/// guard transitively (both call `resize` via `?`).
+///
+/// # Errors
+/// - [`Error::ShapeMismatch`] if either target dimension is `0`, if
+///   `height * width * 4` overflows `u64`, or if it exceeds
+///   [`MAX_DECODED_IMAGE_BYTES`] — the message carries the offending
+///   dims and the cap. (The over-cap case uses `ShapeMismatch` rather
+///   than [`Error::OutOfMemory`] so it can name the dims + ceiling,
+///   matching [`pad_to_square`]'s canvas gate; `OutOfMemory` is
+///   reserved for true allocator failures, which the residual
+///   `image`-crate-internal `to_rgba8`/`Image::new` allocs surface as
+///   a process abort only at a now-bounded ≤512 MiB request.)
 pub fn resize(
   img: &::image::DynamicImage,
   target: (u32, u32),
   filter: ResizeFilter,
-) -> ::image::DynamicImage {
+) -> Result<::image::DynamicImage> {
   let (height, width) = target;
+  // Target-dimension guard (Codex review): `target` now flows from an
+  // UNTRUSTED loaded processor config, so validate it BEFORE the
+  // source-sized `to_rgba8()` clone and the `width * height * 4`
+  // destination alloc. Mirrors `pad_to_square`'s canvas gate so the
+  // per-step caps stay consistent.
+  if width == 0 || height == 0 {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "resize: target dimensions must be non-zero, got {height}x{width} (height x width)"
+      ),
+    });
+  }
+  // `height * width * 4` (RGBA8 destination bytes). u64 throughout so the
+  // check is host-width-independent; `u32::MAX^2 * 4 ≈ 7.4e19` fits in
+  // u64, so the `checked_mul` chain only fires for a truly hostile
+  // dimension product.
+  let dst_bytes = u64::from(height)
+    .checked_mul(u64::from(width))
+    .and_then(|hw| hw.checked_mul(4))
+    .ok_or_else(|| Error::ShapeMismatch {
+      message: format!("resize: height*width*4 overflows u64 for {height}x{width}"),
+    })?;
+  if dst_bytes > MAX_DECODED_IMAGE_BYTES {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "resize: {height}x{width} target would need {dst_bytes} bytes, \
+         exceeds MAX_DECODED_IMAGE_BYTES={MAX_DECODED_IMAGE_BYTES}"
+      ),
+    });
+  }
   // SIMD-accelerated resize via `fast_image_resize` — 5-15x faster than
   // `image::imageops::resize` on the same algorithms (used by `wgpu`
   // examples, `kornia-rs`, etc.). Decode-side stays on `image` (above
@@ -882,9 +924,10 @@ pub fn resize(
   // returns a fresh `RgbaImage` and clones even when the source is
   // already `ImageRgba8` (only the consuming `into_rgba8()` path avoids
   // that clone, and we can't use it here because `img: &DynamicImage`).
-  // This is the infallible RGBA conversion captured in the module
-  // audit table and the `resize` doc's bounded-memory-but-NOT-
-  // recoverable-OOM contract (Codex review R10).
+  // This is the infallible RGBA conversion captured in the module audit
+  // table; its byte count is bounded by [`MAX_DECODED_IMAGE_BYTES`] via
+  // `load_image`'s decoder cap on the source (the destination side is
+  // now bounded by the target-dimension guard above).
   let src = img.to_rgba8();
   let src_view = ::fast_image_resize::images::ImageRef::new(
     src.width(),
@@ -911,13 +954,13 @@ pub fn resize(
     // construction, so the only error class (`DifferentTypesOfPixelsError`)
     // is structurally excluded.
     .expect("Resizer::resize: src/dst PixelType match by construction (both U8x4)");
-  ::image::DynamicImage::ImageRgba8(
+  Ok(::image::DynamicImage::ImageRgba8(
     ::image::ImageBuffer::from_raw(width, height, dst.into_vec())
       // `Image::new(width, height, U8x4)` allocates exactly
       // `width * height * 4` bytes — the precise length
       // `ImageBuffer::from_raw` requires for a `width x height` RGBA buffer.
       .expect("ImageBuffer::from_raw: dst buffer length matches width * height * 4 by construction"),
-  )
+  ))
 }
 
 /// Resize `img` to `(target_h, target_w)` using Lanczos3 interpolation.
@@ -939,13 +982,14 @@ pub fn resize(
 /// to `cropped(to: exactRect)` after `lanczosScaleTransform` produces a
 /// near-target output).
 ///
-/// Infallible by reference parity — see [`resize`]'s NOTE block for the
-/// faithful-port rationale.
+/// # Errors
+/// Propagates [`resize`]'s target-dimension guard verbatim
+/// ([`Error::ShapeMismatch`] on zero/overflow/over-cap target dims).
 pub fn resize_lanczos(
   img: &::image::DynamicImage,
   target_h: u32,
   target_w: u32,
-) -> ::image::DynamicImage {
+) -> Result<::image::DynamicImage> {
   resize(img, (target_h, target_w), ResizeFilter::Lanczos3)
 }
 
@@ -1676,25 +1720,20 @@ pub fn patchify(arr: &Array, patch_size: usize) -> Result<Array> {
 /// post-step (one lazy `reshape` + `transpose_axes` — see the module
 /// `Conventions > Channel layout` block for the rationale).
 ///
-/// **Allocation contract (Codex round-5 finding).** This composer
-/// returns `Result<Array>` but its [`resize`] sub-step is
-/// **bounded-memory only, not recoverable-OOM** (image-rs's
-/// `to_rgba8` clone and `fast_image_resize::Image::new` destination
-/// alloc both abort on allocator failure — see [`resize`]'s doc for
-/// the per-call rationale). The remaining stages —
-/// [`image_to_array`] (f32 widening), [`rescale`], and
-/// [`normalize_imagenet`] — are end-to-end recoverable
-/// ([`Error::OutOfMemory`] / mlx backend `Result`). The composite
-/// contract is therefore:
-/// - **Bounded-memory:** Y. Source is capped by
-///   [`MAX_DECODED_IMAGE_BYTES`] (512 MiB) via [`load_image`] and
-///   the [`resize`] destination by trusted [`ImageProcessorConfig::size`].
-/// - **Recoverable-OOM:** PARTIAL. Recoverable on
-///   [`image_to_array`] / [`rescale`] / [`normalize`];
-///   bounded-but-not-recoverable on the [`resize`] sub-step when
-///   `cfg.do_resize == true`. Setting `cfg.do_resize = false` (and
-///   handing a pre-sized `DynamicImage`) keeps the entire pipeline
-///   end-to-end recoverable.
+/// **Allocation contract.** This composer returns `Result<Array>` and
+/// is fully **bounded-memory**: the source is capped by
+/// [`MAX_DECODED_IMAGE_BYTES`] (512 MiB) via [`load_image`], and the
+/// [`resize`] destination is capped against the same ceiling by
+/// [`resize`]'s target-dimension guard (Codex review: `cfg.size` now
+/// flows from an UNTRUSTED loaded processor config, so an over-budget /
+/// zero / overflowing `size` surfaces as a typed
+/// [`Error::ShapeMismatch`] from `resize` via `?` — NOT a process
+/// abort). The remaining stages — [`image_to_array`] (f32 widening),
+/// [`rescale`], and [`normalize_imagenet`] — are end-to-end recoverable
+/// ([`Error::OutOfMemory`] / mlx backend `Result`). The only residual
+/// abort path is `resize`'s two image-crate-internal `Vec` allocs
+/// (`to_rgba8` clone, `Image::new` destination) under a genuine
+/// system-wide OOM at a now-bounded ≤512 MiB request.
 ///
 /// See the module-level audit table for the per-site breakdown.
 // NOTE (Codex finding, round 2): a review request asked `preprocess`
@@ -1708,7 +1747,7 @@ pub fn patchify(arr: &Array, patch_size: usize) -> Result<Array> {
 pub fn preprocess(img: &::image::DynamicImage, cfg: &ImageProcessorConfig) -> Result<Array> {
   let resized;
   let src = if cfg.do_resize {
-    resized = resize(img, cfg.size, cfg.resample);
+    resized = resize(img, cfg.size, cfg.resample)?;
     &resized
   } else {
     img
