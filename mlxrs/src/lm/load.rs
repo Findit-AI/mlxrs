@@ -57,7 +57,7 @@
 
 use std::{
   collections::{BTreeMap, HashMap},
-  path::Path,
+  path::{Path, PathBuf},
 };
 
 use crate::{
@@ -898,26 +898,45 @@ fn shard_file_name(index_1based: usize, shards_count: usize) -> String {
 /// 3. `total_size` (the sum of every weight's `array_nbytes`) and
 ///    `total_parameters` ([`get_total_parameters`]) are computed for the
 ///    index `metadata` block (`utils.py:734-741`).
-/// 4. Each shard is written with [`crate::io::save_safetensors_with_metadata`]
-///    and the `{"format": "mlx"}` safetensors metadata mlx writes
-///    (`utils.py:756`); the shard file name comes from `shard_file_name`.
-/// 5. Any **stale** pre-existing `model*.safetensors` shard whose name is
-///    not in the freshly written set is removed, so the destination ends
-///    up holding *only* the new checkpoint. The reference does not do
-///    this (`save_model` assumes a fresh directory), but mlxrs
-///    [`load_weights`] reads **every** `model*.safetensors` in the
-///    directory — not just the ones named in the index — so overwriting,
-///    say, a 3-shard checkpoint with a single-`model.safetensors` one
-///    would otherwise leave `model-00002-of-00003.safetensors` …
-///    behind and silently resurrect stale tensors on the next load. This
-///    cleanup makes `save_model` idempotent: a second save to the same
-///    directory yields exactly the second checkpoint.
-/// 6. The `weight_map` (`weight name → shard file name`) is assembled, then
-///    **sorted by key** (`utils.py:762-764`), and the whole `index_data`
-///    (`{ "metadata": { total_size, total_parameters }, "weight_map": … }`)
-///    is written to `model.safetensors.index.json` with 4-space indentation
-///    (`json.dump(..., indent=4)`, `utils.py:766-771`). The index file name
-///    is constant, so the new index always overwrites any prior one.
+/// 4. Each shard is written — with the `{"format": "mlx"}` safetensors
+///    metadata mlx writes (`utils.py:756`) and the `shard_file_name`
+///    name — to a **same-directory, exclusively created (`O_EXCL`)
+///    `.safetensors` tempfile**, which is then **fsync**ed. The `index.json`
+///    body is likewise serialized to its own same-directory `O_EXCL`
+///    tempfile and fsynced. **Nothing is written to a final path yet.**
+/// 5. Once every shard tempfile *and* the index tempfile are durable, each
+///    is **atomically renamed** over its final name (the shards over
+///    `shard_file_name`, the index over `model.safetensors.index.json`).
+///    Until this step the directory still holds the previously-valid
+///    checkpoint untouched; an ENOSPC / abort / backend failure at any
+///    point in step 4 leaves that old checkpoint fully intact and loadable
+///    (the new one simply never becomes visible) and removes every
+///    tempfile. This failure-atomic discipline mirrors
+///    `audio::io::save_wav` / `lm::cache_prompt`'s atomic save: a direct
+///    `mlx_save_safetensors` onto a final shard path would overwrite a
+///    still-valid shard *before* the new checkpoint is durable, and a
+///    crash there would leave the directory neither the old checkpoint
+///    nor the new one.
+/// 6. **After** all renames succeed, any **stale** pre-existing
+///    `model*.safetensors` shard whose name is not in the freshly written
+///    set is removed, so the destination ends up holding *only* the new
+///    checkpoint. The reference does not do this (`save_model` assumes a
+///    fresh directory), but mlxrs [`load_weights`] reads **every**
+///    `model*.safetensors` in the directory — not just the ones named in
+///    the index — so overwriting, say, a 3-shard checkpoint with a
+///    single-`model.safetensors` one would otherwise leave
+///    `model-00002-of-00003.safetensors` … behind and silently resurrect
+///    stale tensors on the next load. This cleanup makes `save_model`
+///    idempotent: a second save to the same directory yields exactly the
+///    second checkpoint. It runs only once the new shard set + index are
+///    all durably renamed into place, so a failed save never deletes a
+///    shard the old checkpoint still needs.
+///
+/// The `weight_map` (`weight name → shard file name`) is assembled and
+/// **sorted by key** (`utils.py:762-764`); the whole `index_data`
+/// (`{ "metadata": { total_size, total_parameters }, "weight_map": … }`)
+/// is serialized with 4-space indentation (`json.dump(..., indent=4)`,
+/// `utils.py:766-771`).
 ///
 /// `quant` supplies the per-layer [`Quantization`]
 /// [`get_total_parameters`] needs (pass
@@ -955,8 +974,10 @@ pub fn save_model(
   }
   let total_parameters = get_total_parameters(weights, quant)?;
 
-  // 4. write each shard, recording `weight name → shard file name`. The
-  //    `{"format": "mlx"}` safetensors metadata matches mlx-lm
+  // 4. write every shard + the index to same-directory `O_EXCL` tempfiles
+  //    and fsync each — NOTHING touches a final path yet, so the
+  //    previously-valid checkpoint stays intact through this whole step.
+  //    The `{"format": "mlx"}` safetensors metadata matches mlx-lm
   //    (`mx.save_safetensors(..., metadata={"format": "mlx"})`,
   //    `utils.py:756`). The shards are borrowed views, so they go through
   //    `save_safetensors_view` — no `Array` is cloned for the write.
@@ -965,34 +986,101 @@ pub fn save_model(
   // `weight_map` collected sorted-by-key so the written index is
   // deterministic (`utils.py:762-764` sorts it before the `json.dump`).
   let mut weight_map: BTreeMap<String, String> = BTreeMap::new();
+  // `(tmp_path, final_path)` for every file to be atomically published in
+  // step 5. Held so any failure in this step can remove every tempfile.
+  let mut pending: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(shards_count + 1);
   // The names of the shards just written — every other `model*.safetensors`
-  // in `save_path` is stale and removed in step 5.
+  // in `save_path` is stale and removed in step 6.
   let mut written_shards: std::collections::HashSet<String> =
     std::collections::HashSet::with_capacity(shards_count);
-  for (i, shard) in shards.iter().enumerate() {
-    let shard_name = shard_file_name(i + 1, shards_count);
-    let shard_path = save_path.join(&shard_name);
-    crate::io::save_safetensors_view(
-      &shard_path,
-      shard.iter().map(|(&k, &v)| (k, v)),
-      &shard_metadata,
-    )?;
-    for &weight_name in shard.keys() {
-      weight_map.insert(weight_name.to_string(), shard_name.clone());
+
+  // Inner closure so ANY failure below cleans up every tempfile staged so
+  // far before returning — no leaked `.tmp.safetensors` on a failed save.
+  let staged: Result<()> = (|| {
+    for (i, shard) in shards.iter().enumerate() {
+      let shard_name = shard_file_name(i + 1, shards_count);
+      let final_path = save_path.join(&shard_name);
+      // Exclusively created, same-directory, `.safetensors`-suffixed
+      // tempfile: `save_safetensors_view` (mlx-c) writes exactly this path
+      // (the trailing `.safetensors` stops mlx from appending its own).
+      let tmp_path = open_excl_temp_shard(&final_path)?;
+      pending.push((tmp_path.clone(), final_path));
+      crate::io::save_safetensors_view(
+        &tmp_path,
+        shard.iter().map(|(&k, &v)| (k, v)),
+        &shard_metadata,
+      )?;
+      fsync_path(&tmp_path)?;
+      for &weight_name in shard.keys() {
+        weight_map.insert(weight_name.to_string(), shard_name.clone());
+      }
+      written_shards.insert(shard_name);
     }
-    written_shards.insert(shard_name);
+
+    // assemble `model.safetensors.index.json` with `indent=4`
+    // (`utils.py:735-771`). `serde_json::Value` preserves the reference
+    // key order (`metadata` before `weight_map`); `weight_map` is a
+    // `BTreeMap`, so its keys serialize sorted.
+    let index = serde_json::json!({
+      "metadata": {
+        "total_size": total_size,
+        "total_parameters": total_parameters,
+      },
+      "weight_map": weight_map,
+    });
+    let index_final = save_path.join("model.safetensors.index.json");
+    let index_tmp = open_excl_temp_shard(&index_final)?;
+    pending.push((index_tmp.clone(), index_final));
+    write_json_pretty(
+      &index_tmp,
+      &index,
+      "save_model: model.safetensors.index.json",
+    )?;
+    fsync_path(&index_tmp)
+  })();
+  if let Err(err) = staged {
+    for (tmp, _) in &pending {
+      let _ = std::fs::remove_file(tmp);
+    }
+    return Err(err);
   }
 
-  // 5. idempotency: drop any pre-existing `model*.safetensors` left over
+  // 5. publish: every shard + the index is durable, so atomically rename
+  //    each tempfile over its final name. POSIX `rename(2)` is
+  //    atomic-within-fs (same-dir tempfiles keep it single-fs); the new
+  //    checkpoint becomes visible only here. On a rename failure, remove
+  //    every still-staged tempfile and propagate — already-renamed files
+  //    are valid members of the *new* shard set, so the directory holds a
+  //    consistent (if partially published) checkpoint rather than a
+  //    corrupt mix. (`fs::rename` already replaces an existing
+  //    destination, so a surviving same-named old shard is overwritten
+  //    in place by its durable replacement.)
+  for idx in 0..pending.len() {
+    let (tmp, final_path) = &pending[idx];
+    if let Err(e) = std::fs::rename(tmp, final_path) {
+      for (leftover, _) in &pending[idx..] {
+        let _ = std::fs::remove_file(leftover);
+      }
+      return Err(Error::Backend {
+        message: format!(
+          "save_model: cannot rename {} -> {}: {e}",
+          tmp.display(),
+          final_path.display()
+        ),
+      });
+    }
+  }
+
+  // 6. idempotency: drop any pre-existing `model*.safetensors` left over
   //    from an earlier checkpoint that the new shard set did not just
   //    rewrite. Without this, [`load_weights`] (which merges *every*
   //    `model*.safetensors`, not the index) would resurrect stale tensors
-  //    when a multi-shard checkpoint is overwritten by a smaller one. The
-  //    `model.safetensors.index.json` has a constant name and is
-  //    overwritten unconditionally in step 6, so it needs no cleanup.
-  //    `collect_sorted` applies the same `model*.safetensors` predicate
-  //    `load_weights` uses, so exactly the files a later load would pick
-  //    up are considered.
+  //    when a multi-shard checkpoint is overwritten by a smaller one. This
+  //    runs ONLY after every new shard + the index are durably renamed
+  //    into place (step 5), so a failed save never deletes a shard the
+  //    previously-valid checkpoint still needs. `collect_sorted` applies
+  //    the same `model*.safetensors` predicate `load_weights` uses, so
+  //    exactly the files a later load would pick up are considered.
   let existing_shards = collect_sorted(save_path, |name| {
     name.starts_with("model") && name.ends_with(".safetensors")
   })?;
@@ -1010,25 +1098,108 @@ pub fn save_model(
       })?;
     }
   }
-
-  // 6. assemble + write `model.safetensors.index.json` with `indent=4`
-  //    (`utils.py:735-771`). `serde_json::Value` preserves the
-  //    reference key order (`metadata` before `weight_map`); `weight_map`
-  //    is a `BTreeMap`, so its keys serialize sorted.
-  let index = serde_json::json!({
-    "metadata": {
-      "total_size": total_size,
-      "total_parameters": total_parameters,
-    },
-    "weight_map": weight_map,
-  });
-  let index_path = save_path.join("model.safetensors.index.json");
-  write_json_pretty(
-    &index_path,
-    &index,
-    "save_model: model.safetensors.index.json",
-  )?;
   Ok(())
+}
+
+/// Open an exclusively created (`O_CREAT|O_EXCL`), randomized tempfile in the
+/// SAME directory as `final_path`, of the form
+/// `<file_name>.<pid>.<rand>.tmp.safetensors`, and return its path. The
+/// created handle is dropped immediately: `crate::io::save_safetensors_view`
+/// (mlx-c) reopens the path by name to write it, and `write_json_pretty`
+/// re-opens it via `fs::write` — the exclusive create still guarantees the
+/// path is a regular file *we* own (never an attacker-precreated symlink), so
+/// the subsequent truncate-by-name follows no symlink.
+///
+/// The trailing `.safetensors` is required for the shard tempfiles:
+/// `mlx_save_safetensors` appends `.safetensors` to a path that lacks it
+/// (`mlx/io/safetensors.cpp`), so a temp name ending in `.safetensors` makes
+/// mlx write *exactly* this path. The index tempfile reuses the same suffix
+/// harmlessly (it is `fs::write`-d, then renamed onto the `.index.json` name).
+/// Same-directory keeps the later [`std::fs::rename`] single-fs (atomic on
+/// POSIX/Windows; a cross-fs rename silently degrades to copy+unlink, losing
+/// atomicity). Mirrors `cache_prompt`'s `open_excl_temp_safetensors` /
+/// `audio::io::save_wav`'s `open_excl_tempfile` discipline.
+fn open_excl_temp_shard(final_path: &Path) -> Result<PathBuf> {
+  use std::{
+    fs::OpenOptions,
+    io::ErrorKind,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{SystemTime, UNIX_EPOCH},
+  };
+  static COUNTER: AtomicU64 = AtomicU64::new(0);
+  const MAX_RETRIES: u32 = 16;
+
+  let parent = final_path.parent().unwrap_or_else(|| Path::new("."));
+  let file_name = final_path
+    .file_name()
+    .ok_or_else(|| Error::Backend {
+      message: format!(
+        "save: destination {} has no file_name component",
+        final_path.display()
+      ),
+    })?
+    .to_string_lossy()
+    .into_owned();
+  let pid = std::process::id();
+  let mut last_err: Option<std::io::Error> = None;
+  for _ in 0..MAX_RETRIES {
+    let nanos = SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .map(|d| d.as_nanos() as u64)
+      .unwrap_or(0);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let rand = nanos ^ counter.rotate_left(17);
+    let candidate = parent.join(format!("{file_name}.{pid}.{rand:016x}.tmp.safetensors"));
+    match OpenOptions::new()
+      .write(true)
+      .create_new(true)
+      .open(&candidate)
+    {
+      Ok(file) => {
+        // The writer (mlx-c / `fs::write`) reopens this path by name; drop
+        // our exclusive handle now.
+        drop(file);
+        return Ok(candidate);
+      }
+      Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+        last_err = Some(e);
+        continue;
+      }
+      Err(e) => {
+        return Err(Error::Backend {
+          message: format!(
+            "save: create_new tempfile {} failed: {e}",
+            candidate.display()
+          ),
+        });
+      }
+    }
+  }
+  Err(Error::Backend {
+    message: format!(
+      "save: exhausted {MAX_RETRIES} tempfile retries (last error: {})",
+      last_err
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| "<none>".into())
+    ),
+  })
+}
+
+/// fsync `path` so its bytes are durable on disk before it is renamed into
+/// place — a delayed-allocation / NFS / quota writeback failure must surface
+/// *here*, not after a not-yet-on-disk file has been renamed over a
+/// previously-valid checkpoint. mlx-c does not fsync; reopen the path
+/// read-only and `sync_all` it. Mirrors `cache_prompt::save_prompt_cache_atomic`.
+fn fsync_path(path: &Path) -> Result<()> {
+  let f = std::fs::File::open(path).map_err(|e| Error::Backend {
+    message: format!(
+      "save: reopen tempfile {} for fsync failed: {e}",
+      path.display()
+    ),
+  })?;
+  f.sync_all().map_err(|e| Error::Backend {
+    message: format!("save: fsync tempfile {} failed: {e}", path.display()),
+  })
 }
 
 /// Write back a model configuration as `config.json`, mirroring
@@ -1047,6 +1218,13 @@ pub fn save_model(
 ///
 /// then the result is written to `config_path` with 4-space indentation
 /// (`json.dump(config, fid, indent=4)`, `utils.py:921-922`).
+///
+/// The write is **failure-atomic** — the same temp + fsync + rename
+/// discipline `save_model` uses for its shards: the JSON is written to a
+/// same-directory `O_EXCL` tempfile and fsynced, then atomically renamed over
+/// `config_path`. A previously-valid `config.json` is therefore left fully
+/// intact if the write fails partway, and the tempfile is cleaned up on every
+/// error path.
 ///
 /// `config` must be a JSON **object**; anything else (or invalid JSON) is an
 /// [`Error::Backend`]. A write failure is an [`Error::Backend`] naming the
@@ -1078,7 +1256,27 @@ pub fn save_config(config: &str, config_path: &Path) -> Result<()> {
     message: format!("save_config: cannot re-serialize sorted config: {e}"),
   })?;
 
-  write_json_pretty(config_path, &sorted_value, "save_config: config.json")
+  // Failure-atomic write: stage to a same-directory `O_EXCL` tempfile, fsync,
+  // then atomically rename over `config_path` (cleaning up the tempfile on
+  // any error) — a partial write never clobbers a valid `config.json`.
+  let tmp_path = open_excl_temp_shard(config_path)?;
+  let staged = write_json_pretty(&tmp_path, &sorted_value, "save_config: config.json")
+    .and_then(|()| fsync_path(&tmp_path));
+  if let Err(err) = staged {
+    let _ = std::fs::remove_file(&tmp_path);
+    return Err(err);
+  }
+  if let Err(e) = std::fs::rename(&tmp_path, config_path) {
+    let _ = std::fs::remove_file(&tmp_path);
+    return Err(Error::Backend {
+      message: format!(
+        "save_config: cannot rename {} -> {}: {e}",
+        tmp_path.display(),
+        config_path.display()
+      ),
+    });
+  }
+  Ok(())
 }
 
 /// Save a model — weights and config — into `dst_path`, mirroring the
@@ -1816,6 +2014,204 @@ mod save_tests {
     let loaded = load_weights(&dir).unwrap();
     assert_eq!(loaded.len(), 1);
     assert!(loaded.contains_key("m.w.weight"));
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  // ─────────────────── save_model failure-atomicity ───────────────────
+
+  /// Failure-atomic save (Codex finding): when a `save_model` overwrite
+  /// FAILS partway, the previously-valid checkpoint in the directory is
+  /// left **fully intact and loadable**, and no partial `.tmp.safetensors`
+  /// remains. A direct (non-atomic) per-shard write would clobber a
+  /// still-valid shard *before* the new checkpoint is durable, leaving the
+  /// directory neither the old checkpoint nor the new one.
+  ///
+  /// Failure is injected by making the checkpoint directory read-only so
+  /// the next save's shard-tempfile `create_new` fails (mirrors
+  /// `cache_prompt`'s read-only-dir injection). POSIX-only (`unix`): the
+  /// permission bits are the failure lever.
+  #[cfg(unix)]
+  #[test]
+  fn save_model_failed_save_keeps_previous_checkpoint_intact() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = fresh_dir("save-model-failed-intact");
+
+    // 1. Write a good single-shard checkpoint.
+    let mut orig: Weights = HashMap::new();
+    orig.insert(
+      "orig.a.weight".to_string(),
+      Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &(3usize,)).unwrap(),
+    );
+    orig.insert(
+      "orig.b.weight".to_string(),
+      Array::from_slice::<f32>(&[4.0, 5.0], &(2usize,)).unwrap(),
+    );
+    save_model(&dir, &orig, &PerLayerQuantization::default()).unwrap();
+    assert!(dir.join("model.safetensors").is_file());
+    let orig_index = std::fs::read_to_string(dir.join("model.safetensors.index.json")).unwrap();
+
+    // 2. Make the directory read-only so the next save's tempfile
+    //    `create_new` fails. (Root could bypass this; CI/dev users are not.)
+    let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+    let orig_mode = perms.mode();
+    perms.set_mode(0o500); // r-x------ : no write ⇒ create_new fails
+    std::fs::set_permissions(&dir, perms).unwrap();
+
+    // 3. Attempt to overwrite with a different checkpoint — must fail.
+    let mut replacement: Weights = HashMap::new();
+    replacement.insert("SHOULD.NOT.WIN.weight".to_string(), f32_weight(7));
+    let r = save_model(&dir, &replacement, &PerLayerQuantization::default());
+
+    // Restore write perms BEFORE asserting so cleanup + reads work even if
+    // an assert fails.
+    let mut restore = std::fs::metadata(&dir).unwrap().permissions();
+    restore.set_mode(orig_mode);
+    std::fs::set_permissions(&dir, restore).unwrap();
+
+    assert!(r.is_err(), "a save into a read-only dir must fail");
+
+    // 4. The original checkpoint is untouched: same shard set + index, it
+    //    still `load_weights`-loads byte-equal, and no leftover tempfile.
+    let mut loaded = load_weights(&dir).unwrap();
+    assert_eq!(loaded.len(), 2, "only the original two weights load back");
+    assert!(loaded.contains_key("orig.a.weight"));
+    assert!(loaded.contains_key("orig.b.weight"));
+    assert!(
+      !loaded.contains_key("SHOULD.NOT.WIN.weight"),
+      "the failed save's weight must not have leaked in"
+    );
+    assert_eq!(
+      loaded
+        .get_mut("orig.a.weight")
+        .unwrap()
+        .to_vec::<f32>()
+        .unwrap(),
+      vec![1.0, 2.0, 3.0]
+    );
+    assert_eq!(
+      loaded
+        .get_mut("orig.b.weight")
+        .unwrap()
+        .to_vec::<f32>()
+        .unwrap(),
+      vec![4.0, 5.0]
+    );
+    assert_eq!(
+      std::fs::read_to_string(dir.join("model.safetensors.index.json")).unwrap(),
+      orig_index,
+      "the original index.json must survive the failed save unchanged"
+    );
+    let leftover_tmp = std::fs::read_dir(&dir)
+      .unwrap()
+      .filter_map(|e| e.ok())
+      .any(|e| {
+        e.file_name()
+          .to_string_lossy()
+          .ends_with(".tmp.safetensors")
+      });
+    assert!(
+      !leftover_tmp,
+      "no partial tempfile may remain after a failed save"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// Failure-atomic save, rename-failure branch: when the final atomic
+  /// `rename` fails (here a final shard name pre-exists as a **directory**,
+  /// which `fs::rename(file -> dir)` rejects), every staged
+  /// `.tmp.safetensors` is cleaned up — no leftover tempfile. This reaches
+  /// the write-succeeds / rename-fails path the read-only-dir test (which
+  /// fails earlier, at tempfile *create*) does not.
+  #[test]
+  fn save_model_failed_save_rename_failure_cleans_up_tempfiles() {
+    let dir = fresh_dir("save-model-failed-rename");
+    // A single-shard `save_model` renames its shard tempfile over
+    // `model.safetensors`; pre-create that name as a directory so the
+    // rename (file -> dir) fails after the tempfile is written + fsynced.
+    std::fs::create_dir_all(dir.join("model.safetensors")).unwrap();
+
+    let mut w: Weights = HashMap::new();
+    w.insert("m.w.weight".to_string(), f32_weight(4));
+    let r = save_model(&dir, &w, &PerLayerQuantization::default());
+    assert!(
+      r.is_err(),
+      "rename of a shard onto an existing directory must fail"
+    );
+
+    // `model.safetensors` is still the (untouched) directory.
+    assert!(
+      dir.join("model.safetensors").is_dir(),
+      "the colliding directory must be left untouched"
+    );
+    // No `.tmp.safetensors` leftover — every staged tempfile was removed.
+    let leftover_tmp = std::fs::read_dir(&dir)
+      .unwrap()
+      .filter_map(|e| e.ok())
+      .any(|e| {
+        e.file_name()
+          .to_string_lossy()
+          .ends_with(".tmp.safetensors")
+      });
+    assert!(
+      !leftover_tmp,
+      "every staged tempfile must be removed when a rename fails"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// `save_config` is failure-atomic too: a FAILED config write leaves a
+  /// previously-valid `config.json` fully intact and removes the tempfile.
+  /// Failure is injected with a read-only directory (POSIX-only).
+  #[cfg(unix)]
+  #[test]
+  fn save_config_failed_write_keeps_previous_config_intact() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = fresh_dir("save-config-failed-intact");
+    let config_path = dir.join("config.json");
+
+    // 1. Write a good config.
+    save_config(r#"{"model_type": "good", "hidden_size": 8}"#, &config_path).unwrap();
+    let orig = std::fs::read_to_string(&config_path).unwrap();
+
+    // 2. Make the directory read-only so the next write's tempfile
+    //    `create_new` fails.
+    let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+    let orig_mode = perms.mode();
+    perms.set_mode(0o500);
+    std::fs::set_permissions(&dir, perms).unwrap();
+
+    // 3. Attempt to overwrite — must fail.
+    let r = save_config(r#"{"model_type": "SHOULD-NOT-WIN"}"#, &config_path);
+
+    let mut restore = std::fs::metadata(&dir).unwrap().permissions();
+    restore.set_mode(orig_mode);
+    std::fs::set_permissions(&dir, restore).unwrap();
+
+    assert!(r.is_err(), "a config write into a read-only dir must fail");
+
+    // 4. The original config is byte-identical, no leftover tempfile.
+    assert_eq!(
+      std::fs::read_to_string(&config_path).unwrap(),
+      orig,
+      "the original config.json must survive the failed write unchanged"
+    );
+    let leftover_tmp = std::fs::read_dir(&dir)
+      .unwrap()
+      .filter_map(|e| e.ok())
+      .any(|e| {
+        e.file_name()
+          .to_string_lossy()
+          .ends_with(".tmp.safetensors")
+      });
+    assert!(
+      !leftover_tmp,
+      "no partial tempfile may remain after a failed config write"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
   }
 
