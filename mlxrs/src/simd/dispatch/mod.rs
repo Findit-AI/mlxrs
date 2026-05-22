@@ -4,10 +4,10 @@
 //! Public dispatchers for the [`crate::simd`] primitives.
 //!
 //! Each dispatcher selects the best-available SIMD backend at runtime
-//! (via `is_aarch64_feature_detected!` against [`crate::simd::arch`]),
-//! falling back to [`crate::simd::scalar`] when no SIMD backend
-//! applies. Callers needing scalar output explicitly call
-//! [`crate::simd::scalar`].
+//! (via `is_aarch64_feature_detected!` against the `aarch64`-gated
+//! `crate::simd::arch` module), falling back to
+//! [`crate::simd::scalar`] when no SIMD backend applies. Callers
+//! needing scalar output explicitly call [`crate::simd::scalar`].
 
 mod dot;
 

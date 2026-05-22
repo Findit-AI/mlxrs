@@ -18,8 +18,9 @@
 //!   kernels. **Always compiled**, independent of `target_arch`. The
 //!   math contract is anchored here; it is also the differential-test
 //!   oracle and the fallback path.
-//! - [`arch`](crate::simd::arch) — architecture-specific SIMD
-//!   backends. `arch::neon` (`#[cfg(target_arch = "aarch64")]`) holds
+//! - `arch` — architecture-specific SIMD backends, gated behind
+//!   `#[cfg(target_arch = "aarch64")]` (so not linkable from these
+//!   always-rendered docs). `arch::neon` holds
 //!   `#[target_feature(enable = "neon")] unsafe fn` kernels.
 //! - `dispatch` — runtime-detection routers. Each public dispatcher
 //!   asserts its slice-length preconditions **unconditionally**, then
@@ -43,9 +44,10 @@
 //! ([`neon_available`](crate::simd::neon_available)); on every other
 //! target the dispatchers route to [`scalar`](crate::simd::scalar)
 //! automatically. The [`scalar`](crate::simd::scalar) and `dispatch`
-//! layers therefore compile on **all** targets — only
-//! [`arch`](crate::simd::arch) and
-//! [`neon_available`](crate::simd::neon_available) are `aarch64`-gated.
+//! layers therefore compile on **all** targets — only the `arch`
+//! module is `aarch64`-gated (the
+//! [`neon_available`](crate::simd::neon_available) detector is a
+//! `const false` stub elsewhere).
 //! This matches the `dia` reference (no simd feature). A pure-scalar
 //! build for bisecting a numeric regression — even on a NEON-capable
 //! host — is available via the `--cfg mlxrs_force_scalar` build escape
@@ -87,16 +89,33 @@ pub use dispatch::{dot, sum_of_squares};
 /// `true`; the explicit check keeps the scalar fallback a real,
 /// reachable branch and honours the force-scalar escape.
 ///
-/// Compiled only on `aarch64` — the single target with a NEON backend
-/// to gate. On every other target there is no SIMD backend, so the
-/// detector itself is elided and every dispatcher routes to
-/// [`scalar`].
+/// On every non-`aarch64` target there is no NEON backend to gate, so
+/// this is a `const false` stub: every dispatcher then routes to
+/// [`scalar`]. The stub keeps the symbol present on all targets so
+/// intra-doc links resolve in a non-`aarch64` rustdoc build.
 #[cfg(target_arch = "aarch64")]
 pub fn neon_available() -> bool {
   if cfg!(mlxrs_force_scalar) {
     return false;
   }
   std::arch::is_aarch64_feature_detected!("neon")
+}
+
+/// Whether the NEON SIMD backend is usable on the executing CPU.
+///
+/// `true` when NEON is reported by the CPU **and** `--cfg
+/// mlxrs_force_scalar` is not set. NEON is part of the AArch64
+/// baseline, so on a normal `aarch64` host this is effectively always
+/// `true`; the explicit check keeps the scalar fallback a real,
+/// reachable branch and honours the force-scalar escape.
+///
+/// On every non-`aarch64` target there is no NEON backend to gate, so
+/// this is a `const false` stub: every dispatcher then routes to
+/// [`scalar`]. The stub keeps the symbol present on all targets so
+/// intra-doc links resolve in a non-`aarch64` rustdoc build.
+#[cfg(not(target_arch = "aarch64"))]
+pub fn neon_available() -> bool {
+  false
 }
 
 #[cfg(test)]
