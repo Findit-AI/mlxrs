@@ -196,9 +196,11 @@ impl Default for FineTuneType {
 /// dropout is the identity — see the [module docs](self)).
 #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct LoraParameters {
-  /// Low-rank dimension `r` (mlx-lm `config["rank"]`). Defaults to
-  /// [`DEFAULT_LORA_RANK`].
-  #[serde(default = "default_rank")]
+  /// Low-rank dimension `r`. Deserializes from `rank` (mlx-lm
+  /// `config["rank"]`) **or** the PEFT/HF key `r` (PEFT-trained adapters name
+  /// it `r`, e.g. `"r": 16`) — mlx-lm-trained configs use `rank`, so accept
+  /// both. Defaults to [`DEFAULT_LORA_RANK`] when neither is present.
+  #[serde(default = "default_rank", alias = "r")]
   pub rank: i32,
   /// Literal low-rank scale (mlx-lm `config["scale"]`). Used when `alpha` is
   /// absent; defaults to [`DEFAULT_LORA_SCALE`] when neither `scale` nor
@@ -1092,6 +1094,45 @@ fn validate_factor_shapes(base: &BaseLinear, params: &AdapterParams, who: &str) 
   Ok(())
 }
 
+/// Check the adapter factor tensors' rank axis against the rank declared in
+/// `adapter_config.json` (`config.rank()`) — the *config-vs-tensor* rank
+/// cross-check.
+///
+/// [`validate_factor_shapes`] only verifies `lora_a` and `lora_b` agree with
+/// **each other** on the shared rank axis; it cannot see the config. But the
+/// layer SCALE is `alpha / config.rank()` when an `alpha` (`lora_alpha`) is
+/// present, so a config whose `rank` has drifted from the tensors' rank — a
+/// stale `adapter_config.json`, or a PEFT config whose `r` key was not
+/// recognized and silently defaulted — would otherwise build rank-`R` tensors
+/// while scaling by `alpha / config.rank()` (the wrong divisor): silently wrong
+/// strength on every adapted projection.
+///
+/// Requiring `lora_a`'s rank axis (`[input_dims, r]`, last axis) and
+/// `lora_b`'s rank axis (`[r, output_dims]`, leading axis) to both equal
+/// `config_rank` makes that drift a loud, recoverable [`Error::ShapeMismatch`]
+/// at load time instead. Indexing is defensive (a non-2-D factor reads as a
+/// `0` rank axis), so this is safe to call independently of
+/// [`validate_factor_shapes`].
+fn validate_config_rank(params: &AdapterParams, config_rank: usize, who: &str) -> Result<()> {
+  let a_shape = params.lora_a.shape();
+  let b_shape = params.lora_b.shape();
+  // A well-formed `lora_a` is `[input_dims, r]` and `lora_b` is
+  // `[r, output_dims]`; a non-2-D factor reads as a `0` rank axis here and
+  // fails the equality below (it also fails `validate_factor_shapes`).
+  let a_rank = a_shape.get(1).copied().unwrap_or_default();
+  let b_rank = b_shape.first().copied().unwrap_or_default();
+  if a_rank != config_rank || b_rank != config_rank {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "{who}: adapter factor rank ({a_rank}) does not match adapter_config.json rank \
+         ({config_rank}); a stale config (or a PEFT config whose `r` key was not recognized) \
+         would silently scale by alpha/{config_rank} instead of alpha/{a_rank}"
+      ),
+    });
+  }
+  Ok(())
+}
+
 // ─────────────────────── linear_to_lora_layers ───────────────────────
 
 /// Apply LoRA/DoRA wrapping to the targeted linear layers of a [`Weights`]
@@ -1148,7 +1189,11 @@ fn validate_factor_shapes(base: &BaseLinear, params: &AdapterParams, who: &str) 
 ///
 /// A selected path whose factor shapes don't match the base (or a DoRA path
 /// with no magnitude) is a recoverable [`Error::ShapeMismatch`] /
-/// [`Error::Backend`].
+/// [`Error::Backend`]. A selected path whose factor tensors' rank axis
+/// disagrees with `config.rank()` (a stale `adapter_config.json`, or a PEFT
+/// `r` key that defaulted) is a recoverable [`Error::ShapeMismatch`]
+/// (`validate_config_rank`) — caught before the `alpha / rank` scale is
+/// applied, so a rank drift cannot silently scale by the wrong divisor.
 pub fn linear_to_lora_layers(
   weights: &Weights,
   config: &LoraConfig,
@@ -1160,6 +1205,13 @@ pub fn linear_to_lora_layers(
   let scale = config.scale();
   let is_dora = config.is_dora();
   let keys = config.lora_parameters.keys.as_deref();
+  // The config-declared rank, cross-checked against every adapter factor group
+  // below (`validate_config_rank`). A non-positive rank cannot index a tensor
+  // axis — `load_adapters` already rejects it, but `linear_to_lora_layers` is
+  // also a public entry point, so guard here too. `None` ⇒ skip the
+  // config-rank cross-check (degenerate config; the empty/zero-rank factors it
+  // would build are caught by the shape checks instead).
+  let config_rank: Option<usize> = usize::try_from(config.rank()).ok().filter(|&r| r > 0);
   // mlx-lm selects `model.layers[-max(num_layers, 0):]` (`tuner/utils.py:103`).
   // Note the Python `-0` quirk: when `num_layers <= 0`, `max(num_layers, 0)` is
   // `0` and `layers[-0:]` == `layers[0:]` == ALL blocks (so `num_layers: -1` —
@@ -1215,6 +1267,15 @@ pub fn linear_to_lora_layers(
       continue;
     };
     consumed.insert(path);
+
+    // Cross-check the factor tensors' rank axis against the config-declared
+    // rank BEFORE building the layer (and resolving the alpha/rank scale): a
+    // config/tensor rank drift must fail loudly here, not silently scale by
+    // the wrong divisor (`alpha / config.rank()`).
+    if let Some(rank) = config_rank {
+      let who = if is_dora { "DoRALinear" } else { "LoRALinear" };
+      validate_config_rank(params, rank, who)?;
+    }
 
     let base = build_base_linear(weights, path, weight, quant)?;
     let layer = if is_dora {
@@ -1955,6 +2016,22 @@ mod tests {
   }
 
   #[test]
+  fn config_parse_peft_r_alias() {
+    // A PEFT-style adapter_config.json names the rank `r` (not `rank`). The
+    // `#[serde(alias = "r")]` must pick it up so a PEFT-trained adapter does
+    // NOT silently fall back to the default rank.
+    let json = r#"{
+      "fine_tune_type": "lora",
+      "num_layers": 4,
+      "lora_parameters": { "r": 16, "lora_alpha": 32.0 }
+    }"#;
+    let cfg = LoraConfig::from_json(json).unwrap();
+    assert_eq!(cfg.rank(), 16, "PEFT `r` key must populate `rank`");
+    // alpha/rank = 32/16 = 2.0 — the alias feeding `rank` makes the scale right.
+    assert_eq!(cfg.scale(), 2.0);
+  }
+
+  #[test]
   fn config_parse_dora_and_alpha_scale() {
     // alpha/rank scale: alpha=32, rank=8 ⇒ scale=4.0. fine_tune_type dora.
     let json = r#"{
@@ -2169,6 +2246,73 @@ mod tests {
       .unwrap();
     approx_eq(&out.to_vec::<f32>().unwrap(), &[3.0, 6.0], 1e-5);
 
+    std::fs::remove_dir_all(&tmp).ok();
+  }
+
+  /// Write a mock adapter dir whose `adapter_config.json` is `config_json`
+  /// (caller-supplied, so a test can vary `rank`/`r`/`alpha`) and whose
+  /// `adapters.safetensors` carries rank-`r` factors for the 4 q_proj paths
+  /// over the toy `[2, 3]` base: `lora_a` is `[3, r]`, `lora_b` is `[r, 2]`.
+  fn write_mock_adapter_rank(dir: &Path, config_json: &str, r: usize) {
+    std::fs::write(dir.join("adapter_config.json"), config_json).unwrap();
+    let la = Array::full::<f32>(&(3usize, r), 0.01).unwrap();
+    let lb = Array::full::<f32>(&(r, 2usize), 0.01).unwrap();
+    let mut arrays: HashMap<String, Array> = HashMap::new();
+    for b in 0..4 {
+      let path = format!("model.layers.{b}.self_attn.q_proj");
+      arrays.insert(format!("{path}.lora_a"), la.try_clone().unwrap());
+      arrays.insert(format!("{path}.lora_b"), lb.try_clone().unwrap());
+    }
+    crate::io::save_safetensors(&dir.join("adapters.safetensors"), &arrays).unwrap();
+  }
+
+  #[test]
+  fn load_adapters_peft_r_alias_rank16_loads() {
+    // PEFT-style config: rank under the key `r` (not `rank`), `lora_alpha`
+    // present. The `r` alias makes `config.rank() == 16`, so rank-16 factor
+    // tensors pass the config-rank cross-check and load cleanly.
+    let tmp = std::env::temp_dir().join(format!("mlxrs_peft_r16_test_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let cfg = r#"{
+      "fine_tune_type": "lora",
+      "num_layers": 16,
+      "lora_parameters": { "r": 16, "lora_alpha": 32.0, "keys": ["self_attn.q_proj"] }
+    }"#;
+    write_mock_adapter_rank(&tmp, cfg, 16);
+    let weights = toy_weights();
+    let layers = load_adapters(&weights, &tmp, None, 4).unwrap();
+    assert_eq!(layers.len(), 4);
+    // The resolved scale is alpha/rank = 32/16 = 2.0 — i.e. the `r` alias fed
+    // the rank that divides alpha.
+    if let Some(LoraLayer::Lora(l)) = layers.get("model.layers.0.self_attn.q_proj") {
+      assert_eq!(l.scale(), 2.0);
+    } else {
+      panic!("expected a LoRA layer");
+    }
+    std::fs::remove_dir_all(&tmp).ok();
+  }
+
+  #[test]
+  fn load_adapters_rank_drift_is_shape_mismatch() {
+    // Config declares rank 8 with `lora_alpha` present, but the factor tensors
+    // are rank 16 (a stale config / unrecognized `r` drift). Without the
+    // config-vs-tensor rank cross-check this silently builds rank-16 factors
+    // and scales by alpha/8 instead of alpha/16 — wrong strength. It must now
+    // fail loudly at load with a ShapeMismatch.
+    let tmp = std::env::temp_dir().join(format!("mlxrs_rankdrift_test_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let cfg = r#"{
+      "fine_tune_type": "lora",
+      "num_layers": 16,
+      "lora_parameters": { "rank": 8, "lora_alpha": 32.0, "keys": ["self_attn.q_proj"] }
+    }"#;
+    write_mock_adapter_rank(&tmp, cfg, 16);
+    let weights = toy_weights();
+    let err = load_adapters(&weights, &tmp, None, 4).unwrap_err();
+    assert!(
+      matches!(err, Error::ShapeMismatch { .. }),
+      "rank drift must be a ShapeMismatch, got {err:?}"
+    );
     std::fs::remove_dir_all(&tmp).ok();
   }
 
