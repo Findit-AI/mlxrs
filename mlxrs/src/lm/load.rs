@@ -1,4 +1,5 @@
-//! Architecture-agnostic model-load **support surface**, ported from
+//! Architecture-agnostic model-load **and -save support surface**, ported
+//! from
 //! [`mlx_lm.utils`](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/utils.py)
 //! (the authoritative spec) and cross-checked against `mlx-swift-lm`'s
 //! `MLXLMCommon` loader.
@@ -19,19 +20,30 @@
 //! - [`load`] mirrors `utils.load` — wire `config.json` + weights + the #18
 //!   [`Tokenizer`](crate::tokenizer::Tokenizer) into the parts a (per-usecase)
 //!   architecture assembles itself.
+//! - [`make_shards`] / [`save_model`] / [`save_config`] / [`save`] mirror the
+//!   model-**save** half of `mlx_lm.utils`: split a [`Weights`] map into
+//!   `≤ max-shard-size` `.safetensors` shards, write them plus the
+//!   `model.safetensors.index.json` weight-map index, write back a sorted
+//!   `config.json`, and the `save` driver that wires the two together.
+//! - [`get_total_parameters`] / [`compute_bits_per_weight`] /
+//!   [`does_model_support_input_embeddings`] mirror the model-introspection
+//!   helpers (`utils.py:196-215,979-991`).
 //!
 //! **Deliberately NOT ported** (per the project's no-model-arch scoping):
 //! `utils.load_model`'s per-architecture `model_class(model_args)`
 //! construction, `model.sanitize(weights)` key-remap, the `_quantize` /
 //! `class_predicate` quantization *application* (it mutates a constructed
-//! model), the legacy AWQ/bitnet transforms, `_download` (HuggingFace Hub —
-//! this is local-path-only, no network), and `make_shards` / `save` /
-//! `sharded_load`. [`load`] returns the raw `(Config, Weights, Tokenizer)`
+//! model), the legacy AWQ/bitnet transforms, `_download` /
+//! `create_model_card` / `upload_to_hub` (HuggingFace Hub — this is
+//! local-path-only, no network), and `sharded_load` / `pipeline_load`
+//! (distributed). [`load`] returns the raw `(Config, Weights, Tokenizer)`
 //! triple; assembling and (de)quantizing a concrete model is the per-usecase
 //! architecture's job. The [`Config::quantization`] field merely *carries*
 //! `config["quantization"]` (mlx-lm `utils.py`'s
 //! `config.get("quantization")`) so a later arch can apply it — `load` itself
-//! never quantizes.
+//! never quantizes. The save side is symmetric: it works on the arch-agnostic
+//! [`Weights`] name map (mlx-lm's `dict(tree_flatten(model.parameters()))`),
+//! not a constructed `nn.Module`.
 //!
 //! Conventions mirror [`crate::lm::sample`] and
 //! [`crate::embeddings::config`]: `Result`-fallible, no implicit eval (the
@@ -43,10 +55,14 @@
 //!
 //! [`Error::Backend`]: crate::Error::Backend
 
-use std::{collections::HashMap, path::Path};
+use std::{
+  collections::{BTreeMap, HashMap},
+  path::Path,
+};
 
 use crate::{
   array::Array,
+  dtype::Dtype,
   error::{Error, Result},
 };
 
@@ -541,4 +557,916 @@ pub fn load_tokenizer_with_eos(
   crate::tokenizer::Tokenizer::from_path(dir, resolved_eos.as_deref()).map_err(|e| Error::Backend {
     message: format!("cannot load tokenizer from {}: {e}", dir.display()),
   })
+}
+
+// ───────────────────────────── save side ─────────────────────────────
+//
+// The model-**save** half of `mlx_lm.utils`: shard a weight map, write the
+// shards plus the `model.safetensors.index.json` index, write back a sorted
+// `config.json`, and the `save` driver. All of these work on the
+// arch-agnostic [`Weights`] name map (mlx-lm's
+// `dict(tree_flatten(model.parameters()))`) — mlxrs has no `nn.Module` tree
+// to flatten (the per-usecase architecture owns that), so a caller flattens
+// its own model into a [`Weights`] map and hands it here, exactly as
+// [`crate::lm::quant`] takes a [`Weights`] map rather than walking modules.
+
+/// Default per-shard size cap, in **gigabytes**, mirroring
+/// `mlx_lm.utils.MAX_FILE_SIZE_GB` (`utils.py:57`). [`make_shards`] /
+/// [`save_model`] split a weight map so no single `.safetensors` shard
+/// exceeds this; the on-the-wire byte cap is `MAX_FILE_SIZE_GB << 30`
+/// (`utils.py:609` — gibibytes, `1 << 30` per "GB").
+pub const MAX_FILE_SIZE_GB: u64 = 5;
+
+/// In-memory byte size of one [`Dtype`] element — mlx-c's `mlx_dtype_size`,
+/// reproduced as a pure Rust mapping so `array_nbytes` needs no FFI/eval
+/// (twin of `crate::lm::cache`'s private `dtype_size`, restated here so the
+/// save side carries no `cache`-module dependency).
+fn dtype_size(d: Dtype) -> usize {
+  match d {
+    Dtype::Bool | Dtype::U8 | Dtype::I8 => 1,
+    Dtype::U16 | Dtype::I16 | Dtype::F16 | Dtype::BF16 => 2,
+    Dtype::U32 | Dtype::I32 | Dtype::F32 => 4,
+    Dtype::U64 | Dtype::I64 | Dtype::F64 | Dtype::Complex64 => 8,
+  }
+}
+
+/// Byte size of a weight `Array` — `elem_count * dtype_size` (mlx's
+/// `array.nbytes`, which mlx-lm's `make_shards` / `save_model` /
+/// `compute_bits_per_weight` all read). A **pure metadata read**: it forces
+/// no `eval` and allocates nothing (no implicit eval — spec rule). An
+/// unrecognized dtype surfaces as a recoverable [`Error::Backend`].
+fn array_nbytes(a: &Array) -> Result<usize> {
+  Ok(a.size() * dtype_size(a.dtype()?))
+}
+
+/// One weight shard: a **borrowed** sub-view of a [`Weights`] map whose
+/// arrays' combined `array_nbytes` respects the [`make_shards`] size cap
+/// (except a lone over-cap weight, which still gets its own shard — see
+/// [`make_shards`]). Borrowed (`&'a str` keys, `&'a Array` values), not
+/// owned: [`make_shards`] **partitions** the input map rather than
+/// duplicating any `Array` — `Array` is intentionally not `Clone` (a
+/// refcount-sharing duplicate is [`Array::try_clone`](crate::array::Array::try_clone)),
+/// and a save partition has no reason to clone. Written verbatim by
+/// [`crate::io::save_safetensors_view`] (the no-clone shard writer).
+pub type Shard<'a> = BTreeMap<&'a str, &'a Array>;
+
+/// Split a weight map into smaller shards, mirroring
+/// `mlx_lm.utils.make_shards` (`utils.py:598-619`).
+///
+/// Weights are accumulated into the current shard until adding the next one
+/// would push the shard past `max_file_size_gb` gibibytes
+/// (`max_file_size_bytes = max_file_size_gb << 30`, `utils.py:609`); at that
+/// point the current shard is flushed and a fresh one started. The check is
+/// `shard_size + v.nbytes > max_file_size_bytes` **before** the weight is
+/// added (`utils.py:613`), so — exactly as the reference — a single weight
+/// larger than the cap is flushed onto its own shard and still placed (the
+/// cap is never *enforced*, only used as a split point). The result is
+/// always non-empty: a final (possibly empty, if `weights` itself was empty)
+/// shard is always appended (`utils.py:618`).
+///
+/// Python `dict` preserves insertion order, so `make_shards` is
+/// order-sensitive; a Rust [`HashMap`] is unordered, so this port iterates
+/// the keys in **sorted order** — the same determinism convention
+/// [`load_weights`] applies to its shard merge. Shard *contents* (which keys
+/// land together) are therefore deterministic and reproducible; the final
+/// `model.safetensors.index.json` `weight_map` [`save_model`] writes is
+/// sorted regardless, so a load-back is byte-identical either way.
+///
+/// The returned [`Shard`]s **borrow** from `weights` — no `Array` is cloned
+/// (each shard is a partition, not a copy).
+///
+/// `max_file_size_gb` is in gibibytes (the reference's "GB" = `1 << 30`); a
+/// `0` cap makes every weight flush onto its own shard (`0 + n > 0` for any
+/// non-empty weight). A weight whose dtype is unrecognized surfaces as a
+/// recoverable [`Error::Backend`] from `array_nbytes`.
+pub fn make_shards(weights: &Weights, max_file_size_gb: u64) -> Result<Vec<Shard<'_>>> {
+  // `gb << 30` in `u64` so there is no `usize` truncation on a 32-bit host;
+  // `MAX_FILE_SIZE_GB` (5) << 30 is ~5.4e9, well within `u64`.
+  let max_file_size_bytes: u64 = max_file_size_gb << 30;
+
+  // Deterministic, reproducible split order: sorted keys (a `HashMap` has no
+  // insertion order, unlike the Python `dict` the reference iterates).
+  let sorted: BTreeMap<&str, &Array> = weights.iter().map(|(k, v)| (k.as_str(), v)).collect();
+
+  let mut shards: Vec<Shard<'_>> = Vec::new();
+  let mut shard: Shard<'_> = BTreeMap::new();
+  let mut shard_size: u64 = 0;
+  for (k, v) in sorted {
+    let nbytes = array_nbytes(v)? as u64;
+    // mlx-lm `utils.py:613`: flush BEFORE adding when the running size plus
+    // the next weight would exceed the cap. `saturating_add` keeps a
+    // pathological multi-exabyte map from wrapping the comparison (it would
+    // only ever push the sum *higher*, never spuriously under the cap).
+    if shard_size.saturating_add(nbytes) > max_file_size_bytes && !shard.is_empty() {
+      shards.push(std::mem::take(&mut shard));
+      shard_size = 0;
+    }
+    shard.insert(k, v);
+    shard_size = shard_size.saturating_add(nbytes);
+  }
+  // mlx-lm always appends the trailing shard (`utils.py:618`), even when
+  // `weights` is empty — then the single shard is itself empty.
+  shards.push(shard);
+  Ok(shards)
+}
+
+/// Total parameter count of a weight map, mirroring
+/// `mlx_lm.utils.get_total_parameters` (`utils.py:196-207`).
+///
+/// The reference walks the model's leaf `nn.Module`s: a **quantized** module
+/// (one carrying a `bits` attribute) contributes `bias.size + weight.size *
+/// 32 // bits` — the *logical* (unpacked) parameter count, since a quantized
+/// `weight` is a `uint32`-packed matrix holding `32 / bits` logical weights
+/// per element — while a dense module contributes the plain sum of its
+/// parameters' `.size`.
+///
+/// mlxrs has no `nn.Module` tree, so this port walks the [`Weights`] **name
+/// map** (exactly as [`crate::lm::quant`] does). A quantized layer is
+/// detected by a `<path>.scales` sibling next to a `<path>.weight` — the
+/// very signal mlx-lm's own loader uses (`class_predicate`'s `f"{p}.scales"
+/// in weights`, `utils.py:354`). For such a layer the packed `<path>.weight`
+/// (a `uint32` matrix) contributes `weight.size * 32 / bits` logical
+/// parameters and `<path>.biases` — if present — contributes `bias.size`
+/// (`utils.py:203-204`); the `<path>.scales` array, like the reference, is
+/// **not** counted (it is quantization metadata, not a model parameter).
+/// Every other array contributes its plain `.size` (a dense `.weight`, a
+/// dense bias, norms, embeddings, …) — the dense `sum(v.size …)` branch.
+///
+/// `bits` per quantized layer is resolved through
+/// [`PerLayerQuantization::quantization_for`](crate::lm::quant::PerLayerQuantization::quantization_for)
+/// (`quant` carries the global + per-layer overrides). A quantized triple
+/// whose layer has no resolvable [`Quantization`] in `quant` is a
+/// configuration error → [`Error::Backend`].
+///
+/// A **pure metadata read**: no `eval`, no allocation of weight data.
+pub fn get_total_parameters(
+  weights: &Weights,
+  quant: &crate::lm::quant::PerLayerQuantization,
+) -> Result<u64> {
+  let mut total: u64 = 0;
+  for (key, arr) in weights {
+    // A quantized `<path>.weight` is the one whose `<path>.scales` sibling
+    // is also present (mlx-lm's `f"{p}.scales" in weights` signal). Its
+    // packed `uint32` matrix unpacks to `size * 32 / bits` logical weights.
+    if let Some(path) = key.strip_suffix(".weight") {
+      let scales_key = format!("{path}.scales");
+      if weights.contains_key(&scales_key) {
+        let q = quant.quantization_for(path).ok_or_else(|| Error::Backend {
+          message: format!(
+            "get_total_parameters: quantized layer {path:?} (has `.scales`) \
+             but no quantization params for it in the config"
+          ),
+        })?;
+        if q.bits <= 0 {
+          return Err(Error::Backend {
+            message: format!(
+              "get_total_parameters: quantized layer {path:?} has non-positive bits {}",
+              q.bits
+            ),
+          });
+        }
+        // `weight.size * 32 // bits` (`utils.py:204`), in `u64` so a large
+        // packed matrix cannot overflow the multiply on a 32-bit host.
+        total = total.saturating_add(arr.size() as u64 * 32 / q.bits as u64);
+        continue;
+      }
+    }
+    // A `<path>.scales` for a quantized layer is metadata, not a parameter
+    // — the reference's quantized branch counts only `weight` and `bias`
+    // (`utils.py:203-204`). Skip a `.scales` whose `.weight` sibling exists.
+    if let Some(path) = key.strip_suffix(".scales")
+      && weights.contains_key(&format!("{path}.weight"))
+    {
+      continue;
+    }
+    // Everything else — a dense `.weight`, any `.biases`, norms, embeddings
+    // — is a plain parameter counted by its element count (the dense
+    // `sum(v.size for _, v in tree_flatten(m.parameters()))` branch).
+    total = total.saturating_add(arr.size() as u64);
+  }
+  Ok(total)
+}
+
+/// Bits-per-weight of a weight map, mirroring
+/// `mlx_lm.utils.compute_bits_per_weight` (`utils.py:210-215`).
+///
+/// `model_bytes * 8 / model_params`, where `model_bytes` is the sum of every
+/// array's `array_nbytes` (the reference's `tree_reduce(... + x.nbytes
+/// ...)`, `utils.py:211-213` — it sums **every** array, `scales` / `biases`
+/// included) and `model_params` is [`get_total_parameters`]. The result is
+/// the average number of stored bits backing each logical parameter; for a
+/// `b`-bit quantized model it lands near `b` plus the scale/bias overhead.
+///
+/// `quant` supplies the per-layer [`Quantization`] [`get_total_parameters`]
+/// needs. A `model_params == 0` map (no weights) is an [`Error::Backend`]
+/// rather than a divide-by-zero. A **pure metadata read** — no `eval`.
+pub fn compute_bits_per_weight(
+  weights: &Weights,
+  quant: &crate::lm::quant::PerLayerQuantization,
+) -> Result<f64> {
+  let mut model_bytes: u64 = 0;
+  for arr in weights.values() {
+    model_bytes = model_bytes.saturating_add(array_nbytes(arr)? as u64);
+  }
+  let model_params = get_total_parameters(weights, quant)?;
+  if model_params == 0 {
+    return Err(Error::Backend {
+      message: "compute_bits_per_weight: model has zero parameters".into(),
+    });
+  }
+  Ok(model_bytes as f64 * 8.0 / model_params as f64)
+}
+
+/// Whether `model` accepts pre-computed input embeddings, mirroring
+/// `mlx_lm.utils.does_model_support_input_embeddings` (`utils.py:979-991`).
+///
+/// The reference inspects `model.__call__` for an `input_embeddings`
+/// parameter. mlxrs has no runtime call-signature introspection, so the
+/// capability is declared on the [`Model`](crate::lm::model::Model) trait
+/// itself: this is a thin forward to
+/// [`Model::supports_input_embeddings`](crate::lm::model::Model::supports_input_embeddings)
+/// (text-only models inherit the `false` default; a VLM that overrides
+/// [`forward_embeddings`](crate::lm::model::Model::forward_embeddings) also
+/// overrides that to `true`). Kept as a free function so the public name
+/// matches the reference helper.
+pub fn does_model_support_input_embeddings(model: &dyn crate::lm::model::Model) -> bool {
+  model.supports_input_embeddings()
+}
+
+/// Per-shard file name, mirroring `mlx_lm.utils.save_model`'s
+/// `shard_file_format` (`utils.py:728-732`): a lone shard is the bare
+/// `model.safetensors`; a multi-shard set uses the
+/// `model-{:05d}-of-{:05d}.safetensors` HF convention (**1-based** shard
+/// index, zero-padded to 5 digits).
+fn shard_file_name(index_1based: usize, shards_count: usize) -> String {
+  if shards_count > 1 {
+    format!("model-{index_1based:05}-of-{shards_count:05}.safetensors")
+  } else {
+    "model.safetensors".to_string()
+  }
+}
+
+/// Write a weight map as sharded `.safetensors` plus the
+/// `model.safetensors.index.json` weight-map index into `save_path`,
+/// mirroring `mlx_lm.utils.save_model` (`utils.py:714-771`).
+///
+/// Steps, in reference order:
+///
+/// 1. `save_path` is created (`mkdir -p`, `utils.py:723`).
+/// 2. The weights are sharded via [`make_shards`] at [`MAX_FILE_SIZE_GB`]
+///    (`utils.py:726`).
+/// 3. `total_size` (the sum of every weight's `array_nbytes`) and
+///    `total_parameters` ([`get_total_parameters`]) are computed for the
+///    index `metadata` block (`utils.py:734-741`).
+/// 4. Each shard is written with [`crate::io::save_safetensors_with_metadata`]
+///    and the `{"format": "mlx"}` safetensors metadata mlx writes
+///    (`utils.py:756`); the shard file name comes from `shard_file_name`.
+/// 5. The `weight_map` (`weight name → shard file name`) is assembled, then
+///    **sorted by key** (`utils.py:762-764`), and the whole `index_data`
+///    (`{ "metadata": { total_size, total_parameters }, "weight_map": … }`)
+///    is written to `model.safetensors.index.json` with 4-space indentation
+///    (`json.dump(..., indent=4)`, `utils.py:766-771`).
+///
+/// `quant` supplies the per-layer [`Quantization`]
+/// [`get_total_parameters`] needs (pass
+/// [`PerLayerQuantization::default`](crate::lm::quant::PerLayerQuantization)
+/// for an unquantized model). Unlike the reference's `donate_model` /
+/// `weights.clear()` memory-frugality dance (`utils.py:742-760` — it drops
+/// each shard's `Array`s as it goes), this port borrows `&Weights` and never
+/// takes ownership, so there is nothing to donate; the on-disk result is
+/// identical.
+///
+/// A recoverable failure (directory create, a shard write, the index write,
+/// an unrecognized weight dtype) is an [`Error::Backend`] naming the path.
+pub fn save_model(
+  save_path: &Path,
+  weights: &Weights,
+  quant: &crate::lm::quant::PerLayerQuantization,
+) -> Result<()> {
+  // 1. `save_path.mkdir(parents=True, exist_ok=True)` (`utils.py:723`).
+  std::fs::create_dir_all(save_path).map_err(|e| Error::Backend {
+    message: format!(
+      "save_model: cannot create directory {}: {e}",
+      save_path.display()
+    ),
+  })?;
+
+  // 2. shard (`utils.py:726`).
+  let shards = make_shards(weights, MAX_FILE_SIZE_GB)?;
+  let shards_count = shards.len();
+
+  // 3. index `metadata` block (`utils.py:734-741`): `total_size` is the sum
+  //    of every weight's `nbytes`, `total_parameters` the unpacked count.
+  let mut total_size: u64 = 0;
+  for arr in weights.values() {
+    total_size = total_size.saturating_add(array_nbytes(arr)? as u64);
+  }
+  let total_parameters = get_total_parameters(weights, quant)?;
+
+  // 4. write each shard, recording `weight name → shard file name`. The
+  //    `{"format": "mlx"}` safetensors metadata matches mlx-lm
+  //    (`mx.save_safetensors(..., metadata={"format": "mlx"})`,
+  //    `utils.py:756`). The shards are borrowed views, so they go through
+  //    `save_safetensors_view` — no `Array` is cloned for the write.
+  let mut shard_metadata: HashMap<String, String> = HashMap::with_capacity(1);
+  shard_metadata.insert("format".to_string(), "mlx".to_string());
+  // `weight_map` collected sorted-by-key so the written index is
+  // deterministic (`utils.py:762-764` sorts it before the `json.dump`).
+  let mut weight_map: BTreeMap<String, String> = BTreeMap::new();
+  for (i, shard) in shards.iter().enumerate() {
+    let shard_name = shard_file_name(i + 1, shards_count);
+    let shard_path = save_path.join(&shard_name);
+    crate::io::save_safetensors_view(
+      &shard_path,
+      shard.iter().map(|(&k, &v)| (k, v)),
+      &shard_metadata,
+    )?;
+    for &weight_name in shard.keys() {
+      weight_map.insert(weight_name.to_string(), shard_name.clone());
+    }
+  }
+
+  // 5. assemble + write `model.safetensors.index.json` with `indent=4`
+  //    (`utils.py:735-771`). `serde_json::Value` preserves the
+  //    reference key order (`metadata` before `weight_map`); `weight_map`
+  //    is a `BTreeMap`, so its keys serialize sorted.
+  let index = serde_json::json!({
+    "metadata": {
+      "total_size": total_size,
+      "total_parameters": total_parameters,
+    },
+    "weight_map": weight_map,
+  });
+  let index_path = save_path.join("model.safetensors.index.json");
+  write_json_pretty(
+    &index_path,
+    &index,
+    "save_model: model.safetensors.index.json",
+  )?;
+  Ok(())
+}
+
+/// Write back a model configuration as `config.json`, mirroring
+/// `mlx_lm.utils.save_config` (`utils.py:899-922`).
+///
+/// `config` is the verbatim `config.json` JSON body (the raw [`String`]
+/// [`load_config`] returns alongside the typed [`Config`]). The reference's
+/// clean-up is applied to the parsed object:
+///
+/// - the `_name_or_path` and `vision_config` keys are dropped
+///   (`config.pop("_name_or_path"/"vision_config", None)`, `utils.py:912-913`);
+/// - if a `quantization` key is present it is **also** copied to
+///   `quantization_config` (`utils.py:914-915` — HF model-tree interop);
+/// - the keys are **sorted** for readability (`dict(sorted(...))`,
+///   `utils.py:918`);
+///
+/// then the result is written to `config_path` with 4-space indentation
+/// (`json.dump(config, fid, indent=4)`, `utils.py:921-922`).
+///
+/// `config` must be a JSON **object**; anything else (or invalid JSON) is an
+/// [`Error::Backend`]. A write failure is an [`Error::Backend`] naming the
+/// path.
+pub fn save_config(config: &str, config_path: &Path) -> Result<()> {
+  let value: serde_json::Value = serde_json::from_str(config).map_err(|e| Error::Backend {
+    message: format!("save_config: config is not valid JSON: {e}"),
+  })?;
+  let serde_json::Value::Object(mut map) = value else {
+    return Err(Error::Backend {
+      message: "save_config: config JSON must be an object".into(),
+    });
+  };
+
+  // Clean unused keys (`utils.py:912-913`).
+  map.remove("_name_or_path");
+  map.remove("vision_config");
+  // Mirror `quantization` into `quantization_config` (`utils.py:914-915`).
+  if let Some(q) = map.get("quantization").cloned() {
+    map.insert("quantization_config".to_string(), q);
+  }
+
+  // Sort keys for readability (`dict(sorted(config.items()))`,
+  // `utils.py:918`). A plain `serde_json::Map` keeps insertion order (the
+  // `preserve_order` feature is on workspace-wide for `minijinja`), so a
+  // `BTreeMap` round-trip is the explicit sort.
+  let sorted: BTreeMap<String, serde_json::Value> = map.into_iter().collect();
+  let sorted_value = serde_json::to_value(sorted).map_err(|e| Error::Backend {
+    message: format!("save_config: cannot re-serialize sorted config: {e}"),
+  })?;
+
+  write_json_pretty(config_path, &sorted_value, "save_config: config.json")
+}
+
+/// Save a model — weights and config — into `dst_path`, mirroring the
+/// local-directory core of `mlx_lm.utils.save` (`utils.py:925-950`).
+///
+/// This wires the save primitives together, in reference order:
+///
+/// 1. [`save_model`] writes the sharded `.safetensors` + the
+///    `model.safetensors.index.json` index (`utils.py:942`).
+/// 2. [`save_config`] writes `<dst_path>/config.json` (`utils.py:943`).
+///
+/// **Deliberately not ported** from `utils.save`:
+///
+/// - `tokenizer.save_pretrained(dst_path)` (`utils.py:944`) — the mlxrs
+///   [`Tokenizer`](crate::tokenizer::Tokenizer) is **load-only** (no
+///   `save_pretrained` equivalent is ported; re-serializing the full
+///   tokenizer file set is tokenizer-architecture surface, outside this
+///   model-save/shard/introspect scope). A caller that needs the tokenizer
+///   alongside the model copies its source files itself.
+/// - the `glob("*.py" / "generation_config.json")` source-file copy
+///   (`utils.py:946-948`) — needs a separate `src_path`, model-arch-adjacent.
+/// - `create_model_card` (`utils.py:950`) — HuggingFace Hub, excluded as
+///   network/hub surface (consistent with the `_download` /
+///   `create_model_card` / `upload_to_hub` omission noted in the
+///   module-level docs, and the project's local-path-only scope).
+///
+/// `quant` supplies the per-layer [`Quantization`] [`save_model`] needs
+/// (pass [`PerLayerQuantization::default`](crate::lm::quant::PerLayerQuantization)
+/// for an unquantized model). Either step's recoverable failure is the
+/// [`Error::Backend`] that step produced.
+pub fn save(
+  dst_path: &Path,
+  weights: &Weights,
+  config: &str,
+  quant: &crate::lm::quant::PerLayerQuantization,
+) -> Result<()> {
+  save_model(dst_path, weights, quant)?;
+  save_config(config, &dst_path.join("config.json"))?;
+  Ok(())
+}
+
+/// Write `value` to `path` as 4-space-indented JSON, mirroring Python's
+/// `json.dump(value, f, indent=4)` byte-for-byte: a 4-space indent and the
+/// `,` / `": "` separators `serde_json::ser::PrettyFormatter` already emits
+/// (Python's `indent=N` uses the same — see [`crate::tokenizer::chat`]'s
+/// `tojson` note). A trailing newline is **not** added — `json.dump` writes
+/// none. The parent directory is assumed to exist (callers `mkdir -p` it).
+fn write_json_pretty(path: &Path, value: &serde_json::Value, label: &str) -> Result<()> {
+  let mut buf = Vec::new();
+  let formatter = serde_json::ser::PrettyFormatter::with_indent(b"    ");
+  let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
+  serde::Serialize::serialize(value, &mut ser).map_err(|e| Error::Backend {
+    message: format!("{label}: cannot serialize JSON: {e}"),
+  })?;
+  std::fs::write(path, &buf).map_err(|e| Error::Backend {
+    message: format!("{label}: cannot write {}: {e}", path.display()),
+  })?;
+  Ok(())
+}
+
+#[cfg(test)]
+mod save_tests {
+  //! F6 — model save / shard / introspect, in isolation. Shard boundaries
+  //! are hand-computed for a chosen cap; `save` then `load_weights` round-
+  //! trips (weights byte-equal, index.json correct); introspection helpers
+  //! are checked against hand-verified counts. No `peak_memory()` assert.
+
+  use super::*;
+  use crate::lm::quant::{PerLayerQuantization, Quantization};
+
+  /// A fresh, writable per-test temp directory (the crate's
+  /// no-`tempfile`-crate convention — `temp_dir()` + pid + a process-unique
+  /// counter, mirroring `lm::factory`'s `fresh_dir`).
+  fn fresh_dir(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("mlxrs-lm-save-{tag}-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+  }
+
+  /// An `f32` weight of `n` elements, shape `[n]` — `n * 4` bytes.
+  fn f32_weight(n: usize) -> Array {
+    Array::from_slice::<f32>(&vec![0.0_f32; n], &(n,)).unwrap()
+  }
+
+  // ─────────────────────── array_nbytes ───────────────────────
+
+  #[test]
+  fn array_nbytes_is_count_times_dtype_size() {
+    // f32 → 4 bytes/elem; 10 elems → 40 bytes.
+    assert_eq!(array_nbytes(&f32_weight(10)).unwrap(), 40);
+    // u8 → 1 byte/elem.
+    let u8s = Array::from_slice::<u8>(&[1u8, 2, 3], &(3usize,)).unwrap();
+    assert_eq!(array_nbytes(&u8s).unwrap(), 3);
+    // u32 → 4 bytes/elem; a `[2, 8]` packed matrix → 16 elems → 64 bytes.
+    let u32s = Array::from_slice::<u32>(&[0u32; 16], &(2usize, 8)).unwrap();
+    assert_eq!(array_nbytes(&u32s).unwrap(), 64);
+  }
+
+  // ─────────────────────── make_shards ───────────────────────
+
+  /// All-fits case: four 100-byte weights (`a`..`d`, each 25 `f32` elems =
+  /// 100 bytes = 400 bytes total) under the default 5-GiB cap land on a
+  /// single shard — the cap is never reached, so the loop never flushes.
+  #[test]
+  fn make_shards_all_fits_one_shard() {
+    let mut w: Weights = HashMap::new();
+    for name in ["a", "b", "c", "d"] {
+      w.insert(name.to_string(), f32_weight(25)); // 100 bytes each
+    }
+    let one = make_shards(&w, MAX_FILE_SIZE_GB).unwrap();
+    assert_eq!(one.len(), 1, "4×100 bytes fits in one 5-GiB shard");
+    assert_eq!(one[0].len(), 4);
+  }
+
+  /// Hand-traced split boundary. `make_shards`'s split point is
+  /// `shard_size + v.nbytes > cap` (`utils.py:613`); the `make_shards`
+  /// API expresses the cap only in **whole GiB** (the reference's
+  /// `max_file_size_gb`), so the tightest hand-computable boundary is a
+  /// `0`-GiB cap: for every non-empty weight `0 + nbytes > 0` holds, so
+  /// each weight (after the first, which lands on a still-empty shard the
+  /// `!shard.is_empty()` guard does not flush) flushes the prior shard.
+  /// Four 100-byte weights → exactly four single-weight shards, in sorted
+  /// key order `a, b, c, d`.
+  #[test]
+  fn make_shards_zero_cap_one_weight_per_shard() {
+    let mut w: Weights = HashMap::new();
+    for name in ["a", "b", "c", "d"] {
+      w.insert(name.to_string(), f32_weight(25));
+    }
+    let shards = make_shards(&w, 0).unwrap();
+    assert_eq!(shards.len(), 4);
+    assert!(shards.iter().all(|s| s.len() == 1));
+    // Sorted-key order: a, b, c, d each in its own shard.
+    assert!(shards[0].contains_key("a"));
+    assert!(shards[1].contains_key("b"));
+    assert!(shards[2].contains_key("c"));
+    assert!(shards[3].contains_key("d"));
+  }
+
+  /// An empty weight map still yields exactly one (empty) shard — mlx-lm's
+  /// `shards.append(shard)` after the loop (`utils.py:618`) always runs.
+  #[test]
+  fn make_shards_empty_map_yields_one_empty_shard() {
+    let w: Weights = HashMap::new();
+    let shards = make_shards(&w, MAX_FILE_SIZE_GB).unwrap();
+    assert_eq!(shards.len(), 1);
+    assert!(shards[0].is_empty());
+  }
+
+  /// A single weight on its own — one shard holding it, regardless of cap.
+  #[test]
+  fn make_shards_single_weight_one_shard() {
+    let mut w: Weights = HashMap::new();
+    w.insert("solo".to_string(), f32_weight(7));
+    // Even a 0-GiB cap: the loop never flushes a still-empty `shard`
+    // (`!shard.is_empty()` guard), so the lone weight lands on the single
+    // trailing shard.
+    let shards = make_shards(&w, 0).unwrap();
+    assert_eq!(shards.len(), 1);
+    assert_eq!(shards[0].len(), 1);
+    assert!(shards[0].contains_key("solo"));
+  }
+
+  // ─────────────────────── get_total_parameters ───────────────────────
+
+  /// Dense model: every array contributes its plain element count
+  /// (`sum(v.size …)`). Two weights of 25 + 7 elems → 32 parameters.
+  #[test]
+  fn get_total_parameters_dense_sums_sizes() {
+    let mut w: Weights = HashMap::new();
+    w.insert("model.embed.weight".to_string(), f32_weight(25));
+    w.insert("model.norm.weight".to_string(), f32_weight(7));
+    let total = get_total_parameters(&w, &PerLayerQuantization::default()).unwrap();
+    assert_eq!(total, 32);
+  }
+
+  /// Quantized layer: a `<path>.weight` (`uint32` packed) with a
+  /// `<path>.scales` sibling counts as `weight.size * 32 / bits` logical
+  /// params; `.scales` itself is NOT counted; `.biases` IS. Hand-trace:
+  /// packed `.weight` = 16 `u32` elems, `bits = 4` → `16 * 32 / 4 = 128`
+  /// logical weights; `.biases` = 2 elems → +2; `.scales` (2 elems) → +0.
+  /// Plus a dense `model.norm.weight` of 7 → +7. Total = 128 + 2 + 7 = 137.
+  #[test]
+  fn get_total_parameters_quantized_unpacks_weight_skips_scales() {
+    let mut w: Weights = HashMap::new();
+    let packed = Array::from_slice::<u32>(&[0u32; 16], &(2usize, 8)).unwrap();
+    w.insert("model.layers.0.q_proj.weight".to_string(), packed);
+    w.insert(
+      "model.layers.0.q_proj.scales".to_string(),
+      Array::from_slice::<f32>(&[0.0, 0.0], &(2usize,)).unwrap(),
+    );
+    w.insert(
+      "model.layers.0.q_proj.biases".to_string(),
+      Array::from_slice::<f32>(&[0.0, 0.0], &(2usize,)).unwrap(),
+    );
+    w.insert("model.norm.weight".to_string(), f32_weight(7));
+
+    let quant = PerLayerQuantization::from_global(Quantization::affine(64, 4));
+    let total = get_total_parameters(&w, &quant).unwrap();
+    assert_eq!(total, 128 + 2 + 7);
+  }
+
+  /// A quantized triple (`.scales` present) with no resolvable
+  /// [`Quantization`] for its layer is a configuration error.
+  #[test]
+  fn get_total_parameters_quantized_without_params_errors() {
+    let mut w: Weights = HashMap::new();
+    w.insert(
+      "model.q.weight".to_string(),
+      Array::from_slice::<u32>(&[0u32; 8], &(2usize, 4)).unwrap(),
+    );
+    w.insert(
+      "model.q.scales".to_string(),
+      Array::from_slice::<f32>(&[0.0, 0.0], &(2usize,)).unwrap(),
+    );
+    // No global default, no per-layer override → unresolvable.
+    let err = get_total_parameters(&w, &PerLayerQuantization::default());
+    assert!(matches!(err, Err(Error::Backend { .. })));
+  }
+
+  // ─────────────────────── compute_bits_per_weight ───────────────────────
+
+  /// `model_bytes * 8 / model_params`. A single dense `f32` weight of 10
+  /// elems: `model_bytes = 40`, `model_params = 10` → `40 * 8 / 10 = 32.0`
+  /// bits per weight (exactly f32's 32 bits — a dense float model).
+  #[test]
+  fn compute_bits_per_weight_dense_f32_is_32() {
+    let mut w: Weights = HashMap::new();
+    w.insert("model.w.weight".to_string(), f32_weight(10));
+    let bpw = compute_bits_per_weight(&w, &PerLayerQuantization::default()).unwrap();
+    assert!((bpw - 32.0).abs() < 1e-9, "expected 32.0, got {bpw}");
+  }
+
+  /// Quantized: `model_bytes` sums EVERY array (`scales`/`biases` too),
+  /// `model_params` is the unpacked count. Hand-trace: packed `.weight`
+  /// 16 `u32` = 64 bytes; `.scales` 2 `f32` = 8 bytes; `.biases` 2 `f32`
+  /// = 8 bytes → `model_bytes = 80`. `model_params = 16 * 32 / 4 = 128`
+  /// (+0 for scales) `+ 2` biases `= 130`. `bpw = 80 * 8 / 130 ≈ 4.923`.
+  #[test]
+  fn compute_bits_per_weight_quantized_includes_scale_overhead() {
+    let mut w: Weights = HashMap::new();
+    w.insert(
+      "model.q.weight".to_string(),
+      Array::from_slice::<u32>(&[0u32; 16], &(2usize, 8)).unwrap(),
+    );
+    w.insert(
+      "model.q.scales".to_string(),
+      Array::from_slice::<f32>(&[0.0, 0.0], &(2usize,)).unwrap(),
+    );
+    w.insert(
+      "model.q.biases".to_string(),
+      Array::from_slice::<f32>(&[0.0, 0.0], &(2usize,)).unwrap(),
+    );
+    let quant = PerLayerQuantization::from_global(Quantization::affine(64, 4));
+    let bpw = compute_bits_per_weight(&w, &quant).unwrap();
+    let expected = 80.0 * 8.0 / 130.0;
+    assert!(
+      (bpw - expected).abs() < 1e-9,
+      "expected {expected}, got {bpw}"
+    );
+  }
+
+  /// An empty weight map has zero parameters → a clean error, not a
+  /// divide-by-zero NaN.
+  #[test]
+  fn compute_bits_per_weight_zero_params_errors() {
+    let w: Weights = HashMap::new();
+    let err = compute_bits_per_weight(&w, &PerLayerQuantization::default());
+    assert!(matches!(err, Err(Error::Backend { .. })));
+  }
+
+  // ─────────────────── does_model_support_input_embeddings ───────────────
+
+  #[test]
+  fn does_model_support_input_embeddings_false_for_text_model() {
+    // The text-only `MockModel` inherits the `false` default.
+    let model = crate::lm::model::MockModel::new(4);
+    assert!(!does_model_support_input_embeddings(&model));
+  }
+
+  // ─────────────────────── shard_file_name ───────────────────────
+
+  #[test]
+  fn shard_file_name_single_vs_multi() {
+    // 1 shard → bare `model.safetensors`.
+    assert_eq!(shard_file_name(1, 1), "model.safetensors");
+    // multi-shard → 1-based, 5-digit zero-padded HF convention.
+    assert_eq!(shard_file_name(1, 3), "model-00001-of-00003.safetensors");
+    assert_eq!(shard_file_name(3, 3), "model-00003-of-00003.safetensors");
+  }
+
+  // ─────────────────────── save_model round-trip ───────────────────────
+
+  /// `save_model` writes a single `model.safetensors` (the 3 small weights
+  /// fit one 5-GiB shard) plus a `model.safetensors.index.json`;
+  /// [`load_weights`] reads the weights back byte-equal, and the index JSON
+  /// has the expected `metadata` + sorted `weight_map`.
+  #[test]
+  fn save_model_single_shard_round_trips() {
+    let dir = fresh_dir("save-model-single");
+    let mut w: Weights = HashMap::new();
+    // Distinct values so byte-equality is meaningful.
+    w.insert(
+      "model.b.weight".to_string(),
+      Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &(3usize,)).unwrap(),
+    );
+    w.insert(
+      "model.a.weight".to_string(),
+      Array::from_slice::<f32>(&[4.0, 5.0], &(2usize,)).unwrap(),
+    );
+
+    save_model(&dir, &w, &PerLayerQuantization::default()).unwrap();
+
+    // Exactly one shard file, named `model.safetensors`.
+    assert!(dir.join("model.safetensors").is_file());
+    assert!(dir.join("model.safetensors.index.json").is_file());
+
+    // Weights round-trip byte-equal.
+    let mut loaded = load_weights(&dir).unwrap();
+    assert_eq!(loaded.len(), 2);
+    assert_eq!(
+      loaded
+        .get_mut("model.a.weight")
+        .unwrap()
+        .to_vec::<f32>()
+        .unwrap(),
+      vec![4.0, 5.0]
+    );
+    assert_eq!(
+      loaded
+        .get_mut("model.b.weight")
+        .unwrap()
+        .to_vec::<f32>()
+        .unwrap(),
+      vec![1.0, 2.0, 3.0]
+    );
+
+    // index.json: metadata + sorted weight_map.
+    let index_text = std::fs::read_to_string(dir.join("model.safetensors.index.json")).unwrap();
+    let index: serde_json::Value = serde_json::from_str(&index_text).unwrap();
+    // total_size = (2 + 3) elems × 4 bytes = 20.
+    assert_eq!(index["metadata"]["total_size"], 20);
+    // dense → total_parameters = 2 + 3 = 5.
+    assert_eq!(index["metadata"]["total_parameters"], 5);
+    let wm = index["weight_map"].as_object().unwrap();
+    assert_eq!(wm.len(), 2);
+    assert_eq!(wm["model.a.weight"], "model.safetensors");
+    assert_eq!(wm["model.b.weight"], "model.safetensors");
+    // weight_map keys are sorted (a before b).
+    let keys: Vec<&String> = wm.keys().collect();
+    assert_eq!(keys, vec!["model.a.weight", "model.b.weight"]);
+
+    // 4-space indent — Python `json.dump(indent=4)` parity.
+    assert!(index_text.contains("\n    \"metadata\""));
+    assert!(
+      !index_text.ends_with('\n'),
+      "json.dump writes no trailing newline"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// `make_shards` borrows, never clones: each [`Shard`] entry points at the
+  /// very same `Array` object in the input `weights` map. Verified by
+  /// pointer identity (the shard's `&Array` is the input map's `&Array`).
+  #[test]
+  fn make_shards_borrows_without_cloning() {
+    let mut w: Weights = HashMap::new();
+    w.insert("x".to_string(), f32_weight(3));
+    let shards = make_shards(&w, MAX_FILE_SIZE_GB).unwrap();
+    assert_eq!(shards.len(), 1);
+    let shard_ref: &Array = shards[0]["x"];
+    let map_ref: &Array = w.get("x").unwrap();
+    assert!(
+      std::ptr::eq(shard_ref, map_ref),
+      "make_shards must borrow the input array, not clone it"
+    );
+  }
+
+  /// Multi-shard path: a `0`-GiB cap can't be passed to `save_model`
+  /// (it hard-codes [`MAX_FILE_SIZE_GB`]), so this exercises the multi-shard
+  /// *file naming + index* through `shard_file_name` +
+  /// [`crate::io::save_safetensors_view`] directly, then confirms a
+  /// hand-built 2-shard layout reloads via [`load_weights`].
+  #[test]
+  fn save_model_multi_shard_naming_and_index_reload() {
+    let dir = fresh_dir("save-model-multi");
+    // Two weights; write them as a 2-shard layout by hand using the same
+    // primitives `save_model` uses, to exercise the multi-shard names.
+    let w0 = Array::from_slice::<f32>(&[10.0], &(1usize,)).unwrap();
+    let w1 = Array::from_slice::<f32>(&[20.0, 21.0], &(2usize,)).unwrap();
+    let shards: Vec<Shard<'_>> = vec![BTreeMap::from([("w0", &w0)]), BTreeMap::from([("w1", &w1)])];
+    let count = shards.len();
+    let mut meta: HashMap<String, String> = HashMap::new();
+    meta.insert("format".to_string(), "mlx".to_string());
+    for (i, s) in shards.iter().enumerate() {
+      let name = shard_file_name(i + 1, count);
+      assert_eq!(
+        name,
+        format!("model-{:05}-of-{:05}.safetensors", i + 1, count)
+      );
+      crate::io::save_safetensors_view(&dir.join(&name), s.iter().map(|(&k, &v)| (k, v)), &meta)
+        .unwrap();
+    }
+    // Both shard files reload + merge via `load_weights` (`model*.safetensors`).
+    let mut loaded = load_weights(&dir).unwrap();
+    assert_eq!(loaded.len(), 2);
+    assert_eq!(
+      loaded.get_mut("w0").unwrap().to_vec::<f32>().unwrap(),
+      vec![10.0]
+    );
+    assert_eq!(
+      loaded.get_mut("w1").unwrap().to_vec::<f32>().unwrap(),
+      vec![20.0, 21.0]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  // ─────────────────────── save_config ───────────────────────
+
+  /// `save_config` drops `_name_or_path` / `vision_config`, mirrors
+  /// `quantization` into `quantization_config`, sorts the keys, and writes
+  /// 4-space-indented JSON with no trailing newline.
+  #[test]
+  fn save_config_cleans_mirrors_and_sorts() {
+    let dir = fresh_dir("save-config");
+    let path = dir.join("config.json");
+    let src = r#"{
+      "model_type": "qwen3",
+      "_name_or_path": "/tmp/should-be-dropped",
+      "vision_config": {"drop": "me"},
+      "hidden_size": 64,
+      "quantization": {"group_size": 64, "bits": 4}
+    }"#;
+    save_config(src, &path).unwrap();
+
+    let text = std::fs::read_to_string(&path).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let obj = v.as_object().unwrap();
+
+    // Dropped keys.
+    assert!(!obj.contains_key("_name_or_path"));
+    assert!(!obj.contains_key("vision_config"));
+    // `quantization` preserved AND mirrored to `quantization_config`.
+    assert_eq!(obj["quantization"]["bits"], 4);
+    assert_eq!(obj["quantization_config"]["bits"], 4);
+    assert_eq!(obj["quantization_config"]["group_size"], 64);
+    // Surviving content keys.
+    assert_eq!(obj["model_type"], "qwen3");
+    assert_eq!(obj["hidden_size"], 64);
+    // Keys sorted ascending.
+    let keys: Vec<&String> = obj.keys().collect();
+    let mut sorted = keys.clone();
+    sorted.sort();
+    assert_eq!(keys, sorted, "config.json keys must be sorted");
+
+    // 4-space indent, no trailing newline.
+    assert!(text.contains("\n    \""));
+    assert!(!text.ends_with('\n'));
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn save_config_rejects_non_object_json() {
+    let dir = fresh_dir("save-config-bad");
+    let err = save_config("[1, 2, 3]", &dir.join("config.json"));
+    assert!(matches!(err, Err(Error::Backend { .. })));
+    let err2 = save_config("not json at all", &dir.join("config.json"));
+    assert!(matches!(err2, Err(Error::Backend { .. })));
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  // ─────────────────────── save (driver) ───────────────────────
+
+  /// The `save` driver writes both the sharded weights+index and the
+  /// cleaned `config.json`; the weights reload byte-equal and the config
+  /// is the cleaned/sorted form.
+  #[test]
+  fn save_driver_writes_weights_and_config() {
+    let dir = fresh_dir("save-driver");
+    let mut w: Weights = HashMap::new();
+    w.insert(
+      "model.embed_tokens.weight".to_string(),
+      Array::from_slice::<f32>(&[1.0, 2.0, 3.0, 4.0], &(4usize,)).unwrap(),
+    );
+    let config = r#"{"model_type": "qwen3", "_name_or_path": "drop", "hidden_size": 8}"#;
+
+    save(&dir, &w, config, &PerLayerQuantization::default()).unwrap();
+
+    // Weights side.
+    assert!(dir.join("model.safetensors").is_file());
+    assert!(dir.join("model.safetensors.index.json").is_file());
+    let mut loaded = load_weights(&dir).unwrap();
+    assert_eq!(
+      loaded
+        .get_mut("model.embed_tokens.weight")
+        .unwrap()
+        .to_vec::<f32>()
+        .unwrap(),
+      vec![1.0, 2.0, 3.0, 4.0]
+    );
+
+    // Config side: `_name_or_path` dropped, keys sorted.
+    let cfg_text = std::fs::read_to_string(dir.join("config.json")).unwrap();
+    let cfg: serde_json::Value = serde_json::from_str(&cfg_text).unwrap();
+    assert!(!cfg.as_object().unwrap().contains_key("_name_or_path"));
+    assert_eq!(cfg["model_type"], "qwen3");
+    assert_eq!(cfg["hidden_size"], 8);
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
 }
