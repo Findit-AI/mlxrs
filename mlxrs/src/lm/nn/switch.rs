@@ -1946,6 +1946,33 @@ mod tests {
   }
 
   #[test]
+  fn switch_mlp_forward_preserves_f16_dtype() {
+    // `SwitchMLP::default_activation()` is `gelu_approx`, whose scalar
+    // constants are dtype-matched (see `activations::scalar_like`). With F16
+    // weights and an F16 input the whole block stays F16 — a stray F32
+    // activation constant would promote the output to F32. Weights are cast
+    // from f32 so no `half`-crate scalars are needed.
+    let w16 = all_identity_weight().astype(Dtype::F16).unwrap();
+    let mlp = SwitchMLP::new(
+      SwitchLinear::from_parts(w16.try_clone().unwrap(), None).unwrap(),
+      SwitchLinear::from_parts(w16, None).unwrap(),
+      SwitchMLP::default_activation(),
+    )
+    .unwrap();
+    let x = Array::from_slice::<f32>(&[-1.0, 0.5, 1.0, 2.0], &(2, 2))
+      .unwrap()
+      .astype(Dtype::F16)
+      .unwrap();
+    let indices = Array::from_slice::<u32>(&[0, 1], &(2, 1)).unwrap();
+    let out = mlp.forward(&x, &indices).unwrap();
+    assert_eq!(
+      out.dtype().unwrap(),
+      Dtype::F16,
+      "SwitchMLP default forward must preserve the F16 input dtype"
+    );
+  }
+
+  #[test]
   fn switch_mlp_sorted_path_matches_hand_trace() {
     // Same `indices.size() >= 64` sorted-path exercise as the SwitchGLU
     // sibling test, for the un-gated `fc2(square(fc1(x)))` body.

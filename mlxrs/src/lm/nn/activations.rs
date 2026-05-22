@@ -28,21 +28,49 @@
 //!
 //! Mirroring the references' forward expressions verbatim, the scalar
 //! literals (`0.5`, `1 / √2`, `√(2/π)`, `0.044715`, `1.702`) are folded into
-//! rank-1 single-element [`Array`]s that broadcast against `x`; no constant is
+//! [`Array`] constants that broadcast against `x`; no constant is
 //! pre-multiplied away from the form the reference writes.
+//!
+//! The python/swift references write those literals as *weak* scalars that
+//! adopt the operand's dtype, so an F16/BF16 activation stays F16/BF16. To
+//! match that, each constant here is cast to `x`'s dtype (via the private
+//! `scalar_like` helper) before it is combined with `x` — a plain F32
+//! constant would promote a half-precision activation to F32, inflating
+//! memory and changing the downstream matmul rounding. The constant is also
+//! genuinely **rank-0** (not shape-`[1]`), so it NumPy-broadcasts against `x`
+//! without ever lifting a rank-0 scalar input to rank 1.
 
-use crate::{array::Array, error::Result};
+use crate::{array::Array, dtype::Dtype, error::Result, ops};
 
-/// Build a broadcastable single-element `f32` constant array.
+/// Build a rank-0 `f32` constant of `value`, cast to `like`'s dtype.
 ///
 /// The activation expressions below mix `Array` operands with scalar
 /// literals; mlx-c's element-wise ops take two `Array`s, so each literal is
-/// lifted to a shape-`[1]` array that NumPy-broadcasts against `x` regardless
-/// of `x`'s rank. Shape `[1]` (rather than rank-0) keeps the constructor on
-/// the common [`Array::from_slice`] path.
+/// lifted to a constant array. Two properties matter for parity with the
+/// `mlx`/`mlx-lm` references, where these literals are *weak* Python scalars:
+///
+/// - **dtype** — the constant is `astype`-cast to `like.dtype()`, so combining
+///   it with an F16/BF16 `x` keeps the result F16/BF16 (a bare F32 constant
+///   would promote the activation to F32, raising memory use and altering the
+///   half-precision matmul rounding downstream).
+/// - **rank** — the constant is rank-0 (shape `&[0i32; 0]`, an empty shape
+///   whose element count is 1), so it broadcasts against `x` of any rank
+///   without ever promoting a rank-0 scalar input to rank 1 the way a
+///   shape-`[1]` constant would.
 #[inline]
-fn scalar(value: f32) -> Result<Array> {
-  Array::from_slice::<f32>(&[value], &(1usize,))
+fn scalar_like(value: f32, like: &Array) -> Result<Array> {
+  // `Array::full` runs the fallible `mlx_array_new_float32` ctor BEFORE its
+  // `mlx_full` call (whose `default_stream()` arg installs the error
+  // handler), so install eagerly here — without it that first ctor could
+  // reach mlx-c with no handler → its default `printf + exit(-1)` instead of
+  // a recoverable `Err`. Same defense-in-depth as `lm::nn::norm` /
+  // `lm::sample`'s `scalar_like`.
+  crate::error::ensure_handler_installed();
+  // `&[0i32; 0]` is an empty shape ⇒ a genuinely rank-0 array (element count
+  // is the empty product, 1); `astype` to `like`'s dtype keeps the constant
+  // weak so the activation preserves F16/BF16/F32 unchanged.
+  let dtype: Dtype = like.dtype()?;
+  ops::misc::astype(&Array::full::<f32>(&[0i32; 0], value)?, dtype)
 }
 
 /// Sigmoid Linear Unit, a.k.a. Swish: `silu(x) = x · σ(x)`.
@@ -87,10 +115,11 @@ pub fn swiglu(gate: &Array, x: &Array) -> Result<Array> {
 /// eval).
 pub fn gelu(x: &Array) -> Result<Array> {
   // `x * (1 + mx.erf(x / math.sqrt(2))) / 2` — verbatim from the reference,
-  // with the scalar literals (`√2`, `1`, `2`) lifted to broadcast arrays.
-  let inv_sqrt2 = scalar(std::f32::consts::FRAC_1_SQRT_2)?;
-  let one = scalar(1.0)?;
-  let two = scalar(2.0)?;
+  // with the scalar literals (`√2`, `1`, `2`) lifted to dtype-matched
+  // rank-0 broadcast arrays (see the `scalar_like` helper).
+  let inv_sqrt2 = scalar_like(std::f32::consts::FRAC_1_SQRT_2, x)?;
+  let one = scalar_like(1.0, x)?;
+  let two = scalar_like(2.0, x)?;
   // erf(x / √2) — `x / math.sqrt(2)` is written here as `x * (1/√2)` so the
   // single-element constant is the (cheaper) multiplier; the value is exact.
   let erf_term = x.multiply(&inv_sqrt2)?.erf()?;
@@ -110,11 +139,12 @@ pub fn gelu(x: &Array) -> Result<Array> {
 /// eval).
 pub fn gelu_approx(x: &Array) -> Result<Array> {
   // `0.5 * x * (1 + mx.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * x**3)))`
-  // — verbatim from the reference, scalar literals lifted to broadcast arrays.
-  let half = scalar(0.5)?;
-  let one = scalar(1.0)?;
-  let sqrt_2_over_pi = scalar((2.0 / std::f32::consts::PI).sqrt())?;
-  let c = scalar(0.044715)?;
+  // — verbatim from the reference, scalar literals lifted to dtype-matched
+  // rank-0 broadcast arrays (see the `scalar_like` helper).
+  let half = scalar_like(0.5, x)?;
+  let one = scalar_like(1.0, x)?;
+  let sqrt_2_over_pi = scalar_like((2.0 / std::f32::consts::PI).sqrt(), x)?;
+  let c = scalar_like(0.044715, x)?;
   // x + 0.044715 * x³  (x³ via `x.square() * x` — mlx's `x**3`).
   let x_cubed = x.square()?.multiply(x)?;
   let inner = x.add(&c.multiply(&x_cubed)?)?;
@@ -134,8 +164,9 @@ pub fn gelu_approx(x: &Array) -> Result<Array> {
 /// Returns a new lazy [`Array`] the same shape/dtype as `x` (no implicit
 /// eval).
 pub fn gelu_fast_approx(x: &Array) -> Result<Array> {
-  // `x * mx.sigmoid(1.702 * x)` — verbatim from the reference.
-  let c = scalar(1.702)?;
+  // `x * mx.sigmoid(1.702 * x)` — verbatim from the reference, the `1.702`
+  // literal lifted to a dtype-matched rank-0 array (see `scalar_like`).
+  let c = scalar_like(1.702, x)?;
   x.multiply(&c.multiply(x)?.sigmoid()?)
 }
 
@@ -309,6 +340,57 @@ mod tests {
     assert_eq!(gelu_approx(&x).unwrap().shape(), vec![2, 3, 4]);
     assert_eq!(gelu_fast_approx(&x).unwrap().shape(), vec![2, 3, 4]);
     assert_eq!(swiglu(&x, &x).unwrap().shape(), vec![2, 3, 4]);
+  }
+
+  #[test]
+  fn gelu_variants_preserve_input_dtype() {
+    // The python/swift references write the activation constants as *weak*
+    // scalar literals that adopt the operand dtype, so an F16/BF16 activation
+    // must stay F16/BF16 — a bare F32 constant would promote it to F32,
+    // inflating memory and changing the half-precision matmul rounding. The
+    // `scalar_like` helper casts each constant to `x.dtype()` to match.
+    for dtype in [Dtype::F16, Dtype::BF16, Dtype::F32] {
+      // Cast an f32 input so no `half`-crate scalars are needed and the exact
+      // production op path runs.
+      let x = sample_input().astype(dtype).unwrap();
+      assert_eq!(
+        gelu(&x).unwrap().dtype().unwrap(),
+        dtype,
+        "gelu must preserve {dtype:?}"
+      );
+      assert_eq!(
+        gelu_approx(&x).unwrap().dtype().unwrap(),
+        dtype,
+        "gelu_approx must preserve {dtype:?}"
+      );
+      assert_eq!(
+        gelu_fast_approx(&x).unwrap().dtype().unwrap(),
+        dtype,
+        "gelu_fast_approx must preserve {dtype:?}"
+      );
+    }
+  }
+
+  #[test]
+  fn activations_on_rank0_scalar_stay_rank0() {
+    // The constants are genuinely rank-0, so a rank-0 scalar input must come
+    // back rank-0 — a shape-`[1]` constant would broadcast the result to
+    // rank 1. `&[0i32; 0]` is an empty shape ⇒ a rank-0 array.
+    let x = Array::full::<f32>(&[0i32; 0], 0.7).unwrap();
+    assert_eq!(x.ndim(), 0, "rank-0 input precondition");
+    assert_eq!(gelu(&x).unwrap().ndim(), 0, "gelu must keep rank 0");
+    assert_eq!(
+      gelu_approx(&x).unwrap().ndim(),
+      0,
+      "gelu_approx must keep rank 0"
+    );
+    assert_eq!(
+      gelu_fast_approx(&x).unwrap().ndim(),
+      0,
+      "gelu_fast_approx must keep rank 0"
+    );
+    assert_eq!(silu(&x).unwrap().ndim(), 0, "silu must keep rank 0");
+    assert_eq!(swiglu(&x, &x).unwrap().ndim(), 0, "swiglu must keep rank 0");
   }
 
   /// `erf` for the f64 reference path. The standard library has no `erf`, so
