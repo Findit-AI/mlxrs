@@ -1187,3 +1187,702 @@ pub fn infer_tool_parser(chat_template: Option<&str>) -> Option<&'static str> {
   }
   None
 }
+
+// ----------------------------------------------------------------------------
+// Streaming processor
+// ----------------------------------------------------------------------------
+
+/// Strip the parser's `tool_call_start` / `tool_call_end` delimiters from a
+/// buffered tool-call payload, returning the trimmed inner text.
+///
+/// In `mlx-swift-lm` each `ToolCallParser` strips its own tags inside `parse`
+/// (e.g. `JSONToolCallParser` removes `<tool_call>` / `</tool_call>`). mlxrs
+/// keeps delimiters in one shared marker table instead, so the streaming
+/// processor strips them centrally before delegating — the existing
+/// [`ToolParser`]s expect the bare payload (`JsonTools` feeds the body
+/// straight to `serde_json`; the tag-scanning parsers are unaffected because
+/// stripping a delimiter they would only have searched for is idempotent).
+/// Only the first start tag and the last end tag are removed, matching the
+/// Swift `range(of:)` strip; literal delimiter text inside argument values is
+/// otherwise preserved.
+fn strip_markers<'a>(parser: &dyn ToolParser, buffer: &'a str) -> &'a str {
+  let mut text = buffer;
+  let start = parser.tool_call_start();
+  if !start.is_empty()
+    && let Some(idx) = text.find(start)
+  {
+    text = &text[idx + start.len()..];
+  }
+  let end = parser.tool_call_end();
+  if !end.is_empty()
+    && let Some(idx) = text.rfind(end)
+  {
+    text = &text[..idx];
+  }
+  text.trim()
+}
+
+/// Streaming `parseEOS` over a [`ToolParser`], mirroring the default
+/// `ToolCallParser.parseEOS` extension in `mlx-swift-lm`
+/// (`MLXLMCommon/Tool/ToolCallFormat.swift`).
+///
+/// When the parser has a non-empty `tool_call_start`, the buffer is split on
+/// it and every non-empty segment is parsed individually; otherwise the whole
+/// buffer is parsed once. A segment that fails to parse is dropped (Swift
+/// `compactMap`), so a malformed tail can never panic the stream. Each
+/// segment has its end tag stripped via [`strip_markers`] before delegating.
+fn parse_eos(parser: &dyn ToolParser, buffer: &str, tools: Option<&Value>) -> Vec<ToolCall> {
+  let start = parser.tool_call_start();
+  if start.is_empty() {
+    let inner = strip_markers(parser, buffer);
+    return parser.parse(inner, tools).unwrap_or_default();
+  }
+  buffer
+    .split(start)
+    .filter(|seg| !seg.is_empty())
+    .filter_map(|seg| parser.parse(strip_markers(parser, seg), tools).ok())
+    .flatten()
+    .collect()
+}
+
+/// Streaming state-machine for detecting and extracting tool calls while a
+/// model is still generating, fed text chunk-by-chunk.
+///
+/// Direct port of `mlx-swift-lm`'s `ToolCallProcessor`
+/// (`MLXLMCommon/Tool/ToolCallProcessor.swift`): partial content is buffered
+/// so a half-finished tool call is never leaked to the UI, and a complete
+/// tool call is extracted into [`tool_calls`](Self::tool_calls) the moment its
+/// closing delimiter (or balanced JSON) arrives. It reuses the per-format
+/// [`ToolParser`]s above rather than re-implementing any parsing.
+///
+/// Two delimiter regimes, dispatched on whether the parser has a start tag:
+///
+/// - **Tagged** (`tool_call_start` non-empty, e.g. `json_tools`'
+///   `<tool_call>`): the buffer is matched against the start tag character by
+///   character; once the full start tag is seen the state advances to
+///   collecting, and the call is parsed when the end tag arrives.
+/// - **Inline** (`tool_call_start` empty): brace counting drives detection —
+///   while `{`/`}` are unbalanced the content is buffered; a balanced buffer
+///   that fails to parse is flushed back out as ordinary text.
+///
+/// # Example
+///
+/// ```
+/// use mlxrs::tokenizer::tools::{JsonTools, ToolCallProcessor};
+///
+/// let mut proc = ToolCallProcessor::new(Box::new(JsonTools), None);
+/// // Regular text passes straight through.
+/// assert_eq!(proc.process_chunk("Sure! ").as_deref(), Some("Sure! "));
+/// // A tool call split across chunks is buffered (returns `None`) ...
+/// assert_eq!(proc.process_chunk("<tool_call>{\"name\": \"now\","), None);
+/// // ... and emitted once its end tag arrives.
+/// assert_eq!(proc.process_chunk("\"arguments\": {}}</tool_call>"), None);
+/// assert_eq!(proc.tool_calls.len(), 1);
+/// assert_eq!(proc.tool_calls[0].name, "now");
+/// ```
+pub struct ToolCallProcessor {
+  /// The per-format parser the state machine delegates structured parsing to.
+  parser: Box<dyn ToolParser>,
+  /// Optional tool schemas forwarded to the parser for type-aware coercion.
+  tools: Option<Value>,
+  /// Current state machine position.
+  state: State,
+  /// Buffered partial tool-call text not yet emitted or parsed.
+  tool_call_buffer: String,
+  /// Tool calls extracted so far, in arrival order.
+  pub tool_calls: Vec<ToolCall>,
+}
+
+/// State-machine position (Swift `ToolCallProcessor.State`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum State {
+  /// Passing generated text straight through; no tool call in progress.
+  Normal,
+  /// A start-tag prefix has been seen; still confirming it is a real tag.
+  PotentialToolCall,
+  /// Inside a confirmed tool call, buffering until it completes.
+  CollectingToolCall,
+}
+
+impl ToolCallProcessor {
+  /// Create a processor driving `parser`, with optional `tools` schemas for
+  /// type-aware argument coercion.
+  pub fn new(parser: Box<dyn ToolParser>, tools: Option<Value>) -> Self {
+    Self {
+      parser,
+      tools,
+      state: State::Normal,
+      tool_call_buffer: String::new(),
+      tool_calls: Vec::new(),
+    }
+  }
+
+  /// Whether this processor uses an inline format (no start tag).
+  fn is_inline_format(&self) -> bool {
+    self.parser.tool_call_start().is_empty()
+  }
+
+  /// The first `char` of the start tag, for quick chunk pre-screening.
+  fn start_tag_first_char(&self) -> Option<char> {
+    self.parser.tool_call_start().chars().next()
+  }
+
+  /// Process one generated text chunk.
+  ///
+  /// Returns the regular (non-tool-call) text that should be displayed, or
+  /// `None` while partial tool-call content is being buffered.
+  pub fn process_chunk(&mut self, chunk: &str) -> Option<String> {
+    if self.is_inline_format() {
+      self.process_inline_chunk(chunk)
+    } else {
+      self.process_tagged_chunk(chunk)
+    }
+  }
+
+  /// Process end-of-sequence, parsing any buffered content as tool call(s).
+  ///
+  /// Call this when generation ends (e.g. on an EOS token) to handle formats
+  /// whose end tag is never delivered as text (e.g. `mistral`, whose `</s>`
+  /// is intercepted at the token-ID level). For formats whose end tag does
+  /// appear in the text stream the buffer is already empty here, making this
+  /// a no-op.
+  pub fn process_eos(&mut self) {
+    if self.state != State::CollectingToolCall && self.state != State::PotentialToolCall {
+      return;
+    }
+    if self.tool_call_buffer.is_empty() {
+      self.state = State::Normal;
+      return;
+    }
+    let parsed = parse_eos(
+      self.parser.as_ref(),
+      &self.tool_call_buffer,
+      self.tools.as_ref(),
+    );
+    self.tool_calls.extend(parsed);
+    self.tool_call_buffer.clear();
+    self.state = State::Normal;
+  }
+
+  /// Run the parser against the current buffer (with delimiters stripped),
+  /// treating an `Err` as a failed parse (Swift returns `nil`). On success any
+  /// extracted calls are appended; returns `true` when at least one call was
+  /// extracted.
+  fn try_parse_buffer(&mut self) -> bool {
+    let inner = strip_markers(self.parser.as_ref(), &self.tool_call_buffer);
+    let parsed = self.parser.parse(inner, self.tools.as_ref());
+    match parsed {
+      Ok(calls) if !calls.is_empty() => {
+        self.tool_calls.extend(calls);
+        true
+      }
+      _ => false,
+    }
+  }
+
+  /// Process a chunk for inline formats (no wrapper tags).
+  ///
+  /// Uses brace counting to decide when output looks like a JSON tool call.
+  /// While braces are unbalanced the content is buffered (returns `None`) so
+  /// partial JSON is never leaked; a balanced buffer that fails to parse is
+  /// not a tool call and is flushed back out.
+  fn process_inline_chunk(&mut self, chunk: &str) -> Option<String> {
+    match self.state {
+      State::Normal => {
+        // Does this chunk start what looks like a JSON tool call?
+        if let Some(brace) = chunk.find('{') {
+          let leading = chunk[..brace].to_owned();
+          self.tool_call_buffer.clear();
+          self.tool_call_buffer.push_str(&chunk[brace..]);
+          self.state = State::CollectingToolCall;
+
+          if self.try_parse_buffer() {
+            self.tool_call_buffer.clear();
+            self.state = State::Normal;
+            return if leading.is_empty() {
+              None
+            } else {
+              Some(leading)
+            };
+          }
+
+          // Still collecting — balanced braces with a failed parse means this
+          // was complete JSON that is not a tool call, so flush it.
+          if json_braces_balanced(&self.tool_call_buffer) {
+            self.state = State::Normal;
+            let buffer = std::mem::take(&mut self.tool_call_buffer);
+            return Some(leading + &buffer);
+          }
+
+          return if leading.is_empty() {
+            None
+          } else {
+            Some(leading)
+          };
+        }
+
+        // No brace seen — pass through as regular text.
+        Some(chunk.to_owned())
+      }
+
+      State::PotentialToolCall | State::CollectingToolCall => {
+        self.tool_call_buffer.push_str(chunk);
+
+        if self.try_parse_buffer() {
+          self.tool_call_buffer.clear();
+          self.state = State::Normal;
+          return None;
+        }
+
+        // Balanced braces but parse failed — not a tool call, flush it.
+        if json_braces_balanced(&self.tool_call_buffer) {
+          self.state = State::Normal;
+          return Some(std::mem::take(&mut self.tool_call_buffer));
+        }
+
+        // Still collecting.
+        None
+      }
+    }
+  }
+
+  /// Process a chunk for tagged formats.
+  fn process_tagged_chunk(&mut self, chunk: &str) -> Option<String> {
+    let start_tag = self.parser.tool_call_start();
+    let Some(start_char) = self.start_tag_first_char() else {
+      return Some(chunk.to_owned());
+    };
+
+    // In `Normal`, ignore chunks that cannot begin a tag; once past `Normal`
+    // every chunk is appended regardless.
+    if self.state == State::Normal && !chunk.contains(start_char) {
+      return Some(chunk.to_owned());
+    }
+
+    self.tool_call_buffer.push_str(chunk);
+    let mut leading_token: Option<String> = None;
+
+    if self.state == State::Normal {
+      // Advance to potential tool call, splitting off any leading text.
+      self.state = State::PotentialToolCall;
+      leading_token = separate_token(&mut self.tool_call_buffer, start_char, true);
+    }
+
+    if self.state == State::PotentialToolCall {
+      if partial_match(&self.tool_call_buffer, start_tag) {
+        if self.tool_call_buffer.starts_with(start_tag) {
+          // Confirmed start tag — fall through to collecting.
+          self.state = State::CollectingToolCall;
+        } else {
+          return None;
+        }
+      } else {
+        // Not a tool call after all — return the collected text and reset.
+        self.state = State::Normal;
+        let buffer = std::mem::take(&mut self.tool_call_buffer);
+        return Some(leading_token.unwrap_or_default() + &buffer);
+      }
+    }
+
+    // State::CollectingToolCall
+    let end_tag = self.parser.tool_call_end();
+    if end_tag.is_empty() {
+      // No end tag (e.g. `mistral`): the call is closed at EOS, not in-stream.
+      return None;
+    }
+
+    if self.tool_call_buffer.contains(end_tag) {
+      // Split off the trailing token after the end tag.
+      let trailing_token = separate_token_str(&mut self.tool_call_buffer, end_tag, false);
+
+      self.try_parse_buffer();
+
+      self.state = State::Normal;
+      self.tool_call_buffer.clear();
+
+      // If the trailing token holds the start char there may be more calls.
+      match trailing_token {
+        Some(tok) if tok.contains(start_char) => self.process_chunk(&tok),
+        Some(tok) if !tok.is_empty() => Some(tok),
+        _ => None,
+      }
+    } else {
+      None
+    }
+  }
+}
+
+/// Count whether `{` / `}` are balanced in `text` (Swift `jsonBracesBalanced`).
+fn json_braces_balanced(text: &str) -> bool {
+  let mut depth: i32 = 0;
+  for ch in text.chars() {
+    match ch {
+      '{' => depth += 1,
+      '}' => depth -= 1,
+      _ => {}
+    }
+  }
+  depth == 0
+}
+
+/// Split `buffer` on the first occurrence of the `char` `separator`, mirroring
+/// Swift `separateToken(returnLeading:)`.
+///
+/// When `return_leading` is `true` the text *before* the separator is returned
+/// and `buffer` keeps the separator onward; when `false` the text *after* is
+/// returned and `buffer` keeps everything up to and including the separator.
+/// Returns `None` (leaving `buffer` untouched) when the separator is absent.
+fn separate_token(buffer: &mut String, separator: char, return_leading: bool) -> Option<String> {
+  let idx = buffer.find(separator)?;
+  if return_leading {
+    let token = buffer[..idx].to_owned();
+    buffer.replace_range(..idx, "");
+    Some(token)
+  } else {
+    let after = idx + separator.len_utf8();
+    let token = buffer[after..].to_owned();
+    buffer.truncate(after);
+    Some(token)
+  }
+}
+
+/// String-separator variant of [`separate_token`] (Swift `separateToken` with
+/// a multi-character separator), used for end tags.
+fn separate_token_str(
+  buffer: &mut String,
+  separator: &str,
+  return_leading: bool,
+) -> Option<String> {
+  let idx = buffer.find(separator)?;
+  if return_leading {
+    let token = buffer[..idx].to_owned();
+    buffer.replace_range(..idx, "");
+    Some(token)
+  } else {
+    let after = idx + separator.len();
+    let token = buffer[after..].to_owned();
+    buffer.truncate(after);
+    Some(token)
+  }
+}
+
+/// Whether `buffer` is a prefix-compatible partial (or full) match of `tag`:
+/// every char they share in order must be equal (Swift `partialMatch`). An
+/// empty buffer trivially matches; a buffer longer than `tag` matches iff it
+/// starts with `tag`.
+fn partial_match(buffer: &str, tag: &str) -> bool {
+  buffer.chars().zip(tag.chars()).all(|(b, t)| b == t)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Inline (no-tag) parser used to exercise the brace-counting code path of
+  /// [`ToolCallProcessor`]: its `name()` is absent from the marker table, so
+  /// both `tool_call_start` / `tool_call_end` resolve to `""`, just like the
+  /// Swift `Llama3ToolCallParser` (`startTag == nil`). It parses a plain
+  /// `{"name": ..., "arguments": ...}` JSON object.
+  struct InlineJson;
+
+  impl ToolParser for InlineJson {
+    fn parse(&self, text: &str, _tools: Option<&Value>) -> Result<Vec<ToolCall>, Error> {
+      let v: Value =
+        serde_json::from_str(text.trim()).map_err(|e| err(format!("inline_json: {e}")))?;
+      let name = v
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| err("inline_json: missing name"))?;
+      let args = v.get("arguments").cloned().unwrap_or(Value::Null);
+      Ok(obj(name, args))
+    }
+    fn name(&self) -> &'static str {
+      "inline_json_test_parser"
+    }
+  }
+
+  // --- tagged formats (json_tools: <tool_call>{json}</tool_call>) ----------
+
+  #[test]
+  fn streaming_tagged_json_single_chunk() {
+    let mut p = ToolCallProcessor::new(Box::new(JsonTools), None);
+    let out = p.process_chunk(r#"<tool_call>{"name": "get_time", "arguments": {}}</tool_call>"#);
+    // Whole call consumed in one chunk: no display text leaks.
+    assert_eq!(out, None);
+    assert_eq!(p.tool_calls.len(), 1);
+    assert_eq!(p.tool_calls[0].name, "get_time");
+    assert_eq!(p.tool_calls[0].arguments, serde_json::json!({}));
+  }
+
+  #[test]
+  fn streaming_tagged_json_split_across_chunks() {
+    let mut p = ToolCallProcessor::new(Box::new(JsonTools), None);
+    // Payload split in the middle of the JSON body.
+    assert_eq!(
+      p.process_chunk(r#"<tool_call>{"name": "get_weather", "#),
+      None
+    );
+    assert_eq!(p.tool_calls.len(), 0); // not complete yet
+    assert_eq!(
+      p.process_chunk(r#""arguments": {"city": "Tokyo"}}</tool_call>"#),
+      None
+    );
+    assert_eq!(p.tool_calls.len(), 1);
+    assert_eq!(p.tool_calls[0].name, "get_weather");
+    assert_eq!(
+      p.tool_calls[0].arguments,
+      serde_json::json!({"city": "Tokyo"})
+    );
+  }
+
+  #[test]
+  fn streaming_tagged_json_split_mid_token() {
+    let mut p = ToolCallProcessor::new(Box::new(JsonTools), None);
+    // The `<tool_call>` start tag itself is split mid-token across two feeds.
+    assert_eq!(p.process_chunk("<tool_"), None); // partial tag — buffered
+    assert_eq!(p.tool_calls.len(), 0);
+    assert_eq!(
+      p.process_chunk(r#"call>{"name": "ping", "arguments": {}}</tool_call>"#),
+      None
+    );
+    assert_eq!(p.tool_calls.len(), 1);
+    assert_eq!(p.tool_calls[0].name, "ping");
+  }
+
+  #[test]
+  fn streaming_leading_text_then_tool_call() {
+    let mut p = ToolCallProcessor::new(Box::new(JsonTools), None);
+    // Leading prose in the same chunk as the start tag is returned for display.
+    let out = p.process_chunk(r#"Let me check. <tool_call>{"name": "ls", "arguments": {}}"#);
+    assert_eq!(out, None); // tag-bearing chunk buffers; leading text not yet flushed
+    assert_eq!(p.process_chunk("</tool_call>"), None);
+    assert_eq!(p.tool_calls.len(), 1);
+    assert_eq!(p.tool_calls[0].name, "ls");
+  }
+
+  #[test]
+  fn streaming_trailing_text_after_end_tag() {
+    let mut p = ToolCallProcessor::new(Box::new(JsonTools), None);
+    let out = p.process_chunk(r#"<tool_call>{"name": "ls", "arguments": {}}</tool_call> all done"#);
+    // Text after the end tag is emitted as ordinary display text.
+    assert_eq!(out.as_deref(), Some(" all done"));
+    assert_eq!(p.tool_calls.len(), 1);
+    assert_eq!(p.tool_calls[0].name, "ls");
+  }
+
+  #[test]
+  fn streaming_multiple_tool_calls() {
+    let mut p = ToolCallProcessor::new(Box::new(JsonTools), None);
+    // Two back-to-back tool calls; the trailing token after the first end tag
+    // holds the second start char, so processing recurses into it.
+    let out = p.process_chunk(
+      r#"<tool_call>{"name": "a", "arguments": {}}</tool_call><tool_call>{"name": "b", "arguments": {}}</tool_call>"#,
+    );
+    assert_eq!(out, None);
+    assert_eq!(p.tool_calls.len(), 2);
+    assert_eq!(p.tool_calls[0].name, "a");
+    assert_eq!(p.tool_calls[1].name, "b");
+  }
+
+  // --- no tool call --------------------------------------------------------
+
+  #[test]
+  fn streaming_passthrough_no_tool_call() {
+    let mut p = ToolCallProcessor::new(Box::new(JsonTools), None);
+    // Plain generation with no tool call: every chunk passes straight through
+    // and nothing is extracted.
+    assert_eq!(
+      p.process_chunk("The capital of France ").as_deref(),
+      Some("The capital of France ")
+    );
+    assert_eq!(p.process_chunk("is Paris.").as_deref(), Some("is Paris."));
+    p.process_eos();
+    assert!(p.tool_calls.is_empty());
+  }
+
+  #[test]
+  fn streaming_false_start_flushed() {
+    let mut p = ToolCallProcessor::new(Box::new(JsonTools), None);
+    // `<thinking>` shares the `<` start char but is not the `<tool_call>` tag:
+    // the partial match fails and the buffered text is flushed back out.
+    let out = p.process_chunk("<thinking>hmm</thinking>");
+    assert_eq!(out.as_deref(), Some("<thinking>hmm</thinking>"));
+    assert!(p.tool_calls.is_empty());
+  }
+
+  #[test]
+  fn streaming_false_start_split_then_flushed() {
+    let mut p = ToolCallProcessor::new(Box::new(JsonTools), None);
+    // `<t` is a genuine prefix of `<tool_call>`, so it stays buffered as
+    // ambiguous; only once `<thinking>` diverges from the tag is it flushed.
+    assert_eq!(p.process_chunk("<t"), None); // still a valid tag prefix
+    let out = p.process_chunk("hinking>");
+    assert_eq!(out.as_deref(), Some("<thinking>"));
+    assert!(p.tool_calls.is_empty());
+  }
+
+  // --- inline (no-tag) format: brace counting ------------------------------
+
+  #[test]
+  fn streaming_inline_single_chunk() {
+    let mut p = ToolCallProcessor::new(Box::new(InlineJson), None);
+    let out = p.process_chunk(r#"{"name": "now", "arguments": {}}"#);
+    assert_eq!(out, None);
+    assert_eq!(p.tool_calls.len(), 1);
+    assert_eq!(p.tool_calls[0].name, "now");
+  }
+
+  #[test]
+  fn streaming_inline_split_across_chunks() {
+    let mut p = ToolCallProcessor::new(Box::new(InlineJson), None);
+    // Unbalanced braces buffer; the call emits once balanced + parseable.
+    assert_eq!(p.process_chunk(r#"{"name": "now", "#), None);
+    assert_eq!(p.tool_calls.len(), 0);
+    assert_eq!(p.process_chunk(r#""arguments": {"tz": "UTC"}}"#), None);
+    assert_eq!(p.tool_calls.len(), 1);
+    assert_eq!(p.tool_calls[0].name, "now");
+    assert_eq!(p.tool_calls[0].arguments, serde_json::json!({"tz": "UTC"}));
+  }
+
+  #[test]
+  fn streaming_inline_leading_text() {
+    let mut p = ToolCallProcessor::new(Box::new(InlineJson), None);
+    // Text before the first `{` is returned for display.
+    let out = p.process_chunk(r#"sure {"name": "now", "arguments": {}}"#);
+    assert_eq!(out.as_deref(), Some("sure "));
+    assert_eq!(p.tool_calls.len(), 1);
+    assert_eq!(p.tool_calls[0].name, "now");
+  }
+
+  #[test]
+  fn streaming_inline_balanced_non_tool_call_flushed() {
+    let mut p = ToolCallProcessor::new(Box::new(InlineJson), None);
+    // Balanced JSON that is not a tool call (no `name`): flushed back as text.
+    let out = p.process_chunk(r#"{"unrelated": 1}"#);
+    assert_eq!(out.as_deref(), Some(r#"{"unrelated": 1}"#));
+    assert!(p.tool_calls.is_empty());
+  }
+
+  #[test]
+  fn streaming_inline_no_brace_passthrough() {
+    let mut p = ToolCallProcessor::new(Box::new(InlineJson), None);
+    assert_eq!(
+      p.process_chunk("just plain text").as_deref(),
+      Some("just plain text")
+    );
+    assert!(p.tool_calls.is_empty());
+  }
+
+  // --- end-of-sequence (mistral: start tag, no end tag) --------------------
+
+  #[test]
+  fn streaming_mistral_eos() {
+    let mut p = ToolCallProcessor::new(Box::new(Mistral), None);
+    // Mistral has no end tag in the text stream — the call stays buffered ...
+    assert_eq!(
+      p.process_chunk(r#"[TOOL_CALLS]get_weather[ARGS]{"city": "Tokyo"}"#),
+      None
+    );
+    assert_eq!(p.tool_calls.len(), 0);
+    // ... until process_eos parses the buffered tail.
+    p.process_eos();
+    assert_eq!(p.tool_calls.len(), 1);
+    assert_eq!(p.tool_calls[0].name, "get_weather");
+    assert_eq!(
+      p.tool_calls[0].arguments,
+      serde_json::json!({"city": "Tokyo"})
+    );
+  }
+
+  #[test]
+  fn streaming_eos_noop_when_normal() {
+    let mut p = ToolCallProcessor::new(Box::new(JsonTools), None);
+    p.process_chunk("plain text");
+    // EOS while in Normal state with an empty buffer extracts nothing.
+    p.process_eos();
+    assert!(p.tool_calls.is_empty());
+  }
+
+  // --- malformed / partial input: no panic ---------------------------------
+
+  #[test]
+  fn streaming_malformed_partial_no_panic() {
+    let mut p = ToolCallProcessor::new(Box::new(JsonTools), None);
+    // A start tag with garbage payload that never closes: buffered, no panic,
+    // no spurious tool call, and process_eos drops the unparseable tail.
+    assert_eq!(p.process_chunk("<tool_call>{not valid json"), None);
+    assert!(p.tool_calls.is_empty());
+    p.process_eos();
+    assert!(p.tool_calls.is_empty());
+  }
+
+  #[test]
+  fn streaming_malformed_unicode_chunks_no_panic() {
+    let mut p = ToolCallProcessor::new(Box::new(JsonTools), None);
+    // Non-ASCII text around a partial tag must not slice a UTF-8 boundary.
+    let _ = p.process_chunk("héllo <");
+    let _ = p.process_chunk("tøøl");
+    let _ = p.process_chunk("</tool_call>");
+    p.process_eos();
+    // No assertion on contents — the contract here is "does not panic".
+  }
+
+  #[test]
+  fn streaming_malformed_inline_garbage_no_panic() {
+    let mut p = ToolCallProcessor::new(Box::new(InlineJson), None);
+    // Unbalanced inline braces with garbage: buffered without panic.
+    assert_eq!(p.process_chunk("{{{ broken"), None);
+    assert!(p.tool_calls.is_empty());
+    p.process_eos();
+    assert!(p.tool_calls.is_empty());
+  }
+
+  // --- helper unit coverage ------------------------------------------------
+
+  #[test]
+  fn json_braces_balanced_basics() {
+    assert!(json_braces_balanced(""));
+    assert!(json_braces_balanced("{}"));
+    assert!(json_braces_balanced(r#"{"a": {"b": 1}}"#));
+    assert!(!json_braces_balanced("{"));
+    assert!(!json_braces_balanced("{}}"));
+  }
+
+  #[test]
+  fn partial_match_basics() {
+    assert!(partial_match("", "<tool_call>"));
+    assert!(partial_match("<tool", "<tool_call>"));
+    assert!(partial_match("<tool_call>", "<tool_call>"));
+    // A longer buffer matches only if it starts with the full tag.
+    assert!(partial_match("<tool_call>extra", "<tool_call>"));
+    assert!(!partial_match("<thinking>", "<tool_call>"));
+  }
+
+  #[test]
+  fn separate_token_leading_and_trailing() {
+    let mut buf = String::from("abc<tool_call>def");
+    let leading = separate_token(&mut buf, '<', true);
+    assert_eq!(leading.as_deref(), Some("abc"));
+    assert_eq!(buf, "<tool_call>def");
+
+    let mut buf = String::from("abc</tool_call>def");
+    let trailing = separate_token_str(&mut buf, "</tool_call>", false);
+    assert_eq!(trailing.as_deref(), Some("def"));
+    assert_eq!(buf, "abc</tool_call>");
+
+    // Absent separator leaves the buffer untouched.
+    let mut buf = String::from("no sep here");
+    assert_eq!(separate_token(&mut buf, '<', true), None);
+    assert_eq!(buf, "no sep here");
+  }
+
+  #[test]
+  fn strip_markers_tagged_and_inline() {
+    // Tagged: both delimiters removed, inner trimmed.
+    let inner = strip_markers(&JsonTools, "<tool_call>  {\"x\": 1}  </tool_call>");
+    assert_eq!(inner, r#"{"x": 1}"#);
+    // Inline parser (empty markers): only trimmed.
+    let inner = strip_markers(&InlineJson, "  {\"x\": 1}  ");
+    assert_eq!(inner, r#"{"x": 1}"#);
+  }
+}
