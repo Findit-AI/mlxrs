@@ -627,6 +627,74 @@ impl QuantizedSwitchLinear {
 /// `Sampler` / `LogitsProcessor` runtime-configurable callables.
 pub type Activation = Box<dyn Fn(&Array) -> Result<Array>>;
 
+/// Validate the [`SwitchGLU`] / [`SwitchMLP`] `forward` shape contract on
+/// `indices` *before* the `do_sort` / [`gather_sort`] path, so no `indices`
+/// shape can be silently misrouted.
+///
+/// The python reference (`switch_layers.py`) always constructs `indices` with
+/// an **explicit trailing top-`k` axis** — every MoE model feeds
+/// `mx.argpartition(gates, kth=…, axis=-1)[..., -k:]` (or `[..., :k]`), which
+/// keeps a length-`k` axis even for top-1 routing. `_gather_sort` then reads
+/// `*_, M = indices.shape` and maps a sorted flat position back to a token
+/// row via `order // M`. That arithmetic is only correct when `M` is the
+/// genuine top-`k` count — i.e. when `indices` is `[..batch.., k]` with
+/// leading dims matching `x`'s batch dims.
+///
+/// If a caller instead passes a top-1 route shaped like the batch with **no**
+/// trailing `k` axis — `[N]` for a flat `x = [N, D]`, or `[B, S]` for `x =
+/// [B, S, D]` — the last dim (`N` or `S`) is mis-read as `M`. For `[N]` every
+/// `order // M` collapses to token row 0, so all routed rows reuse the first
+/// token, yet `_scatter_unsort` + `squeeze` still return a plausibly-shaped
+/// `[N, D]` output: silent Mixture-of-Experts corruption rather than a shape
+/// error.
+///
+/// This port follows the reference faithfully — the reference's contract *is*
+/// an explicit `k` axis — so an ambiguous `[..batch..]` `indices` (whose shape
+/// equals `x`'s batch dims, with no extra trailing axis) is **rejected** here
+/// with a recoverable [`Error::ShapeMismatch`](crate::Error::ShapeMismatch).
+/// A caller doing top-1 routing must pass an explicit `[..batch.., 1]` (the
+/// same shape `argpartition(...)[..., -1:]` produces); that singleton-`k`
+/// shape sorts correctly (`M == 1`, `order // 1 == order`) and is accepted.
+///
+/// `x` here is the pre-`expand_dims` input — `[..batch.., input_dims]`, so its
+/// batch dims are `x.shape()[..x.ndim()-1]`. The check: `indices` must have
+/// exactly one more axis than those batch dims, and `indices.shape()[..n-1]`
+/// must equal them. (`indices.ndim() == x.ndim()` with matching leading dims
+/// is the ambiguous `[..batch..]` case — the trailing dim is a batch dim, not
+/// a `k` axis — and is the one rejected.)
+fn check_routing_indices(x: &Array, indices: &Array) -> Result<()> {
+  let x_shape = x.shape();
+  // `x` is `[..batch.., input_dims]`; the matmul `K` (input_dims) is the last
+  // axis, so the batch dims are everything before it. `forward` is never
+  // called with a rank-0 `x` (it `expand_dims`es `x` and routes per token),
+  // but guard so the slice below cannot underflow.
+  if x_shape.is_empty() {
+    return Err(crate::Error::ShapeMismatch {
+      message: "SwitchGLU/SwitchMLP::forward: x must have at least one axis \
+                ([..batch.., input_dims])"
+        .to_string(),
+    });
+  }
+  let x_batch = &x_shape[..x_shape.len() - 1];
+  let idx_shape = indices.shape();
+  // `indices` must be `[..batch.., k]`: exactly one trailing axis (the
+  // explicit top-`k`, ≥ 1) beyond `x`'s batch dims, and leading dims equal to
+  // them. `idx_shape.len() == x_batch.len()` is the ambiguous `[..batch..]`
+  // shape (`[N]` / `[B, S]`) — no `k` axis — which `_gather_sort` would
+  // silently mis-read as top-`k`; reject it.
+  if idx_shape.len() != x_batch.len() + 1 || idx_shape[..x_batch.len()] != *x_batch {
+    return Err(crate::Error::ShapeMismatch {
+      message: format!(
+        "SwitchGLU/SwitchMLP::forward: indices must be [..batch.., k] with leading \
+         dims matching x's batch dims {x_batch:?} and one explicit trailing top-k \
+         axis (pass [..batch.., 1] for top-1 routing); got indices shape {idx_shape:?} \
+         for x shape {x_shape:?}"
+      ),
+    });
+  }
+  Ok(())
+}
+
 /// Sort the routed tokens by expert id so each expert's rows are contiguous,
 /// enabling [`SwitchLinear`]'s faster `sorted_indices` `gather_mm` path.
 ///
@@ -737,11 +805,16 @@ fn scatter_unsort(x: &Array, inv_order: &Array, shape: &[usize]) -> Result<Array
 /// # Shape contract
 ///
 /// `forward(x, indices)` takes `x` of shape `[..batch.., input_dims]` and
-/// `indices` of shape `[..batch.., k]` (the per-token top-`k` expert ids).
-/// Internally the input is `expand_dims`'d to `[..batch.., 1, 1, input_dims]`
-/// so the trailing dims are the matmul `(M=1, K=input_dims)` pair and the
-/// `k` axis materializes by broadcasting against `indices`. The result is
-/// `[..batch.., k, input_dims]`.
+/// `indices` of shape `[..batch.., k]` — the per-token top-`k` expert ids,
+/// with leading dims matching `x`'s batch dims and an **explicit trailing
+/// top-`k` axis** (use `[..batch.., 1]` for top-1 routing). Internally the
+/// input is `expand_dims`'d to `[..batch.., 1, 1, input_dims]` so the trailing
+/// dims are the matmul `(M=1, K=input_dims)` pair and the `k` axis
+/// materializes by broadcasting against `indices`. The result is
+/// `[..batch.., k, input_dims]`. An ambiguous `indices` shaped like the batch
+/// with no `k` axis (`[N]` / `[B, S]`) is rejected with
+/// [`Error::ShapeMismatch`](crate::Error::ShapeMismatch) — see the
+/// `forward` method docs.
 pub struct SwitchGLU {
   /// `input_dims → hidden_dims` gate projection (`SwitchLinear`). Its output
   /// is squashed by [`Self::activation`] before the elementwise gate.
@@ -819,7 +892,21 @@ impl SwitchGLU {
   /// and swift `SwitchGLU.callAsFunction`.
   ///
   /// `x`: `[..batch.., input_dims]`. `indices`: `[..batch.., k]` integer
-  /// expert ids. Returns `[..batch.., k, input_dims]`.
+  /// expert ids — leading dims must match `x`'s batch dims, with an **explicit
+  /// trailing top-`k` axis** (pass `[..batch.., 1]` for top-1 routing).
+  /// Returns `[..batch.., k, input_dims]`.
+  ///
+  /// An ambiguous `indices` shaped like the batch with **no** explicit `k`
+  /// axis — `[N]` for a flat `x = [N, D]`, or `[B, S]` for `x = [B, S, D]` —
+  /// is rejected with [`Error::ShapeMismatch`](crate::Error::ShapeMismatch).
+  /// The python reference always constructs `indices` via
+  /// `argpartition(...)[..., -k:]`, which keeps an explicit length-`k` axis
+  /// even for top-1; the `_gather_sort` rebatch reads `indices.shape[-1]` as
+  /// the top-`k` count, so a batch-shaped `indices` would have its last
+  /// *batch* dim silently mis-read as top-`k` and route every token through
+  /// the first token's row — silent Mixture-of-Experts corruption. Requiring
+  /// the explicit `k` axis (faithful to the reference) makes that
+  /// unrepresentable.
   ///
   /// Steps (verbatim from the reference):
   /// 1. `x = expand_dims(x, (-2, -3))` — add the `(top-k, M=1)` axes.
@@ -836,6 +923,14 @@ impl SwitchGLU {
   /// integer routing indices carry no gradient), so that branch has no
   /// analogue. Returns a new lazy [`Array`] (no implicit eval).
   pub fn forward(&self, x: &Array, indices: &Array) -> Result<Array> {
+    // Validate the `indices` shape contract *before* `expand_dims` / the
+    // `do_sort` path: `indices` must be `[..batch.., k]` with an explicit
+    // trailing top-k axis (see `check_routing_indices`). Without this an
+    // ambiguous top-1 `[..batch..]` shape (`[N]` / `[B, S]`) would be silently
+    // mis-routed by `gather_sort`'s `order // M` (every row would reuse the
+    // first token) — silent MoE corruption, not a shape error.
+    check_routing_indices(x, indices)?;
+
     // `x = mx.expand_dims(x, (-2, -3))` — insert the top-k and `M=1` axes,
     // taking `[..batch.., D]` to `[..batch.., 1, 1, D]`.
     let mut x = shape::expand_dims_axes(x, &[-2, -3])?;
@@ -962,8 +1057,11 @@ fn check_glu_shapes(
 /// # Shape contract
 ///
 /// Same as [`SwitchGLU`]: `forward(x, indices)` takes `x` of shape
-/// `[..batch.., input_dims]` and `indices` of `[..batch.., k]`, and returns
-/// `[..batch.., k, input_dims]`.
+/// `[..batch.., input_dims]` and `indices` of `[..batch.., k]` (an **explicit
+/// trailing top-`k` axis** required — `[..batch.., 1]` for top-1; an ambiguous
+/// `[..batch..]` shape is rejected with
+/// [`Error::ShapeMismatch`](crate::Error::ShapeMismatch), see the `forward`
+/// method docs), and returns `[..batch.., k, input_dims]`.
 pub struct SwitchMLP {
   /// `input_dims → hidden_dims` first projection (`SwitchLinear`); its output
   /// is squashed by [`Self::activation`].
@@ -1049,7 +1147,12 @@ impl SwitchMLP {
   /// and swift `SwitchMLP.callAsFunction`.
   ///
   /// `x`: `[..batch.., input_dims]`. `indices`: `[..batch.., k]` integer
-  /// expert ids. Returns `[..batch.., k, input_dims]`.
+  /// expert ids — leading dims must match `x`'s batch dims, with an **explicit
+  /// trailing top-`k` axis** (pass `[..batch.., 1]` for top-1 routing).
+  /// Returns `[..batch.., k, input_dims]`. An ambiguous `[..batch..]`
+  /// `indices` with no `k` axis is rejected with
+  /// [`Error::ShapeMismatch`](crate::Error::ShapeMismatch) — identical
+  /// contract to [`SwitchGLU::forward`], whose docs explain why.
   ///
   /// Identical rebatching skeleton to [`SwitchGLU::forward`] — `expand_dims`,
   /// the `indices.size >= 64` `gather_sort` / `scatter_unsort` pair, the
@@ -1058,6 +1161,12 @@ impl SwitchMLP {
   /// training-only `stop_gradient` has no analogue (inference port). Returns
   /// a new lazy [`Array`] (no implicit eval).
   pub fn forward(&self, x: &Array, indices: &Array) -> Result<Array> {
+    // Validate the `indices` shape contract *before* `expand_dims` / the
+    // `do_sort` path — identical to [`SwitchGLU::forward`]; see
+    // `check_routing_indices`. Rejects an ambiguous top-1 `[..batch..]`
+    // `indices` that `gather_sort` would otherwise silently mis-route.
+    check_routing_indices(x, indices)?;
+
     // `x = mx.expand_dims(x, (-2, -3))` — add the top-k and `M=1` axes.
     let mut x = shape::expand_dims_axes(x, &[-2, -3])?;
 
@@ -2060,5 +2169,269 @@ mod tests {
     assert_eq!(restored.shape(), vec![3, 2, 1]);
     let restored_flat = restored.to_vec::<u32>().unwrap();
     assert_eq!(restored_flat, vec![2, 0, 1, 1, 0, 2]);
+  }
+
+  // ─── `indices` shape-contract regression (silent-MoE-corruption guard) ───
+  //
+  // `gather_sort` (the `indices.size() >= 64` sorted path) reads `M =
+  // indices.shape[-1]` as the top-k count and maps a sorted flat slot back to
+  // a token row via `order // M`. A top-1 `indices` shaped like the batch with
+  // NO explicit trailing k axis (`[N]` for x=`[N, D]`, `[B, S]` for
+  // x=`[B, S, D]`) would have its last *batch* dim mis-read as `M` — for `[N]`
+  // every `order // N` collapses to row 0, so all routed rows silently reuse
+  // token 0, yet unsort + squeeze still return a plausible `[N, D]` output.
+  // `check_routing_indices` rejects those ambiguous shapes (the reference
+  // always carries an explicit k axis); a top-1 caller must pass `[N, 1]`,
+  // which sorts correctly (`M == 1`, `order // 1 == order`).
+
+  #[test]
+  fn switch_glu_sorted_path_rejects_ambiguous_flat_indices() {
+    // 64 routed tokens, `indices` shaped `[N]` (no trailing k axis) — the
+    // sorted path is entered (`size >= 64`) but the shape is ambiguous: `N`
+    // would be mis-read as the top-k count `M`. Must be a recoverable
+    // `ShapeMismatch`, not silent corruption.
+    let glu = SwitchGLU::new(
+      SwitchLinear::from_parts(identity_then_swap_weight(), None).unwrap(),
+      SwitchLinear::from_parts(all_identity_weight(), None).unwrap(),
+      SwitchLinear::from_parts(all_identity_weight(), None).unwrap(),
+      SwitchGLU::default_activation(),
+    )
+    .unwrap();
+    let n = 64usize;
+    let mut x_data = Vec::with_capacity(n * 2);
+    let mut idx_data = Vec::with_capacity(n);
+    for t in 0..n {
+      x_data.push(t as f32);
+      x_data.push(t as f32 + 1.0);
+      idx_data.push((t % 2) as u32);
+    }
+    let x = Array::from_slice::<f32>(&x_data, &(n, 2usize)).unwrap();
+    // `[N]` — rank-1, same length as x's batch dim, NO explicit k axis.
+    let indices = Array::from_slice::<u32>(&idx_data, &(n,)).unwrap();
+    assert!(indices.size() >= 64, "test must exercise the sorted path");
+    let err = glu.forward(&x, &indices).unwrap_err();
+    assert!(
+      matches!(err, crate::Error::ShapeMismatch { .. }),
+      "expected ShapeMismatch on ambiguous [N] indices, got {err:?}"
+    );
+  }
+
+  #[test]
+  fn switch_glu_sorted_path_rejects_ambiguous_batch_indices() {
+    // 64 routed tokens via a 2-D batch x=`[B=8, S=8, D=2]`, `indices` shaped
+    // `[B, S]` (no trailing k axis). `S` would be mis-read as `M`; reject.
+    let glu = SwitchGLU::new(
+      SwitchLinear::from_parts(identity_then_swap_weight(), None).unwrap(),
+      SwitchLinear::from_parts(all_identity_weight(), None).unwrap(),
+      SwitchLinear::from_parts(all_identity_weight(), None).unwrap(),
+      SwitchGLU::default_activation(),
+    )
+    .unwrap();
+    let (b, s) = (8usize, 8usize);
+    let mut x_data = Vec::with_capacity(b * s * 2);
+    let mut idx_data = Vec::with_capacity(b * s);
+    for t in 0..(b * s) {
+      x_data.push(t as f32);
+      x_data.push(t as f32 + 1.0);
+      idx_data.push((t % 2) as u32);
+    }
+    let x = Array::from_slice::<f32>(&x_data, &(b, s, 2usize)).unwrap();
+    // `[B, S]` — rank matches x's batch dims exactly, NO explicit k axis.
+    let indices = Array::from_slice::<u32>(&idx_data, &(b, s)).unwrap();
+    assert!(indices.size() >= 64, "test must exercise the sorted path");
+    let err = glu.forward(&x, &indices).unwrap_err();
+    assert!(
+      matches!(err, crate::Error::ShapeMismatch { .. }),
+      "expected ShapeMismatch on ambiguous [B, S] indices, got {err:?}"
+    );
+  }
+
+  #[test]
+  fn switch_glu_sorted_path_top1_explicit_k_routes_each_token_to_its_expert() {
+    // The accepted top-1 form: `indices` shaped `[N, 1]` (explicit k=1). On the
+    // sorted path (`size >= 64`) every token must route to ITS OWN selected
+    // expert. Tokens 0..32 → expert 0 (identity gate), tokens 32..64 → expert 1
+    // (swap gate); every token has a DISTINCT feature pair, so a `[N]`-style
+    // mis-route (all rows reuse token 0) would make every output equal token
+    // 0's value and fail the per-row assertion below.
+    let glu = SwitchGLU::new(
+      SwitchLinear::from_parts(identity_then_swap_weight(), None).unwrap(),
+      SwitchLinear::from_parts(all_identity_weight(), None).unwrap(),
+      SwitchLinear::from_parts(all_identity_weight(), None).unwrap(),
+      SwitchGLU::default_activation(),
+    )
+    .unwrap();
+    let n = 64usize;
+    let mut x_data = Vec::with_capacity(n * 2);
+    let mut idx_data = Vec::with_capacity(n);
+    for t in 0..n {
+      // Distinct, non-zero per-token features so reusing token 0 is detectable.
+      x_data.push(t as f32 + 1.0);
+      x_data.push(t as f32 + 2.0);
+      // First half → expert 0, second half → expert 1.
+      idx_data.push(if t < n / 2 { 0u32 } else { 1u32 });
+    }
+    let x = Array::from_slice::<f32>(&x_data, &(n, 2usize)).unwrap();
+    let indices = Array::from_slice::<u32>(&idx_data, &(n, 1usize)).unwrap();
+    assert!(indices.size() >= 64, "test must exercise the sorted path");
+    let mut out = glu.forward(&x, &indices).unwrap();
+    assert_eq!(out.shape(), vec![n, 1, 2]);
+    let got = out.to_vec::<f32>().unwrap();
+    // Reference: silu(gate_e(x)) · x — expert 0 keeps features, expert 1 swaps.
+    let mut want = Vec::with_capacity(n * 2);
+    for t in 0..n {
+      let (x0, x1) = (t as f32 + 1.0, t as f32 + 2.0);
+      if t < n / 2 {
+        // expert 0: identity gate
+        want.push(silu_ref(x0) * x0);
+        want.push(silu_ref(x1) * x1);
+      } else {
+        // expert 1: swap gate sees [x1, x0]
+        want.push(silu_ref(x1) * x0);
+        want.push(silu_ref(x0) * x1);
+      }
+    }
+    assert_close(&got, &want);
+  }
+
+  #[test]
+  fn switch_glu_sorted_path_explicit_2d_batch_k_routes_each_token() {
+    // The explicit-`[..batch.., k]` contract with a 2-D batch: x=`[B=8, S=8,
+    // D=2]`, `indices`=`[B, S, k=1]` (one extra trailing axis beyond x's
+    // batch dims). Accepted, sorted path, each token routed to its own expert.
+    let glu = SwitchGLU::new(
+      SwitchLinear::from_parts(identity_then_swap_weight(), None).unwrap(),
+      SwitchLinear::from_parts(all_identity_weight(), None).unwrap(),
+      SwitchLinear::from_parts(all_identity_weight(), None).unwrap(),
+      SwitchGLU::default_activation(),
+    )
+    .unwrap();
+    let (b, s) = (8usize, 8usize);
+    let mut x_data = Vec::with_capacity(b * s * 2);
+    let mut idx_data = Vec::with_capacity(b * s);
+    for t in 0..(b * s) {
+      x_data.push(t as f32 + 1.0);
+      x_data.push(t as f32 + 2.0);
+      idx_data.push((t % 2) as u32);
+    }
+    let x = Array::from_slice::<f32>(&x_data, &(b, s, 2usize)).unwrap();
+    let indices = Array::from_slice::<u32>(&idx_data, &(b, s, 1usize)).unwrap();
+    assert!(indices.size() >= 64, "test must exercise the sorted path");
+    let mut out = glu.forward(&x, &indices).unwrap();
+    // forward returns `[..batch.., k, input_dims]` == `[B, S, 1, 2]`.
+    assert_eq!(out.shape(), vec![b, s, 1, 2]);
+    let got = out.to_vec::<f32>().unwrap();
+    let mut want = Vec::with_capacity(b * s * 2);
+    for t in 0..(b * s) {
+      let (x0, x1) = (t as f32 + 1.0, t as f32 + 2.0);
+      if t % 2 == 0 {
+        want.push(silu_ref(x0) * x0);
+        want.push(silu_ref(x1) * x1);
+      } else {
+        want.push(silu_ref(x1) * x0);
+        want.push(silu_ref(x0) * x1);
+      }
+    }
+    assert_close(&got, &want);
+  }
+
+  #[test]
+  fn switch_mlp_sorted_path_rejects_ambiguous_flat_indices() {
+    // `SwitchMLP` sibling of `switch_glu_sorted_path_rejects_ambiguous_flat_indices`:
+    // a `[N]` top-1 `indices` on the sorted path is rejected, not mis-routed.
+    let square: Activation = Box::new(|a: &Array| a.multiply(a));
+    let mlp = SwitchMLP::new(
+      SwitchLinear::from_parts(identity_then_swap_weight(), None).unwrap(),
+      SwitchLinear::from_parts(all_identity_weight(), None).unwrap(),
+      square,
+    )
+    .unwrap();
+    let n = 64usize;
+    let mut x_data = Vec::with_capacity(n * 2);
+    let mut idx_data = Vec::with_capacity(n);
+    for t in 0..n {
+      x_data.push(t as f32);
+      x_data.push(t as f32 + 1.0);
+      idx_data.push((t % 2) as u32);
+    }
+    let x = Array::from_slice::<f32>(&x_data, &(n, 2usize)).unwrap();
+    let indices = Array::from_slice::<u32>(&idx_data, &(n,)).unwrap();
+    assert!(indices.size() >= 64, "test must exercise the sorted path");
+    let err = mlp.forward(&x, &indices).unwrap_err();
+    assert!(
+      matches!(err, crate::Error::ShapeMismatch { .. }),
+      "expected ShapeMismatch on ambiguous [N] indices, got {err:?}"
+    );
+  }
+
+  #[test]
+  fn switch_mlp_sorted_path_rejects_ambiguous_batch_indices() {
+    // `SwitchMLP` sibling: a `[B, S]` top-1 `indices` (no k axis) on a 2-D
+    // batch x=`[B, S, D]` is rejected on the sorted path.
+    let square: Activation = Box::new(|a: &Array| a.multiply(a));
+    let mlp = SwitchMLP::new(
+      SwitchLinear::from_parts(identity_then_swap_weight(), None).unwrap(),
+      SwitchLinear::from_parts(all_identity_weight(), None).unwrap(),
+      square,
+    )
+    .unwrap();
+    let (b, s) = (8usize, 8usize);
+    let mut x_data = Vec::with_capacity(b * s * 2);
+    let mut idx_data = Vec::with_capacity(b * s);
+    for t in 0..(b * s) {
+      x_data.push(t as f32);
+      x_data.push(t as f32 + 1.0);
+      idx_data.push((t % 2) as u32);
+    }
+    let x = Array::from_slice::<f32>(&x_data, &(b, s, 2usize)).unwrap();
+    let indices = Array::from_slice::<u32>(&idx_data, &(b, s)).unwrap();
+    assert!(indices.size() >= 64, "test must exercise the sorted path");
+    let err = mlp.forward(&x, &indices).unwrap_err();
+    assert!(
+      matches!(err, crate::Error::ShapeMismatch { .. }),
+      "expected ShapeMismatch on ambiguous [B, S] indices, got {err:?}"
+    );
+  }
+
+  #[test]
+  fn switch_mlp_sorted_path_top1_explicit_k_routes_each_token_to_its_expert() {
+    // `SwitchMLP` sibling of the SwitchGLU `[N, 1]` regression: the accepted
+    // explicit-k=1 top-1 form, sorted path, every token routed to ITS OWN
+    // expert with distinct per-token features (a `[N]`-style mis-route reusing
+    // token 0 would fail the per-row assertion).
+    let square: Activation = Box::new(|a: &Array| a.multiply(a));
+    let mlp = SwitchMLP::new(
+      SwitchLinear::from_parts(identity_then_swap_weight(), None).unwrap(),
+      SwitchLinear::from_parts(all_identity_weight(), None).unwrap(),
+      square,
+    )
+    .unwrap();
+    let n = 64usize;
+    let mut x_data = Vec::with_capacity(n * 2);
+    let mut idx_data = Vec::with_capacity(n);
+    for t in 0..n {
+      x_data.push(t as f32 + 1.0);
+      x_data.push(t as f32 + 2.0);
+      idx_data.push(if t < n / 2 { 0u32 } else { 1u32 });
+    }
+    let x = Array::from_slice::<f32>(&x_data, &(n, 2usize)).unwrap();
+    let indices = Array::from_slice::<u32>(&idx_data, &(n, 1usize)).unwrap();
+    assert!(indices.size() >= 64, "test must exercise the sorted path");
+    let mut out = mlp.forward(&x, &indices).unwrap();
+    assert_eq!(out.shape(), vec![n, 1, 2]);
+    let got = out.to_vec::<f32>().unwrap();
+    // Reference: square(fc1_e(x)) — expert 0 identity, expert 1 swap.
+    let mut want = Vec::with_capacity(n * 2);
+    for t in 0..n {
+      let (x0, x1) = (t as f32 + 1.0, t as f32 + 2.0);
+      if t < n / 2 {
+        want.push(x0 * x0);
+        want.push(x1 * x1);
+      } else {
+        want.push(x1 * x1);
+        want.push(x0 * x0);
+      }
+    }
+    assert_close(&got, &want);
   }
 }
