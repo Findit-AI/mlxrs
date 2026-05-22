@@ -332,6 +332,19 @@ pub enum ChatSessionError {
   /// cache that does not encode the conversation. No Swift analogue (the
   /// Swift `ChatSession` never made the speculative cache observable).
   SpeculativeCacheUnsupported,
+  /// [`ChatSessionBuilder::build`] was called with both
+  /// [`ChatSessionBuilder::cache`] (a restored opaque KV prefix) and
+  /// [`ChatSessionBuilder::speculative`] set. This combination is
+  /// **unsupported** because [`speculative_stream_generate`] consumes its KV
+  /// caches and does not return them: the first speculative turn would use
+  /// the restored prefix, but the second turn would silently rebuild from a
+  /// fresh offset-0 cache (the opaque prefix's ids are unknown, so the
+  /// session cannot re-render and re-prefill it). Pick one of:
+  /// drop [`ChatSessionBuilder::cache`] (run speculative decoding without a
+  /// restored prefix) or drop [`ChatSessionBuilder::speculative`] (use the
+  /// standard path, which reuses its KV cache across turns and preserves the
+  /// restored prefix).
+  SpeculativeCacheRestoreUnsupported,
 }
 
 impl std::fmt::Display for ChatSessionError {
@@ -344,6 +357,16 @@ impl std::fmt::Display for ChatSessionError {
         "speculative-decoding sessions do not support cache save: the speculative \
          generator consumes its KV caches and rebuilds them each turn, so there is \
          no advanced cache that encodes the conversation to persist",
+      ),
+      ChatSessionError::SpeculativeCacheRestoreUnsupported => f.write_str(
+        "ChatSessionBuilder::cache() combined with ChatSessionBuilder::speculative() \
+         is unsupported: speculative_stream_generate consumes its KV caches and does \
+         not return them, so the restored opaque prefix would be used on the first \
+         turn and silently lost on every subsequent turn (the opaque prefix's token \
+         ids are unknown, so the session cannot re-prefill it). Drop .cache(..) to \
+         run speculative decoding without a restored prefix, or drop .speculative(..) \
+         to use the standard path (which reuses its KV cache across turns and \
+         preserves the restored prefix)",
       ),
     }
   }
@@ -373,7 +396,7 @@ impl From<ChatSessionError> for Error {
 /// ```ignore
 /// let session = ChatSession::builder(model, tokenizer, cache_config)
 ///     .instructions("You are a helpful assistant.")
-///     .build();
+///     .build()?;
 /// ```
 pub struct ChatSessionBuilder {
   model: Box<dyn Model>,
@@ -449,8 +472,31 @@ impl ChatSessionBuilder {
   }
 
   /// Finish building the [`ChatSession`].
-  pub fn build(self) -> ChatSession {
-    ChatSession {
+  ///
+  /// Returns [`ChatSessionError::SpeculativeCacheRestoreUnsupported`] if both
+  /// [`ChatSessionBuilder::cache`] (a restored opaque KV prefix) and
+  /// [`ChatSessionBuilder::speculative`] were set: see that variant's doc for
+  /// why the combination is rejected and what to drop instead. Every other
+  /// builder shape (fresh, `.history(..)`-seeded, `.cache(..)` alone,
+  /// `.speculative(..)` alone) is supported and returns `Ok`.
+  pub fn build(self) -> Result<ChatSession> {
+    // Reject `.cache(restored).speculative(..)` — Finding 1. A restored cache
+    // is stored as `CacheSlot::Realised` with an OPAQUE prefix whose token
+    // ids the builder was never given. The first speculative turn would
+    // consume that cache (correctly using the restored prefix) and the
+    // `commit()` write-back would set the slot to `CacheSlot::SpeculativeSpent`,
+    // because `speculative_stream_generate` does not hand its caches back.
+    // The next turn's `take_cache()` treats `SpeculativeSpent` like `Empty`
+    // and allocates a fresh offset-0 cache with `CachedTokens::empty()` —
+    // silently losing the restored prefix (it cannot be re-rendered, since
+    // the session was never given its token ids). Rather than re-prefilling
+    // the opaque region every turn (expensive, changes the speculative
+    // driver's contract) we reject the combination at build time with an
+    // actionable message pointing at the two alternatives.
+    if self.speculative.is_some() && matches!(self.initial, CacheSlot::Realised { .. }) {
+      return Err(ChatSessionError::SpeculativeCacheRestoreUnsupported.into());
+    }
+    Ok(ChatSession {
       model: self.model,
       tokenizer: self.tokenizer,
       cache_config: self.cache_config,
@@ -459,7 +505,7 @@ impl ChatSessionBuilder {
       speculative: self.speculative,
       cache: self.initial,
       history: Vec::new(),
-    }
+    })
   }
 }
 
@@ -952,6 +998,7 @@ impl ChatSession {
       opaque_len,
       generated: Vec::new(),
       finished: false,
+      detok_finalized: false,
       committed: false,
     })
   }
@@ -1126,6 +1173,20 @@ pub struct ChatResponseStream<'s> {
   /// `true` once the stream has ended (eos, `max_tokens`, or an `Err`) — the
   /// iterator fuses afterwards, never re-entering the model.
   finished: bool,
+  /// `true` once the streaming detokenizer has been **finalized** for this
+  /// turn (`detok.finalize()` called and any withheld tail appended to
+  /// `reply`). Split from [`finished`](Self::finished) for Finding 2:
+  /// `finished` is also set on the `Err` branch of [`Iterator::next`], but an
+  /// `Err`-terminated turn has NOT had its detokenizer finalized — its
+  /// withheld tail (e.g. the BPE detok's bare-space token) is still in the
+  /// detok's `unflushed` buffer. [`commit`](Self::commit) finalizes the detok
+  /// (standard or speculative path) whenever `!detok_finalized`, so an
+  /// error-terminated stream — like the early-drop and natural-termination
+  /// paths — records token-complete history. Set to `true` by the natural-
+  /// finish branches (eos / `max_tokens` in `next`, which already finalize
+  /// inline), and again by `commit` when it finalizes on the error / early-
+  /// drop path; idempotent (`finalize_tail()` returns "" on repeats).
+  detok_finalized: bool,
   /// `true` once the turn's cache + reply have been written back to the
   /// session, so a `Drop` after a manual drain does not commit twice.
   committed: bool,
@@ -1180,13 +1241,21 @@ impl ChatResponseStream<'_> {
 
     match self.driver.take() {
       Some(Driver::Standard(turn)) => {
-        // Finding 3: finalize the detokenizer if the stream was dropped
-        // before the generator reached eos / max_tokens (those paths
-        // already finalized). A withheld tail (e.g. the BPE detok's bare-
-        // space token) is otherwise lost from `reply` while its tokens are
-        // in the cache — desyncing the recorded history from the KV state.
-        if !self.finished {
+        // Finding 2 (round 3): finalize the detokenizer on ANY non-natural
+        // termination — early drop AND yielded `Err`. The natural eos /
+        // max_tokens paths already finalized inline (and set
+        // `detok_finalized`), so they skip here; the early-drop AND
+        // error-terminated paths land here with `detok_finalized = false`
+        // and flush the withheld tail. Without this, an `Err`-terminated
+        // BPE/SPM stream would commit a TRUNCATED assistant message — the
+        // detok's `unflushed` tail (e.g. a bare-space token) is dropped
+        // while its tokens are in the cache, desyncing recorded history
+        // from KV state. Earlier rounds keyed on `!self.finished`, but
+        // `next()` sets `finished = true` on Err too, so the Err path was
+        // silently skipping this flush (Finding 2 in this round).
+        if !self.detok_finalized {
           self.detok.finalize();
+          self.detok_finalized = true;
           let tail = self.detok.last_segment();
           self.reply.push_str(&tail);
         }
@@ -1234,16 +1303,20 @@ impl ChatResponseStream<'_> {
         };
       }
       Some(Driver::Speculative(mut turn)) => {
-        // Finding 2 (detok tail): the speculative driver's streaming
-        // detokenizer is finalized only on eos / `max_tokens`. If this
-        // stream was dropped mid-generation (`!finished`), that detok still
-        // holds a withheld tail (e.g. a BPE detok's trailing bare-space
-        // token) — flush it so the recorded `reply` is token-complete and
-        // the next speculative turn rebuilds from an exact history. On a
-        // run that ended naturally the detok was already finalized, and
-        // `finalize_tail()` is idempotent (returns ""), so this is a no-op.
-        if !self.finished {
+        // Finding 2 (detok tail, round 3): the speculative driver's
+        // streaming detokenizer is finalized only on eos / `max_tokens`. On
+        // ANY non-natural termination — early drop OR yielded `Err` — that
+        // detok still holds a withheld tail (e.g. a BPE detok's trailing
+        // bare-space token) and must be flushed here so the recorded `reply`
+        // is token-complete and the next speculative turn rebuilds from an
+        // exact history. Earlier rounds gated on `!self.finished`, but
+        // `next()` sets `finished = true` on Err too, so the error-
+        // terminated path was silently skipping this flush (Finding 2).
+        // `finalize_tail()` is idempotent — natural completion already set
+        // `detok_finalized` so we never re-finalize there.
+        if !self.detok_finalized {
           let tail = turn.iter.finalize_tail();
+          self.detok_finalized = true;
           self.reply.push_str(&tail);
         }
         // Finding 2 (cache): the speculative iterator consumed the caches
@@ -1298,16 +1371,30 @@ impl Iterator for ChatResponseStream<'_> {
             self.reply.push_str(&response.text);
           }
           if response.finish_reason.is_some() {
+            // Natural termination (eos / max_tokens) — the speculative
+            // driver already finalized its inner detokenizer in this step's
+            // response, so `commit()` MUST NOT re-finalize (would double-
+            // append). Distinct from the `Err` arm below: that one fuses
+            // the stream without finalization, so `commit` still flushes.
             self.finished = true;
+            self.detok_finalized = true;
           }
           Some(Ok(response))
         }
         Some(Err(e)) => {
+          // Finding 2: `finished = true` here fuses the iterator, but the
+          // speculative driver's detok has NOT been finalized (the inner
+          // driver finalizes only on eos / max_tokens). Leave `detok_finalized
+          // = false` so `commit()` flushes the withheld tail.
           self.finished = true;
           Some(Err(e))
         }
         None => {
+          // The inner iterator returned None — by contract this only follows
+          // a natural-termination response (eos / max_tokens), so the detok
+          // is already finalized. Mirror that invariant here.
           self.finished = true;
+          self.detok_finalized = true;
           None
         }
       },
@@ -1317,10 +1404,21 @@ impl Iterator for ChatResponseStream<'_> {
         let step = match turn.generator.next() {
           Some(Ok(step)) => step,
           Some(Err(e)) => {
+            // Finding 2: `finished = true` fuses the stream, but the detok
+            // has NOT been finalized — leave `detok_finalized = false` so
+            // `commit()` flushes the BPE/SPM withheld tail before recording
+            // the assistant message. Without this, an error-terminated
+            // standard stream commits a TRUNCATED reply (history shorter
+            // than the token sequence advanced into the cache).
             self.finished = true;
             return Some(Err(e));
           }
           None => {
+            // `Generator::next == None` is unexpected on the standard path:
+            // we yield "length" inline at `produced >= max_tokens`, so the
+            // generator should not run out underneath us. Treat as an
+            // unexpected stop — leave `detok_finalized = false` so `commit`
+            // flushes any withheld tail.
             self.finished = true;
             return None;
           }
@@ -1341,6 +1439,9 @@ impl Iterator for ChatResponseStream<'_> {
         if self.eos.contains(&token) {
           self.finished = true;
           self.detok.finalize();
+          // Detok finalized inline on natural eos — `commit()` MUST NOT
+          // re-finalize (would double-append the tail to the reply).
+          self.detok_finalized = true;
           let text = self.detok.last_segment();
           self.reply.push_str(&text);
           return Some(Ok(GenerationResponse {
@@ -1367,6 +1468,9 @@ impl Iterator for ChatResponseStream<'_> {
         if self.produced >= self.max_tokens {
           self.finished = true;
           self.detok.finalize();
+          // Detok finalized inline on natural max_tokens — `commit()` MUST
+          // NOT re-finalize (would double-append the tail).
+          self.detok_finalized = true;
           // `finalize()` may release a withheld tail (e.g. the BPE detok's
           // bare-space token); append it to both the yielded text and the
           // accumulated reply.
@@ -1466,6 +1570,7 @@ mod tests {
     )
     .generate_params(cfg)
     .build()
+    .expect("build")
   }
 
   #[test]
@@ -1715,7 +1820,8 @@ mod tests {
       max_tokens: 3,
       ..Default::default()
     })
-    .build();
+    .build()
+    .expect("build");
 
     let _ = s.respond("hello").expect("turn");
     assert!(s.has_cache());
@@ -1836,7 +1942,8 @@ mod tests {
       max_tokens: 3,
       ..Default::default()
     })
-    .build();
+    .build()
+    .expect("build");
 
     // `.history` state behaves like `.empty`: no cache before generation.
     assert!(!s.has_cache(), "history-seeded: cache unrealised pre-turn");
@@ -1881,7 +1988,8 @@ mod tests {
         max_tokens: 1,
         ..Default::default()
       })
-      .build();
+      .build()
+      .expect("build");
       let _ = s.respond("hello").expect("turn");
       s.current_cache().unwrap()[0].offset()
     };
@@ -1931,7 +2039,8 @@ mod tests {
       max_tokens: 4,
       ..Default::default()
     })
-    .build();
+    .build()
+    .expect("build");
 
     assert!(
       !s.has_cache(),
@@ -1972,7 +2081,8 @@ mod tests {
       max_tokens: 3,
       ..Default::default()
     })
-    .build();
+    .build()
+    .expect("build");
 
     let _ = s.respond("hello").expect("speculative turn");
     // History accumulated, the turn ran — but no realised cache.
@@ -2036,6 +2146,7 @@ mod tests {
     })
     .cache(prefilled_opaque_cache(opaque_len))
     .build()
+    .expect("build")
   }
 
   #[test]
@@ -2261,7 +2372,8 @@ mod tests {
         max_tokens: 12,
         ..Default::default()
       })
-      .build();
+      .build()
+      .expect("build");
 
     // Drain only a few tokens, then drop the stream mid-generation.
     let mut produced_tokens: Vec<u32> = Vec::new();
@@ -2315,6 +2427,348 @@ mod tests {
     assert!(
       !reference.is_empty() && recorded.len() > streamed.len(),
       "the BPE detok genuinely withheld a tail that `commit()` flushed \
+       (streamed {streamed:?}, recorded {recorded:?})"
+    );
+  }
+
+  /// A model that delegates every call to `inner` for the first `ok_calls`
+  /// `forward` invocations and then returns a [`Error::Backend`] on every
+  /// later one. Used to drive a [`ChatSession`] stream into the `Err` branch
+  /// of [`Iterator::next`] partway through generation so the round-3 Finding 2
+  /// (detokenizer not finalized on an error-terminated stream) is exercised.
+  ///
+  /// `forward` is `&self`, so the call counter sits behind a [`Cell`]
+  /// ([`MockModel`] is single-thread). The optional `forward_embeddings` hook
+  /// just delegates — the LM path only uses `forward`.
+  struct ErringAfterModel {
+    inner: MockModel,
+    ok_calls: std::cell::Cell<usize>,
+  }
+
+  impl ErringAfterModel {
+    fn new(inner: MockModel, ok_calls: usize) -> Self {
+      Self {
+        inner,
+        ok_calls: std::cell::Cell::new(ok_calls),
+      }
+    }
+  }
+
+  impl Model for ErringAfterModel {
+    fn forward(
+      &self,
+      tokens: &crate::array::Array,
+      cache: &mut [Box<dyn KvCache>],
+    ) -> Result<crate::array::Array> {
+      let remaining = self.ok_calls.get();
+      if remaining == 0 {
+        return Err(Error::Backend {
+          message: "ErringAfterModel: budget exhausted (test fixture)".into(),
+        });
+      }
+      self.ok_calls.set(remaining - 1);
+      self.inner.forward(tokens, cache)
+    }
+
+    fn forward_embeddings(
+      &self,
+      embeddings: &crate::array::Array,
+      cache: &mut [Box<dyn KvCache>],
+    ) -> Result<crate::array::Array> {
+      self.inner.forward_embeddings(embeddings, cache)
+    }
+  }
+
+  #[test]
+  fn build_rejects_cache_plus_speculative_combination() {
+    // Finding 1 (round 3) — the `.cache(restored).speculative(..)` builder
+    // combination MUST be rejected at `build()` time, with no session
+    // constructed. The opaque cache cannot be re-rendered from history (its
+    // token ids are unknown to the session), and `speculative_stream_generate`
+    // consumes its KV caches and does not return them — so the first
+    // speculative turn would use the restored prefix and the next turn would
+    // silently fall back to a fresh offset-0 cache, losing the prefix without
+    // warning. We reject up-front with an actionable message pointing at
+    // either workaround (drop one of `.cache(..)` / `.speculative(..)`).
+    let restored = prefilled_opaque_cache(8);
+    let res = ChatSession::builder(
+      Box::new(MockModel::new(11)),
+      fixture_tokenizer(),
+      cache_config(),
+    )
+    .cache(restored)
+    .speculative(SpeculativeDecodingConfig::new(
+      Rc::new(MockModel::new(11)),
+      cache_config(),
+    ))
+    .build();
+
+    let err = match res {
+      Ok(_) => panic!("cache + speculative must be rejected at build()"),
+      Err(e) => e,
+    };
+    let msg = format!("{err}");
+    // Decisive: the error names the unsupported combination AND points at
+    // BOTH alternatives, so the caller can act on it without reading source.
+    assert!(
+      msg.contains("speculative") && msg.contains("cache"),
+      "error names the rejected combination: {msg}"
+    );
+    assert!(
+      msg.contains(".cache") && msg.contains(".speculative"),
+      "error points at both workarounds: {msg}"
+    );
+
+    // Reverse builder order: `.speculative(..)` first then `.cache(..)` — the
+    // rejection is order-independent (both fields are set at `build()` time).
+    let restored2 = prefilled_opaque_cache(8);
+    let res2 = ChatSession::builder(
+      Box::new(MockModel::new(11)),
+      fixture_tokenizer(),
+      cache_config(),
+    )
+    .speculative(SpeculativeDecodingConfig::new(
+      Rc::new(MockModel::new(11)),
+      cache_config(),
+    ))
+    .cache(restored2)
+    .build();
+    assert!(
+      res2.is_err(),
+      "rejection is independent of builder-method order"
+    );
+
+    // Sanity-check the same combination minus `.cache(..)` builds fine — the
+    // rejection is precisely scoped to the unsupported pair, not a regression
+    // of the lone `.speculative(..)` path.
+    let ok = ChatSession::builder(
+      Box::new(MockModel::new(11)),
+      fixture_tokenizer(),
+      cache_config(),
+    )
+    .speculative(SpeculativeDecodingConfig::new(
+      Rc::new(MockModel::new(11)),
+      cache_config(),
+    ))
+    .build();
+    assert!(
+      ok.is_ok(),
+      ".speculative(..) alone still builds (only the cache+speculative combo is unsupported)"
+    );
+  }
+
+  #[test]
+  fn standard_error_terminated_stream_flushes_detokenizer_tail() {
+    // Finding 2 (round 3) — the round-3 defect on the STANDARD path. An
+    // error-terminated stream (the `Generator` yields `Err`) used to skip
+    // `commit()`'s finalize because the gate was `!self.finished`, but
+    // `next()` sets `finished = true` on BOTH natural termination AND `Err`.
+    // The fix splits natural completion (which already finalized) from
+    // error/early-drop termination (which has NOT) via `detok_finalized`, so
+    // an `Err`-terminated BPE/SPM stream now flushes the withheld tail and
+    // records token-complete history.
+    let (tok, a_id, vocab) = bpe_withholding_tokenizer();
+    // Argmax samples `â` (id 11) every step — every produced token decodes to
+    // byte 0xE2, so the BPE detok withholds the whole reply in `unflushed`
+    // until `finalize()` (mid-stream `last_segment()` returns "").
+    let mut canned = vec![0.0_f32; vocab];
+    canned[a_id as usize] = 10.0;
+    let inner = MockModel {
+      canned,
+      n_kv_heads: 1,
+      head_dim: 2,
+    };
+    // Allow `ok_steps` successful `forward` calls (1 prefill + decode steps),
+    // then return Err on every later one — so the stream's standard generator
+    // yields a few `Ok(GenStep)`s and then an `Err`, fusing with
+    // `finished = true` but `detok_finalized = false`. Pre-fix, `commit()`
+    // would skip the flush and the assistant message would be empty (every
+    // mid-stream segment was "").
+    let ok_steps: usize = 4;
+    let model = ErringAfterModel::new(inner, ok_steps);
+
+    let mut s = ChatSession::builder(Box::new(model), tok, cache_config())
+      .generate_params(GenConfig {
+        // `max_tokens` set high so the error fires before the natural-finish
+        // branch can set `detok_finalized = true`.
+        max_tokens: 32,
+        ..Default::default()
+      })
+      .build()
+      .expect("build");
+
+    // Drain the stream — collect every token actually produced (the run ends
+    // when the wrapped model returns `Err`).
+    let mut produced_tokens: Vec<u32> = Vec::new();
+    let mut streamed = String::new();
+    let mut saw_err = false;
+    {
+      let stream = s.stream_respond("hello").expect("stream");
+      for resp in stream {
+        match resp {
+          Ok(r) => {
+            produced_tokens.push(r.token);
+            streamed.push_str(&r.text);
+          }
+          Err(_) => {
+            saw_err = true;
+            break;
+          }
+        }
+        // `break` on Err — the explicit drain ends, the stream is then
+        // dropped (its `commit()` must flush the tail).
+      }
+    }
+    assert!(saw_err, "the stream MUST yield an Err mid-generation");
+    assert!(
+      !produced_tokens.is_empty(),
+      "at least one token must have streamed before the Err"
+    );
+    assert!(
+      produced_tokens.iter().all(|&t| t == a_id),
+      "every sampled token is the withheld `â`"
+    );
+
+    // The committed assistant turn.
+    assert_eq!(s.history().len(), 2, "error-terminated turn still recorded");
+    let recorded = &s.history()[1].content;
+
+    // Token-complete oracle: feed the SAME produced tokens into an
+    // independent BPE detokenizer and `finalize()` — the committed history
+    // text must equal that full detokenization. Pre-fix (gating on
+    // `!self.finished`), `commit()` would have skipped the flush on the Err
+    // path: `recorded` would equal `streamed`, which is empty (the BPE detok
+    // buffered every `â` in `unflushed`).
+    let reference = {
+      let mut d =
+        crate::tokenizer::BpeStreamingDetokenizer::new(vec![("â".to_string(), a_id)], false);
+      for &t in &produced_tokens {
+        d.add_token(t);
+      }
+      d.finalize();
+      d.last_segment()
+    };
+    assert_eq!(
+      *recorded, reference,
+      "the error-terminated standard turn recorded token-complete text \
+       (detok tail flushed in commit): recorded {recorded:?} == finalized {reference:?}"
+    );
+    // Load-bearing: the BPE detok genuinely withheld a tail — pre-fix the
+    // recorded text would have been empty (`streamed.is_empty()`).
+    assert!(
+      !reference.is_empty() && recorded.len() > streamed.len(),
+      "the BPE detok genuinely withheld a tail commit() flushed \
+       (streamed {streamed:?}, recorded {recorded:?})"
+    );
+  }
+
+  #[test]
+  fn speculative_error_terminated_stream_flushes_detokenizer_tail() {
+    // Finding 2 (round 3) — the same round-3 defect on the SPECULATIVE
+    // path. An `Err` from the speculative iterator sets `finished = true`
+    // without finalizing the inner driver's detok; pre-fix `commit()` keyed
+    // on `!self.finished` and so skipped the flush. The fix: `commit()` now
+    // gates on `detok_finalized`, which the Err arm intentionally leaves
+    // `false`, so `finalize_tail()` runs and flushes the withheld tail.
+    let (tok, a_id, vocab) = bpe_withholding_tokenizer();
+    let mut canned = vec![0.0_f32; vocab];
+    canned[a_id as usize] = 10.0;
+
+    // Wrap BOTH target and draft in `ErringAfterModel`: the speculative
+    // driver calls both each cycle, so erring either eventually surfaces as
+    // an `Err` step from the iterator. The driver's call shape is
+    // `1 + n_draft_tokens` draft forwards per cycle and `1 + 1` target
+    // forwards per cycle (1 prefill + 1 verify), so a `draft.ok_calls` budget
+    // sized to allow ~1 full cycle (1 prefill + 5 propose) plus a partial
+    // second-cycle draft propose lets the iterator emit up to a full burst of
+    // tokens (~6) and then `Err` in the next cycle's draft phase. The target
+    // budget is set high so the error is sourced from the draft (easier to
+    // reason about: target stays consistent for stream bookkeeping).
+    let target_inner = MockModel {
+      canned: canned.clone(),
+      n_kv_heads: 1,
+      head_dim: 2,
+    };
+    let draft_inner = MockModel {
+      canned,
+      n_kv_heads: 1,
+      head_dim: 2,
+    };
+    // target survives the whole run — the Err comes from draft.
+    let target = ErringAfterModel::new(target_inner, 64);
+    // draft: 1 prefill + 5 propose = 6 (one full cycle), then a partial 2nd
+    // cycle: 1 propose succeeds, next propose Errs → ≥1 burst of tokens
+    // already streamed when the Err arrives.
+    let draft = ErringAfterModel::new(draft_inner, 7);
+
+    let mut s = ChatSession::builder(Box::new(target), tok, cache_config())
+      .speculative(SpeculativeDecodingConfig::new(
+        Rc::new(draft),
+        cache_config(),
+      ))
+      .generate_params(GenConfig {
+        max_tokens: 32,
+        ..Default::default()
+      })
+      .build()
+      .expect("build");
+
+    // Drain the stream until an `Err` is yielded; then drop.
+    let mut produced_tokens: Vec<u32> = Vec::new();
+    let mut streamed = String::new();
+    let mut saw_err = false;
+    {
+      let stream = s.stream_respond("hello").expect("speculative stream");
+      for resp in stream {
+        match resp {
+          Ok(r) => {
+            produced_tokens.push(r.token);
+            streamed.push_str(&r.text);
+          }
+          Err(_) => {
+            saw_err = true;
+            break;
+          }
+        }
+      }
+    }
+    assert!(
+      saw_err,
+      "the speculative stream MUST yield an Err mid-generation"
+    );
+    assert!(
+      !produced_tokens.is_empty(),
+      "at least one token must have streamed before the speculative Err"
+    );
+    assert!(
+      produced_tokens.iter().all(|&t| t == a_id),
+      "every sampled token is the withheld `â`"
+    );
+
+    // Committed assistant turn must equal the independent finalized detok of
+    // the tokens actually produced. Pre-fix `recorded` would equal the empty
+    // `streamed` — every mid-stream `last_segment()` returned "" because the
+    // BPE detok buffered every `â`.
+    assert_eq!(s.history().len(), 2, "error-terminated turn still recorded");
+    let recorded = &s.history()[1].content;
+
+    let reference = {
+      let mut d =
+        crate::tokenizer::BpeStreamingDetokenizer::new(vec![("â".to_string(), a_id)], false);
+      for &t in &produced_tokens {
+        d.add_token(t);
+      }
+      d.finalize();
+      d.last_segment()
+    };
+    assert_eq!(
+      *recorded, reference,
+      "the error-terminated speculative turn recorded token-complete text: \
+       recorded {recorded:?} == finalized {reference:?}"
+    );
+    assert!(
+      !reference.is_empty() && recorded.len() > streamed.len(),
+      "speculative BPE detok genuinely withheld a tail commit() flushed \
        (streamed {streamed:?}, recorded {recorded:?})"
     );
   }
