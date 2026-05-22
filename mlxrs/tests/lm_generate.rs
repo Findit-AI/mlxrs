@@ -1534,6 +1534,136 @@ fn generate_step_opt_out_f16_tiny_temp_safe() {
   }
 }
 
+/// L3 zero-cost opt-out — R4 subnormal-temp numerical safety net (Codex
+/// review R4). Separate from R3: `categorical_sampling` computes `1/temp`
+/// in **`f32`** (because `GenConfig.temp` is `f32`) BEFORE the
+/// `scalar_like` cast to the logits dtype. For any subnormal positive
+/// `temp < 1.0/f32::MAX ≈ 2.94e-39` the f32 reciprocal itself is `+Inf`
+/// — independent of logits dtype. The `make_sampler` /
+/// `categorical_sampling` validator only requires
+/// `temp.is_finite() && temp > 0.0`, so a subnormal positive `f32` passes
+/// (it's a valid finite positive `f32`). With the prior R3 dtype-only
+/// guard, bf16 / f32 / f64 logits would NOT trip — so `0 * Inf = NaN`
+/// would still bleed through. The R4 fix tightens the guard to also
+/// catch `r > f32::MAX as f64`, which fires for every logits dtype when
+/// the upstream f32 reciprocal overflows.
+///
+/// Test premise (why subnormal temp): `1.0e-40_f32` is below the f16
+/// representable range (so it could never reach a `Dtype::F16` path via
+/// the GenConfig field — which is `f32`) but IS a valid finite positive
+/// `f32` (subnormal); `1.0_f32 / 1.0e-40_f32 = +Inf`. The R3 dtype check
+/// alone returns `false` for bf16/f32/f64 in this regime; only the R4
+/// `r > f32::MAX as f64` term routes through `argmax_sample`. Without
+/// the R4 fix the sampler would produce NaN draws.
+///
+/// Sub-scenarios: bf16 logits + subnormal temp, and f32 logits +
+/// subnormal temp — both should now route through the bypass and yield
+/// the argmax token every step.
+///
+/// The underlying defect (`categorical_sampling`'s f32 `1/temp` then
+/// in-dtype multiply) is tracked as LM-6 in
+/// `docs/rust-golden-standard-followups.md` for a separate follow-up PR
+/// per `feedback_review_finding_must_be_in_diff`; this test pins the
+/// in-diff R4 safety net.
+#[test]
+fn generate_step_opt_out_subnormal_temp_safe() {
+  // bias[3] = 5.0 dominates; argmax == 3 in bf16/f32 (both preserve the
+  // ordering of the five biases).
+  let bias = vec![0.0_f32, 1.0, 2.0, 5.0, 1.5];
+  let argmax_id = 3u32;
+  let prompt = [1u32];
+  let max_tokens = 4;
+  // `temp = 1.0e-40_f32` is a subnormal positive f32 — `is_finite() &&
+  // > 0.0` is TRUE (passes the `categorical_sampling` validator), and
+  // `1.0_f32 / 1.0e-40_f32` is `+Inf` (the upstream f32 reciprocal
+  // overflow R4 catches independently of logits dtype).
+  let subnormal_temp = 1.0e-40_f32;
+  assert!(
+    subnormal_temp.is_finite() && subnormal_temp > 0.0,
+    "test premise: subnormal_temp must pass the validator (finite + > 0); \
+     got {subnormal_temp}, is_finite={}, > 0 = {}",
+    subnormal_temp.is_finite(),
+    subnormal_temp > 0.0
+  );
+  // f32 reciprocal must overflow to +Inf — this is the R4 condition.
+  let recip_f32: f32 = 1.0_f32 / subnormal_temp;
+  assert!(
+    !recip_f32.is_finite(),
+    "test premise: 1/subnormal_temp in f32 must be non-finite (R4 \
+     overflow path), got {recip_f32}"
+  );
+  // f64 reciprocal stays finite (the precomputed `temp_recip_f64` is
+  // the comparison input the guard reads) — but must exceed f32::MAX.
+  let recip_f64: f64 = 1.0_f64 / subnormal_temp as f64;
+  assert!(
+    recip_f64.is_finite() && recip_f64 > f32::MAX as f64,
+    "test premise: 1/subnormal_temp in f64 must be finite AND exceed \
+     f32::MAX (so the new `r > f32::MAX as f64` guard fires); got \
+     {recip_f64:e}, f32::MAX = {:e}",
+    f32::MAX
+  );
+
+  // bf16 logits + subnormal temp + opt-out (default
+  // collect_logprobs=false). The R3 dtype-only check returned `false`
+  // for bf16 (its range exceeds the dtype-cast reciprocal). The R4
+  // upstream f32-reciprocal-overflow term fires here; the loop must
+  // route through `argmax_sample` — every emitted token == argmax_id.
+  let model_bf16 = DtypedMockModel::with_bias(bias.clone(), Dtype::BF16);
+  let cfg_bf16 = GenConfig {
+    max_tokens,
+    eos: vec![],
+    temp: subnormal_temp,
+    seed: Some(42),
+    ..GenConfig::default()
+  };
+  let tokens_bf16: Vec<u32> = generate_step(&model_bf16, &prompt, cache(1), cfg_bf16)
+    .map(|r| r.unwrap().token)
+    .collect();
+  assert_eq!(
+    tokens_bf16.len(),
+    max_tokens,
+    "{max_tokens} tokens produced (bf16 + subnormal temp)"
+  );
+  for (i, t) in tokens_bf16.iter().enumerate() {
+    assert_eq!(
+      *t, argmax_id,
+      "R4 bypass: bf16 + subnormal temp must route to argmax; step {i} \
+       got {t} != argmax_id {argmax_id} (sampler hit the f32 1/temp = \
+       +Inf path → 0 * Inf = NaN categorical draw)"
+    );
+  }
+
+  // f32 logits + subnormal temp + opt-out. Same R4 path: the upstream
+  // f32 reciprocal overflow is dtype-independent. Without the R4
+  // tightening, the f32 dtype arm returned `false` and the sampler
+  // would multiply by `+Inf` (f32 stays `+Inf` after the dtype-cast
+  // no-op), producing NaN draws.
+  let model_f32 = DtypedMockModel::with_bias(bias, Dtype::F32);
+  let cfg_f32 = GenConfig {
+    max_tokens,
+    eos: vec![],
+    temp: subnormal_temp,
+    seed: Some(42),
+    ..GenConfig::default()
+  };
+  let tokens_f32: Vec<u32> = generate_step(&model_f32, &prompt, cache(1), cfg_f32)
+    .map(|r| r.unwrap().token)
+    .collect();
+  assert_eq!(
+    tokens_f32.len(),
+    max_tokens,
+    "{max_tokens} tokens produced (f32 + subnormal temp)"
+  );
+  for (i, t) in tokens_f32.iter().enumerate() {
+    assert_eq!(
+      *t, argmax_id,
+      "R4 bypass: f32 + subnormal temp must route to argmax; step {i} \
+       got {t} != argmax_id {argmax_id} (f32 1/temp = +Inf → 0 * Inf \
+       = NaN categorical draw without R4)"
+    );
+  }
+}
+
 /// `generate` with `max_tokens == 0` produces no tokens; the returned
 /// `GenerationStats` carries zero-counts + a zero tps + the original
 /// `prompt_tokens`.
