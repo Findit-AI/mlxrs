@@ -919,43 +919,79 @@ pub fn quantize_weights(
 /// `dequantize_model` only replaces *modules*, never deletes parameters).
 /// Symmetric with the orphan-`.biases` guard in
 /// [`quantize_weights`]'s triple classifier, the one exception is a
-/// layer carrying `.weight` + `.biases` with NO `.scales` — that
-/// combination is never a valid mlx-produced triple (mlx
-/// `affine_quantize` always writes `.scales` alongside `.biases`,
-/// `mlx/ops.cpp:4793-4798`) and would otherwise leave the
-/// `uint32`-packed `.weight` as a pass-through in the dequantized
-/// output; it returns [`Error::Backend`] naming the layer + the
-/// missing `.scales` instead.
+/// layer carrying a `uint32`-packed `.weight` plus `.biases` with NO
+/// `.scales` — that combination is never a valid mlx-produced
+/// quantized triple (mlx `affine_quantize` always writes `.scales`
+/// alongside `.biases`, `mlx/ops.cpp:4793-4798`) and would otherwise
+/// leave the `uint32`-packed `.weight` as a pass-through in the
+/// dequantized output; it returns [`Error::Backend`] naming the layer
+/// and the missing `.scales` instead. The guard is narrowed to the
+/// `uint32` dtype signal (`mlx/ops.cpp:4795,4900`) so that a normal
+/// dense Linear layer (`P.weight` F32 plus `P.biases` F32 with no
+/// `P.scales`) passes through verbatim — there's no quantization
+/// involvement and nothing to dequantize.
 pub fn dequantize_weights(weights: Weights, cfg: &PerLayerQuantization) -> Result<Weights> {
   let mut out: Weights = HashMap::with_capacity(weights.len());
 
   // Symmetric with [`classify_triple`]'s orphan-`.biases` guard
   // (`(None, Some(_))` arm above): a layer with `.weight` + `.biases`
-  // but NO `.scales` is never a valid mlx-produced triple — mlx
+  // but NO `.scales` is never a valid mlx-produced QUANTIZED triple — mlx
   // `affine_quantize` always writes `.scales` alongside `.biases`
   // (`mlx/ops.cpp:4793-4798`) and the `fp_*` schemes write no biases
   // at all (`mlx/ops.cpp:4898-4900`). Without this guard the `.biases`
   // would fall into the pass-through branch (no triple → not staged)
   // and the `.weight` (still `uint32` packed) would ALSO pass through,
   // handing the caller a packed weight in an output it expects dense.
-  // Catch this upfront with the same exit point + message style as the
-  // dequantize arity check below.
+  //
+  // The guard MUST be narrowed to the U32-packed `.weight` signal,
+  // otherwise it over-rejects a perfectly normal dense Linear layer
+  // (`P.weight` F32 + `P.biases` F32, no `P.scales`) — that combination
+  // is a standard dense+bias layer with no quantization involvement at
+  // all, and there is nothing to dequantize. We only flag when `.weight`
+  // is `uint32` (the mlx-quantization signal: `mlx/ops.cpp:4795,4900`),
+  // matching the dtype check in [`classify_triple`]. A dense `.weight`
+  // with a sibling `.biases` and no `.scales` passes through verbatim
+  // — the orphan-`.biases` concern only applies when there's a packed
+  // weight that would otherwise leak unconverted.
   for key in weights.keys() {
     if let Some(path) = key.strip_suffix(BIASES_SUFFIX) {
       let scales_key = format!("{path}{SCALES_SUFFIX}");
       let weight_key = format!("{path}{WEIGHT_SUFFIX}");
-      if !weights.contains_key(&scales_key) && weights.contains_key(&weight_key) {
-        return Err(Error::Backend {
-          message: format!(
-            "dequantize_weights: layer {path}: input has a stale \
-             `{path}{BIASES_SUFFIX}` with no matching `{path}{SCALES_SUFFIX}` \
-             (mlx `quantize` always writes `.scales` alongside `.biases`, \
-             `mlx/ops.cpp:4793-4798`); this is a structurally incomplete \
-             triple — refusing to silently leave the `uint32`-packed \
-             `{path}{WEIGHT_SUFFIX}` as a pass-through in the dequantized output"
-          ),
-        });
+      if weights.contains_key(&scales_key) {
+        continue;
       }
+      let Some(weight_arr) = weights.get(&weight_key) else {
+        continue;
+      };
+      let w_dtype = weight_arr.dtype().map_err(|e| Error::Backend {
+        message: format!(
+          "dequantize_weights: layer {path}: cannot read `{weight_key}` dtype \
+           (required to classify orphan `.biases` against packed `.weight`): {e}"
+        ),
+      })?;
+      // Mirror `classify_triple`: only `uint32` `.weight` is the
+      // mlx-packed signal (`mlx/ops.cpp:4795,4900`). Any other dtype
+      // (`F32` and friends) is a dense layer — pass through.
+      if w_dtype != Dtype::U32 {
+        continue;
+      }
+      // Mirror `classify_triple` shape symmetry: a rank<2 U32 `.weight`
+      // is not a real mlx-packed matrix (`mlx/ops.cpp:4925-4929` requires
+      // rank ≥ 2), so don't flag the orphan `.biases` as a quantization
+      // hazard against it.
+      if weight_arr.shape().len() < 2 {
+        continue;
+      }
+      return Err(Error::Backend {
+        message: format!(
+          "dequantize_weights: layer {path}: input has a stale \
+           `{path}{BIASES_SUFFIX}` with no matching `{path}{SCALES_SUFFIX}` \
+           (mlx `quantize` always writes `.scales` alongside `.biases`, \
+           `mlx/ops.cpp:4793-4798`); this is a structurally incomplete \
+           triple — refusing to silently leave the `uint32`-packed \
+           `{path}{WEIGHT_SUFFIX}` as a pass-through in the dequantized output"
+        ),
+      });
     }
   }
 
@@ -2067,5 +2103,59 @@ mod tests {
       }
       other => panic!("expected Error::Backend, got: {other:?}"),
     }
+  }
+
+  /// R7 Finding: the R6 orphan-bias guard over-rejected a normal dense
+  /// Linear layer carrying `P.weight` (F32) + `P.biases` (F32) with no
+  /// `P.scales` — that combination is a standard dense+bias layer, not a
+  /// malformed quantized triple. The narrowed guard only fires when
+  /// `P.weight` is `uint32` (the mlx-quantization signal,
+  /// `mlx/ops.cpp:4795,4900`); a dense (non-`uint32`) `.weight` passes
+  /// through verbatim, both keys preserved.
+  #[test]
+  fn dequantize_weights_dense_weight_with_biases_passes_through() {
+    let n_rows = 2_usize;
+    let n_cols = 8_usize;
+    // Dense F32 `.weight` shaped [2, 8] + F32 `.biases` [8], NO `.scales`.
+    let w = arr_f32(
+      &(0..n_rows * n_cols).map(|i| i as f32).collect::<Vec<_>>(),
+      &[n_rows, n_cols],
+    );
+    let biases = arr_f32(&vec![0.5_f32; n_cols], &[n_cols]);
+    let mut weights: Weights = HashMap::new();
+    weights.insert("model.dense.weight".to_string(), w);
+    weights.insert("model.dense.biases".to_string(), biases);
+
+    let cfg = PerLayerQuantization::from_global(Quantization::affine(64, 4));
+    let out = dequantize_weights(weights, &cfg)
+      .expect("dense `.weight` (F32) + `.biases` (F32) with no `.scales` must pass through");
+
+    // Both keys preserved verbatim, dtypes unchanged.
+    let mut w_out = out
+      .get("model.dense.weight")
+      .expect("passed-through .weight")
+      .try_clone()
+      .unwrap();
+    let mut b_out = out
+      .get("model.dense.biases")
+      .expect("passed-through .biases")
+      .try_clone()
+      .unwrap();
+    assert_eq!(w_out.dtype().unwrap(), Dtype::F32);
+    assert_eq!(b_out.dtype().unwrap(), Dtype::F32);
+    assert_eq!(w_out.shape(), vec![n_rows, n_cols]);
+    assert_eq!(b_out.shape(), vec![n_cols]);
+    let w_vec: Vec<f32> = w_out.to_vec().unwrap();
+    let b_vec: Vec<f32> = b_out.to_vec().unwrap();
+    assert_eq!(
+      w_vec,
+      (0..n_rows * n_cols).map(|i| i as f32).collect::<Vec<_>>(),
+      "dense `.weight` data must be passed through verbatim"
+    );
+    assert_eq!(
+      b_vec,
+      vec![0.5_f32; n_cols],
+      "`.biases` data must be passed through verbatim"
+    );
   }
 }
