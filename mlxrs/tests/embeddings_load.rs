@@ -591,23 +591,42 @@ fn capturing_constructor(
   )
 }
 
-/// Restores the process current directory to its saved value on drop — so a
-/// `set_current_dir` test cannot leak a changed CWD into the next test (these
-/// run under `--test-threads=1`) even if an assertion panics mid-test.
-struct RestoreCwd(PathBuf);
+/// Process-wide lock serializing every CWD-mutating test. Rust's test harness
+/// runs a binary's tests concurrently by default, so a `set_current_dir` test
+/// must hold this lock for its whole body — otherwise an overlapping test
+/// resolves a relative path (`.` / `./ckpt`) against the wrong directory.
+static CWD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Serializes a CWD-mutating test against every other one (holds
+/// [`CWD_TEST_LOCK`] for the guard's lifetime) and restores the process current
+/// directory to its saved value on drop — so a `set_current_dir` test neither
+/// overlaps another nor leaks a changed CWD into the next test, even if an
+/// assertion panics mid-test.
+struct RestoreCwd {
+  saved: PathBuf,
+  // Held for the test's whole body; released only after `Drop` restores the
+  // CWD (fields drop after `Drop::drop` runs). Underscore-prefixed: the guard
+  // exists purely for its lifetime.
+  _lock: std::sync::MutexGuard<'static, ()>,
+}
 
 impl RestoreCwd {
-  /// Capture the current directory, then `cd` into `to`.
+  /// Acquire the global CWD lock, capture the current directory, then `cd`
+  /// into `to`. The returned guard restores the CWD and releases the lock on
+  /// drop.
   fn change_to(to: &Path) -> Self {
+    // Ignore poisoning: the guarded data is `()`, so a prior test's panic
+    // corrupts nothing — only the CWD, which this guard's `Drop` restores.
+    let lock = CWD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let saved = std::env::current_dir().expect("read current dir");
     std::env::set_current_dir(to).expect("set current dir");
-    RestoreCwd(saved)
+    RestoreCwd { saved, _lock: lock }
   }
 }
 
 impl Drop for RestoreCwd {
   fn drop(&mut self) {
-    let _ = std::env::set_current_dir(&self.0);
+    let _ = std::env::set_current_dir(&self.saved);
   }
 }
 
