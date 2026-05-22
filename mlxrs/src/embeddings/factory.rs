@@ -817,7 +817,8 @@ fn path_has_hidden_component(path: &Path, root: &Path) -> bool {
   // `strip_prefix` operates on `OsStr`-backed `Path`s with no UTF-8
   // requirement; `Err` (the glob result is somehow not under `root`) is treated
   // conservatively as "no hidden component" — `glob` always yields paths under
-  // the escaped `dir` prefix, so this branch is unreachable in practice.
+  // the *normalized* glob root ([`glob_root`]; `root` MUST be that normalized
+  // form, not the raw `dir`), so this branch is unreachable in practice.
   let Ok(rel) = path.strip_prefix(root) else {
     return false;
   };
@@ -845,6 +846,53 @@ fn starts_with_dot(name: &std::ffi::OsStr) -> bool {
     // a leading ASCII `.` survives any lossy conversion intact.
     name.to_string_lossy().starts_with('.')
   }
+}
+
+/// The model directory `dir` re-expressed in the **exact path shape the
+/// [`glob`] crate yields matched paths in**, so a glob result can be
+/// [`strip_prefix`](Path::strip_prefix)ed against it.
+///
+/// `glob` does **not** preserve a leading current-directory (`.`) component:
+/// walking the pattern `"./**/model*.safetensors"` it yields a root shard as
+/// `model.safetensors` — *not* `./model.safetensors` — and a root shard under
+/// `"./model/..."` as `model/model.safetensors`, *not* `./model/...`. (It also
+/// drops any further interior `.` segment of the pattern's `dir` portion.) A
+/// raw `dir` of `"."` / `"./sub"` therefore is **not** a prefix of what glob
+/// returns, and the previous `path.parent() == dir` test in
+/// [`collect_glob_shards`] mis-classified a valid root shard as nested.
+///
+/// This rebuilds `dir` keeping only the components glob keeps:
+/// [`Component::Normal`](std::path::Component) names, a leading
+/// [`RootDir`](std::path::Component)/[`Prefix`](std::path::Component) (so an
+/// absolute `dir` stays absolute — glob yields absolute results verbatim), and
+/// [`ParentDir`](std::path::Component) (`..`) segments, while **dropping every
+/// [`CurDir`](std::path::Component) (`.`)** — exactly glob's own normalization.
+/// `"."` and `"./"` collapse to the **empty** path, which `strip_prefix` treats
+/// as the identity prefix (every relative glob result strips cleanly against
+/// it). No `canonicalize`, no symlink resolution: the result is purely a
+/// lexical re-spelling of `dir`, so a symlinked component directory still
+/// contributes its on-disk *link* name to the key prefix — the documented
+/// behavior. Operates on [`OsStr`](std::ffi::OsStr) components, so a non-UTF-8
+/// directory name is carried through losslessly and never panics.
+fn glob_root(dir: &Path) -> PathBuf {
+  let mut root = PathBuf::new();
+  for component in dir.components() {
+    match component {
+      // `glob` strips `.` segments from the paths it yields — drop them so the
+      // normalized root matches.
+      std::path::Component::CurDir => {}
+      // A leading `/` (Unix) or a Windows drive/UNC prefix: glob yields
+      // absolute matches with this intact, so keep it.
+      std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+        root.push(component.as_os_str());
+      }
+      // `..` and real directory names are preserved verbatim.
+      std::path::Component::ParentDir | std::path::Component::Normal(_) => {
+        root.push(component.as_os_str());
+      }
+    }
+  }
+  root
 }
 
 fn collect_glob_shards(dir: &Path, pattern_suffix: &str) -> Result<Vec<DiscoveredShard>> {
@@ -885,6 +933,17 @@ fn collect_glob_shards(dir: &Path, pattern_suffix: &str) -> Result<Vec<Discovere
   // `pattern_suffix` contributes pattern metacharacters (`**`, `model*`).
   let pattern = format!("{}/{}", glob::Pattern::escape(dir_str), pattern_suffix);
 
+  // The model directory in the **exact path shape glob yields matches in** —
+  // `glob` strips a leading `./` (and any interior `.` segment) from the paths
+  // it returns, so the raw `dir` (`"."`, `"./sub"`, `"sub/"`, an absolute path,
+  // ...) is generally NOT a literal prefix of a glob result. Every glob result
+  // below is classified by `strip_prefix`-ing it against THIS normalized root
+  // (root-vs-nested + key prefix) and by `path_has_hidden_component`; using the
+  // raw `dir` instead mis-classified a valid root shard as nested for the very
+  // common `.` / `./sub` spellings. `glob_root` is a purely lexical re-spelling
+  // (no `canonicalize`, no symlink resolution).
+  let glob_root = glob_root(dir);
+
   // `require_literal_leading_dot` is deliberately `false`, NOT `true`: the
   // `true` spelling would be the natural port of Python glob's
   // `include_hidden=False`, but `glob 0.3.3` implements that filter by calling
@@ -922,7 +981,9 @@ fn collect_glob_shards(dir: &Path, pattern_suffix: &str) -> Result<Vec<Discovere
     // is the panic-free replacement for `glob`'s own `to_str().unwrap()` hidden
     // -filter: a `.checkpoints/model.safetensors`, a root `.model.safetensors`,
     // and a normal shard under any `.`-prefixed ancestor are all skipped.
-    if path_has_hidden_component(&path, dir) {
+    // Stripped against the NORMALIZED `glob_root` (not the raw `dir`) so the
+    // strip succeeds for a `.` / `./sub` spelling.
+    if path_has_hidden_component(&path, &glob_root) {
       continue;
     }
 
@@ -959,25 +1020,55 @@ fn collect_glob_shards(dir: &Path, pattern_suffix: &str) -> Result<Vec<Discovere
     // glob-returned path, so a symlinked component dir contributes its LINK
     // name (the path glob walked), not the canonical target.
     //
+    // Root-vs-nested is decided by `strip_prefix`-ing the glob result against
+    // the NORMALIZED `glob_root` (NOT a `path.parent() == dir` test on the raw
+    // `dir`: glob strips a leading `./`, so for `dir == "."` a root shard's
+    // parent is the empty path `!= "."` — mis-flagged nested — and for
+    // `dir == "./sub"` a root shard's parent `sub != "./sub"` — mis-flagged
+    // nested, corrupting root keys with a bogus `sub.` prefix). The stripped
+    // remainder's `Normal` components are: the shard file name, preceded by 0+
+    // directory names. ZERO directory names ⇒ a genuine ROOT shard ⇒ `None`
+    // (keys verbatim). ONE+ ⇒ a NESTED shard ⇒ prefix = the LAST directory name
+    // (the IMMEDIATE parent: `a/b/model.safetensors` → `b`).
+    //
     // A NESTED shard whose immediate parent folder name is not valid UTF-8
     // cannot become a `String` prefix — and must NOT fall through to `None`,
     // which would silently mis-merge its keys verbatim (and collide with a real
-    // root shard). Fail loudly with a path-naming `Error::Backend` instead. A
-    // genuine ROOT shard (no parent below `dir`) still correctly yields `None`.
-    let prefix = match path.parent() {
-      Some(parent) if parent != dir => {
-        let folder = parent
-          .file_name()
-          .and_then(|n| n.to_str())
-          .ok_or_else(|| Error::Backend {
-            message: format!(
-              "weight shard {} has a non-UTF-8 parent directory name; cannot derive the key \
-               prefix",
-              path.display()
-            ),
-          })?;
+    // root shard). Fail loudly with a path-naming `Error::Backend` instead.
+    let relative = path.strip_prefix(&glob_root).map_err(|_| Error::Backend {
+      // `glob` always yields matches under the normalized root, so this is
+      // unreachable in practice — surface it as a recoverable error all the
+      // same rather than silently mis-classifying the shard as root.
+      message: format!(
+        "weight shard {} is not under the model directory {}; cannot derive the key prefix",
+        path.display(),
+        glob_root.display()
+      ),
+    })?;
+    // `Path::components()` already collapses any interior `.` segment, so only
+    // `Normal` components remain to count; the last is the file name.
+    let dir_names: Vec<&std::ffi::OsStr> = relative
+      .components()
+      .filter_map(|component| match component {
+        std::path::Component::Normal(name) => Some(name),
+        _ => None,
+      })
+      .collect();
+    let prefix = match dir_names.split_last() {
+      // `[.., immediate_parent, file_name]` — a NESTED shard; the prefix is the
+      // immediate parent folder name (the component just before the file name).
+      Some((_file_name, [.., immediate_parent])) => {
+        let folder = immediate_parent.to_str().ok_or_else(|| Error::Backend {
+          message: format!(
+            "weight shard {} has a non-UTF-8 parent directory name; cannot derive the key \
+             prefix",
+            path.display()
+          ),
+        })?;
         Some(folder.to_owned())
       }
+      // `[file_name]` (or, defensively, an empty remainder) — a genuine ROOT
+      // shard directly under the model directory: keys merge verbatim.
       _ => None,
     };
     out.push(DiscoveredShard { path, prefix });

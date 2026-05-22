@@ -559,3 +559,207 @@ fn load_permission_denied_pooling_config_is_recoverable_error() {
     "expected a recoverable Backend error; got {err:?}"
   );
 }
+
+// ───────────── relative-`directory` shard discovery (`.` / `./sub`) ──────────
+//
+// Shard discovery globs `"<dir>/**/model*.safetensors"` and then classifies
+// each match as a ROOT shard (keys verbatim) or a NESTED component shard (keys
+// prefixed `<folder>.`). The `glob` crate does NOT preserve a leading
+// current-directory component in the paths it yields: from `from_directory(".")`
+// a root `model.safetensors` comes back as `model.safetensors` (no `./`), and
+// from `from_directory("./sub")` a root shard comes back as `sub/model...` (the
+// `./` stripped). A `path.parent() == directory` classification therefore
+// mis-flagged a valid root shard as nested for these — the most common — local
+// path spellings: `from_directory(".")` would ERROR on a valid checkpoint, and
+// `from_directory("./sub")` would rewrite root weight keys with a bogus `sub.`
+// prefix and corrupt the load. These tests drive the PUBLIC `load()` with each
+// such spelling and assert the merged weight key set, end-to-end.
+
+/// A constructor that records the loaded model's weight **key set** into
+/// `slot`, so a test can assert root keys stayed verbatim (vs. being wrongly
+/// rewritten `<folder>.<key>`). Returns the trivial [`MockEmbedding`].
+fn capturing_constructor(
+  slot: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) -> EmbeddingModelConstructor {
+  Box::new(
+    move |loaded: &LoadedEmbeddingModel| -> Result<Box<dyn EmbeddingModel>, Error> {
+      let mut keys: Vec<String> = loaded.weights.keys().cloned().collect();
+      keys.sort();
+      *slot.lock().unwrap() = keys;
+      Ok(Box::new(MockEmbedding))
+    },
+  )
+}
+
+/// Restores the process current directory to its saved value on drop — so a
+/// `set_current_dir` test cannot leak a changed CWD into the next test (these
+/// run under `--test-threads=1`) even if an assertion panics mid-test.
+struct RestoreCwd(PathBuf);
+
+impl RestoreCwd {
+  /// Capture the current directory, then `cd` into `to`.
+  fn change_to(to: &Path) -> Self {
+    let saved = std::env::current_dir().expect("read current dir");
+    std::env::set_current_dir(to).expect("set current dir");
+    RestoreCwd(saved)
+  }
+}
+
+impl Drop for RestoreCwd {
+  fn drop(&mut self) {
+    let _ = std::env::set_current_dir(&self.0);
+  }
+}
+
+/// Build a loadable model directory `<parent>/<leaf>` whose single weight shard
+/// is named `weight_file` (so a test can use either `model.safetensors` or the
+/// legacy `weights.safetensors`), carrying one tensor keyed `weight_key`.
+/// Returns `(parent, leaf)` so the caller can `cd` to `parent` and address the
+/// model dir by a relative spelling (`.`, `./<leaf>`, `<leaf>`).
+fn write_relative_model_dir(
+  tag: &str,
+  leaf: &str,
+  weight_file: &str,
+  weight_key: &str,
+) -> (PathBuf, String) {
+  let parent = temp_dir(tag);
+  let model_dir = parent.join(leaf);
+  fs::create_dir_all(&model_dir).unwrap();
+  fs::write(model_dir.join("config.json"), config_json("bert")).unwrap();
+  write_tokenizer(&model_dir);
+  let mut weights: EmbeddingWeights = HashMap::new();
+  weights.insert(
+    weight_key.to_owned(),
+    Array::from_slice::<f32>(&[1.0, 2.0], &(2usize,)).unwrap(),
+  );
+  io::save_safetensors(&model_dir.join(weight_file), &weights).unwrap();
+  (parent, leaf.to_owned())
+}
+
+#[test]
+fn load_from_dot_directory_keeps_root_shard_keys_verbatim() {
+  // `from_directory(".")` with a root-level `model.safetensors`. `glob` yields
+  // the shard as `model.safetensors` (NO `./` prefix) — its `.parent()` is the
+  // empty path, `!= "."`, so the old code mis-flagged it NESTED and ERRORED on
+  // a perfectly valid checkpoint. It must load, root keys verbatim.
+  let (parent, leaf) = write_relative_model_dir("dot-dir", "ckpt", "model.safetensors", "root.w");
+  let keys = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+  let registry =
+    EmbeddingModelTypeRegistry::new().with("bert", capturing_constructor(keys.clone()));
+
+  // `cd` INTO the model dir so the directory spelling is literally ".".
+  let _cwd = RestoreCwd::change_to(&parent.join(&leaf));
+  load(&EmbeddingModelConfiguration::from_directory("."), &registry)
+    .expect("from_directory(\".\") with a root model.safetensors must load, not error");
+
+  assert_eq!(
+    *keys.lock().unwrap(),
+    vec!["root.w".to_string()],
+    "a root shard discovered via `.` must keep its keys verbatim (no prefix)"
+  );
+}
+
+#[test]
+fn load_from_dot_slash_subdir_does_not_rewrite_root_shard_keys() {
+  // `from_directory("./ckpt")` with a root-level `model.safetensors`. `glob`
+  // strips the leading `./` and yields `ckpt/model.safetensors`; its parent
+  // `ckpt` `!= "./ckpt"`, so the old code mis-flagged the ROOT shard as nested
+  // and rewrote every key `ckpt.<key>` — silently corrupting the load. The keys
+  // must stay verbatim.
+  let (parent, leaf) =
+    write_relative_model_dir("dotslash-model", "ckpt", "model.safetensors", "root.w");
+  let keys = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+  let registry =
+    EmbeddingModelTypeRegistry::new().with("bert", capturing_constructor(keys.clone()));
+
+  let _cwd = RestoreCwd::change_to(&parent);
+  let spelling = format!("./{leaf}");
+  load(
+    &EmbeddingModelConfiguration::from_directory(&spelling),
+    &registry,
+  )
+  .unwrap_or_else(|e| panic!("from_directory({spelling:?}) must load: {e}"));
+
+  let got = keys.lock().unwrap().clone();
+  assert_eq!(
+    got,
+    vec!["root.w".to_string()],
+    "a root shard reached via `./{leaf}` must keep keys verbatim, NOT be rewritten `{leaf}.<key>`"
+  );
+  assert!(
+    !got.iter().any(|k| k.starts_with(&format!("{leaf}."))),
+    "root keys must not gain a `{leaf}.` prefix; got {got:?}"
+  );
+}
+
+#[test]
+fn load_from_dot_slash_subdir_loads_legacy_weight_glob_shard() {
+  // `from_directory("./ckpt")` with only a legacy root `weights.safetensors`
+  // (the non-recursive `weight*.safetensors` fallback). The root-vs-nested fix
+  // applies to the legacy glob pass too: the root shard must load with keys
+  // verbatim, not be mis-classified nested and rewritten `ckpt.<key>`.
+  let (parent, leaf) =
+    write_relative_model_dir("dotslash-weight", "ckpt", "weights.safetensors", "legacy.w");
+  let keys = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+  let registry =
+    EmbeddingModelTypeRegistry::new().with("bert", capturing_constructor(keys.clone()));
+
+  let _cwd = RestoreCwd::change_to(&parent);
+  let spelling = format!("./{leaf}");
+  load(
+    &EmbeddingModelConfiguration::from_directory(&spelling),
+    &registry,
+  )
+  .unwrap_or_else(|e| panic!("legacy weight*.safetensors via {spelling:?} must load: {e}"));
+
+  assert_eq!(
+    *keys.lock().unwrap(),
+    vec!["legacy.w".to_string()],
+    "a legacy root weight*.safetensors reached via `./{leaf}` must keep keys verbatim"
+  );
+}
+
+#[test]
+fn load_relative_directory_still_prefixes_genuine_nested_component_shards() {
+  // Regression: the fix must NOT collapse a genuinely NESTED component shard to
+  // "root". A model dir holds a root `model.safetensors` (key `embed.w`) AND a
+  // nested `vision_model/model.safetensors` (key `enc.w`). For BOTH a plain
+  // `<leaf>` and a `./<leaf>` directory spelling, the nested shard's keys must
+  // still be prefixed with the immediate parent folder (`vision_model.`), while
+  // the root shard's keys stay verbatim.
+  let (parent, leaf) =
+    write_relative_model_dir("rel-nested", "ckpt", "model.safetensors", "embed.w");
+  // Add a genuine nested component shard under `<leaf>/vision_model/`.
+  let nested = parent.join(&leaf).join("vision_model");
+  fs::create_dir_all(&nested).unwrap();
+  let mut nested_weights: EmbeddingWeights = HashMap::new();
+  nested_weights.insert(
+    "enc.w".to_owned(),
+    Array::from_slice::<f32>(&[3.0, 4.0], &(2usize,)).unwrap(),
+  );
+  io::save_safetensors(&nested.join("model.safetensors"), &nested_weights).unwrap();
+
+  for spelling in [leaf.clone(), format!("./{leaf}")] {
+    let keys = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let registry =
+      EmbeddingModelTypeRegistry::new().with("bert", capturing_constructor(keys.clone()));
+
+    let _cwd = RestoreCwd::change_to(&parent);
+    load(
+      &EmbeddingModelConfiguration::from_directory(&spelling),
+      &registry,
+    )
+    .unwrap_or_else(|e| {
+      panic!("model with a nested component shard via {spelling:?} must load: {e}")
+    });
+    drop(_cwd);
+
+    let got = keys.lock().unwrap().clone();
+    assert_eq!(
+      got,
+      vec!["embed.w".to_string(), "vision_model.enc.w".to_string()],
+      "via {spelling:?}: the root shard's keys must stay verbatim and the nested \
+       component shard's keys must be prefixed `vision_model.`; got {got:?}"
+    );
+  }
+}
