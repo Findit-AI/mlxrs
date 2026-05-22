@@ -376,16 +376,22 @@ struct ProcessorClassOnly {
 /// to `processor_config.json`, then decodes `BaseProcessorConfiguration`).
 ///
 /// Returns the parsed [`ProcessorConfig`] (the registry-lookup key) plus
-/// the verbatim JSON body — the same single-read pattern
+/// the verbatim JSON body of **each** processor-config file that was
+/// present (`preprocessor_config.json` and/or `processor_config.json`),
+/// keyed by file identity — the same single-read pattern
 /// [`crate::lm::load::load_config`] uses for `config.json`, so a
 /// processor constructor consuming both the typed key and the raw JSON
 /// (for model-specific fields outside the typed subset, mirroring the
 /// swift per-processor `Codable` init that decodes the full
 /// `processorConfigData`) can never get them from two different on-disk
-/// versions of the file. Also returns the source filename (one of
-/// `"preprocessor_config.json"` / `"processor_config.json"`) so error
-/// messages and the [`LoadedProcessor`] hand-off can name the file the
-/// constructor saw.
+/// versions of a file. Carrying *both* bodies (rather than only the one
+/// the dispatch class was extracted from) means a per-model processor
+/// that needs image-preprocessor metadata AND `processor_config.json`
+/// processor-level fields never has to re-open a file. Also returns the
+/// source filename (one of `"preprocessor_config.json"` /
+/// `"processor_config.json"`) of the file the dispatch class + primary
+/// image-preprocessor metadata came from, so error messages and the
+/// [`LoadedProcessor`] hand-off can name the file the constructor saw.
 ///
 /// **Processor DISPATCH vs IMAGE-preprocessor metadata.** A real HF VLM
 /// directory's `preprocessor_config.json` is the *image-preprocessor*
@@ -397,20 +403,29 @@ struct ProcessorClassOnly {
 /// 1. If `preprocessor_config.json` is **absent**: fall back entirely to
 ///    `processor_config.json` — strict-parse it for `processor_class` and
 ///    use its body as the constructor JSON. Returns
-///    `(class, body, "processor_config.json")`.
+///    `(class, None, Some(processor_body), "processor_config.json")`.
 /// 2. If `preprocessor_config.json` is **present** and tolerant-parses to
 ///    a `processor_class`: use that class. Returns
-///    `(class, preprocessor_body, "preprocessor_config.json")` — the
-///    constructor gets the preprocessor body (the image-preprocessor
-///    metadata it expects).
+///    `(class, Some(preprocessor_body), <Some processor_body if the file
+///    exists, else None>, "preprocessor_config.json")` — the constructor
+///    gets the preprocessor body (the image-preprocessor metadata it
+///    expects).
 /// 3. If `preprocessor_config.json` is **present** but has NO
 ///    `processor_class` (the image-preprocessor-only layout): read
-///    `processor_class` from `processor_config.json` for dispatch ONLY,
-///    but keep the preprocessor body for the constructor. Returns
-///    `(class_from_proc_config, preprocessor_body,
-///    "preprocessor_config.json")` — dispatch metadata and
-///    image-preprocessor metadata can come from different files, exactly
-///    as real HF VLM checkpoints ship.
+///    `processor_config.json` for `processor_class` (dispatch). Returns
+///    `(class_from_proc_config, Some(preprocessor_body),
+///    Some(processor_body), "preprocessor_config.json")` — dispatch
+///    metadata and image-preprocessor metadata can come from different
+///    files, exactly as real HF VLM checkpoints ship, and **both** file
+///    bodies are carried so a per-model processor needing image-
+///    preprocessor metadata AND `processor_config.json` processor-level
+///    fields reaches both without re-opening either file (the
+///    TOCTOU/config-divergence this factory exists to avoid).
+///
+/// In every case the two `Option<String>` slots are keyed by file
+/// identity — slot 2 is `preprocessor_config.json`'s body iff that file
+/// is present, slot 3 is `processor_config.json`'s body iff that file is
+/// present — so neither already-performed read is discarded.
 ///
 /// The read is bounded by the same `MAX_CONFIG_BYTES` cap
 /// [`crate::lm::load::load_config`] uses for `config.json` and shares the
@@ -420,7 +435,22 @@ struct ProcessorClassOnly {
 /// `processor_class`, non-regular, oversized, unreadable, invalid JSON,
 /// missing `processor_class`) is a recoverable [`Error::Backend`] naming
 /// the offending path(s).
-pub fn load_processor_config(dir: &Path) -> Result<(ProcessorConfig, String, &'static str)> {
+///
+/// The "single bounded read" contract holds per file: each of
+/// `preprocessor_config.json` / `processor_config.json` is read at most
+/// once. The common path (preprocessor file carries `processor_class`)
+/// still reads only `preprocessor_config.json` — `processor_config.json`
+/// is opened only when it is actually needed for the dispatch class, and
+/// when it *is* opened that one body is carried out rather than
+/// discarded.
+pub fn load_processor_config(
+  dir: &Path,
+) -> Result<(
+  ProcessorConfig,
+  Option<String>,
+  Option<String>,
+  &'static str,
+)> {
   // Preference order matches swift `loadProcessorConfig`:
   // `preprocessor_config.json` first, then `processor_config.json`.
   // (Python `load_image_processor` reads `config.json` not these; its
@@ -458,9 +488,21 @@ pub fn load_processor_config(dir: &Path) -> Result<(ProcessorConfig, String, &'s
 
     if let Some(processor_class) = parsed.processor_class {
       // (2) Preferred file has `processor_class` — use it directly. The
-      // constructor receives the same file's body, exactly as before
-      // the fix (regression cases keep working).
-      return Ok((ProcessorConfig { processor_class }, body, PREFERRED));
+      // dispatch class came from `preprocessor_config.json`, so
+      // `processor_config.json` is NOT read here: doing so would add a
+      // second `stat`+open+read on the common-checkpoint path purely
+      // speculatively, breaking the per-file single-bounded-read
+      // contract. The `processor_config.json` slot is therefore `None`;
+      // a per-model processor whose layout puts processor-level fields
+      // in `processor_config.json` ships them in `preprocessor_config.
+      // json` too (the case below) or in a preprocessor-only file —
+      // either way nothing read here is discarded.
+      return Ok((
+        ProcessorConfig { processor_class },
+        Some(body),
+        None,
+        PREFERRED,
+      ));
     }
 
     // (3) Preferred file is image-preprocessor-only — keep its body for
@@ -494,10 +536,21 @@ pub fn load_processor_config(dir: &Path) -> Result<(ProcessorConfig, String, &'s
         ),
       });
     };
-    // The constructor still sees the PREFERRED body — that's the
-    // image-preprocessor metadata it needs. Filename reflects the body
-    // source, since the constructor decodes off that.
-    return Ok((ProcessorConfig { processor_class }, body, PREFERRED));
+    // Carry BOTH file bodies: the constructor's primary image-
+    // preprocessor metadata is the PREFERRED body, and the dispatch
+    // class came from `processor_config.json` — whose body may ALSO
+    // carry processor-level fields a per-model processor needs. That
+    // read already happened (`fallback_body`); thread it through rather
+    // than discard it, so the processor never has to re-open the file
+    // (the TOCTOU/config-divergence this factory exists to avoid).
+    // Filename still reflects the PREFERRED body, the source the
+    // constructor decodes its primary metadata off.
+    return Ok((
+      ProcessorConfig { processor_class },
+      Some(body),
+      Some(fallback_body),
+      PREFERRED,
+    ));
   }
 
   // (4) `preprocessor_config.json` is absent — fall back entirely to
@@ -527,7 +580,14 @@ pub fn load_processor_config(dir: &Path) -> Result<(ProcessorConfig, String, &'s
       ),
     });
   };
-  Ok((ProcessorConfig { processor_class }, body, FALLBACK))
+  // No `preprocessor_config.json` → its body slot is `None`; the
+  // constructor's metadata is entirely the `processor_config.json` body.
+  Ok((
+    ProcessorConfig { processor_class },
+    None,
+    Some(body),
+    FALLBACK,
+  ))
 }
 
 /// Everything [`load()`] resolved from a VLM model directory's *model*
@@ -583,7 +643,13 @@ pub struct LoadedVlmModel {
 /// `VLMModelFactory.swift:405-407`: the constructor receives the
 /// verbatim processor-config JSON (for its per-model `Codable` init) AND
 /// the already-built [`Tokenizer`] (so the processor can splice the
-/// tokenizer's special-token ids into its preprocessing). The
+/// tokenizer's special-token ids into its preprocessing). Because a real
+/// HF VLM checkpoint can ship the image-preprocessor metadata and the
+/// `AutoProcessor` processor-level metadata in **two separate files**
+/// ([`preprocessor_config_json`](Self::preprocessor_config_json) /
+/// [`processor_config_json`](Self::processor_config_json)), both bodies
+/// that were on disk are carried — a per-model processor needing fields
+/// from either file reaches them without re-opening anything. The
 /// [`config`](Self::config) is the VLM base config (`model_type` /
 /// `eos_token_id` / `quantization`); a processor that needs model-specific
 /// fields beyond those reads them off the verbatim model `config.json`
@@ -594,7 +660,8 @@ pub struct LoadedVlmModel {
 /// constructor was dispatched on (after any
 /// `processor_class_override`); the
 /// [`processor_config_filename`](Self::processor_config_filename) names
-/// the file the JSON came from (one of `"preprocessor_config.json"` /
+/// the file the dispatch class + primary image-preprocessor metadata
+/// came from (one of `"preprocessor_config.json"` /
 /// `"processor_config.json"`) for diagnostic / round-trip purposes.
 ///
 /// The trait the constructor returns is intentionally an opaque
@@ -618,13 +685,30 @@ pub struct LoadedProcessor<'a> {
   /// `processor_class_override`) — useful for diagnostics and for a
   /// constructor that wants to assert it was dispatched correctly.
   pub processor_class: &'a str,
-  /// The verbatim processor-config JSON body — the
-  /// `processor_config_filename` file's bytes. The per-model constructor
-  /// decodes its own model-specific fields (`patch_size`, `crop_size`,
-  /// per-channel mean/std overrides, …) off this string.
-  pub processor_config_json: &'a str,
-  /// Name of the file the [`processor_config_json`](Self::processor_config_json)
-  /// came from (one of `"preprocessor_config.json"` / `"processor_config.json"`).
+  /// The verbatim body of `preprocessor_config.json` — the HF-standard
+  /// *image-preprocessor* config (`image_mean` / `image_std` /
+  /// `crop_size` / `patch_size` / per-channel overrides). `Some` iff the
+  /// directory contained that file; `None` for the `processor_config.
+  /// json`-only layout. The per-model constructor decodes its own
+  /// image-preprocessor fields off this string.
+  pub preprocessor_config_json: Option<&'a str>,
+  /// The verbatim body of `processor_config.json` — the newer combined
+  /// `AutoProcessor` config (carries `processor_class` plus
+  /// processor-level fields like `image_seq_len`, chat-template knobs,
+  /// …). `Some` iff that file was read: always for the
+  /// `processor_config.json`-only layout, and for the split layout where
+  /// `preprocessor_config.json` lacked `processor_class` so this file
+  /// supplied the dispatch class. A per-model processor needing BOTH
+  /// image-preprocessor metadata AND processor-level metadata reads this
+  /// alongside [`preprocessor_config_json`](Self::preprocessor_config_json)
+  /// — neither body is discarded, so no file is re-opened. `None` when
+  /// the dispatch class came from `preprocessor_config.json` and
+  /// `processor_config.json` was therefore never read (the per-file
+  /// single-bounded-read contract — see [`load_processor_config`]).
+  pub processor_config_json: Option<&'a str>,
+  /// Name of the file the dispatch class + primary image-preprocessor
+  /// metadata came from (one of `"preprocessor_config.json"` /
+  /// `"processor_config.json"`).
   pub processor_config_filename: &'static str,
   /// The fully-built [`Tokenizer`] — mlx-swift-lm passes the tokenizer
   /// into the processor constructor at `VLMModelFactory.swift:405-407`
@@ -988,7 +1072,8 @@ pub fn load(
   // resolve the override on the canonical model_type (the same key we
   // dispatched the model constructor on), exactly mirroring
   // VLMModelFactory.swift:399-403.
-  let (proc_config, proc_config_json, proc_filename) = load_processor_config(model_dir)?;
+  let (proc_config, preprocessor_config_json, processor_config_json, proc_filename) =
+    load_processor_config(model_dir)?;
   let canonical_model_type = remap_vlm_model_type(&config.model_type);
   let processor_class = processor_class_override(canonical_model_type)
     .unwrap_or(&proc_config.processor_class)
@@ -1048,7 +1133,8 @@ pub fn load(
     let loaded_proc = LoadedProcessor {
       config: &loaded.config,
       processor_class: &processor_class,
-      processor_config_json: &proc_config_json,
+      preprocessor_config_json: preprocessor_config_json.as_deref(),
+      processor_config_json: processor_config_json.as_deref(),
       processor_config_filename: proc_filename,
       tokenizer: &tokenizer,
     };
@@ -1138,10 +1224,13 @@ mod tests {
     )
   }
 
-  /// A minimal `preprocessor_config.json` for the mock VLM processor.
+  /// A minimal processor-config body (written to whichever of
+  /// `preprocessor_config.json` / `processor_config.json` a test wants).
   /// `processor_class` is the registry key; `mock_image_size` is a
   /// model-specific key OUTSIDE the typed subset, used to prove the
-  /// processor constructor reads [`LoadedProcessor::processor_config_json`].
+  /// processor constructor reads the carried config body
+  /// ([`LoadedProcessor::preprocessor_config_json`] /
+  /// [`LoadedProcessor::processor_config_json`]).
   fn mock_preprocessor_config_json(processor_class: &str, image_size: u32) -> String {
     format!(
       r#"{{
@@ -1281,15 +1370,29 @@ mod tests {
 
   /// Build a [`ProcessorConstructor`] for the mock processor: read the
   /// processor class off [`LoadedProcessor::processor_class`] and the
-  /// model-specific `mock_image_size` off
-  /// [`LoadedProcessor::processor_config_json`].
+  /// model-specific `mock_image_size` off whichever processor-config body
+  /// carries it — [`LoadedProcessor::preprocessor_config_json`] when a
+  /// `preprocessor_config.json` was present (the common + split layouts),
+  /// otherwise [`LoadedProcessor::processor_config_json`] (the
+  /// `processor_config.json`-only layout). Mirrors a real per-model
+  /// processor decoding its image-preprocessor metadata from the file
+  /// that actually carries it.
   fn mock_processor_constructor() -> ProcessorConstructor {
     Box::new(
       |loaded: &LoadedProcessor<'_>| -> Result<Box<dyn Processor>> {
-        let raw: serde_json::Value =
-          serde_json::from_str(loaded.processor_config_json).map_err(|e| Error::Backend {
-            message: format!("mock vlm processor ctor: bad processor config json: {e}"),
+        // The image-preprocessor metadata lives in `preprocessor_config.
+        // json` when that file is present, else in the
+        // `processor_config.json`-only body. Decode from whichever the
+        // loader carried — both bodies that were on disk are available.
+        let body = loaded
+          .preprocessor_config_json
+          .or(loaded.processor_config_json)
+          .ok_or_else(|| Error::Backend {
+            message: "mock vlm processor ctor: no processor-config body carried".into(),
           })?;
+        let raw: serde_json::Value = serde_json::from_str(body).map_err(|e| Error::Backend {
+          message: format!("mock vlm processor ctor: bad processor config json: {e}"),
+        })?;
         let image_size = raw
           .get("mock_image_size")
           .and_then(serde_json::Value::as_u64)
@@ -2284,6 +2387,15 @@ mod tests {
     format!(r#"{{ "processor_class": "{processor_class}" }}"#)
   }
 
+  /// A `processor_config.json` carrying the dispatch class AND a
+  /// **required non-class processor-level field** (`image_seq_len`) — the
+  /// real `AutoProcessor` shape where `processor_config.json` holds
+  /// processor metadata a per-model processor needs *in addition to* the
+  /// image-preprocessor metadata that lives in `preprocessor_config.json`.
+  fn mock_processor_config_with_seq_len(processor_class: &str, image_seq_len: u32) -> String {
+    format!(r#"{{ "processor_class": "{processor_class}", "image_seq_len": {image_seq_len} }}"#)
+  }
+
   #[test]
   fn processor_class_falls_back_to_processor_config_when_preprocessor_has_none() {
     // **Regression** for Codex Fix 2: real HF VLM dir where the
@@ -2335,6 +2447,130 @@ mod tests {
       (24, 24),
       "constructor must see preprocessor_config.json body (image-preprocessor metadata)"
     );
+  }
+
+  #[test]
+  fn split_layout_carries_both_preprocessor_and_processor_config_bodies() {
+    // **Regression** for the Codex finding: in the split layout
+    // (`preprocessor_config.json` has the image-preprocessor metadata but
+    // NO `processor_class`; `processor_config.json` supplies the dispatch
+    // class) the loader used to extract ONLY the dispatch class from
+    // `processor_config.json` and discard that file's body. A per-model
+    // processor needing a processor-level field from `processor_config.
+    // json` (here `image_seq_len`) AND the image-preprocessor metadata
+    // had no way to reach the discarded body. After the fix BOTH bodies
+    // are carried.
+    let dir = fresh_dir("split-carries-both-bodies");
+    // `preprocessor_config.json`: image-preprocessor metadata, no class.
+    std::fs::write(
+      dir.join("preprocessor_config.json"),
+      mock_image_only_preprocessor_config_json(24),
+    )
+    .unwrap();
+    // `processor_config.json`: dispatch class + a REQUIRED non-class
+    // processor-level field.
+    std::fs::write(
+      dir.join("processor_config.json"),
+      mock_processor_config_with_seq_len("MockProc", 256),
+    )
+    .unwrap();
+
+    // (a) `load_processor_config` directly: BOTH `Option<String>` slots
+    // are populated, each keyed by file identity.
+    let (proc_config, preprocessor_body, processor_body, filename) =
+      load_processor_config(&dir).expect("split-layout processor config must resolve");
+    assert_eq!(
+      proc_config.processor_class, "MockProc",
+      "dispatch class must come from processor_config.json"
+    );
+    assert_eq!(
+      filename, "preprocessor_config.json",
+      "primary-body filename is the preprocessor file (image-preprocessor metadata source)"
+    );
+    let preprocessor_body =
+      preprocessor_body.expect("preprocessor_config.json body must be carried");
+    assert!(
+      preprocessor_body.contains("mock_image_size"),
+      "preprocessor body must carry the image-preprocessor metadata, got: {preprocessor_body}"
+    );
+    let processor_body =
+      processor_body.expect("processor_config.json body must be carried, not discarded");
+    assert!(
+      processor_body.contains("image_seq_len"),
+      "processor_config.json body must survive with its non-class field, got: {processor_body}"
+    );
+
+    // (b) Through the full `load()` pipeline: the per-model processor
+    // constructor sees BOTH bodies on `LoadedProcessor`. The constructor
+    // closure asserts `processor_config_json` is `Some` and exposes
+    // `image_seq_len = 256` AND `preprocessor_config_json` is `Some` with
+    // the image-preprocessor metadata — if either is missing it returns
+    // an `Err` and the `load()` below fails.
+    std::fs::write(dir.join("config.json"), mock_config_json("mockvlm")).unwrap();
+    let mut weights: Weights = HashMap::new();
+    weights.insert(
+      "mock.weight".to_owned(),
+      Array::from_slice::<f32>(&[1.0], &(1usize,)).unwrap(),
+    );
+    crate::io::save_safetensors(&dir.join("model.safetensors"), &weights).unwrap();
+    write_tokenizer(&dir);
+
+    let asserting_processor_ctor: ProcessorConstructor = Box::new(
+      |loaded: &LoadedProcessor<'_>| -> Result<Box<dyn Processor>> {
+        let preprocessor = loaded
+          .preprocessor_config_json
+          .ok_or_else(|| Error::Backend {
+            message: "expected preprocessor_config.json body on LoadedProcessor".into(),
+          })?;
+        let processor = loaded.processor_config_json.ok_or_else(|| Error::Backend {
+          message: "expected processor_config.json body on LoadedProcessor (the carried body)"
+            .into(),
+        })?;
+        let pre: serde_json::Value =
+          serde_json::from_str(preprocessor).map_err(|e| Error::Backend {
+            message: format!("bad preprocessor body: {e}"),
+          })?;
+        let image_size = pre
+          .get("mock_image_size")
+          .and_then(serde_json::Value::as_u64)
+          .and_then(|x| u32::try_from(x).ok())
+          .ok_or_else(|| Error::Backend {
+            message: "preprocessor body missing mock_image_size".into(),
+          })?;
+        let proc: serde_json::Value =
+          serde_json::from_str(processor).map_err(|e| Error::Backend {
+            message: format!("bad processor_config.json body: {e}"),
+          })?;
+        let seq_len = proc
+          .get("image_seq_len")
+          .and_then(serde_json::Value::as_u64)
+          .ok_or_else(|| Error::Backend {
+            message: "processor_config.json body missing image_seq_len (the discarded field)"
+              .into(),
+          })?;
+        if seq_len != 256 {
+          return Err(Error::Backend {
+            message: format!("image_seq_len must round-trip as 256, got {seq_len}"),
+          });
+        }
+        Ok(Box::new(MockVlmProcessor {
+          processor_class: loaded.processor_class.to_owned(),
+          image_size,
+        }))
+      },
+    );
+
+    let model_registry = VlmTypeRegistry::new().with("mockvlm", mock_vlm_constructor());
+    let processor_registry =
+      VlmProcessorTypeRegistry::new().with("MockProc", asserting_processor_ctor);
+    let configuration = VlmModelConfiguration::from_directory(&dir);
+
+    let ctx = load(&configuration, &model_registry, &processor_registry)
+      .expect("split-layout load must surface BOTH config bodies to the processor constructor");
+    // The constructor read `mock_image_size = 24` off the preprocessor
+    // body — proof the preprocessor body also reached it alongside the
+    // processor_config.json body.
+    assert_eq!(ctx.processor.image_processor_config().size, (24, 24));
   }
 
   #[test]
