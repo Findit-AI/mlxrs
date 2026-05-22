@@ -287,6 +287,36 @@ pub struct GroupNorm {
   pub pytorch_compatible: bool,
 }
 
+/// Validate a [`GroupNorm`] `(num_groups, dims)` config: both must be
+/// positive and `dims` must be evenly divisible by `num_groups`.
+///
+/// Shared by [`GroupNorm::new`] and [`GroupNorm::with_affine`] so the
+/// rule has one home. Crucially, [`GroupNorm::new`] calls this BEFORE
+/// allocating the default `(ones, zeros)` affine tensors — a malformed
+/// config is a cheap int-check failure, never one paid for after two
+/// MLX array allocations. The checks are pure integer comparisons, so
+/// re-running it (when `new` delegates to `with_affine`) is harmless.
+fn validate_group_params(num_groups: i32, dims: i32) -> Result<()> {
+  if num_groups <= 0 {
+    return Err(crate::error::Error::ShapeMismatch {
+      message: format!("GroupNorm: num_groups ({num_groups}) must be positive"),
+    });
+  }
+  if dims <= 0 {
+    return Err(crate::error::Error::ShapeMismatch {
+      message: format!("GroupNorm: dims ({dims}) must be positive"),
+    });
+  }
+  if dims % num_groups != 0 {
+    return Err(crate::error::Error::ShapeMismatch {
+      message: format!(
+        "GroupNorm: dims ({dims}) must be evenly divisible by num_groups ({num_groups})"
+      ),
+    });
+  }
+  Ok(())
+}
+
 impl GroupNorm {
   /// Construct a GroupNorm matching the swift `GroupNorm(groupCount:,
   /// dimensions:, eps:, affine:, pytorchCompatible:)` init signature.
@@ -322,20 +352,21 @@ impl GroupNorm {
   ) -> Result<Self> {
     // `affine = true` materializes the references' default `(ones,
     // zeros)`; `affine = false` ⇒ no affine. The stored-state construction
-    // and the `num_groups`/`dims`/affine-shape validation all live in
-    // `with_affine` (the single source of truth) — `new` is the
-    // bool-to-`Option` shim. The `ones`/`zeros` alloc needs `dims > 0`
-    // (else `usize::try_from` would fail), so guard that one rule here
-    // before allocating; `with_affine` then re-checks it (cheap) along
-    // with the rest.
+    // and the affine-shape validation live in `with_affine` (the single
+    // source of truth) — `new` is the bool-to-`Option` shim.
+    //
+    // Run the FULL `(num_groups, dims)` validation up-front, BEFORE the
+    // `ones`/`zeros` alloc: a malformed config (`num_groups <= 0`, or a
+    // non-divisible `dims`) must fail as a cheap int check, never after
+    // materializing two MLX arrays (allocation pressure / possible OOM
+    // for a config that is already known-bad). `with_affine` re-runs the
+    // same helper — running it twice is harmless (just int comparisons),
+    // and keeping one helper means one source of truth for the rule.
+    validate_group_params(num_groups, dims)?;
     let affine = if affine {
-      if dims <= 0 {
-        return Err(crate::error::Error::ShapeMismatch {
-          message: format!("GroupNorm: dims ({dims}) must be positive"),
-        });
-      }
-      // `dims > 0` guaranteed just above ⇒ `usize::try_from` cannot fail.
-      let d = usize::try_from(dims).expect("dims > 0 guarded above");
+      // `validate_group_params` proved `dims > 0` ⇒ `usize::try_from`
+      // cannot fail; this alloc is only reached on a valid config.
+      let d = usize::try_from(dims).expect("dims > 0 guarded by validate_group_params");
       Some((Array::ones::<f32>(&(d,))?, Array::zeros::<f32>(&(d,))?))
     } else {
       None
@@ -367,23 +398,10 @@ impl GroupNorm {
     affine: Option<(Array, Array)>,
     pytorch_compatible: bool,
   ) -> Result<Self> {
-    if num_groups <= 0 {
-      return Err(crate::error::Error::ShapeMismatch {
-        message: format!("GroupNorm: num_groups ({num_groups}) must be positive"),
-      });
-    }
-    if dims <= 0 {
-      return Err(crate::error::Error::ShapeMismatch {
-        message: format!("GroupNorm: dims ({dims}) must be positive"),
-      });
-    }
-    if dims % num_groups != 0 {
-      return Err(crate::error::Error::ShapeMismatch {
-        message: format!(
-          "GroupNorm: dims ({dims}) must be evenly divisible by num_groups ({num_groups})"
-        ),
-      });
-    }
+    // Full `(num_groups, dims)` validation first — this is a public entry
+    // point in its own right, and the shared helper is the single source
+    // of truth for the positive/divisible rule.
+    validate_group_params(num_groups, dims)?;
     // When affine tensors are supplied, BOTH must be exactly rank-1
     // `[dims]` — a checkpoint with a `[1, dims]` (rank-2) or `[dims + 1]`
     // (wrong length) tensor would otherwise broadcast/fail unpredictably
@@ -1360,6 +1378,34 @@ mod tests {
       }
       other => panic!("expected ShapeMismatch, got {other:?}"),
     }
+  }
+
+  /// `GroupNorm::new(.., affine = true, ..)` must reject a malformed
+  /// `(num_groups, dims)` config on the cheap integer validation
+  /// (`validate_group_params`) BEFORE materializing the default
+  /// `(ones, zeros)` affine tensors. Previously `new` checked only
+  /// `dims > 0`, built the two MLX arrays, and only THEN ran the full
+  /// `num_groups`/divisibility validation inside `with_affine` — so a
+  /// known-bad config paid for two allocations before erroring. Both a
+  /// non-positive `num_groups` and a non-divisible `dims` must `Err`.
+  ///
+  /// The no-allocation property is structural: `validate_group_params`
+  /// is called before the `Array::ones`/`Array::zeros` lines in `new`,
+  /// so an `Err` here is returned without ever reaching them.
+  #[test]
+  fn group_norm_new_affine_true_invalid_config_rejects_before_alloc() {
+    // `num_groups = 0` (non-positive) with `affine = true`.
+    let err = GroupNorm::new(0, 4, 1e-5, true, false).unwrap_err();
+    assert!(
+      matches!(err, crate::error::Error::ShapeMismatch { .. }),
+      "expected ShapeMismatch for num_groups=0, got {err:?}"
+    );
+    // `dims = 8` not divisible by `num_groups = 3`, with `affine = true`.
+    let err = GroupNorm::new(3, 8, 1e-5, true, false).unwrap_err();
+    assert!(
+      matches!(err, crate::error::Error::ShapeMismatch { .. }),
+      "expected ShapeMismatch for non-divisible dims, got {err:?}"
+    );
   }
 
   // ─── GroupNorm field-visibility regressions (Codex R3) ───
