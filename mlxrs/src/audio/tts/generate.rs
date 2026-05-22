@@ -32,6 +32,7 @@
 
 use crate::{
   array::Array,
+  dtype::Dtype,
   error::{Error, Result},
   ops,
 };
@@ -187,6 +188,54 @@ impl Default for TtsGenConfig {
   }
 }
 
+/// Zero-shot voice-clone reference for a [`tts_generate_with_reference`] /
+/// [`join_audio_with_reference`] run — a reference speaker the model should
+/// clone the voice from.
+///
+/// The mlxrs analogue of mlx-audio's `ref_audio` / `ref_text` pair. It mirrors
+/// mlx-audio-swift's [`SpeechGenerationModel.generate`][swift-gen] shape, where
+/// `refAudio: MLXArray?` / `refText: String?` are a **separate argument** from
+/// the per-generation `generationParameters` (== [`TtsGenConfig`]) — not fields
+/// of it. mlxrs keeps the same separation: the reference is a distinct,
+/// borrowed argument, so [`TtsGenConfig`] stays a cheap-to-clone,
+/// `PartialEq` knob bundle that owns no [`Array`].
+///
+/// Borrows its `&Array` / `&str` from the caller (lifetime `'a`) — the driver
+/// never clones the reference audio; it threads the borrow into every
+/// [`TtsSegment`]. Both fields are independently `Option` (matching swift's two
+/// optional parameters): a caller can supply audio without a transcript (the
+/// per-model code transcribes it, like mlx-audio's STT fallback) or neither
+/// (no cloning).
+///
+/// ## What mlxrs does and does not do with the reference
+///
+/// Like the rest of the TTS driver, mlxrs is a **passthrough**: the per-model
+/// `synthesize_segment` consumes the reference (encodes the speaker, conditions
+/// its backbone). mlxrs does **not** decode a reference *path* here — mirroring
+/// mlx-audio-swift, [`TtsReference::ref_audio`] is an already-decoded
+/// **rank-1 `f32` PCM `[samples]` [`Array`]** (the caller pre-loads it with
+/// [`crate::audio::io::load_wav`] + [`Array::from_slice`], resampled to the
+/// model's [`TtsModel::sample_rate`] if needed). mlx-audio's Python
+/// `generate_audio` accepts a *path* and pre-decodes it with `load_audio`
+/// before handing the array to `model.generate`; mlxrs leaves that one I/O step
+/// to the caller (the audio surface's load/decode primitives are already
+/// public) and keeps the driver pure — it touches no filesystem.
+///
+/// [swift-gen]: https://github.com/Blaizzy/mlx-audio-swift/blob/main/Sources/MLXAudioTTS/Generation.swift
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TtsReference<'a> {
+  /// Reference-speaker waveform to clone the voice from (mlx-audio
+  /// `generate_audio` `ref_audio`, swift `refAudio`). A rank-1 `f32` PCM
+  /// `[samples]` [`Array`] at the model's [`TtsModel::sample_rate`]; `None`
+  /// when not cloning. Threaded into every [`TtsSegment::ref_audio`].
+  pub ref_audio: Option<&'a Array>,
+  /// Transcript of [`TtsReference::ref_audio`] (mlx-audio `generate_audio`
+  /// `ref_text`, swift `refText`). `None` when not cloning, or when the
+  /// per-model code should transcribe the reference itself. Threaded into
+  /// every [`TtsSegment::ref_text`].
+  pub ref_text: Option<&'a str>,
+}
+
 /// One text segment plus the resolved synthesis knobs, handed to
 /// [`TtsModel::synthesize_segment`].
 ///
@@ -196,11 +245,14 @@ impl Default for TtsGenConfig {
 /// per-segment string allocation; the per-model code reads them and feeds
 /// its own tokenizer / G2P.
 ///
-/// The optional `ref_audio` / `ref_text` voice-clone pair mirrors mlx-audio
-/// `generate_audio`'s `ref_audio` / `ref_text` arguments (zero-shot voice
-/// cloning): a model that supports it reads them in `synthesize_segment`; a
-/// model that does not ignores them. They are `Option` and the driver never
-/// inspects them — purely a per-model passthrough.
+/// The optional `ref_audio` / `ref_text` voice-clone pair carries the
+/// per-run [`TtsReference`] (mlx-audio `generate_audio`'s `ref_audio` /
+/// `ref_text`, zero-shot voice cloning) into each segment: a caller supplies
+/// it via [`tts_generate_with_reference`], the driver threads the same borrow
+/// onto **every** segment, and a model that supports cloning reads them in
+/// `synthesize_segment` (a model that does not ignores them). They are
+/// `Option` and the driver never inspects them — purely a per-model
+/// passthrough.
 #[derive(Debug, Clone, Copy)]
 pub struct TtsSegment<'a> {
   /// The segment's raw text (a slice of the [`tts_generate`] input). The
@@ -231,13 +283,14 @@ pub struct TtsSegment<'a> {
   /// `segment_idx`). Stamped onto the produced [`AudioChunk::segment_idx`].
   pub segment_idx: usize,
   /// Optional reference-audio waveform for zero-shot voice cloning
-  /// (mlx-audio `generate_audio` `ref_audio`). A rank-1 `f32` PCM `[samples]`
-  /// tensor; `None` when not cloning. Per-model passthrough — the driver
-  /// never inspects it.
+  /// (mlx-audio `generate_audio` `ref_audio`), from the run's
+  /// [`TtsReference::ref_audio`]. A rank-1 `f32` PCM `[samples]` tensor;
+  /// `None` when not cloning. Per-model passthrough — the driver never
+  /// inspects it.
   pub ref_audio: Option<&'a Array>,
   /// Optional transcript of [`TtsSegment::ref_audio`] (mlx-audio
-  /// `generate_audio` `ref_text`). `None` when not cloning. Per-model
-  /// passthrough.
+  /// `generate_audio` `ref_text`), from the run's [`TtsReference::ref_text`].
+  /// `None` when not cloning. Per-model passthrough.
   pub ref_text: Option<&'a str>,
 }
 
@@ -408,6 +461,11 @@ pub struct TtsGenerator<'a, M: TtsModel> {
   /// The synthesis config — voice / language / per-segment knobs are read
   /// from here for each [`TtsSegment`].
   cfg: &'a TtsGenConfig,
+  /// The zero-shot voice-clone reference (mlx-audio `ref_audio` / `ref_text`).
+  /// Threaded — the same borrow — onto every segment's
+  /// [`TtsSegment::ref_audio`] / [`TtsSegment::ref_text`]. Both fields are
+  /// `None` for a non-cloning run.
+  reference: TtsReference<'a>,
   /// `(start, end)` byte ranges of every non-blank segment, computed once
   /// in the [`tts_generate`] constructor.
   segments: Vec<(usize, usize)>,
@@ -445,8 +503,11 @@ impl<M: TtsModel> TtsGenerator<'_, M> {
       max_tokens: self.cfg.max_tokens,
       streaming_interval: self.cfg.streaming_interval,
       segment_idx: idx,
-      ref_audio: None,
-      ref_text: None,
+      // Thread the run's voice-clone reference onto every segment (the same
+      // borrow each time — no per-segment clone). `None`/`None` for a
+      // non-cloning run.
+      ref_audio: self.reference.ref_audio,
+      ref_text: self.reference.ref_text,
     };
 
     let audio = self.model.synthesize_segment(&segment)?;
@@ -465,6 +526,23 @@ impl<M: TtsModel> TtsGenerator<'_, M> {
           "tts_generate: `synthesize_segment` must return a rank-1 [samples] \
            audio tensor, got shape {shape:?} (segment {idx})"
         ),
+      });
+    }
+
+    // Validate the model's audio output is `f32` PCM — the other half of the
+    // documented `synthesize_segment` / [`AudioChunk`] post-condition (rank-1
+    // **f32** `[samples]` in `[-1, 1]`). A model returning a rank-1 tensor of
+    // some other dtype (`i32` token ids it forgot to decode, an `f16`/`f64`
+    // buffer) would pass the shape check and become a "successful"
+    // [`AudioChunk`] whose invariant is false — `join_audio` could then return
+    // a non-`f32` tensor, and [`AudioChunk::samples`] would only fail later
+    // with an opaque `DtypeMismatch`. Surface the per-model defect here, at the
+    // generator boundary, naming the actual dtype (the `expected`/`got` pair).
+    let dtype = audio.dtype()?;
+    if dtype != Dtype::F32 {
+      return Err(Error::DtypeMismatch {
+        expected: Dtype::F32,
+        got: dtype,
       });
     }
 
@@ -560,6 +638,38 @@ pub fn tts_generate<'a, M: TtsModel>(
   text: &'a str,
   cfg: &'a TtsGenConfig,
 ) -> Result<TtsGenerator<'a, M>> {
+  // No voice-clone reference — the common, non-cloning path. Forwards a
+  // both-`None` `TtsReference` to the threading constructor below.
+  tts_generate_with_reference(model, text, cfg, TtsReference::default())
+}
+
+/// Start an end-to-end TTS synthesis run **with a zero-shot voice-clone
+/// reference**.
+///
+/// Identical to [`tts_generate`] but threads `reference` (mlx-audio
+/// `generate_audio`'s `ref_audio` / `ref_text`, swift's `refAudio` / `refText`)
+/// onto **every** produced [`TtsSegment`], so a model that supports zero-shot
+/// voice cloning ([`TtsReference`] documents the contract) receives the
+/// reference speaker on each segment and clones its voice. A model that does
+/// not support cloning ignores the reference fields.
+///
+/// `reference` is a separate, borrowed argument — not part of [`TtsGenConfig`]
+/// — mirroring mlx-audio-swift's
+/// [`SpeechGenerationModel.generate`][swift-gen] (`refAudio` / `refText` sit
+/// beside `generationParameters`, not inside it). [`tts_generate`] is exactly
+/// this with `reference = TtsReference::default()` (both fields `None`).
+///
+/// The `'a` lifetime now also ties the returned iterator to the `reference`
+/// borrows; the driver clones nothing (it copies the two `Option<&_>` onto each
+/// segment).
+///
+/// [swift-gen]: https://github.com/Blaizzy/mlx-audio-swift/blob/main/Sources/MLXAudioTTS/Generation.swift
+pub fn tts_generate_with_reference<'a, M: TtsModel>(
+  model: &'a M,
+  text: &'a str,
+  cfg: &'a TtsGenConfig,
+  reference: TtsReference<'a>,
+) -> Result<TtsGenerator<'a, M>> {
   // 1. Pre-allocation cap — reject a crafted multi-MB text blob BEFORE the
   //    per-segment split + per-model allocations (the TTS analogue of the
   //    STT loop's `max_audio_seconds` up-front check). `text.len()` is the
@@ -589,6 +699,7 @@ pub fn tts_generate<'a, M: TtsModel>(
     model,
     text,
     cfg,
+    reference,
     segments,
     next_segment: 0,
     done: false,
@@ -614,8 +725,31 @@ pub fn tts_generate<'a, M: TtsModel>(
 /// work continues after a failure). Because [`tts_generate`] rejects an
 /// all-blank input, this never sees an empty chunk list.
 pub fn join_audio<M: TtsModel>(model: &M, text: &str, cfg: &TtsGenConfig) -> Result<Array> {
+  // No voice-clone reference — forwards a both-`None` `TtsReference`.
+  join_audio_with_reference(model, text, cfg, TtsReference::default())
+}
+
+/// Synthesize `text` **with a zero-shot voice-clone reference** and
+/// concatenate every produced chunk into a single `[total_samples]` audio
+/// [`Array`].
+///
+/// Identical to [`join_audio`] but threads `reference` (mlx-audio
+/// `ref_audio` / `ref_text`) onto every segment — the [`join_audio`] analogue
+/// of [`tts_generate_with_reference`]. [`join_audio`] is exactly this with
+/// `reference = TtsReference::default()`.
+///
+/// Every joined chunk is guaranteed `f32` PCM: the [`tts_generate`] driver
+/// rejects a non-`f32` segment output at the generator boundary
+/// ([`Error::DtypeMismatch`]), so this never returns a non-`f32` tensor — the
+/// error propagates here instead.
+pub fn join_audio_with_reference<M: TtsModel>(
+  model: &M,
+  text: &str,
+  cfg: &TtsGenConfig,
+  reference: TtsReference<'_>,
+) -> Result<Array> {
   let mut chunks: Vec<Array> = Vec::new();
-  for chunk in tts_generate(model, text, cfg)? {
+  for chunk in tts_generate_with_reference(model, text, cfg, reference)? {
     chunks.push(chunk?.audio);
   }
 

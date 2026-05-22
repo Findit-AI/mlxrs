@@ -17,7 +17,8 @@ use mlxrs::{
     TextProcessor,
     generate::{
       AudioChunk, AudioFormat, DEFAULT_MAX_TOKENS, DEFAULT_STREAMING_INTERVAL, DEFAULT_TEMPERATURE,
-      DEFAULT_VOICE, TextSegmentation, TtsGenConfig, TtsSegment, join_audio, tts_generate,
+      DEFAULT_VOICE, TextSegmentation, TtsGenConfig, TtsReference, TtsSegment, join_audio,
+      join_audio_with_reference, tts_generate, tts_generate_with_reference,
     },
     model::TtsModel,
   },
@@ -107,6 +108,56 @@ impl TtsModel for FailSynthModel {
     Err(mlxrs::Error::Backend {
       message: "mock synthesize_segment failure".into(),
     })
+  }
+  fn sample_rate(&self) -> u32 {
+    24_000
+  }
+}
+
+/// What a [`RecordingRefModel`] saw for one segment's voice-clone reference:
+/// `(ref_audio_is_some, ref_text)`. The `ref_audio` is recorded only as a
+/// presence flag (an `Array` is not `Clone`); `ref_text` is captured verbatim.
+type SeenRef = (bool, Option<String>);
+
+/// A [`TtsModel`] that records the [`TtsSegment::ref_audio`] /
+/// [`TtsSegment::ref_text`] it received on every segment — so a test can prove
+/// the voice-clone reference is threaded through the public path onto each
+/// segment (Fix 1).
+struct RecordingRefModel {
+  /// One [`SeenRef`] per `synthesize_segment` call, in order.
+  seen_refs: RefCell<Vec<SeenRef>>,
+}
+
+impl RecordingRefModel {
+  fn new() -> Self {
+    Self {
+      seen_refs: RefCell::new(Vec::new()),
+    }
+  }
+}
+
+impl TtsModel for RecordingRefModel {
+  fn synthesize_segment(&self, segment: &TtsSegment<'_>) -> mlxrs::Result<Array> {
+    self.seen_refs.borrow_mut().push((
+      segment.ref_audio.is_some(),
+      segment.ref_text.map(str::to_string),
+    ));
+    // A valid rank-1 f32 waveform so synthesis succeeds.
+    Array::from_slice::<f32>(&[0.0_f32, 0.1, 0.2], &[3])
+  }
+  fn sample_rate(&self) -> u32 {
+    24_000
+  }
+}
+
+/// A `synthesize_segment` returning a rank-1 but NON-`f32` (here `i32`) tensor
+/// — drives the driver's "must be f32 PCM" dtype guard (Fix 2). The shape is
+/// valid rank-1, so only the dtype check can reject it.
+struct NonF32Model;
+impl TtsModel for NonF32Model {
+  fn synthesize_segment(&self, _segment: &TtsSegment<'_>) -> mlxrs::Result<Array> {
+    // Rank-1 [4] i32 — passes the rank-1 shape check, fails the f32 check.
+    Array::from_slice::<i32>(&[1_i32, 2, 3, 4], &[4])
   }
   fn sample_rate(&self) -> u32 {
     24_000
@@ -286,6 +337,178 @@ fn join_audio_propagates_segment_error() {
     }
     other => panic!("expected Backend error, got {other:?}"),
   }
+}
+
+// ─────────────────── voice-clone reference (Fix 1) ───────────────────
+
+/// `tts_generate_with_reference` threads the [`TtsReference`]'s `ref_audio` /
+/// `ref_text` onto EVERY segment: a 3-segment input with a `Some` reference
+/// makes the model see `Some` for BOTH on all three segments.
+#[test]
+fn tts_generate_threads_reference_to_every_segment() {
+  let model = RecordingRefModel::new();
+  let cfg = TtsGenConfig::default();
+  // A rank-1 f32 reference waveform + a transcript.
+  let ref_wav = Array::from_slice::<f32>(&[0.5_f32, -0.5, 0.25, -0.25], &[4]).unwrap();
+  let reference = TtsReference {
+    ref_audio: Some(&ref_wav),
+    ref_text: Some("the reference transcript"),
+  };
+  // Three newline-split segments.
+  let _ = tts_generate_with_reference(&model, "one\ntwo\nthree", &cfg, reference)
+    .unwrap()
+    .map(|r| r.unwrap())
+    .collect::<Vec<_>>();
+  let seen = model.seen_refs.borrow();
+  assert_eq!(seen.len(), 3, "every segment synthesized");
+  for (i, (has_audio, text)) in seen.iter().enumerate() {
+    assert!(has_audio, "segment {i} received ref_audio = Some");
+    assert_eq!(
+      text.as_deref(),
+      Some("the reference transcript"),
+      "segment {i} received the ref_text verbatim"
+    );
+  }
+}
+
+/// A reference carrying ONLY `ref_audio` (no transcript) is threaded as such:
+/// every segment sees `ref_audio = Some`, `ref_text = None` (the per-model
+/// code would transcribe it). Proves the two fields are independently
+/// optional.
+#[test]
+fn tts_generate_threads_audio_only_reference() {
+  let model = RecordingRefModel::new();
+  let cfg = TtsGenConfig::default();
+  let ref_wav = Array::from_slice::<f32>(&[0.1_f32, 0.2], &[2]).unwrap();
+  let reference = TtsReference {
+    ref_audio: Some(&ref_wav),
+    ref_text: None,
+  };
+  let _ = tts_generate_with_reference(&model, "alpha\nbeta", &cfg, reference)
+    .unwrap()
+    .map(|r| r.unwrap())
+    .collect::<Vec<_>>();
+  let seen = model.seen_refs.borrow();
+  assert_eq!(seen.len(), 2);
+  for (has_audio, text) in seen.iter() {
+    assert!(has_audio, "ref_audio threaded");
+    assert!(text.is_none(), "ref_text stays None (audio-only reference)");
+  }
+}
+
+/// Back-compat: the plain `tts_generate` (no reference argument) makes the
+/// model see `None` for BOTH ref fields on every segment — a non-cloning run.
+#[test]
+fn tts_generate_no_reference_passes_none() {
+  let model = RecordingRefModel::new();
+  let cfg = TtsGenConfig::default();
+  let _ = tts_generate(&model, "one\ntwo", &cfg)
+    .unwrap()
+    .map(|r| r.unwrap())
+    .collect::<Vec<_>>();
+  let seen = model.seen_refs.borrow();
+  assert_eq!(seen.len(), 2);
+  for (has_audio, text) in seen.iter() {
+    assert!(!has_audio, "no reference ⇒ ref_audio = None");
+    assert!(text.is_none(), "no reference ⇒ ref_text = None");
+  }
+}
+
+/// `TtsReference::default()` is a both-`None` (non-cloning) reference, and
+/// `tts_generate_with_reference` with it behaves exactly like `tts_generate`.
+#[test]
+fn tts_reference_default_is_non_cloning() {
+  let model = RecordingRefModel::new();
+  let cfg = TtsGenConfig::default();
+  let _ = tts_generate_with_reference(&model, "x\ny", &cfg, TtsReference::default())
+    .unwrap()
+    .map(|r| r.unwrap())
+    .collect::<Vec<_>>();
+  let seen = model.seen_refs.borrow();
+  assert_eq!(seen.len(), 2);
+  for (has_audio, text) in seen.iter() {
+    assert!(
+      !has_audio && text.is_none(),
+      "default reference is None/None"
+    );
+  }
+}
+
+/// `join_audio_with_reference` also threads the reference (proves the join
+/// entry point carries it too, not just the iterator one).
+#[test]
+fn join_audio_with_reference_threads_reference() {
+  let model = RecordingRefModel::new();
+  let cfg = TtsGenConfig::default();
+  let ref_wav = Array::from_slice::<f32>(&[0.3_f32, 0.4, 0.5], &[3]).unwrap();
+  let reference = TtsReference {
+    ref_audio: Some(&ref_wav),
+    ref_text: Some("caption"),
+  };
+  // RecordingRefModel emits a [3] f32 waveform per segment ⇒ 2 segments = [6].
+  let joined = join_audio_with_reference(&model, "p\nq", &cfg, reference).unwrap();
+  assert_eq!(joined.shape(), vec![6], "two [3] segments joined to [6]");
+  let seen = model.seen_refs.borrow();
+  assert_eq!(seen.len(), 2);
+  for (has_audio, text) in seen.iter() {
+    assert!(has_audio, "join_audio_with_reference threads ref_audio");
+    assert_eq!(text.as_deref(), Some("caption"), "and ref_text");
+  }
+}
+
+// ──────────────────── f32 PCM dtype enforcement (Fix 2) ────────────────────
+
+/// A rank-1 but NON-`f32` (`i32`) audio tensor from the model surfaces a
+/// recoverable `Err(DtypeMismatch)` at the generator boundary — NOT a
+/// successful chunk. The shape is valid rank-1, so only the dtype guard can
+/// reject it.
+#[test]
+fn tts_generate_rejects_non_f32_audio_dtype() {
+  let model = NonF32Model;
+  let cfg = TtsGenConfig::default();
+  let mut it = tts_generate(&model, "hi", &cfg).unwrap();
+  match it.next().expect("an item") {
+    Err(mlxrs::Error::DtypeMismatch { expected, got }) => {
+      assert_eq!(expected, mlxrs::Dtype::F32, "f32 expected");
+      assert_eq!(got, mlxrs::Dtype::I32, "actual dtype named (i32)");
+    }
+    other => panic!("expected DtypeMismatch, got {other:?}"),
+  }
+  assert!(it.next().is_none(), "iterator fuses after the dtype Err");
+}
+
+/// `join_audio` over a non-`f32` model NEVER returns a non-`f32` tensor — it
+/// propagates the dtype `Err` instead. (Guards the `AudioChunk` /
+/// `join_audio` f32 invariant.)
+#[test]
+fn join_audio_rejects_non_f32_audio_dtype() {
+  let model = NonF32Model;
+  let cfg = TtsGenConfig::default();
+  let err = join_audio(&model, "x\ny\nz", &cfg).expect_err("non-f32 audio rejected");
+  assert!(
+    matches!(err, mlxrs::Error::DtypeMismatch { .. }),
+    "got {err:?}"
+  );
+}
+
+/// A valid `f32` model still synthesizes successfully through the dtype guard
+/// (the guard rejects only non-f32 — it must not break the happy path).
+#[test]
+fn tts_generate_accepts_f32_audio_dtype() {
+  // MockTtsModel emits f32 ramps.
+  let model = MockTtsModel::new(24_000, 8);
+  let cfg = TtsGenConfig::default();
+  let chunks: Vec<AudioChunk> = tts_generate(&model, "ok", &cfg)
+    .unwrap()
+    .map(|r| r.unwrap())
+    .collect();
+  assert_eq!(chunks.len(), 1, "valid f32 audio ⇒ a successful chunk");
+  assert_eq!(chunks[0].len_samples(), 8);
+  assert_eq!(
+    chunks[0].audio.dtype().unwrap(),
+    mlxrs::Dtype::F32,
+    "the chunk's audio is f32"
+  );
 }
 
 // ───────────────────────── edge cases ─────────────────────────

@@ -14,7 +14,12 @@
 //!   that drives any [`TtsModel`](model::TtsModel) (text → assembled /
 //!   streamed [`AudioChunk`](generate::AudioChunk)s), plus
 //!   [`join_audio`](generate::join_audio) (concatenate every chunk into one
-//!   waveform) and the config / segment / chunk types.
+//!   waveform), the
+//!   [`tts_generate_with_reference`](generate::tts_generate_with_reference) /
+//!   [`join_audio_with_reference`](generate::join_audio_with_reference)
+//!   zero-shot voice-clone entry points (threading a
+//!   [`TtsReference`](generate::TtsReference)), and the config / segment /
+//!   chunk types.
 //! - [`TextProcessor`] (in this module) — the text-preprocessing **hook**
 //!   the synthesis pipeline exposes (the *interface*, not a concrete
 //!   phonemizer — G2P is model-specific).
