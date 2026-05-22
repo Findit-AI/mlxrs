@@ -31,7 +31,7 @@ tokenizer-chat       = ["tokenizer-config", "dep:minijinja", "dep:minijinja-cont
 tokenizer-deepseek-v32 = ["tokenizer-chat"]                                        # the one shipped chat-template override
 tokenizer-tools      = ["tokenizer-config", "dep:serde_json"]                      # tool-call parsers + infer_tool_parser
 # umbrellas (compose only)
-embeddings           = ["tokenizer", "dep:smol_str", "dep:memspan"]                 # encode/decode (tokenizers crate) + `1_Pooling/config.json` parsing (HAND-ROLLED strict-JSON scanner per EMB-1; NO DIRECT `mlxrs::dep:serde_json` — `tokenizers v0.23` still pulls `serde_json` transitively for its `tokenizer.json` parse, so `embeddings` BUILDS but does not OWN `serde_json` after EMB-1. `tokenizer-config`/`tokenizer-bpe`/`tokenizer-spm`/`tokenizer-tools` continue to pull it directly). `smol_str` inlines short keys/values (≤23 bytes) into the JVal payload. `memspan` SIMD-accelerates `skip_ws` (AVX2/AVX-512/NEON dispatch) and the per-string `skip-until-quote-or-backslash` chunk scan, plus enables a no-escape fast path that copies the source slice directly into SmolStr with zero intermediate Vec.
+embeddings           = ["tokenizer", "dep:smol_str", "dep:memspan", "dep:glob"]      # encode/decode (tokenizers crate) + `1_Pooling/config.json` parsing (HAND-ROLLED strict-JSON scanner per EMB-1; NO DIRECT `mlxrs::dep:serde_json` — `tokenizers v0.23` still pulls `serde_json` transitively for its `tokenizer.json` parse, so `embeddings` BUILDS but does not OWN `serde_json` after EMB-1. `tokenizer-config`/`tokenizer-bpe`/`tokenizer-spm`/`tokenizer-tools` continue to pull it directly). `smol_str` inlines short keys/values (≤23 bytes) into the JVal payload. `memspan` SIMD-accelerates `skip_ws` (AVX2/AVX-512/NEON dispatch) and the per-string `skip-until-quote-or-backslash` chunk scan, plus enables a no-escape fast path that copies the source slice directly into SmolStr with zero intermediate Vec. `glob` drives `factory::load_weights`' recursive `**/model*.safetensors` shard discovery — the faithful port of `mlx_embeddings.utils.load_model`'s `glob.glob(..., recursive=True)`.
 lm                   = ["tokenizer-config", "tokenizer-stream", "tokenizer-spm", "tokenizer-bpe", "tokenizer-chat", "tokenizer-deepseek-v32", "tokenizer-tools"]
 vlm                  = ["lm", "dep:image"]
 audio                = ["lm", "dep:symphonia"] # mirrors mlx-audio's Python dep on mlx-lm; symphonia = WAV/MP3/FLAC/OGG-Vorbis codecs for audio::io. The always-compiled `mlxrs::simd` module accelerates the integrated_loudness sum-of-squares (NEON on aarch64, scalar fallback elsewhere) — no feature gate needed.
@@ -65,6 +65,18 @@ smol_str = { version = "0.3", optional = true }
 # license, repo, description, keywords. Pulled SOLELY by `embeddings`.
 # Loose caret semver per `feedback_no_dependency_pinning`.
 memspan = { version = "0.1", optional = true }
+# Unix shell-style path globbing for `embeddings::factory::load_weights`'
+# recursive `**/model*.safetensors` shard discovery — the maintained,
+# std-adjacent (`rust-lang/glob`) port of `mlx_embeddings.utils.load_model`'s
+# `glob.glob(str(model_path / "**/model*.safetensors"), recursive=True)`.
+# `glob_with(MatchOptions { require_literal_leading_dot: true, .. })` gives
+# Python glob's default `include_hidden=False` (dot-prefixed components are
+# excluded), `**` recursion, and directory-symlink follow + scandir-error
+# suppression for free — replacing a hand-rolled recursive walk that could
+# not faithfully reproduce those `glob` corners. Pulled SOLELY by
+# `embeddings`. Loose caret semver per `feedback_no_dependency_pinning`
+# (crates.io current major is 0.3.x — verified 0.3.3); never an exact `=` pin.
+glob = { version = "0.3", optional = true }
 # `strftime_now` chat-template helper only — pulled SOLELY by `tokenizer-chat`
 # (`dep:jiff`), never by the serde_json-free `tokenizer` core, the
 # stream/bpe/spm features, or `[build-dependencies]`. Local-now formatted per

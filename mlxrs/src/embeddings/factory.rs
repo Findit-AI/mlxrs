@@ -67,9 +67,11 @@
 //! to the constructor lazily).
 
 use std::{
-  collections::{HashMap, HashSet},
+  collections::HashMap,
   path::{Path, PathBuf},
 };
+
+use glob::{MatchOptions, glob_with};
 
 use crate::{
   array::Array,
@@ -509,7 +511,7 @@ fn read_optional_pooling(dir: &Path) -> Result<Option<StPoolingConfig>> {
 /// every tensor name it contributes (mlx-embeddings' subfolder rename), or
 /// `None` for a root-level shard whose keys are merged verbatim.
 struct DiscoveredShard {
-  /// Full path to the `*.safetensors` file.
+  /// Full path to the `*.safetensors` file (a [`glob`] match).
   path: PathBuf,
   /// `Some(folder)` when the shard lives in a *child* directory of the model
   /// root — every key is rewritten to `<folder>.<key>` (mlx-embeddings'
@@ -519,39 +521,32 @@ struct DiscoveredShard {
   prefix: Option<String>,
 }
 
-/// Hard cap on how deep the recursive shard walk will descend below the model
-/// root. mlx-embeddings' `glob("**/model*.safetensors", recursive=True)` has no
-/// depth bound, but a hostile / symlink-free-but-deep model directory could
-/// otherwise drive [`collect_shards_recursive`]'s recursion arbitrarily deep
-/// (turning a pathological directory into a stack overflow / abort instead of a
-/// recoverable error). Real multi-component embedding checkpoints nest one level
-/// (`vision_model/model.safetensors`, `text_model/model.safetensors`); 64 levels
-/// covers every realistic layout with a constant stack bound.
-const MAX_WEIGHT_DIR_DEPTH: usize = 64;
-
 /// Discover and merge an embedding model's weights from `dir`, mirroring the
 /// weight-loading half of `mlx_embeddings.utils.load_model`.
 ///
-/// Resolution order (mirroring `load_model`'s two `glob` passes):
+/// Resolution order (a faithful port of `load_model`'s two `glob.glob` passes —
+/// see [`collect_glob_shards`] for the [`glob`]-crate mechanics):
 ///
 /// 1. **Sharded / single safetensors, RECURSIVELY:** every `model*.safetensors`
-///    anywhere under `dir` (mlx-embeddings
-///    `glob.glob(model_path / "**/model*.safetensors", recursive=True)`),
-///    iterated in **sorted full-path order** for a deterministic merge —
-///    [`crate::io::load_safetensors`] each and `extend(...)` (later shard wins
-///    on a duplicate key, which a well-formed shard set never produces). Covers
-///    both `model.safetensors` and `model-00001-of-000NN.safetensors`, at the
-///    root and in nested component folders (e.g. a ColVision-style
-///    `vision_model/model.safetensors` + `text_model/model.safetensors`).
+///    anywhere under `dir` —
+///    `glob.glob(str(model_path / "**/model*.safetensors"), recursive=True)`
+///    (mlx-embeddings `utils.py` line 159) — iterated in **sorted full-path
+///    order** for a deterministic merge — [`crate::io::load_safetensors`] each
+///    and `extend(...)` (later shard wins on a duplicate key, which a
+///    well-formed shard set never produces). Covers both `model.safetensors`
+///    and `model-00001-of-000NN.safetensors`, at the root and in nested
+///    component folders (e.g. a ColVision-style `vision_model/model.safetensors`
+///    + `text_model/model.safetensors`).
 /// 2. **Back-compat `weight*.safetensors` (root only):** if there is no
 ///    `model*.safetensors` anywhere, mlx-embeddings `load_model` retries
-///    `glob(model_path / "weight*.safetensors")` — the legacy layout, **not**
-///    recursive (no `**`) — and so does this loader. The fallback fires only on
-///    a genuinely empty `model*.safetensors` match: a `model*.safetensors`
-///    dirent that exists but is broken (dangling symlink / non-regular target)
-///    makes [`collect_shards_recursive`] **error**, so a corrupt primary shard
-///    fails the load loudly rather than silently degrading to a stale legacy
-///    snapshot.
+///    `glob.glob(str(model_path / "weight*.safetensors"))` (`utils.py` line
+///    163) — the legacy layout, **not** recursive (no `**`) — and so does this
+///    loader. The fallback fires only on a genuinely empty `model*.safetensors`
+///    match: a `model*.safetensors` path `glob` *yields* but
+///    [`crate::io::load_safetensors`] cannot load (a non-regular target — see
+///    [`collect_glob_shards`]'s stat gate) makes step 1 **error**, so a corrupt
+///    primary shard fails the load loudly rather than silently degrading to a
+///    stale legacy snapshot.
 ///
 /// **Nested-shard key prefixing (mlx-embeddings parity):** a shard found in a
 /// *child* directory has every tensor key rewritten to `<folder>.<key>` before
@@ -559,28 +554,29 @@ const MAX_WEIGHT_DIR_DEPTH: usize = 64;
 /// exactly `load_model`'s
 /// `folder_name = Path(wf).parent.name; new_key = f"{folder_name}.{key}"` (so a
 /// deeper `a/b/model.safetensors` prefixes with `b`, not `a.b`). Root-level
-/// shards (`Path(wf).parent == model_path`) keep their keys verbatim. This is
-/// the one place the embeddings factory diverges from
-/// [`crate::lm::load::load_weights`]'s flat, verbatim merge: multi-component
-/// embedding models (vision + text) ship per-component shard folders the loader
-/// must namespace, and the prefixing is done **here** (per shard, then merge),
-/// leaving the shared [`crate::io::load_safetensors`] and the lm loader
-/// untouched. GGUF is not a `mlx_embeddings` weight path and is not handled.
+/// shards (`Path(wf).parent == model_path`) keep their keys verbatim. The
+/// prefix is computed from the **glob-returned** path's immediate parent (which,
+/// for a symlinked component dir, is the *link* name — `glob` yields the path it
+/// walked, not the symlink's canonical target). This is the one place the
+/// embeddings factory diverges from [`crate::lm::load::load_weights`]'s flat,
+/// verbatim merge: multi-component embedding models (vision + text) ship
+/// per-component shard folders the loader must namespace, and the prefixing is
+/// done **here** (per shard, then merge), leaving the shared
+/// [`crate::io::load_safetensors`] and the lm loader untouched. GGUF is not a
+/// `mlx_embeddings` weight path and is not handled.
 ///
 /// No safetensors at all → [`Error::Backend`] (mlx-embeddings'
 /// `FileNotFoundError("No safetensors found in {model_path}")`).
 fn load_weights(dir: &Path) -> Result<EmbeddingWeights> {
-  // mlx-embeddings' primary glob: `**/model*.safetensors` (RECURSIVE).
-  let mut shards = collect_shards_recursive(dir, |name| {
-    name.starts_with("model") && name.ends_with(".safetensors")
-  })?;
+  // mlx-embeddings' primary glob: `**/model*.safetensors`, RECURSIVE — the
+  // `glob` crate's `**` matches the model dir itself plus arbitrary
+  // subdirectories, so a root shard and nested-component shards are all found.
+  let mut shards = collect_glob_shards(dir, "**/model*.safetensors")?;
 
   // mlx-embeddings' back-compat retry: `weight*.safetensors` at the ROOT only
-  // (the legacy glob is not recursive — no `**`).
+  // (the legacy glob is NOT recursive — `utils.py` line 163 has no `**`).
   if shards.is_empty() {
-    shards = collect_shards_root(dir, |name| {
-      name.starts_with("weight") && name.ends_with(".safetensors")
-    })?;
+    shards = collect_glob_shards(dir, "weight*.safetensors")?;
   }
 
   if shards.is_empty() {
@@ -593,9 +589,9 @@ fn load_weights(dir: &Path) -> Result<EmbeddingWeights> {
     });
   }
 
-  // Deterministic merge in sorted full-path order (`collect_*` already sort by
-  // path; the cross-shard dup-key tie-break — which a valid shard set never hits
-  // — is thus reproducible). A nested shard's keys are prefixed `<folder>.`
+  // Deterministic merge in sorted full-path order (`collect_glob_shards` sorts
+  // by path; the cross-shard dup-key tie-break — which a valid shard set never
+  // hits — is thus reproducible). A nested shard's keys are prefixed `<folder>.`
   // before merge (mlx-embeddings' subfolder rename); root shards merge verbatim.
   let mut weights: EmbeddingWeights = HashMap::new();
   for shard in &shards {
@@ -613,255 +609,145 @@ fn load_weights(dir: &Path) -> Result<EmbeddingWeights> {
   Ok(weights)
 }
 
-/// List the root-level entries of `dir` whose file name matches `pred` as
-/// root-level [`DiscoveredShard`]s (no key prefix), sorted by path.
+/// Run one `glob` pass under `dir` for the relative `pattern_suffix` (e.g.
+/// `"**/model*.safetensors"` or `"weight*.safetensors"`), returning the matched
+/// shards — each with its mlx-embeddings `<folder>.` key prefix already computed
+/// — sorted by full path.
 ///
-/// The non-recursive collector used for mlx-embeddings' back-compat
-/// `weight*.safetensors` glob (which has no `**`). A non-readable directory
-/// (absent / not a directory / permission) maps to [`Error::Backend`]; only
-/// regular files (after symlink resolution) are considered.
-fn collect_shards_root(dir: &Path, pred: impl Fn(&str) -> bool) -> Result<Vec<DiscoveredShard>> {
-  let entries = std::fs::read_dir(dir).map_err(|e| Error::Backend {
-    message: format!("cannot read model directory {}: {e}", dir.display()),
+/// This is the faithful port of `mlx_embeddings.utils.load_model`'s
+/// `glob.glob(str(model_path / "<suffix>"), recursive=True)`. Using the
+/// maintained [`glob`] crate (`rust-lang/glob`) — rather than a hand-rolled
+/// recursive directory walk — is what makes the Python-`glob` corner semantics
+/// faithful by construction:
+///
+/// - **`**` recursion** is built into the pattern grammar: with the
+///   `"**/model*.safetensors"` suffix `glob` matches `model*.safetensors` at the
+///   model dir itself *and* in every subdirectory, exactly Python's
+///   `recursive=True`. The legacy `"weight*.safetensors"` suffix has no `**`, so
+///   it is root-only — matching `utils.py` line 163.
+/// - **`include_hidden=False`** (Python `glob`'s default) is
+///   [`MatchOptions::require_literal_leading_dot`]` = true`: a path component
+///   whose name starts with `.` is *not* matched by `*`/`**`/`?`/`[...]`, so a
+///   `.hidden/model.safetensors` directory shard and a root `.model.safetensors`
+///   file shard are both excluded — a `.`-prefixed component would have to
+///   appear *literally* in the pattern (it does not) to match.
+/// - **`require_literal_separator` is forced `true`** by `glob_with` regardless
+///   of the field, so a `*` never matches across a `/` — `model*.safetensors`
+///   matches one path component, as in Python.
+/// - **`case_sensitive` is `true`**: `model.safetensors` is matched, `MODEL.SAFETENSORS`
+///   is not — Python `glob` is case-sensitive on a case-sensitive filesystem.
+/// - **Directory symlinks are followed, and `scandir`/`OSError`s are
+///   suppressed**, by the crate: a symlinked component directory is descended
+///   (its shard discovered with the *link* name as the immediate-parent prefix),
+///   a symlink **cycle** terminates (the crate does not recurse forever), and an
+///   unreadable nested directory yields a per-entry [`glob::GlobError`] that is
+///   **skipped** here (`continue`) so one bad subdirectory never aborts a load
+///   whose real shards live elsewhere — matching Python `glob`, which swallows
+///   the `scandir` `OSError`. (`**` recursion has no separate depth cap: the
+///   crate bounds the walk itself, so the old hand-rolled `MAX_WEIGHT_DIR_DEPTH`
+///   sanity ceiling is gone — there is no unbounded *our-code* recursion left to
+///   guard.)
+///
+/// **Fail-loud on a `model*.safetensors`-named non-regular entry.** `glob`'s
+/// match is **name-based** (like Python `glob`): a *directory*, a
+/// symlink-to-directory, a FIFO/device, or a **dangling symlink** named
+/// `model.safetensors` *is* yielded by the pattern. Each yielded path is
+/// therefore `stat`-ed here (via [`std::fs::metadata`], which dereferences
+/// symlinks) and a non-regular — or unresolvable — target is rejected with a
+/// recoverable [`Error::Backend`] **naming the offending path**. This is the
+/// explicit-stat form of the prior rounds' fail-loud contract: a broken
+/// primary shard must fail the load, never silently vanish and let
+/// [`load_weights`] degrade to a stale `weight*.safetensors` fallback. (HF Hub
+/// snapshots store shards as symlinks into `blobs/<hash>`; a *valid* such
+/// symlink resolves to a regular file and passes.)
+///
+/// **Non-UTF-8 model directory.** `glob_with` takes a `&str` pattern and
+/// internally `unwrap()`s `Path::to_str()` on it, so a model directory whose
+/// path is not valid UTF-8 would *panic* inside the crate. That is rejected up
+/// front here with a recoverable [`Error::Backend`] (a non-UTF-8 *model dir
+/// path* — distinct from a non-UTF-8 *file name within* it, which the host
+/// filesystem on the supported macOS/arm64 target does not permit and which
+/// `glob` would in any case simply not match). The literal `dir` portion of the
+/// pattern is [`glob::Pattern::escape`]d so a real directory name containing a
+/// glob metacharacter (`*`, `?`, `[`, `]`) is matched literally, not
+/// interpreted — only the `pattern_suffix` carries pattern metacharacters.
+///
+/// A malformed *pattern* (a [`glob::PatternError`]) would be a bug in this
+/// fixed, escaped pattern, not untrusted input, and maps to [`Error::Backend`].
+fn collect_glob_shards(dir: &Path, pattern_suffix: &str) -> Result<Vec<DiscoveredShard>> {
+  // `glob_with` takes a `&str` and `unwrap()`s `to_str()` internally — reject a
+  // non-UTF-8 model dir path here so that becomes a recoverable error, not a
+  // panic inside the crate.
+  let dir_str = dir.to_str().ok_or_else(|| Error::Backend {
+    message: format!(
+      "model directory path {} is not valid UTF-8; cannot glob for weight shards",
+      dir.display()
+    ),
   })?;
+
+  // The literal model-dir prefix is escaped so a metacharacter in a real
+  // directory name (`*`, `?`, `[`, `]`) is matched verbatim; only
+  // `pattern_suffix` contributes pattern metacharacters (`**`, `model*`).
+  let pattern = format!("{}/{}", glob::Pattern::escape(dir_str), pattern_suffix);
+
+  // `require_literal_leading_dot: true` == Python glob's default
+  // `include_hidden=False` (a `.`-prefixed component is excluded).
+  // `case_sensitive: true` matches Python glob on a case-sensitive filesystem.
+  // `require_literal_separator` is forced `true` by `glob_with` regardless.
+  let options = MatchOptions {
+    case_sensitive: true,
+    require_literal_separator: false,
+    require_literal_leading_dot: true,
+  };
+
+  let matches = glob_with(&pattern, options).map_err(|e| Error::Backend {
+    // A `PatternError` from this fixed, escaped pattern would be an internal
+    // bug, not untrusted input — surface it as a recoverable error all the same.
+    message: format!("internal error building weight-shard glob pattern {pattern:?}: {e}"),
+  })?;
+
   let mut out = Vec::new();
-  for entry in entries {
-    let entry = entry.map_err(|e| Error::Backend {
-      message: format!("cannot read an entry of {}: {e}", dir.display()),
-    })?;
-    let name = entry.file_name();
-    let Some(name) = name.to_str() else { continue };
-    if !pred(name) {
-      continue;
-    }
-    // Resolve via `fs::metadata` (follows symlinks) and gate on the target
-    // being a regular file — a hostile dir could name a subdir / FIFO
-    // `weight.safetensors`, on which the IO loader would fail opaquely.
-    match std::fs::metadata(entry.path()) {
-      Ok(m) if m.is_file() => out.push(DiscoveredShard {
-        path: entry.path(),
-        prefix: None,
-      }),
-      Ok(_) => continue,
+  for entry in matches {
+    // Python `glob` swallows the `scandir` `OSError` of an unreadable
+    // directory; the crate surfaces it as a per-entry `GlobError`. Skip just
+    // that entry (the iterator continues over the rest) so one unreadable
+    // nested directory never aborts a load whose real shards live elsewhere.
+    let Ok(path) = entry else { continue };
+
+    // `glob`'s match is name-based: a directory / symlink-to-dir / FIFO /
+    // device / dangling symlink NAMED `model*.safetensors` is yielded. Stat the
+    // yielded path (`fs::metadata` dereferences symlinks) and fail loudly on a
+    // non-regular — or unresolvable — target, so a broken primary shard fails
+    // the load instead of silently vanishing into a stale `weight*.safetensors`
+    // fallback.
+    match std::fs::metadata(&path) {
+      Ok(m) if m.is_file() => {}
+      Ok(_) => {
+        return Err(Error::Backend {
+          message: format!(
+            "weight shard {} is a non-regular entry (directory / FIFO / device / socket); \
+             refusing to load",
+            path.display()
+          ),
+        });
+      }
       Err(e) => {
         return Err(Error::Backend {
-          message: format!("cannot stat {} in {}: {e}", name, dir.display()),
+          message: format!(
+            "weight shard {} cannot be resolved (broken symlink / unreadable target): {e}",
+            path.display()
+          ),
         });
       }
     }
-  }
-  out.sort_by(|a, b| a.path.cmp(&b.path));
-  Ok(out)
-}
 
-/// Recursively discover every file under `root` whose file name matches `pred`,
-/// returning [`DiscoveredShard`]s (with the mlx-embeddings `<folder>.` prefix
-/// already computed) sorted by full path.
-///
-/// Faithfully mirrors mlx-embeddings' `load_model` glob —
-/// `glob.glob(model_path / "**/model*.safetensors", recursive=True)` with the
-/// default `include_hidden=False` — matching three documented `glob` behaviors
-/// the naive walk got wrong ([Python `glob`](https://docs.python.org/3/library/glob.html)):
-///
-/// 1. **Scan errors are suppressed.** `glob` swallows the `OSError` from a
-///    `scandir` it cannot read; an unreadable subdirectory is **skipped** and
-///    the rest of the walk continues, rather than failing the whole load (a
-///    single unreadable nested dir must not abort a model with valid shards
-///    elsewhere). This suppression is for unreadable *directories* and for
-///    entries whose name does **not** match `pred` (irrelevant non-shard
-///    files/dirs) only — a dirent **named** like a shard whose target cannot be
-///    resolved (a dangling symlink, or a non-regular target) is **not**
-///    suppressed: it is a recoverable [`Error`] so a broken `model.safetensors`
-///    fails the load loudly instead of silently vanishing (which would let
-///    `load_weights` fall back to a stale `weight*.safetensors`).
-/// 2. **Hidden path components are excluded.** With `include_hidden=False`
-///    (`glob`'s default), `**` does not match any path component whose name
-///    starts with `.`. We therefore skip every dot-prefixed entry — both
-///    *directories* (do not descend, e.g. a stale `.ipynb_checkpoints/` whose
-///    `model.safetensors` could otherwise override a real component's weights
-///    via the immediate-parent prefix scheme) and *files* (a `.model.safetensors`
-///    is excluded even though it would pass `pred`).
-/// 3. **Symlinked directories are followed**, with cycle protection. `**`
-///    follows directory symlinks, so we resolve each entry via `fs::metadata`
-///    (which dereferences symlinks) and descend symlink-to-dir entries too —
-///    guarding against symlink loops with a **recursion-stack** set of
-///    **canonicalized** directory paths ([`std::fs::canonicalize`]): a directory
-///    whose real path is already on the current descent stack (a true cycle —
-///    the canonical path is an *ancestor*) is skipped, so a symlink cycle
-///    terminates instead of recursing forever. The canonical path is **removed
-///    from the stack after** the recursive call returns, so two distinct walked
-///    paths that alias the **same** real directory (`real_text_model/` itself
-///    plus a sibling `text_model -> real_text_model`, or two component symlinks
-///    sharing one target) are **each** walked with their own as-walked prefix —
-///    a global never-removed visited-set would instead drop whichever alias
-///    `read_dir` reached second, losing required tensors with a
-///    filesystem-iteration-order-dependent surviving prefix.
-///    [`MAX_WEIGHT_DIR_DEPTH`] remains a secondary, constant stack bound for a
-///    (symlink-free) pathologically deep tree.
-///
-/// A matched file is still gated on its resolved target being a **regular file**
-/// — but, per (1), a hostile dir naming a FIFO / device / directory / dangling
-/// symlink `model.safetensors` fails the load with a recoverable [`Error`]
-/// rather than being silently skipped (HF Hub snapshots store shards as symlinks
-/// into `blobs/<hash>`, which this follows). For each match the prefix is
-/// `Some(parent.name)` when the file's immediate parent (as **walked** — the
-/// symlink name, not its canonicalized target, matching `glob`'s returned path)
-/// is **not** `root`, else `None` (mlx-embeddings' `Path(wf).parent != model_path`
-/// test using `Path(wf).parent.name`).
-fn collect_shards_recursive(
-  root: &Path,
-  pred: impl Fn(&str) -> bool,
-) -> Result<Vec<DiscoveredShard>> {
-  let mut out = Vec::new();
-  // Recursion-stack cycle-guard: the canonicalized paths of the directories
-  // currently being descended (root + every ancestor of `dir`). Seed it with
-  // `root`'s real path so a symlink pointing straight back to the model root is
-  // caught as a cycle on first encounter. If `root` itself cannot be
-  // canonicalized the per-directory inserts below still catch every other cycle
-  // (a symlink to any *descended* ancestor).
-  let mut stack: HashSet<PathBuf> = HashSet::new();
-  if let Ok(canon_root) = std::fs::canonicalize(root) {
-    stack.insert(canon_root);
-  }
-  walk_shards(root, root, &pred, 0, &mut stack, &mut out)?;
-  out.sort_by(|a, b| a.path.cmp(&b.path));
-  Ok(out)
-}
-
-/// One directory level of [`collect_shards_recursive`]'s walk. `root` is the
-/// model directory (for the prefix decision); `dir` is the directory currently
-/// being read (the path **as walked**, so a symlinked component keeps its link
-/// name); `stack` is the recursion-stack cycle-guard — the canonicalized paths
-/// of `root` and every directory currently being descended (inserted before a
-/// recursive call, removed after it returns); `depth` is the level below
-/// `root`.
-fn walk_shards(
-  root: &Path,
-  dir: &Path,
-  pred: &impl Fn(&str) -> bool,
-  depth: usize,
-  stack: &mut HashSet<PathBuf>,
-  out: &mut Vec<DiscoveredShard>,
-) -> Result<()> {
-  if depth > MAX_WEIGHT_DIR_DEPTH {
-    return Err(Error::Backend {
-      message: format!(
-        "model directory {} nests deeper than the {MAX_WEIGHT_DIR_DEPTH}-level cap; \
-         refusing to recurse",
-        root.display()
-      ),
-    });
-  }
-  // `glob` suppresses the `scandir` `OSError` of a directory it cannot read:
-  // skip this whole level (the caller continues over its siblings) instead of
-  // failing the load. (`collect_shards_recursive` seeds the root, so an
-  // unreadable root simply yields no shards → the back-compat / not-found path.)
-  let Ok(entries) = std::fs::read_dir(dir) else {
-    return Ok(());
-  };
-  for entry in entries {
-    // A per-dirent read error is likewise swallowed (skip just this entry).
-    let Ok(entry) = entry else { continue };
-    let name = entry.file_name();
-    let Some(name) = name.to_str() else { continue };
-    // `include_hidden=False`: `**` excludes ANY path component starting with `.`
-    // — skip dot-prefixed entries whether file or dir (a `.ipynb_checkpoints/`
-    // is not descended; a `.model.safetensors` is not matched).
-    if name.starts_with('.') {
-      continue;
-    }
-    let path = entry.path();
-    let name_matches = pred(name);
-    // Resolve the dirent through symlinks (`fs::metadata` dereferences) so a
-    // symlink-to-dir is descended and a symlink-to-file is gated as a file —
-    // matching `glob`'s `**`, which follows directory symlinks.
-    //
-    // Suppression of a resolution failure is gated on the FILENAME predicate,
-    // because `glob`'s `model*.safetensors` match is name-based: a dirent NAMED
-    // like a shard whose target is unresolvable (a dangling symlink) or
-    // non-regular must NOT vanish — that would let `load_weights` silently fall
-    // back to a stale root `weight*.safetensors`. A non-shard-named entry whose
-    // target can't be resolved is irrelevant and IS skipped (it can't be a
-    // descend target or a match either way).
-    let meta = match std::fs::metadata(&path) {
-      Ok(meta) => meta,
-      Err(e) => {
-        if name_matches {
-          // A `model*.safetensors`-named dirent that is a dangling symlink (or
-          // otherwise unresolvable) — fail the load loudly with a recoverable
-          // error, like `glob` yielding a path `load_safetensors` then rejects.
-          return Err(Error::Backend {
-            message: format!(
-              "weight shard {} cannot be resolved (broken symlink / unreadable target): {e}",
-              path.display()
-            ),
-          });
-        }
-        // A non-shard entry whose target can't be resolved — irrelevant, skip.
-        continue;
-      }
-    };
-    // Dispatch on the two independent axes — does the FILENAME match the
-    // `model*.safetensors` predicate, and what is the (symlink-resolved) target
-    // kind. The name-match arms are decided FIRST, before directory descent,
-    // because `glob`'s `model*.safetensors` match is name-based: a dirent NAMED
-    // like a shard whose target is anything but a regular file (a directory, a
-    // symlink-to-dir, a FIFO, a device) is a path `glob` would yield and
-    // `load_safetensors` would then reject — it must fail the load loudly, not
-    // be descended-into or skipped. Descending a `model.safetensors`-named
-    // directory would silently drop the canonical shard name into a stale
-    // `weight*.safetensors` fallback.
-    if name_matches && !meta.is_file() {
-      // A `model*.safetensors`-named entry whose target is non-regular (a
-      // directory, a symlink-to-dir, a FIFO, a device, a socket) — fail loudly
-      // rather than descend-into or silently skip, for the same reason a
-      // dangling symlink does: the canonical shard name must not vanish into a
-      // stale `weight*.safetensors` fallback.
-      return Err(Error::Backend {
-        message: format!(
-          "weight shard {} is a model*.safetensors-named non-regular entry \
-           (directory / FIFO / device / socket); refusing to load",
-          path.display()
-        ),
-      });
-    }
-    if !name_matches && meta.is_dir() {
-      // Cycle guard (recursion-stack): descend a directory (real or symlinked)
-      // unless its real path is already on the CURRENT descent stack — i.e. it
-      // is an ancestor, a true symlink cycle. `canonicalize` resolves symlinks +
-      // `..`; if it fails (e.g. a freshly-broken link mid-walk) the dir is
-      // skipped rather than risking an unguarded descent. `insert` returns false
-      // when the canonical path is already on the stack → a symlink loop
-      // terminates here. The canonical path is REMOVED after the recursive call
-      // so a sibling alias to the SAME real directory is still walked (each with
-      // its own as-walked prefix) — only an ancestor blocks descent.
-      let Ok(canon) = std::fs::canonicalize(&path) else {
-        continue;
-      };
-      if !stack.insert(canon.clone()) {
-        continue;
-      }
-      // Descend with the path AS WALKED (`path`, keeping any symlink name) so a
-      // shard's immediate-parent prefix is the link name, matching `glob`'s
-      // returned path; the canonical form is only the cycle-guard key.
-      let res = walk_shards(root, &path, pred, depth + 1, stack, out);
-      // Pop this directory off the recursion stack whether the descent
-      // succeeded or errored, so the guard reflects only live ancestors.
-      stack.remove(&canon);
-      res?;
-      continue;
-    }
-    if !name_matches {
-      // A non-shard-named, non-directory entry — irrelevant to
-      // `model*.safetensors`, skip.
-      continue;
-    }
-    // `name_matches && meta.is_file()` — a genuine shard.
-    // mlx-embeddings: `folder_name = Path(wf).parent.name` and apply the prefix
-    // iff `Path(wf).parent != model_path`. The immediate parent's name
-    // (`a/b/model.safetensors` → `b`), never the full relative path.
+    // mlx-embeddings: `folder_name = Path(wf).parent.name`, applied iff
+    // `Path(wf).parent != model_path` — the IMMEDIATE parent's name
+    // (`a/b/model.safetensors` → `b`), never the full relative path. `wf` is the
+    // glob-returned path, so a symlinked component dir contributes its LINK
+    // name (the path glob walked), not the canonical target.
     let prefix = match path.parent() {
-      Some(parent) if parent != root => parent
+      Some(parent) if parent != dir => parent
         .file_name()
         .and_then(|n| n.to_str())
         .map(str::to_owned),
@@ -869,7 +755,11 @@ fn walk_shards(
     };
     out.push(DiscoveredShard { path, prefix });
   }
-  Ok(())
+
+  // `glob` yields in alphabetical order already, but sort explicitly so the
+  // deterministic-merge contract does not silently depend on that.
+  out.sort_by(|a, b| a.path.cmp(&b.path));
+  Ok(out)
 }
 
 /// Read `<dir>/config.json` **once**, returning the canonicalized
@@ -2045,10 +1935,13 @@ mod tests {
   }
 
   // ───────── glob-faithful recursive-walk tests (Codex review) ─────────
-  // `walk_shards` mirrors `glob.glob("**/model*.safetensors", recursive=True,
-  // include_hidden=False)`: hidden (`.`-prefixed) components are excluded,
-  // directory symlinks are followed (with cycle protection), and a `scandir`
-  // error on a nested directory is suppressed.
+  // `collect_glob_shards` drives `glob::glob_with` with
+  // `MatchOptions { require_literal_leading_dot: true, .. }` — the faithful
+  // port of `glob.glob("**/model*.safetensors", recursive=True,
+  // include_hidden=False)`: hidden (`.`-prefixed) components are excluded, `**`
+  // recursion + directory-symlink follow (with cycle termination) + `scandir`
+  // -error suppression are the `glob` crate's job, and a `model*.safetensors`
+  // -named non-regular entry is rejected by the per-match stat gate.
 
   #[test]
   fn load_weights_excludes_hidden_directory_shards() {
@@ -2138,9 +2031,24 @@ mod tests {
   #[cfg(unix)]
   #[test]
   fn load_weights_symlink_cycle_terminates() {
-    // A directory symlink pointing to an ANCESTOR creates a cycle. The
-    // canonicalized-path visited-set must make the walk terminate (no infinite
-    // loop / stack overflow) and still discover the legitimate shards.
+    // A directory symlink pointing to an ANCESTOR creates a cycle. The load
+    // must TERMINATE — never hang or stack-overflow — and still discover the
+    // legitimate shards.
+    //
+    // Termination here is the `glob` crate's (and Python `glob`'s) behavior:
+    // `**` follows directory symlinks and neither side detects the cycle
+    // structurally — the walk down `sub/loop/sub/loop/...` simply stops once
+    // the OS `ELOOP` limit refuses to resolve a path that deep. The prior
+    // hand-rolled walk additionally deduped the cycle with a recursion-stack of
+    // canonicalized paths, yielding *exactly* the 2 underlying shards; that
+    // dedup was a DIVERGENCE from Python `glob` (Python `glob` does NOT dedup a
+    // symlink cycle — it relies on `ELOOP` just like this). The structural port
+    // to the `glob` crate faithfully drops that divergence, so the merged map
+    // legitimately also carries the cycle's shards under extra `<folder>.`
+    // prefixes (e.g. `loop.root.weight`) — the same keys Python `glob` +
+    // `load_model`'s immediate-parent prefix would produce. The load-bearing
+    // contract is unchanged: the load terminates, and every real tensor is
+    // present and correct.
     let dir = fresh_dir("symlink-cycle");
     write_one_tensor(&dir.join("model.safetensors"), "root.weight");
     let sub = dir.join("sub");
@@ -2149,12 +2057,32 @@ mod tests {
     // `sub/loop` points back at the model root → `root/sub/loop/sub/loop/...`.
     std::os::unix::fs::symlink(&dir, sub.join("loop")).unwrap();
 
-    // The assertion is implicitly "this returns at all" — a missing cycle guard
-    // would hang or stack-overflow here.
+    // `expect` (rather than a hang / stack overflow) IS the termination
+    // assertion — a non-terminating cycle would never reach it.
     let weights = load_weights(&dir).expect("a symlink cycle must terminate, not hang");
-    assert!(weights.contains_key("root.weight"));
-    assert!(weights.contains_key("sub.nested.weight"));
-    assert_eq!(weights.len(), 2);
+    // The two real shards are discovered, verbatim and immediate-parent-prefixed.
+    assert!(
+      weights.contains_key("root.weight"),
+      "the root shard must load; got {:?}",
+      weights.keys().collect::<Vec<_>>()
+    );
+    assert!(
+      weights.contains_key("sub.nested.weight"),
+      "the nested shard must load with its immediate-parent prefix; got {:?}",
+      weights.keys().collect::<Vec<_>>()
+    );
+    // The cycle's extra prefixed aliases (`loop.…`) are expected and harmless —
+    // they reference the SAME underlying tensors, so every value in the merged
+    // map is one of the two single-element tensors `write_one_tensor` wrote.
+    for (key, value) in &weights {
+      assert_eq!(
+        value.shape(),
+        vec![2],
+        "every merged weight (including a cycle alias) must be a real shard \
+         tensor; key {key:?} has shape {:?}",
+        value.shape()
+      );
+    }
   }
 
   #[cfg(unix)]
@@ -2335,6 +2263,102 @@ mod tests {
       weights.keys().collect::<Vec<_>>()
     );
     assert_eq!(weights.len(), 1);
+  }
+
+  #[test]
+  fn load_weights_glob_recurses_deeply_and_excludes_hidden() {
+    // Combined `**`-recursion + `require_literal_leading_dot` exclusion: the
+    // `glob` `**` matches `model*.safetensors` at the root AND in arbitrarily
+    // deep subdirectories, while a `.`-prefixed component ANYWHERE on the path
+    // — whether a hidden directory, a hidden FILE, or a hidden directory ABOVE
+    // an otherwise-normal shard — is excluded (`include_hidden=False`).
+    let dir = fresh_dir("glob-deep-hidden");
+    // (a) a root shard — `**` matches the model dir itself.
+    write_one_tensor(&dir.join("model.safetensors"), "root.weight");
+    // (b) a DEEPLY nested shard `a/b/c/model.safetensors` — `**` recurses with
+    //     no depth cap; the prefix is the IMMEDIATE parent (`c`).
+    let deep = dir.join("a").join("b").join("c");
+    std::fs::create_dir_all(&deep).unwrap();
+    write_one_tensor(&deep.join("model.safetensors"), "deep.weight");
+    // (c) a hidden DIRECTORY shard — excluded (the `.`-component is not
+    //     descended).
+    let hidden_dir = dir.join(".checkpoints");
+    std::fs::create_dir_all(&hidden_dir).unwrap();
+    write_one_tensor(&hidden_dir.join("model.safetensors"), "hidden_dir.weight");
+    // (d) a hidden FILE shard at the root — excluded (the leading `.` makes it
+    //     a hidden path component `**`/`*` will not match).
+    write_one_tensor(&dir.join(".model.safetensors"), "hidden_file.weight");
+    // (e) a normal shard under a hidden ANCESTOR — excluded: a `.`-component
+    //     anywhere on the path disqualifies the whole match.
+    let under_hidden = dir.join(".secret").join("text_model");
+    std::fs::create_dir_all(&under_hidden).unwrap();
+    write_one_tensor(
+      &under_hidden.join("model.safetensors"),
+      "under_hidden.weight",
+    );
+
+    let weights = load_weights(&dir).expect("deep recursive glob load");
+    assert!(
+      weights.contains_key("root.weight"),
+      "the root shard must load (** matches the model dir itself); got {:?}",
+      weights.keys().collect::<Vec<_>>()
+    );
+    assert!(
+      weights.contains_key("c.deep.weight"),
+      "the deeply-nested shard must load, prefixed by its immediate parent `c`; got {:?}",
+      weights.keys().collect::<Vec<_>>()
+    );
+    // None of the hidden-path shards may appear, under any prefix spelling.
+    for forbidden in [
+      "hidden_dir.weight",
+      ".checkpoints.hidden_dir.weight",
+      "checkpoints.hidden_dir.weight",
+      "hidden_file.weight",
+      "under_hidden.weight",
+      "text_model.under_hidden.weight",
+    ] {
+      assert!(
+        !weights.contains_key(forbidden),
+        "a `.`-prefixed path component must exclude its shard \
+         (require_literal_leading_dot); leaked {forbidden:?} in {:?}",
+        weights.keys().collect::<Vec<_>>()
+      );
+    }
+    // Exactly the two non-hidden shards.
+    assert_eq!(weights.len(), 2);
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn load_weights_non_utf8_model_dir_is_recoverable_error() {
+    // `glob_with` takes a `&str` and `unwrap()`s `Path::to_str()` internally,
+    // so a non-UTF-8 model directory path would PANIC inside the crate. The
+    // up-front `dir.to_str()` guard turns that into a recoverable
+    // `Error::Backend` instead — the check fires before any filesystem I/O, so
+    // the directory need not (and, on a UTF-8-enforcing host filesystem,
+    // cannot) actually exist on disk.
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+    // A directory path with a non-UTF-8 byte (0xFF) in its final component.
+    let mut raw: Vec<u8> = b"/tmp/mlxrs-emb-non-utf8-".to_vec();
+    raw.push(0xFF);
+    let bad_dir = PathBuf::from(OsStr::from_bytes(&raw));
+    assert!(
+      bad_dir.to_str().is_none(),
+      "test precondition: the constructed path must be non-UTF-8"
+    );
+
+    let Err(err) = load_weights(&bad_dir) else {
+      panic!("a non-UTF-8 model dir path must be a recoverable error, not a panic");
+    };
+    assert!(
+      matches!(err, Error::Backend { .. }),
+      "expected a recoverable Backend error; got {err:?}"
+    );
+    assert!(
+      err.to_string().contains("not valid UTF-8"),
+      "the error should explain the non-UTF-8 path rejection; got: {err}"
+    );
   }
 
   #[test]
