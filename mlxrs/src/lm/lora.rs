@@ -180,10 +180,36 @@ impl Default for FineTuneType {
   }
 }
 
-/// The `lora_parameters` sub-block of `adapter_config.json` — mlx-lm
-/// `config.lora_parameters` (`tuner/utils.py:133`, a dict with `rank` /
-/// `scale` / optional `keys` / `dropout` / `alpha`) and swift
-/// `LoRAConfiguration.LoRAParameters` (`LoRAContainer.swift:34-45`).
+/// The in-memory low-rank parameter block — the normalized representation of
+/// `adapter_config.json`'s low-rank settings, regardless of which on-disk
+/// *shape* the config used.
+///
+/// # Two on-disk shapes, one in-memory form
+///
+/// `adapter_config.json` comes in **two** structurally different shapes, and
+/// [`LoraConfig`]'s custom [`Deserialize`](serde::Deserialize) bridges both
+/// into this single [`LoraParameters`]:
+///
+/// - **mlx-lm-native** — the low-rank settings live in a *nested*
+///   `lora_parameters` object: `{ "fine_tune_type": …, "num_layers": N,
+///   "lora_parameters": { "rank": R, "scale": S, "dropout": D, "keys": […] } }`
+///   (mlx-lm `config.lora_parameters`, `tuner/utils.py:133`; swift
+///   `LoRAConfiguration.LoRAParameters`, `LoRAContainer.swift:34-45`). Its keys
+///   are `rank` / `scale` / `alpha` / `keys` / `dropout`.
+/// - **PEFT / HuggingFace** — a real `peft` `LoraConfig` has **no**
+///   `lora_parameters` nesting; its fields are *flat at the top level*:
+///   `{ "peft_type": "LORA", "r": R, "lora_alpha": A, "target_modules": […],
+///   "lora_dropout": D, "bias": … }`. PEFT names the rank `r`, the alpha
+///   `lora_alpha`, the target allowlist `target_modules`, the dropout
+///   `lora_dropout`.
+///
+/// The two are detected and bridged in [`LoraConfig`]'s `Deserialize` (see its
+/// docs): a top-level `lora_parameters` object selects the mlx-lm-native read;
+/// top-level `r` / `lora_alpha` / `target_modules` (and/or `peft_type`) with no
+/// `lora_parameters` selects the PEFT read. The PEFT mapping is `r` → [`rank`],
+/// `lora_alpha` → [`alpha`], `target_modules` → [`keys`], `lora_dropout` →
+/// [`dropout`]. Either way the result is *this* struct — the rest of the
+/// module is shape-agnostic.
 ///
 /// `scale` is the literal low-rank scale (mlx-lm `config["scale"]`). When
 /// `alpha` is present (the PEFT/HF convention `scale = alpha / rank`), it
@@ -194,31 +220,43 @@ impl Default for FineTuneType {
 /// auto-discovery, `tuner/utils.py:85-101`). `dropout` is carried for config
 /// round-trip fidelity but **ignored at inference** (an inference adapter's
 /// dropout is the identity — see the [module docs](self)).
+///
+/// [`rank`]: LoraParameters::rank
+/// [`alpha`]: LoraParameters::alpha
+/// [`keys`]: LoraParameters::keys
+/// [`dropout`]: LoraParameters::dropout
 #[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct LoraParameters {
-  /// Low-rank dimension `r`. Deserializes from `rank` (mlx-lm
-  /// `config["rank"]`) **or** the PEFT/HF key `r` (PEFT-trained adapters name
-  /// it `r`, e.g. `"r": 16`) — mlx-lm-trained configs use `rank`, so accept
-  /// both. Defaults to [`DEFAULT_LORA_RANK`] when neither is present.
-  #[serde(default = "default_rank", alias = "r")]
+  /// Low-rank dimension `r`. In the mlx-lm-native nested shape this is the
+  /// `lora_parameters.rank` key; in the PEFT flat shape it is the top-level
+  /// `r` key — [`LoraConfig`]'s `Deserialize` maps whichever applies into here.
+  /// Defaults to [`DEFAULT_LORA_RANK`] when neither shape supplies it.
+  #[serde(default = "default_rank")]
   pub rank: i32,
   /// Literal low-rank scale (mlx-lm `config["scale"]`). Used when `alpha` is
   /// absent; defaults to [`DEFAULT_LORA_SCALE`] when neither `scale` nor
-  /// `alpha` is present.
+  /// `alpha` is present. The PEFT shape has no literal-scale field (PEFT always
+  /// derives the scale from `lora_alpha / r`), so a PEFT-bridged config leaves
+  /// this `None`.
   #[serde(default)]
   pub scale: Option<f32>,
-  /// PEFT/HF `lora_alpha` — if present, the effective scale is `alpha / rank`
-  /// and this **takes precedence** over a literal `scale` (PEFT's `scaling =
-  /// lora_alpha / r`). Carried so adapters trained with the HF convention load
-  /// with the correct scale.
-  #[serde(default, alias = "lora_alpha")]
+  /// The alpha — if present, the effective scale is `alpha / rank` and this
+  /// **takes precedence** over a literal `scale` (PEFT's `scaling = lora_alpha
+  /// / r`). In the mlx-lm-native nested shape this is `lora_parameters.alpha`;
+  /// in the PEFT flat shape it is the top-level `lora_alpha` key.
+  #[serde(default)]
   pub alpha: Option<f32>,
   /// Explicit target-projection allowlist (suffix paths like
-  /// `"self_attn.q_proj"`). `None` ⇒ adapt every eligible linear.
+  /// `"self_attn.q_proj"`). `None` ⇒ adapt every eligible linear. In the
+  /// mlx-lm-native shape this is `lora_parameters.keys`; in the PEFT flat
+  /// shape it is the top-level `target_modules` list (PEFT's list-of-strings
+  /// "ends-with" match is exactly [`linear_to_lora_layers`]'s `keys` suffix
+  /// match — see [`LoraConfig`]'s `Deserialize`).
   #[serde(default)]
   pub keys: Option<Vec<String>>,
   /// Training dropout — carried for round-trip fidelity, **ignored at
-  /// inference** (see module docs).
+  /// inference** (see module docs). The mlx-lm-native `lora_parameters.dropout`
+  /// or the PEFT top-level `lora_dropout`.
   #[serde(default)]
   pub dropout: Option<f32>,
 }
@@ -271,38 +309,260 @@ impl LoraParameters {
 
 /// The `adapter_config.json` schema — mlx-lm's adapter config
 /// (`tuner/utils.py:127-136`: `fine_tune_type`, `num_layers`,
-/// `lora_parameters`) and swift `LoRAConfiguration` (`LoRAContainer.swift:27-66`).
+/// `lora_parameters`) and swift `LoRAConfiguration` (`LoRAContainer.swift:27-66`),
+/// **plus** the PEFT / HuggingFace `peft` `LoraConfig` shape.
+///
+/// # Two on-disk shapes
+///
+/// A LoRA `adapter_config.json` is written in one of **two** structurally
+/// different shapes, and this type's custom [`Deserialize`](serde::Deserialize)
+/// accepts both:
+///
+/// - **mlx-lm-native** — the low-rank settings are *nested* under a
+///   `lora_parameters` object:
+///   `{ "fine_tune_type": …, "num_layers": N, "lora_parameters": { "rank": R,
+///   "scale": S, "dropout": D, "keys": […] } }`.
+/// - **PEFT / HuggingFace** — a real `peft` `LoraConfig` has **no**
+///   `lora_parameters` nesting; the same settings sit *flat at the top level*
+///   under PEFT's own names:
+///   `{ "peft_type": "LORA", "r": R, "lora_alpha": A, "target_modules": […],
+///   "lora_dropout": D, "bias": … }`.
+///
+/// `Deserialize` (see its own docs below) **detects** the shape and bridges it
+/// into the single in-memory representation here — a top-level `lora_parameters`
+/// object ⇒ the nested mlx-lm-native read; top-level `r` / `lora_alpha` /
+/// `target_modules` (and/or `peft_type`) with no `lora_parameters` ⇒ the PEFT
+/// read, mapping `r` → rank, `lora_alpha` → alpha, `target_modules` → keys,
+/// `lora_dropout` → dropout. Everything downstream ([`linear_to_lora_layers`],
+/// [`load_adapters`]) is shape-agnostic — it sees only the normalized
+/// [`LoraParameters`].
 ///
 /// Forward-compatible by design (no `deny_unknown_fields`): an adapter config
 /// carrying extra training-only keys (`optimizer`, `learning_rate`, `data`, …)
+/// or extra PEFT keys (`task_type`, `base_model_name_or_path`, `bias`, …)
 /// parses cleanly — exactly as mlx-lm reads it into a `SimpleNamespace` and
 /// ignores the unused keys.
-#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct LoraConfig {
   /// `lora` / `dora` / `full` (mlx-lm `fine_tune_type`). Defaults to
-  /// [`FineTuneType::Lora`] (mlx-lm's `getattr(..., "lora")`).
-  #[serde(default)]
+  /// [`FineTuneType::Lora`] (mlx-lm's `getattr(..., "lora")`). A PEFT config
+  /// has no `fine_tune_type` key, so a PEFT-bridged config is always
+  /// [`FineTuneType::Lora`] here (DoRA is signalled by PEFT's `use_dora`).
   pub fine_tune_type: FineTuneType,
   /// Number of trailing decoder blocks adapted (mlx-lm `config.num_layers`).
   /// Defaults to [`DEFAULT_NUM_LAYERS`]. A **non-positive** value selects ALL
   /// blocks, not none — mlx-lm's `model.layers[-max(num_layers, 0):]`
   /// (`tuner/utils.py:103`) reduces to `model.layers[-0:]` == `model.layers[0:]`
   /// when `num_layers <= 0` (the Python `-0` slice quirk), so `num_layers: -1`
-  /// (and `0`) adapt every decoder block.
-  #[serde(default = "default_num_layers")]
+  /// (and `0`) adapt every decoder block. A PEFT config has no `num_layers`
+  /// key (PEFT selects by `target_modules` regex/list alone), so a
+  /// PEFT-bridged config takes the [`DEFAULT_NUM_LAYERS`] default.
   pub num_layers: i32,
-  /// The low-rank parameters block (mlx-lm `config.lora_parameters`).
-  #[serde(default)]
+  /// The normalized low-rank parameter block — built from `config.lora_parameters`
+  /// (mlx-lm-native) **or** from the flat PEFT top-level fields (see the type
+  /// docs and [`LoraParameters`]).
   pub lora_parameters: LoraParameters,
   /// PEFT/HF `use_dora` flag — some adapters carry the DoRA signal here
   /// instead of `fine_tune_type: "dora"`. Either signal selects DoRA (see
-  /// [`LoraConfig::is_dora`]).
-  #[serde(default)]
+  /// [`LoraConfig::is_dora`]). Read from the top level in **both** shapes.
   pub use_dora: bool,
 }
 
 fn default_num_layers() -> i32 {
   DEFAULT_NUM_LAYERS
+}
+
+/// The permissive deserialization target that captures the **union** of both
+/// `adapter_config.json` shapes — mlx-lm-native (nested `lora_parameters`) and
+/// PEFT-flat (top-level `r` / `lora_alpha` / `target_modules` / …). Every field
+/// is optional; [`LoraConfig`]'s [`Deserialize`](serde::Deserialize) reads this,
+/// then normalizes it into the typed [`LoraConfig`].
+///
+/// This is the "permissive deserialize then normalize" step: serde cannot
+/// branch on which keys are present from a `#[derive]`, so the raw form
+/// captures *all* keys non-fatally and the normalization picks the shape.
+#[derive(serde::Deserialize)]
+struct RawLoraConfig {
+  /// mlx-lm `fine_tune_type` (`"lora"` / `"dora"` / `"full"`). Absent in PEFT
+  /// configs. An *unknown* string here is still a hard parse error (the
+  /// `FineTuneType` enum has no catch-all variant).
+  #[serde(default)]
+  fine_tune_type: Option<FineTuneType>,
+  /// mlx-lm `num_layers`. Absent in PEFT configs.
+  #[serde(default)]
+  num_layers: Option<i32>,
+  /// The mlx-lm-native nested `lora_parameters` object. Its **presence** is the
+  /// signal that this is the mlx-lm-native shape (vs PEFT-flat).
+  #[serde(default)]
+  lora_parameters: Option<LoraParameters>,
+  /// PEFT/HF `use_dora` — top-level in both shapes.
+  #[serde(default)]
+  use_dora: bool,
+  /// PEFT `peft_type` (`"LORA"` for a LoRA adapter). Present only in PEFT
+  /// configs; used both as a shape signal and to reject a non-LoRA PEFT kind.
+  #[serde(default)]
+  peft_type: Option<String>,
+  /// PEFT top-level rank `r`.
+  #[serde(default)]
+  r: Option<i32>,
+  /// PEFT top-level `lora_alpha`.
+  #[serde(default)]
+  lora_alpha: Option<f32>,
+  /// PEFT top-level `target_modules` — either a list of module-name suffixes
+  /// (the common case, maps directly to `keys`) or a single regex string
+  /// (unsupported as a `keys` allowlist — see the `Deserialize` impl).
+  #[serde(default)]
+  target_modules: Option<TargetModules>,
+  /// PEFT top-level `lora_dropout`.
+  #[serde(default)]
+  lora_dropout: Option<f32>,
+}
+
+/// PEFT's `target_modules`, which is **either** a list of module-name suffixes
+/// **or** a single regex string (`peft` `LoraConfig.target_modules:
+/// Optional[Union[list[str], str]]`).
+///
+/// The list form is PEFT's "exact / ends-with" match — semantically identical
+/// to [`linear_to_lora_layers`]'s `keys` suffix match — so it maps directly to
+/// [`LoraParameters::keys`]. The single-string form is a *regex*, which has no
+/// faithful `keys`-allowlist analogue; [`LoraConfig`]'s `Deserialize` rejects
+/// it with a clear recoverable error rather than silently mis-selecting layers.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum TargetModules {
+  /// `target_modules: ["q_proj", "v_proj"]` — a list of module-name suffixes.
+  List(Vec<String>),
+  /// `target_modules: "...regex..."` — a single regex string.
+  Regex(String),
+}
+
+impl<'de> serde::Deserialize<'de> for LoraConfig {
+  /// Deserialize an `adapter_config.json` of **either** on-disk shape into the
+  /// single normalized [`LoraConfig`].
+  ///
+  /// This is the dual-shape bridge the [type docs](LoraConfig) describe. It
+  /// runs a *permissive* deserialize into a private `RawLoraConfig` (which
+  /// captures the union of both shapes' keys, all optional), then a
+  /// **shape-detection** normalization:
+  ///
+  /// - **mlx-lm-native** — when the raw form has a `lora_parameters` object,
+  ///   that object IS the [`LoraParameters`] (mlx-lm-native `rank` / `scale` /
+  ///   `alpha` / `keys` / `dropout`); `fine_tune_type` / `num_layers` /
+  ///   `use_dora` are read from the top level as before. The flat PEFT keys
+  ///   (`r`, `lora_alpha`, …) are ignored in this branch — a config carrying a
+  ///   `lora_parameters` object is unambiguously mlx-lm-native.
+  /// - **PEFT / HuggingFace** — when there is **no** `lora_parameters` object
+  ///   but the raw form carries top-level `r` / `lora_alpha` / `target_modules`
+  ///   (and/or `peft_type`), the flat PEFT fields are mapped into a
+  ///   [`LoraParameters`]: `r` → [`rank`](LoraParameters::rank), `lora_alpha`
+  ///   → [`alpha`](LoraParameters::alpha), `target_modules` →
+  ///   [`keys`](LoraParameters::keys), `lora_dropout` →
+  ///   [`dropout`](LoraParameters::dropout). PEFT has no `fine_tune_type` /
+  ///   `num_layers` / literal-`scale` keys, so those take their defaults
+  ///   ([`FineTuneType::Lora`] / [`DEFAULT_NUM_LAYERS`] / `None`); DoRA is
+  ///   carried only by PEFT's `use_dora`.
+  /// - **neither** — a config with no `lora_parameters` *and* no PEFT marker
+  ///   (e.g. `{}` or a config carrying only training-only keys) takes every
+  ///   default — same as the previous `#[derive(Deserialize)]` behavior.
+  ///
+  /// # Errors
+  ///
+  /// - A `peft_type` other than `"LORA"` (case-insensitive) is a *different
+  ///   adapter kind* (`LOHA`, `LOKR`, `IA3`, a prompt-tuning method, …) — this
+  ///   module loads LoRA/DoRA adapters only, so a non-LoRA `peft_type` is a
+  ///   recoverable deserialize error (surfaced as [`Error::Backend`] by
+  ///   [`LoraConfig::from_json`]) rather than a silent mis-load.
+  /// - A PEFT `target_modules` given as a single **regex string** has no
+  ///   faithful `keys`-allowlist analogue (the `keys` selector is a
+  ///   suffix-match list, not a regex engine) — this is a recoverable
+  ///   deserialize error naming the limitation.
+  ///
+  /// [`rank`]: LoraParameters::rank
+  /// [`alpha`]: LoraParameters::alpha
+  /// [`keys`]: LoraParameters::keys
+  /// [`dropout`]: LoraParameters::dropout
+  fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+  where
+    D: serde::Deserializer<'de>,
+  {
+    use serde::de::Error as _;
+
+    let raw = RawLoraConfig::deserialize(deserializer)?;
+
+    // ── shape detection ──
+    // A `lora_parameters` object is the unambiguous mlx-lm-native marker; with
+    // it present, the flat PEFT keys are NOT consulted (a real PEFT config has
+    // no `lora_parameters` nesting, so this branch only fires for mlx-lm
+    // configs). Without it, top-level `r` / `lora_alpha` / `target_modules` /
+    // `peft_type` marks the PEFT-flat shape.
+    if let Some(lora_parameters) = raw.lora_parameters {
+      // mlx-lm-native: the nested object is the parameter block verbatim.
+      return Ok(LoraConfig {
+        fine_tune_type: raw.fine_tune_type.unwrap_or_default(),
+        num_layers: raw.num_layers.unwrap_or_else(default_num_layers),
+        lora_parameters,
+        use_dora: raw.use_dora,
+      });
+    }
+
+    let is_peft = raw.peft_type.is_some()
+      || raw.r.is_some()
+      || raw.lora_alpha.is_some()
+      || raw.target_modules.is_some();
+
+    if is_peft {
+      // PEFT-flat: validate `peft_type` (LoRA only) and map the flat fields.
+      if let Some(peft_type) = &raw.peft_type
+        && !peft_type.eq_ignore_ascii_case("LORA")
+      {
+        return Err(D::Error::custom(format!(
+          "adapter_config.json `peft_type` is {peft_type:?}, but this loader handles only \
+           LoRA/DoRA adapters (`peft_type` \"LORA\"); a different PEFT method (LOHA, LOKR, \
+           IA3, prompt-tuning, …) is not supported"
+        )));
+      }
+      // `target_modules`: a list maps to `keys` directly (PEFT's list form is
+      // an exact/ends-with match — the same semantics as `keys`); a single
+      // regex string has no `keys`-allowlist analogue.
+      let keys = match raw.target_modules {
+        None => None,
+        Some(TargetModules::List(modules)) => Some(modules),
+        Some(TargetModules::Regex(re)) => {
+          return Err(D::Error::custom(format!(
+            "adapter_config.json `target_modules` is a regex string ({re:?}); only the \
+             list-of-module-names form is supported (it maps to the `keys` suffix-match \
+             allowlist — a regex has no faithful `keys` analogue)"
+          )));
+        }
+      };
+      let lora_parameters = LoraParameters {
+        rank: raw.r.unwrap_or_else(default_rank),
+        // PEFT has no literal-`scale` field — the scale is always `lora_alpha
+        // / r` (resolved by `LoraParameters::resolved_scale`).
+        scale: None,
+        alpha: raw.lora_alpha,
+        keys,
+        dropout: raw.lora_dropout,
+      };
+      return Ok(LoraConfig {
+        // PEFT configs have no `fine_tune_type` — LoRA by default; DoRA is
+        // carried by `use_dora`.
+        fine_tune_type: FineTuneType::Lora,
+        // PEFT has no `num_layers` — it selects via `target_modules` alone.
+        num_layers: default_num_layers(),
+        lora_parameters,
+        use_dora: raw.use_dora,
+      });
+    }
+
+    // Neither shape: a bare / training-only-keys config — every default.
+    Ok(LoraConfig {
+      fine_tune_type: raw.fine_tune_type.unwrap_or_default(),
+      num_layers: raw.num_layers.unwrap_or_else(default_num_layers),
+      lora_parameters: LoraParameters::default(),
+      use_dora: raw.use_dora,
+    })
+  }
 }
 
 impl LoraConfig {
@@ -1102,10 +1362,10 @@ fn validate_factor_shapes(base: &BaseLinear, params: &AdapterParams, who: &str) 
 /// **each other** on the shared rank axis; it cannot see the config. But the
 /// layer SCALE is `alpha / config.rank()` when an `alpha` (`lora_alpha`) is
 /// present, so a config whose `rank` has drifted from the tensors' rank — a
-/// stale `adapter_config.json`, or a PEFT config whose `r` key was not
-/// recognized and silently defaulted — would otherwise build rank-`R` tensors
-/// while scaling by `alpha / config.rank()` (the wrong divisor): silently wrong
-/// strength on every adapted projection.
+/// stale `adapter_config.json` whose declared rank no longer matches the
+/// shipped factors — would otherwise build rank-`R` tensors while scaling by
+/// `alpha / config.rank()` (the wrong divisor): silently wrong strength on
+/// every adapted projection.
 ///
 /// Requiring `lora_a`'s rank axis (`[input_dims, r]`, last axis) and
 /// `lora_b`'s rank axis (`[r, output_dims]`, leading axis) to both equal
@@ -1125,8 +1385,8 @@ fn validate_config_rank(params: &AdapterParams, config_rank: usize, who: &str) -
     return Err(Error::ShapeMismatch {
       message: format!(
         "{who}: adapter factor rank ({a_rank}) does not match adapter_config.json rank \
-         ({config_rank}); a stale config (or a PEFT config whose `r` key was not recognized) \
-         would silently scale by alpha/{config_rank} instead of alpha/{a_rank}"
+         ({config_rank}); a stale config would silently scale by alpha/{config_rank} instead \
+         of alpha/{a_rank}"
       ),
     });
   }
@@ -2016,28 +2276,146 @@ mod tests {
   }
 
   #[test]
-  fn config_parse_peft_r_alias() {
-    // A PEFT-style adapter_config.json names the rank `r` (not `rank`). The
-    // `#[serde(alias = "r")]` must pick it up so a PEFT-trained adapter does
-    // NOT silently fall back to the default rank.
+  fn config_parse_peft_flat_shape() {
+    // A REAL PEFT adapter_config.json: NO `lora_parameters` nesting — `r`,
+    // `lora_alpha`, `target_modules`, `lora_dropout`, `peft_type` all flat at
+    // the top level. The dual-shape `Deserialize` must detect the PEFT shape
+    // and map the flat fields, so a PEFT-trained adapter does NOT silently
+    // fall back to the default rank/scale.
     let json = r#"{
-      "fine_tune_type": "lora",
-      "num_layers": 4,
-      "lora_parameters": { "r": 16, "lora_alpha": 32.0 }
+      "peft_type": "LORA",
+      "r": 16,
+      "lora_alpha": 32.0,
+      "target_modules": ["q_proj", "v_proj"],
+      "lora_dropout": 0.05,
+      "bias": "none"
     }"#;
     let cfg = LoraConfig::from_json(json).unwrap();
-    assert_eq!(cfg.rank(), 16, "PEFT `r` key must populate `rank`");
-    // alpha/rank = 32/16 = 2.0 — the alias feeding `rank` makes the scale right.
+    assert_eq!(cfg.rank(), 16, "PEFT top-level `r` must populate `rank`");
+    // alpha/rank = 32/16 = 2.0 — `lora_alpha`/`r` resolves the scale.
+    assert_eq!(cfg.scale(), 2.0);
+    // `target_modules` becomes the `keys` layer-selection allowlist.
+    assert_eq!(
+      cfg.lora_parameters.keys.as_deref(),
+      Some(&["q_proj".to_string(), "v_proj".to_string()][..])
+    );
+    // `lora_dropout` maps to `dropout` (carried, ignored at inference).
+    assert_eq!(cfg.lora_parameters.dropout, Some(0.05));
+    // PEFT has no `fine_tune_type` / `num_layers` ⇒ defaults.
+    assert_eq!(cfg.fine_tune_type, FineTuneType::Lora);
+    assert_eq!(cfg.num_layers, DEFAULT_NUM_LAYERS);
+    assert!(!cfg.is_dora());
+  }
+
+  #[test]
+  fn config_parse_peft_use_dora() {
+    // A PEFT config with `use_dora: true` selects DoRA (PEFT carries the DoRA
+    // signal in `use_dora`, not a `fine_tune_type`).
+    let json = r#"{
+      "peft_type": "LORA",
+      "r": 8,
+      "lora_alpha": 16.0,
+      "target_modules": ["q_proj"],
+      "use_dora": true
+    }"#;
+    let cfg = LoraConfig::from_json(json).unwrap();
+    assert!(cfg.is_dora(), "PEFT `use_dora` must select DoRA");
     assert_eq!(cfg.scale(), 2.0);
   }
 
   #[test]
+  fn config_parse_peft_no_peft_type_still_detected() {
+    // A flat config with top-level `r` / `lora_alpha` / `target_modules` but
+    // NO `peft_type` is still recognized as the PEFT shape (some exporters
+    // omit `peft_type`) — the absence of a `lora_parameters` nesting plus the
+    // flat PEFT keys is the signal.
+    let json = r#"{
+      "r": 4,
+      "lora_alpha": 8.0,
+      "target_modules": ["o_proj"]
+    }"#;
+    let cfg = LoraConfig::from_json(json).unwrap();
+    assert_eq!(cfg.rank(), 4);
+    assert_eq!(cfg.scale(), 2.0);
+    assert_eq!(
+      cfg.lora_parameters.keys.as_deref(),
+      Some(&["o_proj".to_string()][..])
+    );
+  }
+
+  #[test]
+  fn config_parse_peft_default_rank_when_r_absent() {
+    // PEFT `r` defaults to 8 in `peft` itself — a PEFT config without `r` but
+    // with another PEFT marker must still parse and use DEFAULT_LORA_RANK.
+    let json = r#"{ "peft_type": "LORA", "lora_alpha": 16.0, "target_modules": ["q_proj"] }"#;
+    let cfg = LoraConfig::from_json(json).unwrap();
+    assert_eq!(cfg.rank(), DEFAULT_LORA_RANK);
+  }
+
+  #[test]
+  fn config_parse_peft_non_lora_peft_type_is_err() {
+    // A non-LoRA PEFT method (LOHA / LOKR / IA3 / prompt-tuning / …) is a
+    // different adapter kind — this loader handles LoRA/DoRA only, so a
+    // `peft_type` other than "LORA" is a recoverable parse error.
+    for kind in ["LOHA", "LOKR", "IA3", "PROMPT_TUNING"] {
+      let json = format!(r#"{{ "peft_type": "{kind}", "r": 8, "target_modules": ["q_proj"] }}"#);
+      assert!(
+        LoraConfig::from_json(&json).is_err(),
+        "peft_type {kind:?} must be rejected"
+      );
+    }
+  }
+
+  #[test]
+  fn config_parse_peft_type_case_insensitive() {
+    // PEFT writes `peft_type` upper-case ("LORA"); accept any case.
+    let json =
+      r#"{ "peft_type": "Lora", "r": 8, "lora_alpha": 16.0, "target_modules": ["q_proj"] }"#;
+    let cfg = LoraConfig::from_json(json).unwrap();
+    assert_eq!(cfg.rank(), 8);
+  }
+
+  #[test]
+  fn config_parse_peft_target_modules_regex_is_err() {
+    // PEFT `target_modules` may be a single regex string — that has no
+    // faithful `keys` suffix-match analogue, so it is a recoverable error
+    // (rather than a silent mis-selection).
+    let json = r#"{ "peft_type": "LORA", "r": 8, "target_modules": ".*proj$" }"#;
+    assert!(
+      LoraConfig::from_json(json).is_err(),
+      "a regex-string `target_modules` must be rejected"
+    );
+  }
+
+  #[test]
+  fn config_lora_parameters_nesting_wins_over_flat_keys() {
+    // A `lora_parameters` object is the unambiguous mlx-lm-native marker: when
+    // it is present the flat PEFT keys are NOT consulted (a real config never
+    // mixes the two shapes — this just pins the detection precedence).
+    let json = r#"{
+      "fine_tune_type": "lora",
+      "num_layers": 3,
+      "lora_parameters": { "rank": 64, "scale": 8.0 },
+      "r": 1, "lora_alpha": 999.0
+    }"#;
+    let cfg = LoraConfig::from_json(json).unwrap();
+    assert_eq!(cfg.rank(), 64, "nested `lora_parameters.rank` wins");
+    assert_eq!(
+      cfg.scale(),
+      8.0,
+      "nested literal `scale` wins, flat keys ignored"
+    );
+    assert_eq!(cfg.num_layers, 3);
+  }
+
+  #[test]
   fn config_parse_dora_and_alpha_scale() {
-    // alpha/rank scale: alpha=32, rank=8 ⇒ scale=4.0. fine_tune_type dora.
+    // mlx-lm-native nested shape — its alpha key is `alpha`. alpha/rank scale:
+    // alpha=32, rank=8 ⇒ scale=4.0. fine_tune_type dora.
     let json = r#"{
       "fine_tune_type": "dora",
       "num_layers": 2,
-      "lora_parameters": { "rank": 8, "lora_alpha": 32.0 }
+      "lora_parameters": { "rank": 8, "alpha": 32.0 }
     }"#;
     let cfg = LoraConfig::from_json(json).unwrap();
     assert!(cfg.is_dora());
@@ -2267,25 +2645,62 @@ mod tests {
   }
 
   #[test]
-  fn load_adapters_peft_r_alias_rank16_loads() {
-    // PEFT-style config: rank under the key `r` (not `rank`), `lora_alpha`
-    // present. The `r` alias makes `config.rank() == 16`, so rank-16 factor
-    // tensors pass the config-rank cross-check and load cleanly.
-    let tmp = std::env::temp_dir().join(format!("mlxrs_peft_r16_test_{}", std::process::id()));
+  fn load_adapters_peft_flat_shape_rank16_end_to_end() {
+    // A REAL PEFT-shaped adapter_config.json — flat top-level `peft_type` /
+    // `r` / `lora_alpha` / `target_modules` / `lora_dropout`, NO
+    // `lora_parameters` nesting — plus rank-16 factor tensors. The dual-shape
+    // `Deserialize` must read `r:16` (so the rank-16 factors pass the
+    // config-rank cross-check), resolve the scale to `lora_alpha/r = 32/16 =
+    // 2.0`, and use `target_modules` to drive layer selection.
+    let tmp = std::env::temp_dir().join(format!("mlxrs_peft_flat16_test_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
     let cfg = r#"{
-      "fine_tune_type": "lora",
-      "num_layers": 16,
-      "lora_parameters": { "r": 16, "lora_alpha": 32.0, "keys": ["self_attn.q_proj"] }
+      "peft_type": "LORA",
+      "r": 16,
+      "lora_alpha": 32.0,
+      "target_modules": ["self_attn.q_proj"],
+      "lora_dropout": 0.0,
+      "bias": "none"
     }"#;
     write_mock_adapter_rank(&tmp, cfg, 16);
     let weights = toy_weights();
     let layers = load_adapters(&weights, &tmp, None, 4).unwrap();
+    // `target_modules: ["self_attn.q_proj"]` selects the 4 q_proj paths (and
+    // NOT the lone k_proj) — i.e. PEFT's `target_modules` drove the selection.
     assert_eq!(layers.len(), 4);
-    // The resolved scale is alpha/rank = 32/16 = 2.0 — i.e. the `r` alias fed
-    // the rank that divides alpha.
+    assert!(layers.contains_key("model.layers.0.self_attn.q_proj"));
+    assert!(!layers.contains_key("model.layers.0.self_attn.k_proj"));
+    // The resolved scale is lora_alpha/r = 32/16 = 2.0.
     if let Some(LoraLayer::Lora(l)) = layers.get("model.layers.0.self_attn.q_proj") {
-      assert_eq!(l.scale(), 2.0);
+      assert_eq!(l.scale(), 2.0, "PEFT scale must be lora_alpha/r");
+    } else {
+      panic!("expected a LoRA layer");
+    }
+    std::fs::remove_dir_all(&tmp).ok();
+  }
+
+  #[test]
+  fn load_adapters_peft_flat_shape_rank8_scale_not_default() {
+    // A PEFT config with `r:8` + rank-8 factors must load and resolve the
+    // scale to `lora_alpha/8`, NOT the literal-`scale` default of 20.0 (PEFT
+    // has no literal-`scale` key — the prior nested-only alias would have left
+    // a real flat PEFT config defaulting both rank and scale).
+    let tmp = std::env::temp_dir().join(format!("mlxrs_peft_flat8_test_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let cfg = r#"{
+      "peft_type": "LORA",
+      "r": 8,
+      "lora_alpha": 32.0,
+      "target_modules": ["self_attn.q_proj"]
+    }"#;
+    write_mock_adapter_rank(&tmp, cfg, 8);
+    let weights = toy_weights();
+    let layers = load_adapters(&weights, &tmp, None, 4).unwrap();
+    assert_eq!(layers.len(), 4);
+    if let Some(LoraLayer::Lora(l)) = layers.get("model.layers.0.self_attn.q_proj") {
+      // lora_alpha/r = 32/8 = 4.0 — explicitly NOT DEFAULT_LORA_SCALE (20.0).
+      assert_eq!(l.scale(), 4.0);
+      assert_ne!(l.scale(), DEFAULT_LORA_SCALE);
     } else {
       panic!("expected a LoRA layer");
     }
@@ -2294,17 +2709,17 @@ mod tests {
 
   #[test]
   fn load_adapters_rank_drift_is_shape_mismatch() {
-    // Config declares rank 8 with `lora_alpha` present, but the factor tensors
-    // are rank 16 (a stale config / unrecognized `r` drift). Without the
-    // config-vs-tensor rank cross-check this silently builds rank-16 factors
-    // and scales by alpha/8 instead of alpha/16 — wrong strength. It must now
-    // fail loudly at load with a ShapeMismatch.
+    // mlx-lm-native config declares rank 8 with `alpha` present, but the
+    // factor tensors are rank 16 (a stale `adapter_config.json` drift).
+    // Without the config-vs-tensor rank cross-check this silently builds
+    // rank-16 factors and scales by alpha/8 instead of alpha/16 — wrong
+    // strength. It must fail loudly at load with a ShapeMismatch.
     let tmp = std::env::temp_dir().join(format!("mlxrs_rankdrift_test_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
     let cfg = r#"{
       "fine_tune_type": "lora",
       "num_layers": 16,
-      "lora_parameters": { "rank": 8, "lora_alpha": 32.0, "keys": ["self_attn.q_proj"] }
+      "lora_parameters": { "rank": 8, "alpha": 32.0, "keys": ["self_attn.q_proj"] }
     }"#;
     write_mock_adapter_rank(&tmp, cfg, 16);
     let weights = toy_weights();
@@ -2312,6 +2727,30 @@ mod tests {
     assert!(
       matches!(err, Error::ShapeMismatch { .. }),
       "rank drift must be a ShapeMismatch, got {err:?}"
+    );
+    std::fs::remove_dir_all(&tmp).ok();
+  }
+
+  #[test]
+  fn load_adapters_peft_rank_drift_is_shape_mismatch() {
+    // The round-2 rank-drift guard must also catch a PEFT-flat config: `r:8`
+    // declared but rank-16 factors shipped. The dual-shape `Deserialize`
+    // reads `r` correctly, then `validate_config_rank` rejects the drift.
+    let tmp =
+      std::env::temp_dir().join(format!("mlxrs_peft_rankdrift_test_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    let cfg = r#"{
+      "peft_type": "LORA",
+      "r": 8,
+      "lora_alpha": 32.0,
+      "target_modules": ["self_attn.q_proj"]
+    }"#;
+    write_mock_adapter_rank(&tmp, cfg, 16);
+    let weights = toy_weights();
+    let err = load_adapters(&weights, &tmp, None, 4).unwrap_err();
+    assert!(
+      matches!(err, Error::ShapeMismatch { .. }),
+      "PEFT rank drift must be a ShapeMismatch, got {err:?}"
     );
     std::fs::remove_dir_all(&tmp).ok();
   }
@@ -2561,10 +3000,11 @@ mod tests {
 
   #[test]
   fn config_both_scale_and_alpha_alpha_wins() {
-    // adapter_config.json carrying BOTH scale and lora_alpha ⇒ alpha wins.
+    // mlx-lm-native config carrying BOTH a literal `scale` and `alpha` ⇒
+    // alpha/rank wins over the literal scale.
     let json = r#"{
       "fine_tune_type": "lora",
-      "lora_parameters": { "rank": 8, "scale": 50.0, "lora_alpha": 16.0 }
+      "lora_parameters": { "rank": 8, "scale": 50.0, "alpha": 16.0 }
     }"#;
     let cfg = LoraConfig::from_json(json).unwrap();
     assert_eq!(cfg.scale(), 2.0); // 16 / 8, not the literal 50.0
