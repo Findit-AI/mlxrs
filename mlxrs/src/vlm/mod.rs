@@ -50,4 +50,5 @@ pub mod image;
 pub mod load;
 pub mod model;
 pub mod prompt;
+pub(crate) mod resize;
 pub mod video;

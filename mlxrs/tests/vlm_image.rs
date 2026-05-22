@@ -91,8 +91,9 @@ fn resize_rejects_zero_target_dimension() {
   // Regression for Codex Finding 1 (high): `ImageProcessorConfig::size`
   // now flows from an UNTRUSTED loaded processor config. A zero target
   // dimension must be rejected as a recoverable `Error::ShapeMismatch`
-  // BEFORE the `to_rgba8()` / `fast_image_resize::Image::new` allocs,
-  // not silently produce a degenerate / panicking allocation. The
+  // BEFORE the source-RGBA materialization / the own resize kernel's
+  // allocations, not silently produce a degenerate / panicking
+  // allocation. The
   // source fixture is a normal small image; only the (untrusted)
   // target is degenerate.
   let img = synthetic_image(8, 6);
@@ -112,11 +113,11 @@ fn resize_rejects_zero_target_dimension() {
 #[test]
 fn resize_rejects_oversized_target() {
   // Regression for Codex Finding 1 (high): a hostile/malformed loaded
-  // config with an enormous `size` would drive
-  // `fast_image_resize::Image::new(width, height, U8x4)` to allocate
-  // `height * width * 4` bytes and panic-abort the process, taking down
-  // image + video preprocessing on the first request. The target-byte
-  // guard must surface this as a recoverable `Error::ShapeMismatch`,
+  // config with an enormous `size` would drive the resize destination
+  // allocation (`height * width * 4` bytes) to panic-abort the process,
+  // taking down image + video preprocessing on the first request. The
+  // target-byte guard must surface this as a recoverable
+  // `Error::ShapeMismatch`,
   // bounded by `MAX_DECODED_IMAGE_BYTES` (the same 512 MiB ceiling
   // `pad_to_square` and `load_image` enforce).
   //
@@ -156,24 +157,28 @@ fn resize_rejects_overflowing_target_product() {
 
 #[test]
 fn resize_accepted_target_uses_fallible_alloc_path_never_aborts() {
-  // Regression for Codex Finding (high, round 2): an accepted target AT
-  // OR BELOW the 512 MiB cap formerly still allocated through INFALLIBLE
-  // buffers — `img.to_rgba8()` (an owned RGBA clone) and
-  // `fast_image_resize::Image::new` (backed by `vec![0; …]`). A hostile
-  // config could pick a just-under-cap size (~11585×11585 ≈ 512 MiB) and
-  // force a ~512 MiB infallible allocation → process abort under memory
-  // pressure, despite the `Result` signature. The cap bounded the SIZE
-  // but not the FALLIBILITY.
+  // Regression for Codex Finding (high, round 2) + the own-resize
+  // omnibus follow-up: an accepted target AT OR BELOW the 512 MiB cap
+  // formerly still allocated through INFALLIBLE buffers — `img.to_rgba8()`
+  // (an owned RGBA clone) and, inside `fast_image_resize`, its internal
+  // coefficient tables + per-row work buffers (allocated infallibly
+  // inside that crate). A hostile config could pick a just-under-cap size
+  // (~11585×11585 ≈ 512 MiB) and force a ~512 MiB infallible allocation →
+  // process abort under memory pressure, despite the `Result` signature.
+  // The cap bounded the SIZE but not the FALLIBILITY. The fix dropped
+  // `fast_image_resize` for an OWN kernel (`vlm::resize`) whose every
+  // buffer is `try_reserve_exact`-backed.
   //
   // We do NOT allocate 512 MiB in CI. Instead we exercise the SAME
   // fallible code path (the `try_reserve_exact`-backed source RGBA buffer
-  // + the `try_reserve_exact` + zero-fill destination handed to
-  // `Image::from_vec_u8`) at a moderate, CI-safe target that genuinely
-  // allocates a real buffer. The fallibility is STRUCTURAL: every
-  // allocation in `resize` driven by the (now-untrusted) config dims
-  // routes through `try_reserve_exact` and surfaces allocator failure as
-  // `Error::OutOfMemory`. A successful return is `Ok`; an allocator
-  // refusal would be a recoverable `Err(OutOfMemory)` — NEVER an abort.
+  // + the own kernel's `try_reserve_exact` coefficient tables, inter-pass
+  // intermediate, and destination) at a moderate, CI-safe target that
+  // genuinely allocates real buffers. The fallibility is STRUCTURAL:
+  // every allocation in `resize` driven by the (now-untrusted) config
+  // dims routes through `try_reserve_exact` and surfaces allocator
+  // failure as `Error::OutOfMemory`. A successful return is `Ok`; an
+  // allocator refusal would be a recoverable `Err(OutOfMemory)` — NEVER
+  // an abort.
   let img = synthetic_image(8, 6);
   // 1024 x 768 destination = 768 * 1024 * 4 = 3 MiB — well under the cap,
   // large enough that BOTH the source-RGBA `try_reserve_exact` and the
@@ -249,6 +254,264 @@ fn resize_non_rgba8_sources_convert_via_fallible_per_pixel_path() {
       "uniform Rgba8 must survive resize as (10, 20, 30); got {px:?}"
     );
   }
+}
+
+// ---------- resize: PIL byte-exact reference values ----------
+//
+// The own resize kernel (`mlxrs::vlm::resize`) replaced the third-party
+// `fast_image_resize` dependency and is **bit-exact with PIL
+// `Image.resize`** — the reference mlx-vlm preprocessing targets (the
+// swift `MediaProcessing.resampleBicubic` mirrors PIL). The expected
+// arrays below were produced with **Pillow 12.2** over the IDENTICAL
+// `synthetic_image` fixture (`pixel(x,y) = Rgb([(y*10)%256, (x*10)%256,
+// 100])`, alpha 255 after RGBA projection), via PIL's exact fixed-point
+// `precompute_coeffs` + `clip8` path:
+//   - coords:   center = (out + 0.5) * scale
+//   - support:  filter_support * max(scale, 1.0)   (downscale AA stretch)
+//   - accum:    i32, seeded with 1<<(PRECISION_BITS-1), >> PRECISION_BITS
+//               (PRECISION_BITS = 22), clamped [0,255]
+// Because the scalar path reproduces PIL's integer math exactly, these
+// are EQUALITY assertions (no ±1 LSB tolerance). On aarch64 the NEON
+// kernel uses the same i32 math and is asserted bit-identical to scalar
+// by the in-module differential test.
+
+/// `synthetic_image` projected to a raw RGBA8 byte vector (row-major,
+/// matching the resize output layout) for byte-exact comparison.
+fn resize_rgba_raw(img: &::image::DynamicImage, h: u32, w: u32, f: ResizeFilter) -> Vec<u8> {
+  resize(img, (h, w), f).unwrap().to_rgba8().into_raw()
+}
+
+#[test]
+fn resize_pil_reference_downscale_8x6_to_4x3() {
+  // 8x6 source -> 4x3 (height x width = 3 x 4). Hand-verified against
+  // Pillow 12.2 (`im.resize((4, 3), Image.<FILTER>)`). Downscale, so the
+  // antialiasing filter-stretch (`filterscale = scale > 1`) is exercised.
+  let img = synthetic_image(8, 6);
+
+  // Nearest: PIL maps out o -> min(floor((o+0.5)*in/out), in-1).
+  assert_eq!(
+    resize_rgba_raw(&img, 3, 4, ResizeFilter::Nearest),
+    vec![
+      10, 10, 100, 255, 10, 30, 100, 255, 10, 50, 100, 255, 10, 70, 100, 255, 30, 10, 100, 255, 30,
+      30, 100, 255, 30, 50, 100, 255, 30, 70, 100, 255, 50, 10, 100, 255, 50, 30, 100, 255, 50, 50,
+      100, 255, 50, 70, 100, 255,
+    ],
+    "Nearest 8x6->4x3 must match PIL Image.NEAREST byte-for-byte"
+  );
+  // Bilinear (triangle, support 1.0).
+  assert_eq!(
+    resize_rgba_raw(&img, 3, 4, ResizeFilter::Bilinear),
+    vec![
+      7, 7, 100, 255, 7, 25, 100, 255, 7, 45, 100, 255, 7, 63, 100, 255, 25, 7, 100, 255, 25, 25,
+      100, 255, 25, 45, 100, 255, 25, 63, 100, 255, 43, 7, 100, 255, 43, 25, 100, 255, 43, 45, 100,
+      255, 43, 63, 100, 255,
+    ],
+    "Bilinear 8x6->4x3 must match PIL Image.BILINEAR byte-for-byte"
+  );
+  // Bicubic (Keys cubic a=-0.5, support 2.0).
+  assert_eq!(
+    resize_rgba_raw(&img, 3, 4, ResizeFilter::Bicubic),
+    vec![
+      5, 5, 100, 255, 5, 25, 100, 255, 5, 45, 100, 255, 5, 65, 100, 255, 25, 5, 100, 255, 25, 25,
+      100, 255, 25, 45, 100, 255, 25, 65, 100, 255, 45, 5, 100, 255, 45, 25, 100, 255, 45, 45, 100,
+      255, 45, 65, 100, 255,
+    ],
+    "Bicubic 8x6->4x3 must match PIL Image.BICUBIC byte-for-byte"
+  );
+  // Lanczos (a=3, support 3.0).
+  assert_eq!(
+    resize_rgba_raw(&img, 3, 4, ResizeFilter::Lanczos3),
+    vec![
+      5, 5, 100, 255, 5, 24, 100, 255, 5, 46, 100, 255, 5, 65, 100, 255, 25, 5, 100, 255, 25, 24,
+      100, 255, 25, 46, 100, 255, 25, 65, 100, 255, 45, 5, 100, 255, 45, 24, 100, 255, 45, 46, 100,
+      255, 45, 65, 100, 255,
+    ],
+    "Lanczos3 8x6->4x3 must match PIL Image.LANCZOS byte-for-byte"
+  );
+}
+
+#[test]
+fn resize_pil_reference_upscale_4x4_to_8x8() {
+  // 4x4 -> 8x8 upscale (filterscale clamps to 1.0 — no AA stretch).
+  // Hand-verified against Pillow 12.2.
+  let img = synthetic_image(4, 4);
+
+  assert_eq!(
+    resize_rgba_raw(&img, 8, 8, ResizeFilter::Bilinear),
+    vec![
+      0, 0, 100, 255, 0, 3, 100, 255, 0, 8, 100, 255, 0, 13, 100, 255, 0, 18, 100, 255, 0, 23, 100,
+      255, 0, 28, 100, 255, 0, 30, 100, 255, 3, 0, 100, 255, 3, 3, 100, 255, 3, 8, 100, 255, 3, 13,
+      100, 255, 3, 18, 100, 255, 3, 23, 100, 255, 3, 28, 100, 255, 3, 30, 100, 255, 8, 0, 100, 255,
+      8, 3, 100, 255, 8, 8, 100, 255, 8, 13, 100, 255, 8, 18, 100, 255, 8, 23, 100, 255, 8, 28,
+      100, 255, 8, 30, 100, 255, 13, 0, 100, 255, 13, 3, 100, 255, 13, 8, 100, 255, 13, 13, 100,
+      255, 13, 18, 100, 255, 13, 23, 100, 255, 13, 28, 100, 255, 13, 30, 100, 255, 18, 0, 100, 255,
+      18, 3, 100, 255, 18, 8, 100, 255, 18, 13, 100, 255, 18, 18, 100, 255, 18, 23, 100, 255, 18,
+      28, 100, 255, 18, 30, 100, 255, 23, 0, 100, 255, 23, 3, 100, 255, 23, 8, 100, 255, 23, 13,
+      100, 255, 23, 18, 100, 255, 23, 23, 100, 255, 23, 28, 100, 255, 23, 30, 100, 255, 28, 0, 100,
+      255, 28, 3, 100, 255, 28, 8, 100, 255, 28, 13, 100, 255, 28, 18, 100, 255, 28, 23, 100, 255,
+      28, 28, 100, 255, 28, 30, 100, 255, 30, 0, 100, 255, 30, 3, 100, 255, 30, 8, 100, 255, 30,
+      13, 100, 255, 30, 18, 100, 255, 30, 23, 100, 255, 30, 28, 100, 255, 30, 30, 100, 255,
+    ],
+    "Bilinear 4x4->8x8 must match PIL Image.BILINEAR byte-for-byte"
+  );
+  // Bicubic spot-check a few representative pixels (the full 256-byte
+  // array is verified by the differential + the bilinear full array
+  // above proves the layout; bicubic upscale overshoots slightly at the
+  // edges, captured here).
+  let bic = resize_rgba_raw(&img, 8, 8, ResizeFilter::Bicubic);
+  // (0,0) -> 0; (0,7) green channel = 31; (7,7) R=31,G=31.
+  assert_eq!(&bic[0..4], &[0, 0, 100, 255], "Bicubic (0,0)");
+  assert_eq!(&bic[7 * 4..7 * 4 + 4], &[0, 31, 100, 255], "Bicubic (0,7)");
+  assert_eq!(
+    &bic[(7 * 8 + 7) * 4..(7 * 8 + 7) * 4 + 4],
+    &[31, 31, 100, 255],
+    "Bicubic (7,7)"
+  );
+}
+
+#[test]
+fn resize_downscale_antialiasing_widens_filter_support() {
+  // A hard left/right edge (left R=0, right R=200) downscaled 4->2 in
+  // width. With proper antialiasing the filter support widens by the
+  // scale factor (filterscale = 2.0), so the output is NOT a sharp
+  // 0/200 split (that would be nearest) but a BLENDED pair — PIL gives
+  // bilinear [29, 171] and bicubic [17, 183] in the R channel.
+  // (Verified against Pillow 12.2.) This is the regression that proves
+  // the `filterscale = max(scale, 1.0)` AA stretch is implemented.
+  let mut rgba = ::image::RgbaImage::new(4, 4);
+  for y in 0..4 {
+    for x in 0..4 {
+      let r = if x >= 2 { 200 } else { 0 };
+      rgba.put_pixel(x, y, ::image::Rgba([r, 0, 0, 255]));
+    }
+  }
+  let img = ::image::DynamicImage::ImageRgba8(rgba);
+
+  let bil = resize(&img, (2, 2), ResizeFilter::Bilinear)
+    .unwrap()
+    .to_rgba8();
+  let r_bil: Vec<u8> = bil.pixels().map(|p| p.0[0]).collect();
+  assert_eq!(
+    r_bil,
+    vec![29, 171, 29, 171],
+    "bilinear 4x4->2x2 AA: edge must blend to [29,171] (PIL), not a sharp [0,200] split"
+  );
+
+  let bic = resize(&img, (2, 2), ResizeFilter::Bicubic)
+    .unwrap()
+    .to_rgba8();
+  let r_bic: Vec<u8> = bic.pixels().map(|p| p.0[0]).collect();
+  assert_eq!(
+    r_bic,
+    vec![17, 183, 17, 183],
+    "bicubic 4x4->2x2 AA: edge must blend to [17,183] (PIL)"
+  );
+
+  // Contrast: NEAREST does NOT antialias — the edge stays sharp.
+  let nn = resize(&img, (2, 2), ResizeFilter::Nearest)
+    .unwrap()
+    .to_rgba8();
+  let r_nn: Vec<u8> = nn.pixels().map(|p| p.0[0]).collect();
+  assert_eq!(
+    r_nn,
+    vec![0, 200, 0, 200],
+    "nearest 4x4->2x2: edge stays sharp"
+  );
+}
+
+#[test]
+fn resize_downscale_4x_to_2x_averages_with_widened_support() {
+  // A 4x4 image of four solid 2x2 quadrants, downscaled 4->2. With the
+  // antialiasing filter-stretch (filterscale = scale = 2.0) the support
+  // window for each output pixel is wider than a single quadrant, so the
+  // quadrants BLEND across their shared edges — proving the support
+  // genuinely widens on downscale (a naive same-size kernel would
+  // reproduce [10,20,30,40] sharply; the AA kernel does not). The exact
+  // blended values are PIL's (Pillow 12.2): bilinear [14,22,28,36],
+  // bicubic [13,21,29,37], lanczos [12,20,30,38].
+  let mut rgba = ::image::RgbaImage::new(4, 4);
+  // quadrants: TL=10, TR=20, BL=30, BR=40 (R channel; G=B=0, A=255).
+  for y in 0..4 {
+    for x in 0..4 {
+      let r = match (x < 2, y < 2) {
+        (true, true) => 10,
+        (false, true) => 20,
+        (true, false) => 30,
+        (false, false) => 40,
+      };
+      rgba.put_pixel(x, y, ::image::Rgba([r, 0, 0, 255]));
+    }
+  }
+  let img = ::image::DynamicImage::ImageRgba8(rgba);
+  for (f, expected) in [
+    (ResizeFilter::Bilinear, [14u8, 22, 28, 36]),
+    (ResizeFilter::Bicubic, [13, 21, 29, 37]),
+    (ResizeFilter::Lanczos3, [12, 20, 30, 38]),
+  ] {
+    let out = resize(&img, (2, 2), f).unwrap().to_rgba8();
+    let r: Vec<u8> = out.pixels().map(|p| p.0[0]).collect();
+    assert_eq!(
+      r,
+      expected.to_vec(),
+      "downscale 4x4->2x2 of 2x2 quadrants must blend per PIL (filter {f:?})"
+    );
+  }
+
+  // Averaging-correctness: a UNIFORM image downscales to itself exactly
+  // (the kernel sums to 1.0, so a flat field is reproduced regardless of
+  // how wide the support stretches).
+  let mut uni = ::image::RgbaImage::new(4, 4);
+  for p in uni.pixels_mut() {
+    *p = ::image::Rgba([77, 0, 0, 255]);
+  }
+  let uni_img = ::image::DynamicImage::ImageRgba8(uni);
+  for f in [
+    ResizeFilter::Bilinear,
+    ResizeFilter::Bicubic,
+    ResizeFilter::Lanczos3,
+  ] {
+    let out = resize(&uni_img, (2, 2), f).unwrap().to_rgba8();
+    let r: Vec<u8> = out.pixels().map(|p| p.0[0]).collect();
+    assert_eq!(
+      r,
+      vec![77, 77, 77, 77],
+      "uniform downscale must reproduce the constant ({f:?})"
+    );
+  }
+}
+
+#[test]
+fn resize_pil_reference_width_straddle_5x1_to_2x1() {
+  // 5x1 -> 2x1: a width that straddles the 4-channel vector boundary and
+  // forces a per-axis-only (height = 1) convolution. R is a 0..200 ramp,
+  // G the reverse, B constant 10. Verified against Pillow 12.2.
+  let mut rgba = ::image::RgbaImage::new(5, 1);
+  let rs = [0u8, 50, 100, 150, 200];
+  let gs = [200u8, 150, 100, 50, 0];
+  for x in 0..5 {
+    rgba.put_pixel(
+      x,
+      0,
+      ::image::Rgba([rs[x as usize], gs[x as usize], 10, 255]),
+    );
+  }
+  let img = ::image::DynamicImage::ImageRgba8(rgba);
+  assert_eq!(
+    resize(&img, (1, 2), ResizeFilter::Bilinear)
+      .unwrap()
+      .to_rgba8()
+      .into_raw(),
+    vec![50, 150, 10, 255, 150, 50, 10, 255],
+    "Bilinear 5x1->2x1 must match PIL byte-for-byte"
+  );
+  assert_eq!(
+    resize(&img, (1, 2), ResizeFilter::Bicubic)
+      .unwrap()
+      .to_rgba8()
+      .into_raw(),
+    vec![43, 157, 10, 255, 157, 43, 10, 255],
+    "Bicubic 5x1->2x1 must match PIL byte-for-byte"
+  );
 }
 
 // ---------- image_to_array ----------
