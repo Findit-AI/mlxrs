@@ -219,10 +219,13 @@ impl EmbeddingModelConfiguration {
 /// A flat name → [`Array`] weight map (mlx-embeddings' `weights` dict /
 /// `mx.load(...)` result, the [`crate::io::load_safetensors`] return type).
 ///
-/// Keys are returned **verbatim** — [`load()`] performs no `sanitize`/remap;
-/// that (and mlx-embeddings' subfolder `<folder>.<key>` renaming) is a
-/// per-usecase architecture's responsibility, kept out of this arch-agnostic
-/// surface (exactly as [`crate::lm::load`] does).
+/// Keys carry mlx-embeddings' subfolder `<folder>.<key>` namespacing for shards
+/// loaded from a nested component directory (see [`load()`]'s weight discovery);
+/// a root-level shard's keys are verbatim. [`load()`] performs no further
+/// `sanitize`/remap — architecture-specific key rewriting is the per-usecase
+/// constructor's responsibility (exactly as [`crate::lm::load`] leaves it), but
+/// the multi-component subfolder prefix is applied at load time to match
+/// `mlx_embeddings.utils.load_model`.
 pub type EmbeddingWeights = HashMap<String, Array>;
 
 /// Everything [`load()`] resolved from a model directory, handed to an
@@ -248,8 +251,9 @@ pub struct LoadedEmbeddingModel {
   /// [`model_type`](Self::model_type) was extracted from.
   pub config_json: String,
   /// The merged, name → [`Array`] weight map (mlx-embeddings' `weights`
-  /// dict). Keys are verbatim — the constructor applies any `sanitize`/remap
-  /// itself.
+  /// dict). Nested-component shards carry the `<folder>.` prefix (see
+  /// [`load()`]'s weight discovery); root shards are verbatim. The constructor
+  /// applies any further `sanitize`/remap itself.
   pub weights: EmbeddingWeights,
 }
 
@@ -390,16 +394,19 @@ pub struct LoadedEmbeddingContext {
 ///    [`Error::Backend`] here, with no weight/tokenizer I/O — mlx-embeddings'
 ///    `ValueError("Model type … not supported.")` / mlx-swift-lm's
 ///    `unsupportedModelType`.
-/// 3. Select the tokenizer directory
+/// 3. Read the optional `1_Pooling/config.json` via
+///    [`pooling_from_st_config_path`](crate::embeddings::pooling_from_st_config_path)
+///    (absent ⇒ `None`; a malformed *present* file ⇒ `Err`) — cheap,
+///    recoverable metadata, validated **before** the heavy weight/tokenizer
+///    loads so a broken pooling config fails fast.
+/// 4. Select the tokenizer directory
 ///    ([`tokenizer_source`](EmbeddingModelConfiguration::tokenizer_source) if
 ///    set, else the model directory — mlx-swift-lm's `tokenizerDirectory`).
-/// 4. Discover and merge the weights from the model directory (reusing
-///    [`crate::io::load_safetensors`]).
-/// 5. Build the [`Tokenizer`] from the selected directory via
+/// 5. Discover and merge the weights from the model directory (reusing
+///    [`crate::io::load_safetensors`]), recursively including nested-component
+///    shards with mlx-embeddings' `<folder>.` key prefix.
+/// 6. Build the [`Tokenizer`] from the selected directory via
 ///    [`Tokenizer::from_path`].
-/// 6. Read the optional `1_Pooling/config.json` via
-///    [`pooling_from_st_config_path`](crate::embeddings::pooling_from_st_config_path)
-///    (absent ⇒ `None`; a malformed *present* file ⇒ `Err`).
 /// 7. Construct the model via `registry` and return it with the tokenizer, the
 ///    canonical `model_type`, and the optional pooling config.
 ///
@@ -432,14 +439,24 @@ pub fn load(
     });
   }
 
-  // (3) Select the tokenizer directory: the separate `tokenizer_source` if
+  // (3) Read the optional `1_Pooling/config.json` (mlx-embeddings
+  // `_read_pooling_config`; mlx-swift-lm `loadPooling`) BEFORE any heavy I/O.
+  // An ABSENT file ⇒ `None` (the common non-`sentence-transformers` layout); a
+  // PRESENT but malformed file ⇒ `Err` (the reader's contract — a planted
+  // broken pooling config is a recoverable error, not a silent wrong strategy).
+  // This is cheap, recoverable metadata, so it is validated up front: a
+  // malformed pooling config must not cost a full weights + tokenizer load
+  // first.
+  let pooling = read_optional_pooling(model_dir)?;
+
+  // (4) Select the tokenizer directory: the separate `tokenizer_source` if
   // set, else the model directory (mlx-swift-lm's `tokenizerDirectory`).
   let tokenizer_dir = configuration.tokenizer_directory();
 
-  // (4) Discover/merge the weights from the model directory.
+  // (5) Discover/merge the weights from the model directory.
   let weights = load_weights(model_dir)?;
 
-  // (5) Build the tokenizer from the selected directory. An embedding encoder
+  // (6) Build the tokenizer from the selected directory. An embedding encoder
   // does not generate, so there is no eos override (mlx-embeddings' embedding
   // `load` builds a plain tokenizer); pass `None` — `Tokenizer::from_path`
   // then uses the tokenizer's own `eos_token`.
@@ -449,13 +466,6 @@ pub fn load(
       tokenizer_dir.display()
     ),
   })?;
-
-  // (6) Read the optional `1_Pooling/config.json` (mlx-embeddings
-  // `_read_pooling_config`; mlx-swift-lm `loadPooling`). An ABSENT file ⇒
-  // `None` (the common non-`sentence-transformers` layout); a PRESENT but
-  // malformed file ⇒ `Err` (the reader's contract — a planted broken pooling
-  // config is a recoverable error, not a silent wrong strategy).
-  let pooling = read_optional_pooling(model_dir)?;
 
   // (7) Construct via the registry (already validated as registered in step 2).
   let loaded = LoadedEmbeddingModel {
@@ -495,39 +505,75 @@ fn read_optional_pooling(dir: &Path) -> Result<Option<StPoolingConfig>> {
   crate::embeddings::config::pooling_from_st_config_path(dir).map(Some)
 }
 
+/// A discovered weight shard: its full path plus the **key prefix** to apply to
+/// every tensor name it contributes (mlx-embeddings' subfolder rename), or
+/// `None` for a root-level shard whose keys are merged verbatim.
+struct DiscoveredShard {
+  /// Full path to the `*.safetensors` file.
+  path: PathBuf,
+  /// `Some(folder)` when the shard lives in a *child* directory of the model
+  /// root — every key is rewritten to `<folder>.<key>` (mlx-embeddings'
+  /// `f"{folder_name}.{key}"`, where `folder_name = Path(wf).parent.name`, the
+  /// **immediate** parent's name). `None` for a root-level shard (keys
+  /// verbatim).
+  prefix: Option<String>,
+}
+
+/// Hard cap on how deep the recursive shard walk will descend below the model
+/// root. mlx-embeddings' `glob("**/model*.safetensors", recursive=True)` has no
+/// depth bound, but a hostile / symlink-free-but-deep model directory could
+/// otherwise drive [`collect_shards_recursive`]'s recursion arbitrarily deep
+/// (turning a pathological directory into a stack overflow / abort instead of a
+/// recoverable error). Real multi-component embedding checkpoints nest one level
+/// (`vision_model/model.safetensors`, `text_model/model.safetensors`); 64 levels
+/// covers every realistic layout with a constant stack bound.
+const MAX_WEIGHT_DIR_DEPTH: usize = 64;
+
 /// Discover and merge an embedding model's weights from `dir`, mirroring the
 /// weight-loading half of `mlx_embeddings.utils.load_model`.
 ///
 /// Resolution order (mirroring `load_model`'s two `glob` passes):
 ///
-/// 1. **Sharded / single safetensors:** every `model*.safetensors` in `dir`
-///    (mlx-embeddings `glob.glob(model_path / "**/model*.safetensors")`),
-///    iterated in **sorted filename order** for a deterministic merge —
+/// 1. **Sharded / single safetensors, RECURSIVELY:** every `model*.safetensors`
+///    anywhere under `dir` (mlx-embeddings
+///    `glob.glob(model_path / "**/model*.safetensors", recursive=True)`),
+///    iterated in **sorted full-path order** for a deterministic merge —
 ///    [`crate::io::load_safetensors`] each and `extend(...)` (later shard wins
 ///    on a duplicate key, which a well-formed shard set never produces). Covers
-///    both `model.safetensors` and `model-00001-of-000NN.safetensors`.
-/// 2. **Back-compat `weight*.safetensors`:** if there is no
-///    `model*.safetensors`, mlx-embeddings `load_model` retries
-///    `glob(model_path / "weight*.safetensors")` — the legacy layout — and so
-///    does this loader.
+///    both `model.safetensors` and `model-00001-of-000NN.safetensors`, at the
+///    root and in nested component folders (e.g. a ColVision-style
+///    `vision_model/model.safetensors` + `text_model/model.safetensors`).
+/// 2. **Back-compat `weight*.safetensors` (root only):** if there is no
+///    `model*.safetensors` anywhere, mlx-embeddings `load_model` retries
+///    `glob(model_path / "weight*.safetensors")` — the legacy layout, **not**
+///    recursive (no `**`) — and so does this loader.
 ///
-/// Subfolder-prefixed weights (mlx-embeddings renames a weight loaded from a
-/// subdirectory to `<folder>.<key>`) are an architecture-`sanitize` concern and
-/// are intentionally **not** applied here — keys stay verbatim, exactly as
-/// [`crate::lm::load::load_weights`] does. GGUF is not a `mlx_embeddings`
-/// weight path and is not handled.
+/// **Nested-shard key prefixing (mlx-embeddings parity):** a shard found in a
+/// *child* directory has every tensor key rewritten to `<folder>.<key>` before
+/// merge, where `folder` is the shard's **immediate** parent-directory name —
+/// exactly `load_model`'s
+/// `folder_name = Path(wf).parent.name; new_key = f"{folder_name}.{key}"` (so a
+/// deeper `a/b/model.safetensors` prefixes with `b`, not `a.b`). Root-level
+/// shards (`Path(wf).parent == model_path`) keep their keys verbatim. This is
+/// the one place the embeddings factory diverges from
+/// [`crate::lm::load::load_weights`]'s flat, verbatim merge: multi-component
+/// embedding models (vision + text) ship per-component shard folders the loader
+/// must namespace, and the prefixing is done **here** (per shard, then merge),
+/// leaving the shared [`crate::io::load_safetensors`] and the lm loader
+/// untouched. GGUF is not a `mlx_embeddings` weight path and is not handled.
 ///
 /// No safetensors at all → [`Error::Backend`] (mlx-embeddings'
 /// `FileNotFoundError("No safetensors found in {model_path}")`).
 fn load_weights(dir: &Path) -> Result<EmbeddingWeights> {
-  // mlx-embeddings' primary glob: `model*.safetensors`.
-  let mut shards = collect_sorted(dir, |name| {
+  // mlx-embeddings' primary glob: `**/model*.safetensors` (RECURSIVE).
+  let mut shards = collect_shards_recursive(dir, |name| {
     name.starts_with("model") && name.ends_with(".safetensors")
   })?;
 
-  // mlx-embeddings' back-compat retry: `weight*.safetensors`.
+  // mlx-embeddings' back-compat retry: `weight*.safetensors` at the ROOT only
+  // (the legacy glob is not recursive — no `**`).
   if shards.is_empty() {
-    shards = collect_sorted(dir, |name| {
+    shards = collect_shards_root(dir, |name| {
       name.starts_with("weight") && name.ends_with(".safetensors")
     })?;
   }
@@ -535,34 +581,41 @@ fn load_weights(dir: &Path) -> Result<EmbeddingWeights> {
   if shards.is_empty() {
     return Err(Error::Backend {
       message: format!(
-        "no model weights found in {}: expected `model*.safetensors` (or legacy \
-         `weight*.safetensors`)",
+        "no model weights found in {}: expected `model*.safetensors` (recursively, or legacy \
+         root-level `weight*.safetensors`)",
         dir.display()
       ),
     });
   }
 
-  // Deterministic merge in sorted filename order (`collect_sorted` already
-  // sorts; the dup-key tie-break — which a valid shard set never hits — is
-  // thus reproducible).
+  // Deterministic merge in sorted full-path order (`collect_*` already sort by
+  // path; the cross-shard dup-key tie-break — which a valid shard set never hits
+  // — is thus reproducible). A nested shard's keys are prefixed `<folder>.`
+  // before merge (mlx-embeddings' subfolder rename); root shards merge verbatim.
   let mut weights: EmbeddingWeights = HashMap::new();
   for shard in &shards {
-    let part = crate::io::load_safetensors(shard)?;
-    weights.extend(part);
+    let part = crate::io::load_safetensors(&shard.path)?;
+    match &shard.prefix {
+      Some(folder) => {
+        weights.reserve(part.len());
+        for (key, value) in part {
+          weights.insert(format!("{folder}.{key}"), value);
+        }
+      }
+      None => weights.extend(part),
+    }
   }
   Ok(weights)
 }
 
-/// List the entries of `dir` whose file name matches `pred`, returning their
-/// full paths sorted by name. A non-readable directory (absent / not a
-/// directory / permission) maps to [`Error::Backend`]. Only regular files are
-/// considered (a directory named `model….safetensors` is ignored).
+/// List the root-level entries of `dir` whose file name matches `pred` as
+/// root-level [`DiscoveredShard`]s (no key prefix), sorted by path.
 ///
-/// Twin of [`crate::lm::load`]'s `collect_sorted`: symlinks are intentionally
-/// followed (HF Hub snapshot dirs store `model*.safetensors` as symlinks into
-/// `blobs/<hash>`) via `fs::metadata`, and the gate is on the *resolved*
-/// target being a regular file.
-fn collect_sorted(dir: &Path, pred: impl Fn(&str) -> bool) -> Result<Vec<PathBuf>> {
+/// The non-recursive collector used for mlx-embeddings' back-compat
+/// `weight*.safetensors` glob (which has no `**`). A non-readable directory
+/// (absent / not a directory / permission) maps to [`Error::Backend`]; only
+/// regular files (after symlink resolution) are considered.
+fn collect_shards_root(dir: &Path, pred: impl Fn(&str) -> bool) -> Result<Vec<DiscoveredShard>> {
   let entries = std::fs::read_dir(dir).map_err(|e| Error::Backend {
     message: format!("cannot read model directory {}: {e}", dir.display()),
   })?;
@@ -578,9 +631,12 @@ fn collect_sorted(dir: &Path, pred: impl Fn(&str) -> bool) -> Result<Vec<PathBuf
     }
     // Resolve via `fs::metadata` (follows symlinks) and gate on the target
     // being a regular file — a hostile dir could name a subdir / FIFO
-    // `model.safetensors`, on which the IO loader would fail opaquely.
+    // `weight.safetensors`, on which the IO loader would fail opaquely.
     match std::fs::metadata(entry.path()) {
-      Ok(m) if m.is_file() => out.push(entry.path()),
+      Ok(m) if m.is_file() => out.push(DiscoveredShard {
+        path: entry.path(),
+        prefix: None,
+      }),
       Ok(_) => continue,
       Err(e) => {
         return Err(Error::Backend {
@@ -589,8 +645,107 @@ fn collect_sorted(dir: &Path, pred: impl Fn(&str) -> bool) -> Result<Vec<PathBuf
       }
     }
   }
-  out.sort();
+  out.sort_by(|a, b| a.path.cmp(&b.path));
   Ok(out)
+}
+
+/// Recursively discover every file under `root` whose file name matches `pred`,
+/// returning [`DiscoveredShard`]s (with the mlx-embeddings `<folder>.` prefix
+/// already computed) sorted by full path.
+///
+/// Mirrors mlx-embeddings' `glob("**/model*.safetensors", recursive=True)`:
+/// the walk descends real subdirectories at any depth (bounded by
+/// [`MAX_WEIGHT_DIR_DEPTH`]) but, like Python's `glob`, does **not** recurse
+/// into symlinked directories (avoiding symlink-loop hangs) — symlinked *files*
+/// are still followed and gated on their resolved target being a regular file
+/// (HF Hub snapshots store shards as symlinks into `blobs/<hash>`). For each
+/// match, the prefix is `Some(parent.name)` when the file's immediate parent is
+/// **not** `root`, else `None` (mlx-embeddings' `Path(wf).parent != model_path`
+/// test using `Path(wf).parent.name`).
+fn collect_shards_recursive(
+  root: &Path,
+  pred: impl Fn(&str) -> bool,
+) -> Result<Vec<DiscoveredShard>> {
+  let mut out = Vec::new();
+  walk_shards(root, root, &pred, 0, &mut out)?;
+  out.sort_by(|a, b| a.path.cmp(&b.path));
+  Ok(out)
+}
+
+/// One directory level of [`collect_shards_recursive`]'s walk. `root` is the
+/// model directory (for the prefix decision); `dir` is the directory currently
+/// being read; `depth` is the level below `root`.
+fn walk_shards(
+  root: &Path,
+  dir: &Path,
+  pred: &impl Fn(&str) -> bool,
+  depth: usize,
+  out: &mut Vec<DiscoveredShard>,
+) -> Result<()> {
+  if depth > MAX_WEIGHT_DIR_DEPTH {
+    return Err(Error::Backend {
+      message: format!(
+        "model directory {} nests deeper than the {MAX_WEIGHT_DIR_DEPTH}-level cap; \
+         refusing to recurse",
+        root.display()
+      ),
+    });
+  }
+  let entries = std::fs::read_dir(dir).map_err(|e| Error::Backend {
+    message: format!("cannot read model directory {}: {e}", dir.display()),
+  })?;
+  for entry in entries {
+    let entry = entry.map_err(|e| Error::Backend {
+      message: format!("cannot read an entry of {}: {e}", dir.display()),
+    })?;
+    // `file_type()` does NOT follow symlinks (it reads the dirent / lstat), so
+    // a symlinked directory is classified as a symlink, not a dir — we do not
+    // descend into it (matching `glob`'s default no-follow recursion and
+    // avoiding symlink loops). Files (real or symlinked) fall through to the
+    // name/predicate + `fs::metadata` regular-file gate below.
+    let file_type = entry.file_type().map_err(|e| Error::Backend {
+      message: format!(
+        "cannot determine the type of {} in {}: {e}",
+        entry.file_name().to_string_lossy(),
+        dir.display()
+      ),
+    })?;
+    if file_type.is_dir() {
+      walk_shards(root, &entry.path(), pred, depth + 1, out)?;
+      continue;
+    }
+    let name = entry.file_name();
+    let Some(name) = name.to_str() else { continue };
+    if !pred(name) {
+      continue;
+    }
+    // Resolve via `fs::metadata` (follows symlinks) and gate on the target
+    // being a regular file — a hostile dir could name a FIFO / device
+    // `model.safetensors`, on which the IO loader would fail opaquely.
+    let path = entry.path();
+    match std::fs::metadata(&path) {
+      Ok(m) if m.is_file() => {
+        // mlx-embeddings: `folder_name = Path(wf).parent.name` and apply the
+        // prefix iff `Path(wf).parent != model_path`. The immediate parent's
+        // name (`a/b/model.safetensors` → `b`), never the full relative path.
+        let prefix = match path.parent() {
+          Some(parent) if parent != root => parent
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_owned),
+          _ => None,
+        };
+        out.push(DiscoveredShard { path, prefix });
+      }
+      Ok(_) => continue,
+      Err(e) => {
+        return Err(Error::Backend {
+          message: format!("cannot stat {} in {}: {e}", name, dir.display()),
+        });
+      }
+    }
+  }
+  Ok(())
 }
 
 /// Read `<dir>/config.json` **once**, returning the canonicalized
@@ -697,12 +852,23 @@ fn read_model_type(dir: &Path) -> Result<(String, String)> {
 /// captures the matched string, and *skips* every other value (strings,
 /// numbers, `true`/`false`/`null`, and — to find their end — nested
 /// objects/arrays) with a depth cap so a hostile `config.json` cannot
-/// stack-overflow the walker. The **first** occurrence of `key` wins.
+/// stack-overflow the walker.
+///
+/// **Duplicate-key semantics match a real JSON parser:** if `key` appears more
+/// than once at the top level, the **last** occurrence wins — exactly what
+/// `serde_json` deserialization into a struct field and Python's `json.load`
+/// (which keeps the last value for a duplicate key) both do. Each occurrence's
+/// value is still required to be a JSON string (a non-string duplicate is
+/// rejected), and every occurrence is fully parsed/validated.
 ///
 /// The whole top-level object is validated to its closing `}` even after the
 /// key is found, so a truncated / malformed `config.json` whose `model_type`
 /// happens to be the first key (e.g. `{"model_type": "bert"` with no close) is
 /// rejected rather than silently accepted — the file must be well-formed JSON.
+/// Numbers are validated against the RFC 8259 grammar
+/// (`-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?`), so a malformed number anywhere in
+/// the object (`01`, `1.`, `1e`) rejects the whole config as invalid JSON
+/// rather than being silently accepted.
 fn extract_string_field(src: &str, key: &str) -> std::result::Result<Option<String>, String> {
   let bytes = src.as_bytes();
   let mut p = JsonCursor { bytes, pos: 0 };
@@ -720,9 +886,11 @@ fn extract_string_field(src: &str, key: &str) -> std::result::Result<Option<Stri
     p.skip_ws();
     p.expect(b':')?;
     p.skip_ws();
-    if field == key && found.is_none() {
-      // The first matching key: its value must be a JSON string. Capture it
-      // but keep validating the rest of the object (do NOT return early).
+    if field == key {
+      // A matching key: its value must be a JSON string. Capture it (a later
+      // duplicate OVERWRITES an earlier capture — last-wins, matching
+      // `serde_json` / Python `json.load` duplicate-key semantics) but keep
+      // validating the rest of the object (do NOT return early).
       if p.peek() == Some(b'"') {
         found = Some(p.parse_string()?);
       } else {
@@ -731,8 +899,8 @@ fn extract_string_field(src: &str, key: &str) -> std::result::Result<Option<Stri
         ));
       }
     } else {
-      // A different key (or a later duplicate of `key`) — skip its value,
-      // whatever JSON type it is, to advance past it.
+      // A different key — skip its value, whatever JSON type it is, to advance
+      // past it.
       p.skip_value(0)?;
     }
     p.skip_ws();
@@ -960,10 +1128,7 @@ impl JsonCursor<'_> {
       Some(b't') => self.expect_lit(b"true"),
       Some(b'f') => self.expect_lit(b"false"),
       Some(b'n') => self.expect_lit(b"null"),
-      Some(c) if c == b'-' || c.is_ascii_digit() => {
-        self.skip_number();
-        Ok(())
-      }
+      Some(c) if c == b'-' || c.is_ascii_digit() => self.parse_number(),
       Some(c) => Err(format!(
         "unexpected byte {:?} where a JSON value was expected at byte {}",
         c as char, self.pos
@@ -1058,18 +1223,79 @@ impl JsonCursor<'_> {
     }
   }
 
-  /// Skip a JSON number — the cursor advances over every byte that can be
-  /// part of an `int frac? exp?` token. Exact numeric validity is not the
-  /// walker's concern (it only needs the value's *extent*); a non-matching
-  /// key's malformed number would simply fail at the following `,`/`}`.
-  fn skip_number(&mut self) {
-    while let Some(b) = self.peek() {
-      if b.is_ascii_digit() || b == b'-' || b == b'+' || b == b'.' || b == b'e' || b == b'E' {
+  /// Parse and **strictly validate** a JSON number against the RFC 8259
+  /// grammar `-?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?` (the cursor must be on the
+  /// leading `-` or first digit). A malformed number — `01` (leading zero),
+  /// `1.` (trailing dot, no fraction digit), `1e` / `1e+` (exponent with no
+  /// digit), or a bare `-` — is rejected as invalid JSON rather than silently
+  /// accepted, so the whole `config.json` is required to be well-formed.
+  ///
+  /// Unlike a lenient extent-skipper, exact validity *is* enforced here: the
+  /// "whole config is valid JSON before dispatch" guarantee means a config the
+  /// model code would later reject (via a real parser) must not be silently
+  /// accepted by this walker.
+  fn parse_number(&mut self) -> std::result::Result<(), String> {
+    let start = self.pos;
+    let invalid = |this: &Self| {
+      // Report the malformed token from its start (not the byte we stopped on)
+      // so the error points at the offending number.
+      Err(format!("invalid JSON number at byte {start}: {:?}", {
+        let end = this.pos.min(this.bytes.len());
+        std::str::from_utf8(&this.bytes[start..end]).unwrap_or("<number>")
+      }))
+    };
+
+    // Optional minus (JSON forbids a leading `+`).
+    if self.peek() == Some(b'-') {
+      self.pos += 1;
+    }
+
+    // Integer part: a single `0`, or a nonzero digit followed by more digits.
+    // A leading zero (`01`) is invalid; an absent integer part (bare `-`) too.
+    match self.peek() {
+      Some(b'0') => {
         self.pos += 1;
-      } else {
-        break;
+        // `0` must NOT be followed by another digit (`01`, `00` are invalid).
+        if matches!(self.peek(), Some(d) if d.is_ascii_digit()) {
+          return invalid(self);
+        }
+      }
+      Some(d) if d.is_ascii_digit() => {
+        // d is 1..=9 here (0 handled above). Consume the rest of the digits.
+        self.pos += 1;
+        while matches!(self.peek(), Some(d) if d.is_ascii_digit()) {
+          self.pos += 1;
+        }
+      }
+      _ => return invalid(self),
+    }
+
+    // Optional fraction: a `.` MUST be followed by at least one digit.
+    if self.peek() == Some(b'.') {
+      self.pos += 1;
+      if !matches!(self.peek(), Some(d) if d.is_ascii_digit()) {
+        return invalid(self);
+      }
+      while matches!(self.peek(), Some(d) if d.is_ascii_digit()) {
+        self.pos += 1;
       }
     }
+
+    // Optional exponent: `e`/`E`, an optional sign, then ≥1 digit.
+    if matches!(self.peek(), Some(b'e' | b'E')) {
+      self.pos += 1;
+      if matches!(self.peek(), Some(b'+' | b'-')) {
+        self.pos += 1;
+      }
+      if !matches!(self.peek(), Some(d) if d.is_ascii_digit()) {
+        return invalid(self);
+      }
+      while matches!(self.peek(), Some(d) if d.is_ascii_digit()) {
+        self.pos += 1;
+      }
+    }
+
+    Ok(())
   }
 }
 
@@ -1514,6 +1740,213 @@ mod tests {
     assert!(
       r.is_err(),
       "pathological nesting must be a recoverable error"
+    );
+  }
+
+  #[test]
+  fn extract_duplicate_key_last_wins() {
+    // A real JSON parser (serde_json into a field / Python `json.load`) keeps
+    // the LAST value for a duplicate top-level key. The hand-rolled extractor
+    // must match: the second `model_type` overwrites the first.
+    let src = r#"{"model_type": "first", "model_type": "second"}"#;
+    assert_eq!(
+      extract_string_field(src, "model_type").unwrap(),
+      Some("second".to_owned()),
+      "last duplicate key must win"
+    );
+    // Three occurrences: the last still wins; intervening keys do not matter.
+    let src3 = r#"{"model_type": "a", "x": 1, "model_type": "b", "model_type": "c"}"#;
+    assert_eq!(
+      extract_string_field(src3, "model_type").unwrap(),
+      Some("c".to_owned())
+    );
+  }
+
+  #[test]
+  fn extract_duplicate_key_non_string_later_value_is_rejected() {
+    // Every occurrence of the key is validated as a string — a later duplicate
+    // with a non-string value rejects the whole config (it is still malformed
+    // for our single-string-field contract).
+    let src = r#"{"model_type": "ok", "model_type": 7}"#;
+    assert!(
+      extract_string_field(src, "model_type").is_err(),
+      "a non-string duplicate value must be rejected"
+    );
+  }
+
+  #[test]
+  fn extract_rejects_rfc8259_malformed_numbers() {
+    // Each malformed number (in a NON-matching key's value, exercised via the
+    // value-skip path) must reject the whole object as invalid JSON.
+    for bad in [
+      r#"{"x": 01}"#,   // leading zero
+      r#"{"x": 00}"#,   // leading zero
+      r#"{"x": 1.}"#,   // trailing dot, no fraction digit
+      r#"{"x": 1e}"#,   // exponent with no digit
+      r#"{"x": 1e+}"#,  // exponent sign with no digit
+      r#"{"x": 1E-}"#,  // uppercase exponent sign with no digit
+      r#"{"x": -}"#,    // bare minus, no integer part
+      r#"{"x": .5}"#,   // no integer part before the dot
+      r#"{"x": 1..2}"#, // double dot
+    ] {
+      assert!(
+        extract_string_field(bad, "model_type").is_err(),
+        "malformed number must be rejected: {bad}"
+      );
+    }
+  }
+
+  #[test]
+  fn extract_accepts_rfc8259_valid_numbers() {
+    // Valid RFC 8259 numbers (in a non-matching key's value) must be accepted;
+    // `model_type` is absent so the result is `Ok(None)`.
+    for good in [
+      r#"{"x": 1}"#,
+      r#"{"x": 1.0}"#,
+      r#"{"x": 1e3}"#,
+      r#"{"x": -1.5e-2}"#,
+      r#"{"x": 0}"#,
+      r#"{"x": 0.5}"#,
+      r#"{"x": 10}"#,
+      r#"{"x": 1E+10}"#,
+      r#"{"x": -0}"#,
+    ] {
+      assert_eq!(
+        extract_string_field(good, "model_type").unwrap(),
+        None,
+        "valid number must be accepted (model_type absent ⇒ None): {good}"
+      );
+    }
+    // A valid number AS the matched value is still rejected (model_type must be
+    // a string) — this is the existing non-string-value contract, unchanged.
+    assert!(extract_string_field(r#"{"model_type": 1.0}"#, "model_type").is_err());
+  }
+
+  // ───────────── recursive nested-shard load tests ─────────────
+
+  /// Write a single-tensor `<dir>/<name>` safetensors whose only key is
+  /// `tensor_key`, for the recursive-load tests.
+  fn write_one_tensor(path: &Path, tensor_key: &str) {
+    let mut weights: EmbeddingWeights = HashMap::new();
+    weights.insert(
+      tensor_key.to_owned(),
+      Array::from_slice::<f32>(&[1.0, 2.0], &(2usize,)).unwrap(),
+    );
+    crate::io::save_safetensors(path, &weights).unwrap();
+  }
+
+  #[test]
+  fn load_weights_recurses_and_prefixes_nested_shards() {
+    // A multi-component layout: a ROOT `model.safetensors` plus a NESTED
+    // `vision_model/model.safetensors`. mlx-embeddings loads both recursively
+    // and prefixes the nested shard's keys with the IMMEDIATE parent folder
+    // name (`vision_model.`); the root shard's keys stay verbatim.
+    let dir = fresh_dir("recursive");
+    write_one_tensor(&dir.join("model.safetensors"), "embeddings.weight");
+    let vision = dir.join("vision_model");
+    std::fs::create_dir_all(&vision).unwrap();
+    write_one_tensor(&vision.join("model.safetensors"), "encoder.weight");
+
+    let weights = load_weights(&dir).expect("recursive load");
+    assert!(
+      weights.contains_key("embeddings.weight"),
+      "root-shard key must be verbatim; got {:?}",
+      weights.keys().collect::<Vec<_>>()
+    );
+    assert!(
+      weights.contains_key("vision_model.encoder.weight"),
+      "nested-shard key must be `<folder>.<key>`; got {:?}",
+      weights.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(weights.len(), 2);
+  }
+
+  #[test]
+  fn load_weights_handles_nested_only_models() {
+    // A model with NO root shard, only nested-component shards (the case the
+    // flat loader silently reported as "missing weights"). Both nested shards
+    // load, each prefixed by its own immediate parent folder.
+    let dir = fresh_dir("nested-only");
+    let vision = dir.join("vision_model");
+    let text = dir.join("text_model");
+    std::fs::create_dir_all(&vision).unwrap();
+    std::fs::create_dir_all(&text).unwrap();
+    write_one_tensor(&vision.join("model.safetensors"), "w");
+    write_one_tensor(&text.join("model.safetensors"), "w");
+
+    let weights = load_weights(&dir).expect("nested-only load");
+    assert!(weights.contains_key("vision_model.w"));
+    assert!(weights.contains_key("text_model.w"));
+    assert_eq!(weights.len(), 2);
+  }
+
+  #[test]
+  fn load_weights_prefixes_with_immediate_parent_only() {
+    // A shard two levels deep `a/b/model.safetensors` is prefixed with the
+    // IMMEDIATE parent's name (`b.`), NOT the full relative path (`a.b.`) —
+    // matching mlx-embeddings' `Path(wf).parent.name`.
+    let dir = fresh_dir("deep-prefix");
+    let deep = dir.join("a").join("b");
+    std::fs::create_dir_all(&deep).unwrap();
+    write_one_tensor(&deep.join("model.safetensors"), "w");
+
+    let weights = load_weights(&dir).expect("deep nested load");
+    assert!(
+      weights.contains_key("b.w"),
+      "prefix must be the immediate parent folder name; got {:?}",
+      weights.keys().collect::<Vec<_>>()
+    );
+    assert!(!weights.contains_key("a.b.w"));
+  }
+
+  #[test]
+  fn load_weights_backcompat_weight_glob_is_root_only() {
+    // The legacy `weight*.safetensors` retry is NOT recursive: a nested
+    // `weight.safetensors` (with no `model*.safetensors` anywhere) must NOT be
+    // discovered — only a ROOT-level `weight*.safetensors` is.
+    let dir = fresh_dir("backcompat");
+    write_one_tensor(&dir.join("weights.safetensors"), "root.w");
+    let sub = dir.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    write_one_tensor(&sub.join("weight.safetensors"), "nested.w");
+
+    let weights = load_weights(&dir).expect("back-compat load");
+    assert!(weights.contains_key("root.w"));
+    assert!(
+      !weights.contains_key("sub.nested.w") && !weights.contains_key("nested.w"),
+      "the legacy weight glob is root-only; nested weight*.safetensors must be ignored; got {:?}",
+      weights.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(weights.len(), 1);
+  }
+
+  #[test]
+  fn load_pooling_validated_before_heavy_io() {
+    // A MALFORMED `1_Pooling/config.json` must fail the load even when the
+    // weights/tokenizer would be expensive/invalid to load — proving the cheap
+    // pooling validation runs BEFORE the heavy I/O. The `model.safetensors`
+    // here is deliberately INVALID: if `load()` reached the weight load it
+    // would surface a safetensors parse error instead of the pooling error.
+    let dir = fresh_dir("pooling-first");
+    std::fs::write(dir.join("config.json"), mock_config_json("mockemb")).unwrap();
+    std::fs::write(dir.join("model.safetensors"), b"not a safetensors file").unwrap();
+    // No tokenizer.json either — another heavy step that would fail later.
+    let pooling_dir = dir.join("1_Pooling");
+    std::fs::create_dir_all(&pooling_dir).unwrap();
+    std::fs::write(pooling_dir.join("config.json"), b"{ not valid json").unwrap();
+
+    let registry = EmbeddingModelTypeRegistry::new().with("mockemb", mock_constructor());
+    let config = EmbeddingModelConfiguration::from_directory(&dir);
+
+    let Err(err) = load(&config, &registry) else {
+      panic!("malformed pooling config must error");
+    };
+    let msg = err.to_string();
+    // The error must be about the pooling config, NOT a safetensors/tokenizer
+    // failure (which would mean the heavy I/O ran first).
+    assert!(
+      !msg.contains("safetensors") && !msg.contains("no model weights"),
+      "pooling must be validated before the weight load; got: {msg}"
     );
   }
 }
