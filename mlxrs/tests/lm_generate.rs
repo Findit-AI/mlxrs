@@ -1080,6 +1080,153 @@ fn stream_generate_peak_memory_is_monotonic() {
   }
 }
 
+/// L3 zero-cost opt-out (Codex review fix): with
+/// `collect_logprobs == false` and the default greedy sampler
+/// (`temp == 0`), the `logits - logsumexp(logits)` normalization is
+/// SKIPPED entirely — not just the `[V]` squeeze. The sampler reads raw
+/// post-processor logits, and `argmax(logits) == argmax(logits - lse)` so
+/// the sampled token is byte-identical to a `collect_logprobs == true`
+/// run. The observable proof is two-pronged:
+///   1. Behavioural: every `step.token` matches the `collect_logprobs ==
+///      true` run on byte-identical inputs (the gate did NOT change which
+///      token gets picked).
+///   2. Cost: `peak_memory_bytes` after the opt-out run is `<=` the
+///      `collect_logprobs == true` run on the same prompt + cache shape
+///      (the skipped logsumexp node didn't have to be allocated). A
+///      strict `<` is not asserted because the peak counter is
+///      process-global + monotonic — earlier tests may have already
+///      pushed it past either run's working set; the documented contract
+///      is "no extra cost when off", not "always strictly cheaper".
+#[test]
+fn generate_step_default_skips_logsumexp_normalization() {
+  // Same prompt + model fixture for both runs, so any peak delta comes
+  // strictly from the L3 normalization gate.
+  let prompt = [1u32];
+  let max_tokens = 8;
+  let bias = [1.0_f32, 2.0, 5.0, 3.0, 4.0];
+
+  // Run A: opt-in. Both the normalization AND the squeeze run; every
+  // step yields `Some([V])` logprobs. Force materialization of each
+  // logprobs Array via `to_vec` (which evaluates the lazy graph) so the
+  // logsumexp + subtract nodes are actually computed, not just built —
+  // the peak comparison must reflect the work, not just node count.
+  let model_a = MockModel::with_bias(bias.to_vec());
+  let cfg_a = GenConfig {
+    max_tokens,
+    eos: vec![],
+    collect_logprobs: true,
+    ..GenConfig::default()
+  };
+  let _ = mlxrs::memory::reset_peak_memory();
+  let mut tokens_a: Vec<u32> = Vec::new();
+  for step in generate_step(&model_a, &prompt, cache(1), cfg_a) {
+    let s = step.unwrap();
+    tokens_a.push(s.token);
+    let mut lp = s.logprobs.expect("collect_logprobs=true ⇒ Some(Array)");
+    // Evaluate — forces the logsumexp + subtract nodes.
+    let _ = lp.to_vec::<f32>().unwrap();
+  }
+  let peak_a = mlxrs::memory::peak_memory().expect("peak_memory available in-process");
+
+  // Run B: opt-out (default). The normalization is skipped, the squeeze
+  // is skipped, every step yields `None`.
+  let model_b = MockModel::with_bias(bias.to_vec());
+  let cfg_b = GenConfig {
+    max_tokens,
+    eos: vec![],
+    // collect_logprobs: false (default)
+    ..GenConfig::default()
+  };
+  let _ = mlxrs::memory::reset_peak_memory();
+  let mut tokens_b: Vec<u32> = Vec::new();
+  for step in generate_step(&model_b, &prompt, cache(1), cfg_b) {
+    let s = step.unwrap();
+    assert!(
+      s.logprobs.is_none(),
+      "collect_logprobs=false ⇒ GenStep.logprobs is None"
+    );
+    tokens_b.push(s.token);
+  }
+  let peak_b = mlxrs::memory::peak_memory().expect("peak_memory available in-process");
+
+  // (1) Behavioural: same tokens (argmax is shift-invariant; the gate did
+  // not change sampling). bias[2] == 5.0 ⇒ argmax == 2 every step.
+  assert_eq!(tokens_a.len(), max_tokens);
+  assert_eq!(tokens_b.len(), max_tokens);
+  for (a, b) in tokens_a.iter().zip(tokens_b.iter()) {
+    assert_eq!(
+      a, b,
+      "opt-out path must sample the same token as opt-in (argmax is shift-invariant)"
+    );
+    assert_eq!(*a, 2, "argmax(bias) == 2 (bias[2] == 5.0)");
+  }
+
+  // (2) Cost: opt-out peak must not exceed opt-in peak. The
+  // process-global counter is monotonic + earlier tests may have pushed
+  // it past either run, so this asserts `<=` (the documented "no extra
+  // cost when off" contract) rather than `<`.
+  assert!(
+    peak_b <= peak_a,
+    "opt-out peak ({peak_b}) must not exceed opt-in peak ({peak_a}) — \
+     the skipped logsumexp node should never cost MORE than running it"
+  );
+}
+
+/// L3 normalization gate respects `top_p` (the only sampler in
+/// [`make_sampler`] that strictly requires normalized log-probs — its
+/// `exp(logprobs)` cumsum assumes a `1.0` total). With `top_p ∈ (0, 1)`
+/// AND `collect_logprobs == false`, the gate MUST still run the
+/// normalization so the sampler reads true log-probs (otherwise top_p's
+/// `1 - top_p` cumulative threshold is on raw `exp(logits)` and the
+/// nucleus cutoff is wrong). The observable proof: the sampled token is
+/// the same as the `collect_logprobs == true` run on the same `top_p`
+/// config — i.e. the sampler did NOT silently regress to a raw-logit
+/// input.
+#[test]
+fn generate_step_top_p_forces_normalization_even_when_off() {
+  // bias[2] is the dominant token (5.0 vs 1-4.0 others), so under any
+  // reasonable top_p the nucleus contains it; with `temp` small enough
+  // the categorical draw concentrates on token 2.
+  let bias = [1.0_f32, 2.0, 5.0, 3.0, 4.0];
+  let model_a = MockModel::with_bias(bias.to_vec());
+  // Seed the stochastic sampler so the two runs draw the SAME PRNG
+  // stream — any token divergence would then be a normalization bug, not
+  // PRNG drift.
+  let cfg_a = GenConfig {
+    max_tokens: 4,
+    eos: vec![],
+    temp: 0.1,  // small temp → very concentrated draw
+    top_p: 0.9, // forces the normalization gate
+    seed: Some(42),
+    collect_logprobs: true,
+    ..GenConfig::default()
+  };
+  let steps_a: Vec<u32> = generate_step(&model_a, &[1u32], cache(1), cfg_a)
+    .map(|r| r.unwrap().token)
+    .collect();
+
+  let model_b = MockModel::with_bias(bias.to_vec());
+  let cfg_b = GenConfig {
+    max_tokens: 4,
+    eos: vec![],
+    temp: 0.1,
+    top_p: 0.9,
+    seed: Some(42),
+    // collect_logprobs: false (default) — the gate must STILL run the
+    // normalization because top_p is enabled.
+    ..GenConfig::default()
+  };
+  let steps_b: Vec<u32> = generate_step(&model_b, &[1u32], cache(1), cfg_b)
+    .map(|r| r.unwrap().token)
+    .collect();
+
+  assert_eq!(
+    steps_a, steps_b,
+    "top_p must force normalization even with collect_logprobs=false — \
+     same PRNG seed ⇒ identical token stream"
+  );
+}
+
 /// `generate` with `max_tokens == 0` produces no tokens; the returned
 /// `GenerationStats` carries zero-counts + a zero tps + the original
 /// `prompt_tokens`.

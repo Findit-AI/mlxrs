@@ -231,8 +231,30 @@ pub fn vlm_generate<'a, M: Model>(
   // an image marker that the caller intends to remain literal text in a
   // no-image run; `lm::generate::generate_step` consumes raw token ids
   // exactly as supplied.
+  //
+  // **`collect_logprobs` override**: the multimodal-path decode loop in
+  // this file ALWAYS emits `Some(logprobs)` (the comment at the
+  // post-sampler squeeze documents the unconditional yield), so the
+  // cross-crate VLM-surface contract is "every `GenStep.logprobs` is
+  // `Some`". The zero-image branch delegates to `lm::generate_step`,
+  // which honors `cfg.lm.collect_logprobs` — and that field's `Default`
+  // is `false`, so a default-cfg zero-image VLM run would otherwise
+  // silently flip to `None`-logprobs and break the documented surface
+  // (Codex finding-2: contract drift between the two branches). Force
+  // the LM-level opt-in here so the zero-image branch yields the same
+  // `Some(logprobs)` shape the multimodal branch does — the caller still
+  // controls `collect_logprobs` end-to-end via [`VlmGenConfig::lm`], but
+  // the zero-image fallback can never undershoot the documented VLM
+  // contract.
   if images.is_empty() {
-    let iter = crate::lm::generate::generate_step(model, text_tokens, cache, cfg.lm);
+    // `cfg` is consumed by this branch (the multimodal path below
+    // re-borrows `cfg.*` fields directly), so move `cfg.lm` out instead
+    // of cloning — `clippy::redundant-clone` flags the avoidable extra
+    // owned `GenConfig` heap-walk of the eos / xtc_special_tokens /
+    // logit_bias vectors.
+    let mut lm = cfg.lm;
+    lm.collect_logprobs = true;
+    let iter = crate::lm::generate::generate_step(model, text_tokens, cache, lm);
     // Box so the two branches share an opaque return type. Allocation
     // here is one-shot at construction (not per step), and the
     // alternative — duplicating the iterator-state struct across both
