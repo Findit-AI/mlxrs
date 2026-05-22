@@ -28,12 +28,22 @@
 //! dispatching to `quantizedScaledDotProductAttention`) and the attention
 //! `sinks` argument are likewise deliberately out of scope here — both are
 //! follow-ups layered on top of the base [`attention::scaled_dot_product_attention`].
+//!
+//! M-N4 adds the **normalization** primitives ([`mod@norm`]):
+//! [`RMSNorm`] / [`LayerNorm`] (both wrapping the fused `mlx_fast_*`
+//! kernels — same primitives mlx-lm's `nn.RMSNorm` / `nn.LayerNorm` and
+//! swift `RMSNorm` / `LayerNorm` delegate to) and [`GroupNorm`]
+//! (no fused kernel; reproduced via [`crate::ops`]). The
+//! `BatchNorm` / `InstanceNorm` siblings are deferred — these three
+//! cover ~all transformer LM/VLM use.
 
 pub mod attention;
+pub mod norm;
 pub mod rope;
 pub mod rope_scaling;
 
 pub use attention::{Mask, scaled_dot_product_attention};
+pub use norm::{GroupNorm, LayerNorm, RMSNorm};
 pub use rope::{
   Rope, RopeOffsetRef, rope, rope_dynamic, rope_dynamic_with_freqs, rope_with_freqs,
   rope_with_freqs_offset, rope_with_offset,
