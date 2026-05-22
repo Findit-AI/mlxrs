@@ -13,10 +13,13 @@
 //!   `generation_config.json` `eos_token_id` override applied. The pure-parse
 //!   step is [`Config::from_json`].
 //! - [`load_weights`] mirrors the weight-discovery + merge of
-//!   `utils.load_model`: `glob("model*.safetensors")`, `mx.load` each, then
-//!   `weights.update(...)` to merge — plus a single-`*.gguf` fallback
-//!   (mirroring mlx-lm's GGUF path). Quantized triples (`*.weight` /
-//!   `*.scales` / `*.biases`) are kept **verbatim**.
+//!   `utils.load_model`, honoring `model.safetensors.index.json` (the HF
+//!   safetensors-sharded authoritative manifest) as the SINGLE source of
+//!   truth for which shards are part of the checkpoint when present, then
+//!   falling back to a single `model.safetensors`, a legacy
+//!   `weights.safetensors`, or a single `*.gguf` (mirroring mlx-lm's GGUF
+//!   path). Quantized triples (`*.weight` / `*.scales` / `*.biases`) are
+//!   kept **verbatim**.
 //! - [`load`] mirrors `utils.load` — wire `config.json` + weights + the #18
 //!   [`Tokenizer`](crate::tokenizer::Tokenizer) into the parts a (per-usecase)
 //!   architecture assembles itself.
@@ -74,6 +77,14 @@ use crate::{
 /// `pub(crate)` so the [`crate::lm::factory`] load path shares the *one* bound
 /// (rather than restating it) — both read `config.json` through the same cap.
 pub(crate) const MAX_CONFIG_BYTES: u64 = 1 << 20;
+
+/// Upper bound on a `model.safetensors.index.json` we will read into memory.
+/// The index carries one `weight_name -> shard_name` entry per tensor; even
+/// a Llama-3-405B-class model lists well under 100 000 tensors, comfortably
+/// under 16 MiB of JSON. A hostile model directory cannot OOM us by planting
+/// a multi-GB index. Twin of [`MAX_CONFIG_BYTES`] for the larger
+/// per-tensor-keyed index file.
+const MAX_INDEX_BYTES: u64 = 16 << 20;
 
 /// Quantization parameters from a checkpoint's `config.json` `quantization`
 /// block (mlx-lm `utils.py` `config["quantization"]`: `{ "group_size": int,
@@ -189,44 +200,69 @@ impl Config {
 pub type Weights = HashMap<String, Array>;
 
 /// Discover and merge a model's weights from `dir`, mirroring the
-/// weight-loading half of `mlx_lm.utils.load_model`.
+/// weight-loading half of `mlx_lm.utils.load_model` while honoring the
+/// HF/safetensors `model.safetensors.index.json` weight-map as the
+/// **authoritative** shard manifest.
 ///
-/// Resolution order:
+/// Resolution order (first match wins):
 ///
-/// 1. **Sharded / single safetensors:** every `model*.safetensors` in `dir`
-///    (mlx-lm `glob.glob(model_path / "model*.safetensors")`), iterated in
-///    **sorted filename order** so a deterministic, reproducible merge —
-///    `mx.load` each and `weights.update(...)` (later shard wins on a
-///    duplicate key, which a well-formed shard set never produces). This
-///    covers both `model.safetensors` and
-///    `model-00001-of-000NN.safetensors` shard sets.
-/// 2. **GGUF fallback:** if there is no `model*.safetensors`, a single
-///    `*.gguf` in `dir` is loaded via [`crate::io::load_gguf`] (mlx-lm's
-///    GGUF load path). Requires the `gguf` feature; without it a present
-///    `*.gguf` is reported as unsupported.
+/// 1. **`model.safetensors.index.json` (authoritative).** If the index file
+///    is present, it is the SINGLE source of truth for which shards belong
+///    to the checkpoint. The unique shard filenames listed in its
+///    `weight_map` are loaded from `<dir>/<shard>` and merged. Stale
+///    `model*.safetensors` files in `dir` whose names are NOT in the index
+///    are **ignored** (so the [`save_model`] index-rename single-commit-point
+///    can leave new-but-not-yet-published shards on disk, or stale-from-an-
+///    earlier-checkpoint shards, without corrupting load). This is the
+///    standard HF safetensors-sharded convention (and mlx-lm's own
+///    distributed-load path: `utils.py:557-558` reads the same `weight_map`
+///    to pick local files; the local-only path's `glob("model*.safetensors")`
+///    happens to converge on the same files only because a fresh
+///    `save_model` directory has no stragglers).
+/// 2. **Single `model.safetensors`** (no index). The HF un-sharded
+///    convention: load the one file directly.
+/// 3. **Legacy `weights.safetensors`.** Pre-HF-convention back-compat: if a
+///    directory carries only this name, load it.
+/// 4. **GGUF fallback:** if no safetensors of any of the three layouts above
+///    is present, a single `*.gguf` in `dir` is loaded via
+///    [`crate::io::load_gguf`] (mlx-lm's GGUF load path). Requires the
+///    `gguf` feature; without it a present `*.gguf` is reported as
+///    unsupported.
 ///
 /// No safetensors and no usable GGUF → [`Error::Backend`] (mlx-lm's
 /// `FileNotFoundError("No safetensors found in {model_path}")`). Keys are
 /// returned **verbatim** (no remap/sanitize — spec §7.2).
+///
+/// The index is parsed with the same bounded-IO / `O_NONBLOCK` /
+/// non-regular-reject discipline `read_bounded_config_file` uses for
+/// `config.json` (capped at 16 MiB — well above a Llama-3-405B-class
+/// index); a malformed or out-of-spec index is a recoverable
+/// [`Error::Backend`].
 pub fn load_weights(dir: &Path) -> Result<Weights> {
-  let mut shards = collect_sorted(dir, |name| {
-    name.starts_with("model") && name.ends_with(".safetensors")
-  })?;
-
-  if !shards.is_empty() {
-    // Deterministic merge in sorted filename order (mlx-lm globs then
-    // `weights.update(...)`; sorting makes the dup-key tie-break — which a
-    // valid shard set never hits — reproducible).
-    shards.sort();
-    let mut weights: Weights = HashMap::new();
-    for shard in &shards {
-      let part = crate::io::load_safetensors(shard)?;
-      weights.extend(part);
-    }
+  // 1. Index-honoring path: the index, if present, IS the authoritative
+  //    shard manifest. Stale `model*.safetensors` files NOT listed in the
+  //    index are invisible to load — that is what makes the [`save_model`]
+  //    index-rename single-commit-point safe.
+  if let Some(weights) = load_via_index(dir)? {
     return Ok(weights);
   }
 
-  // No safetensors → try a single `*.gguf` (mlx-lm's GGUF load path).
+  // 2. Single, un-sharded `model.safetensors` (HF convention without an
+  //    index file).
+  let single = dir.join("model.safetensors");
+  if path_is_file(&single)? {
+    return crate::io::load_safetensors(&single);
+  }
+
+  // 3. Legacy back-compat: a `weights.safetensors`-only directory (pre-HF
+  //    naming). Kept so a hand-rolled or older checkpoint that uses this
+  //    name still loads.
+  let legacy = dir.join("weights.safetensors");
+  if path_is_file(&legacy)? {
+    return crate::io::load_safetensors(&legacy);
+  }
+
+  // 4. No safetensors → try a single `*.gguf` (mlx-lm's GGUF load path).
   let ggufs = collect_sorted(dir, |name| name.ends_with(".gguf"))?;
   if let Some(gguf) = ggufs.first() {
     #[cfg(feature = "gguf")]
@@ -248,10 +284,123 @@ pub fn load_weights(dir: &Path) -> Result<Weights> {
 
   Err(Error::Backend {
     message: format!(
-      "no model weights found in {}: expected `model*.safetensors` (or a single `*.gguf`)",
+      "no model weights found in {}: expected `model.safetensors.index.json`, \
+       `model.safetensors`, `weights.safetensors`, or a single `*.gguf`",
       dir.display()
     ),
   })
+}
+
+/// Load a checkpoint via its `model.safetensors.index.json`, if present.
+///
+/// Returns `Ok(Some(weights))` when an index file is found and successfully
+/// drives the load; `Ok(None)` when no index file is present (the caller's
+/// "try the next candidate" signal — twin of [`read_bounded_config_file`]'s
+/// absent-file convention); `Err` on any structural problem (malformed
+/// index, missing referenced shard, IO failure).
+///
+/// The index is the HF/safetensors authoritative shard manifest: its
+/// `weight_map` lists every weight-name → shard-file-name binding. The
+/// **unique** shard file names from `weight_map`'s values are collected, the
+/// shards are loaded in sorted filename order (the same determinism
+/// convention [`make_shards`] uses), and the per-shard maps are merged. A
+/// shard file named in the index but absent on disk is an
+/// [`Error::Backend`] naming the offending shard. A weight key listed in
+/// `weight_map` whose corresponding tensor is NOT in the named shard's
+/// safetensors body is silently tolerated (mlx-lm tolerates the symmetric
+/// case — see `utils.py:557-558` — and the surrounding model construction
+/// will raise on the missing key with a much better diagnostic).
+///
+/// The index body is bounded at [`MAX_INDEX_BYTES`] via the shared
+/// [`read_bounded_text_file`] primitive.
+fn load_via_index(dir: &Path) -> Result<Option<Weights>> {
+  let index_path = dir.join("model.safetensors.index.json");
+  let Some(text) = read_bounded_text_file(&index_path, "model weight index", MAX_INDEX_BYTES)?
+  else {
+    return Ok(None);
+  };
+
+  let parsed: serde_json::Value = serde_json::from_str(&text).map_err(|e| Error::Backend {
+    message: format!(
+      "model weight index {} is not valid JSON: {e}",
+      index_path.display()
+    ),
+  })?;
+  let weight_map = parsed
+    .get("weight_map")
+    .and_then(|v| v.as_object())
+    .ok_or_else(|| Error::Backend {
+      message: format!(
+        "model weight index {} is missing a `weight_map` object",
+        index_path.display()
+      ),
+    })?;
+
+  // Collect the UNIQUE shard filenames from the index (a `BTreeSet` so the
+  // load order is deterministic — the same sorted-filename convention used
+  // by the pre-index `glob`+merge path). Reject a non-string entry, an
+  // empty name, or a name carrying a path separator (an absolute or
+  // parent-traversing shard name would escape `dir`; the HF convention is
+  // bare basenames living in the same directory).
+  let mut shard_names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+  for (weight_key, shard_value) in weight_map {
+    let shard = shard_value.as_str().ok_or_else(|| Error::Backend {
+      message: format!(
+        "model weight index {}: `weight_map[{}]` is not a string",
+        index_path.display(),
+        weight_key
+      ),
+    })?;
+    if shard.is_empty()
+      || shard.contains('/')
+      || shard.contains('\\')
+      || shard == "."
+      || shard == ".."
+    {
+      return Err(Error::Backend {
+        message: format!(
+          "model weight index {}: `weight_map[{}]` -> {shard:?} is not a bare \
+           shard basename (must live in the same directory as the index)",
+          index_path.display(),
+          weight_key,
+        ),
+      });
+    }
+    shard_names.insert(shard);
+  }
+
+  let mut weights: Weights = HashMap::new();
+  for shard in &shard_names {
+    let shard_path = dir.join(shard);
+    if !path_is_file(&shard_path)? {
+      return Err(Error::Backend {
+        message: format!(
+          "model weight index {} lists shard {shard:?} but {} is missing",
+          index_path.display(),
+          shard_path.display(),
+        ),
+      });
+    }
+    let part = crate::io::load_safetensors(&shard_path)?;
+    weights.extend(part);
+  }
+  Ok(Some(weights))
+}
+
+/// Whether `path` exists AND its (symlink-resolved) target is a regular
+/// file. A symlink whose target is a regular file qualifies (HF Hub snapshot
+/// dirs store these as symlinks into `blobs/<hash>`, the same convention the
+/// [`collect_sorted`] / [`read_bounded_config_file`] paths intentionally
+/// follow). A missing path is `Ok(false)`; any other stat failure is an
+/// [`Error::Backend`].
+fn path_is_file(path: &Path) -> Result<bool> {
+  match std::fs::metadata(path) {
+    Ok(m) => Ok(m.is_file()),
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+    Err(e) => Err(Error::Backend {
+      message: format!("cannot stat {}: {e}", path.display()),
+    }),
+  }
 }
 
 /// List the entries of `dir` whose file name matches `pred`, returning their
@@ -381,6 +530,15 @@ pub fn load_config(dir: &Path) -> Result<(Config, String)> {
 /// [`MAX_CONFIG_BYTES`] via `Read::take` so a hostile model directory
 /// cannot OOM us by planting a huge config.
 pub(crate) fn read_bounded_config_file(path: &Path, label: &str) -> Result<Option<String>> {
+  read_bounded_text_file(path, label, MAX_CONFIG_BYTES)
+}
+
+/// Shared bounded-text-file primitive parametrized on the byte cap. Identical
+/// hardening (open-once + non-regular-reject + `O_NONBLOCK | O_CLOEXEC` on
+/// unix + cap-via-`Read::take`) as [`read_bounded_config_file`]; factored out
+/// so the larger [`MAX_INDEX_BYTES`] cap for `model.safetensors.index.json`
+/// can reuse the *one* hardening path rather than restating it.
+fn read_bounded_text_file(path: &Path, label: &str, max_bytes: u64) -> Result<Option<String>> {
   use std::io::Read;
 
   #[cfg(unix)]
@@ -418,17 +576,16 @@ pub(crate) fn read_bounded_config_file(path: &Path, label: &str) -> Result<Optio
 
   let mut bytes = Vec::new();
   file
-    .take(MAX_CONFIG_BYTES + 1)
+    .take(max_bytes + 1)
     .read_to_end(&mut bytes)
     .map_err(|e| Error::Backend {
       message: format!("cannot read {label} {}: {e}", path.display()),
     })?;
-  if bytes.len() as u64 > MAX_CONFIG_BYTES {
+  if bytes.len() as u64 > max_bytes {
     return Err(Error::Backend {
       message: format!(
-        "{label} {} exceeds the {}-byte cap; refusing to read",
+        "{label} {} exceeds the {max_bytes}-byte cap; refusing to read",
         path.display(),
-        MAX_CONFIG_BYTES
       ),
     });
   }
@@ -888,7 +1045,11 @@ fn shard_file_name(index_1based: usize, shards_count: usize) -> String {
 
 /// Write a weight map as sharded `.safetensors` plus the
 /// `model.safetensors.index.json` weight-map index into `save_path`,
-/// mirroring `mlx_lm.utils.save_model` (`utils.py:714-771`).
+/// mirroring `mlx_lm.utils.save_model` (`utils.py:714-771`) with one
+/// **structural** addition: the [`load_weights`] side reads the index as
+/// the authoritative shard manifest, so the index rename here becomes the
+/// **SINGLE** commit point — a mid-save crash leaves the previously-valid
+/// checkpoint atomically intact.
 ///
 /// Steps, in reference order:
 ///
@@ -903,34 +1064,37 @@ fn shard_file_name(index_1based: usize, shards_count: usize) -> String {
 ///    name — to a **same-directory, exclusively created (`O_EXCL`)
 ///    `.safetensors` tempfile**, which is then **fsync**ed. The `index.json`
 ///    body is likewise serialized to its own same-directory `O_EXCL`
-///    tempfile and fsynced. **Nothing is written to a final path yet.**
-/// 5. Once every shard tempfile *and* the index tempfile are durable, each
-///    is **atomically renamed** over its final name (the shards over
-///    `shard_file_name`, the index over `model.safetensors.index.json`).
-///    Until this step the directory still holds the previously-valid
-///    checkpoint untouched; an ENOSPC / abort / backend failure at any
-///    point in step 4 leaves that old checkpoint fully intact and loadable
-///    (the new one simply never becomes visible) and removes every
-///    tempfile. This failure-atomic discipline mirrors
-///    `audio::io::save_wav` / `lm::cache_prompt`'s atomic save: a direct
-///    `mlx_save_safetensors` onto a final shard path would overwrite a
-///    still-valid shard *before* the new checkpoint is durable, and a
-///    crash there would leave the directory neither the old checkpoint
-///    nor the new one.
-/// 6. **After** all renames succeed, any **stale** pre-existing
+///    tempfile and fsynced. **Nothing is written to a final path yet.** Any
+///    failure here removes every staged tempfile.
+/// 5. **Publish — single commit point.** Every shard tempfile is atomically
+///    renamed over its final shard name FIRST, then the staged index is
+///    atomically renamed over `model.safetensors.index.json` LAST. The
+///    index rename is THE observable commit point: before it, load follows
+///    the OLD index (if any) to the OLD shards (any new-named shards on
+///    disk are invisible — [`load_weights`] only loads what the index
+///    lists); after it, load follows the NEW index to the new shards.
+///    POSIX `rename(2)` is atomic-within-fs (same-dir tempfiles keep it
+///    single-fs); the new checkpoint becomes visible only at that final
+///    rename. A failure between a shard rename and the index rename
+///    leaves the OLD index → OLD shards still loadable; the not-yet-
+///    published staged index is removed, and the renamed shard tempfiles
+///    become silently-orphan files (load ignores them, and step 6 will
+///    clean them up on the next successful save).
+///    [Concurrent-reader caveat: when a NEW shard's name collides with an
+///    OLD shard's name (e.g. both checkpoints are single-shard
+///    `model.safetensors`), the per-shard rename does overwrite the old
+///    file. A crash after that overwrite but before the index rename
+///    leaves the OLD index pointing to a file whose content is the NEW
+///    shard — load returns NEW data through OLD index entries, with
+///    missing-key errors on any key the new shard does not carry. This
+///    is strictly better than a multi-file half-published mix and is the
+///    accepted ceiling without a cross-file transaction.]
+/// 6. **After** the index commits, any **stale** pre-existing
 ///    `model*.safetensors` shard whose name is not in the freshly written
-///    set is removed, so the destination ends up holding *only* the new
-///    checkpoint. The reference does not do this (`save_model` assumes a
-///    fresh directory), but mlxrs [`load_weights`] reads **every**
-///    `model*.safetensors` in the directory — not just the ones named in
-///    the index — so overwriting, say, a 3-shard checkpoint with a
-///    single-`model.safetensors` one would otherwise leave
-///    `model-00002-of-00003.safetensors` … behind and silently resurrect
-///    stale tensors on the next load. This cleanup makes `save_model`
-///    idempotent: a second save to the same directory yields exactly the
-///    second checkpoint. It runs only once the new shard set + index are
-///    all durably renamed into place, so a failed save never deletes a
-///    shard the old checkpoint still needs.
+///    set is removed as **optional hygiene**. Load already ignores
+///    non-indexed shards, so a failure here can only leak files (never
+///    corrupt the checkpoint); cleanup runs AFTER the single commit point
+///    so this step is no longer load-critical.
 ///
 /// The `weight_map` (`weight name → shard file name`) is assembled and
 /// **sorted by key** (`utils.py:762-764`); the whole `index_data`
@@ -974,23 +1138,26 @@ pub fn save_model(
   }
   let total_parameters = get_total_parameters(weights, quant)?;
 
-  // 4. write every shard + the index to same-directory `O_EXCL` tempfiles
-  //    and fsync each — NOTHING touches a final path yet, so the
-  //    previously-valid checkpoint stays intact through this whole step.
-  //    The `{"format": "mlx"}` safetensors metadata matches mlx-lm
-  //    (`mx.save_safetensors(..., metadata={"format": "mlx"})`,
-  //    `utils.py:756`). The shards are borrowed views, so they go through
-  //    `save_safetensors_view` — no `Array` is cloned for the write.
+  // 4. Stage to same-directory `O_EXCL` tempfiles + fsync — NOTHING
+  //    touches a final path yet. Shards and the index are staged
+  //    separately so step 5 can publish shards FIRST and the index LAST
+  //    (the single commit point). The `{"format": "mlx"}` safetensors
+  //    metadata matches mlx-lm (`mx.save_safetensors(..., metadata={
+  //    "format": "mlx"})`, `utils.py:756`). The shards are borrowed views,
+  //    so they go through `save_safetensors_view` — no `Array` is cloned.
   let mut shard_metadata: HashMap<String, String> = HashMap::with_capacity(1);
   shard_metadata.insert("format".to_string(), "mlx".to_string());
   // `weight_map` collected sorted-by-key so the written index is
   // deterministic (`utils.py:762-764` sorts it before the `json.dump`).
   let mut weight_map: BTreeMap<String, String> = BTreeMap::new();
-  // `(tmp_path, final_path)` for every file to be atomically published in
-  // step 5. Held so any failure in this step can remove every tempfile.
-  let mut pending: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(shards_count + 1);
+  // `(tmp_path, final_path)` for every shard to be atomically published in
+  // step 5. Held so any failure can remove every staged tempfile.
+  let mut staged_shards: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(shards_count);
+  // Same for the staged index — kept separate so the publish step can
+  // commit shards first and the index LAST.
+  let mut staged_index: Option<(PathBuf, PathBuf)> = None;
   // The names of the shards just written — every other `model*.safetensors`
-  // in `save_path` is stale and removed in step 6.
+  // in `save_path` is stale hygiene in step 6.
   let mut written_shards: std::collections::HashSet<String> =
     std::collections::HashSet::with_capacity(shards_count);
 
@@ -1004,7 +1171,7 @@ pub fn save_model(
       // tempfile: `save_safetensors_view` (mlx-c) writes exactly this path
       // (the trailing `.safetensors` stops mlx from appending its own).
       let tmp_path = open_excl_temp_shard(&final_path)?;
-      pending.push((tmp_path.clone(), final_path));
+      staged_shards.push((tmp_path.clone(), final_path));
       crate::io::save_safetensors_view(
         &tmp_path,
         shard.iter().map(|(&k, &v)| (k, v)),
@@ -1030,7 +1197,7 @@ pub fn save_model(
     });
     let index_final = save_path.join("model.safetensors.index.json");
     let index_tmp = open_excl_temp_shard(&index_final)?;
-    pending.push((index_tmp.clone(), index_final));
+    staged_index = Some((index_tmp.clone(), index_final));
     write_json_pretty(
       &index_tmp,
       &index,
@@ -1039,31 +1206,38 @@ pub fn save_model(
     fsync_path(&index_tmp)
   })();
   if let Err(err) = staged {
-    for (tmp, _) in &pending {
+    for (tmp, _) in &staged_shards {
+      let _ = std::fs::remove_file(tmp);
+    }
+    if let Some((tmp, _)) = &staged_index {
       let _ = std::fs::remove_file(tmp);
     }
     return Err(err);
   }
 
-  // 5. publish: every shard + the index is durable, so atomically rename
-  //    each tempfile over its final name. POSIX `rename(2)` is
-  //    atomic-within-fs (same-dir tempfiles keep it single-fs); the new
-  //    checkpoint becomes visible only here. On a rename failure, remove
-  //    every still-staged tempfile and propagate — already-renamed files
-  //    are valid members of the *new* shard set, so the directory holds a
-  //    consistent (if partially published) checkpoint rather than a
-  //    corrupt mix. (`fs::rename` already replaces an existing
-  //    destination, so a surviving same-named old shard is overwritten
-  //    in place by its durable replacement.)
-  for idx in 0..pending.len() {
-    let (tmp, final_path) = &pending[idx];
+  // 5. Publish — single commit point.
+  //
+  //    a. Rename every shard tempfile over its final shard name FIRST. A
+  //       rename failure here leaves any still-staged shard + the staged
+  //       index as tempfiles, which are cleaned up before propagating.
+  //       Already-renamed shards remain on disk as silently-invisible
+  //       files (the OLD index, if any, still points to the OLD shard
+  //       names — which, for non-colliding NEW names, are still intact).
+  //       Step 6 of the NEXT successful save will clean these orphans
+  //       up; the OLD checkpoint loads correctly in the meantime.
+  for idx in 0..staged_shards.len() {
+    let (tmp, final_path) = &staged_shards[idx];
     if let Err(e) = std::fs::rename(tmp, final_path) {
-      for (leftover, _) in &pending[idx..] {
+      // Clean every still-unpublished shard tempfile + the staged index.
+      for (leftover, _) in &staged_shards[idx..] {
         let _ = std::fs::remove_file(leftover);
+      }
+      if let Some((index_tmp, _)) = &staged_index {
+        let _ = std::fs::remove_file(index_tmp);
       }
       return Err(Error::Backend {
         message: format!(
-          "save_model: cannot rename {} -> {}: {e}",
+          "save_model: cannot rename shard {} -> {}: {e}",
           tmp.display(),
           final_path.display()
         ),
@@ -1071,16 +1245,46 @@ pub fn save_model(
     }
   }
 
-  // 6. idempotency: drop any pre-existing `model*.safetensors` left over
-  //    from an earlier checkpoint that the new shard set did not just
-  //    rewrite. Without this, [`load_weights`] (which merges *every*
-  //    `model*.safetensors`, not the index) would resurrect stale tensors
-  //    when a multi-shard checkpoint is overwritten by a smaller one. This
-  //    runs ONLY after every new shard + the index are durably renamed
-  //    into place (step 5), so a failed save never deletes a shard the
-  //    previously-valid checkpoint still needs. `collect_sorted` applies
-  //    the same `model*.safetensors` predicate `load_weights` uses, so
-  //    exactly the files a later load would pick up are considered.
+  //    b. Atomically rename the staged index over
+  //       `model.safetensors.index.json` LAST. This is THE observable
+  //       commit point — until it succeeds the OLD index (if any) still
+  //       drives [`load_weights`]; once it succeeds the NEW index does.
+  //       On failure, remove the staged index tempfile and propagate —
+  //       the directory now holds renamed new-named shards alongside the
+  //       OLD checkpoint (load follows the OLD index → still correct, the
+  //       new-named shards are invisible).
+  let (index_tmp, index_final) = staged_index
+    .as_ref()
+    .expect("index was successfully staged in step 4");
+  if let Err(e) = std::fs::rename(index_tmp, index_final) {
+    let _ = std::fs::remove_file(index_tmp);
+    return Err(Error::Backend {
+      message: format!(
+        "save_model: cannot rename index {} -> {}: {e}",
+        index_tmp.display(),
+        index_final.display()
+      ),
+    });
+  }
+
+  // 6. Optional hygiene: drop any pre-existing `model*.safetensors` left
+  //    over from an earlier checkpoint that the new index does not list.
+  //    [`load_weights`] already ignores non-indexed shards, so a failure
+  //    in this step can only leak disk space (never corrupt the
+  //    checkpoint). This is the second guarantee the single-commit-point
+  //    discipline buys: cleanup is no longer load-critical, and a
+  //    permission failure here is harmless to the published checkpoint.
+  let _ = cleanup_stale_shards(save_path, &written_shards);
+  Ok(())
+}
+
+/// Remove any `model*.safetensors` in `save_path` whose basename is NOT in
+/// `keep`. Optional hygiene called AFTER the index commits — a failure
+/// here can only leak disk space (load follows the index, not the glob),
+/// so the result is **deliberately ignored** by the caller. Returns the
+/// first removal error if any (for tests that want to assert hygiene
+/// actually ran), but `save_model` discards it.
+fn cleanup_stale_shards(save_path: &Path, keep: &std::collections::HashSet<String>) -> Result<()> {
   let existing_shards = collect_sorted(save_path, |name| {
     name.starts_with("model") && name.ends_with(".safetensors")
   })?;
@@ -1088,7 +1292,7 @@ pub fn save_model(
     let is_stale = stale
       .file_name()
       .and_then(|n| n.to_str())
-      .is_some_and(|n| !written_shards.contains(n));
+      .is_some_and(|n| !keep.contains(n));
     if is_stale {
       std::fs::remove_file(stale).map_err(|e| Error::Backend {
         message: format!(
@@ -1230,6 +1434,49 @@ fn fsync_path(path: &Path) -> Result<()> {
 /// [`Error::Backend`]. A write failure is an [`Error::Backend`] naming the
 /// path.
 pub fn save_config(config: &str, config_path: &Path) -> Result<()> {
+  let staged = stage_config(config, config_path)?;
+  commit_staged_config(staged, config_path)
+}
+
+/// A `config.json` body that has been parsed, validated, cleaned, sorted,
+/// written to a same-directory `O_EXCL` tempfile, and fsynced — but not yet
+/// renamed into place. [`save`] stages the config FIRST (so an invalid
+/// config aborts before [`save_model`] touches any weight), then atomically
+/// renames it via [`commit_staged_config`] AFTER the index commits.
+///
+/// The tempfile is removed in [`Drop`] if the staging step is dropped
+/// without a successful [`commit_staged_config`] (a `save_model` failure
+/// in between). Holds only its tempfile path — no in-memory JSON.
+struct StagedConfig {
+  tmp_path: PathBuf,
+  /// `false` once [`commit_staged_config`] has taken ownership of the
+  /// rename; the [`Drop`] then becomes a no-op so a successful commit
+  /// does not race with another concurrent process for the same temp
+  /// basename.
+  cleanup_on_drop: bool,
+}
+
+impl Drop for StagedConfig {
+  fn drop(&mut self) {
+    if self.cleanup_on_drop {
+      let _ = std::fs::remove_file(&self.tmp_path);
+    }
+  }
+}
+
+/// Parse, validate, clean, sort, write + fsync a `config.json` body to a
+/// same-directory `O_EXCL` tempfile next to `config_path`, returning the
+/// staged tempfile. The body is NOT renamed yet — the caller is responsible
+/// for atomically renaming it via [`commit_staged_config`] (or dropping the
+/// returned guard to clean the tempfile up). Used by [`save`] so an invalid
+/// config or a tempfile-create failure aborts BEFORE [`save_model`] touches
+/// any weight (the previously-valid checkpoint stays fully intact).
+///
+/// Identical parse / clean / sort behavior as [`save_config`]; see that
+/// function's doc-comment for the schema. Invalid JSON or a non-object
+/// body is an [`Error::Backend`] surfaced here (before any IO failure can
+/// destroy a still-valid checkpoint).
+fn stage_config(config: &str, config_path: &Path) -> Result<StagedConfig> {
   let value: serde_json::Value = serde_json::from_str(config).map_err(|e| Error::Backend {
     message: format!("save_config: config is not valid JSON: {e}"),
   })?;
@@ -1256,37 +1503,73 @@ pub fn save_config(config: &str, config_path: &Path) -> Result<()> {
     message: format!("save_config: cannot re-serialize sorted config: {e}"),
   })?;
 
-  // Failure-atomic write: stage to a same-directory `O_EXCL` tempfile, fsync,
-  // then atomically rename over `config_path` (cleaning up the tempfile on
-  // any error) — a partial write never clobbers a valid `config.json`.
   let tmp_path = open_excl_temp_shard(config_path)?;
-  let staged = write_json_pretty(&tmp_path, &sorted_value, "save_config: config.json")
-    .and_then(|()| fsync_path(&tmp_path));
-  if let Err(err) = staged {
-    let _ = std::fs::remove_file(&tmp_path);
-    return Err(err);
-  }
-  if let Err(e) = std::fs::rename(&tmp_path, config_path) {
-    let _ = std::fs::remove_file(&tmp_path);
+  let staged = StagedConfig {
+    tmp_path,
+    cleanup_on_drop: true,
+  };
+  write_json_pretty(&staged.tmp_path, &sorted_value, "save_config: config.json")?;
+  fsync_path(&staged.tmp_path)?;
+  Ok(staged)
+}
+
+/// Atomically rename a [`StagedConfig`]'s tempfile over `config_path`.
+/// Consumes the staging guard so a successful rename does not also delete
+/// the just-published file via [`Drop`]. On a rename failure the staging
+/// guard's `Drop` cleans the tempfile up.
+fn commit_staged_config(mut staged: StagedConfig, config_path: &Path) -> Result<()> {
+  if let Err(e) = std::fs::rename(&staged.tmp_path, config_path) {
+    // Leave `cleanup_on_drop = true` so `Drop` removes the tempfile.
     return Err(Error::Backend {
       message: format!(
         "save_config: cannot rename {} -> {}: {e}",
-        tmp_path.display(),
+        staged.tmp_path.display(),
         config_path.display()
       ),
     });
   }
+  // The rename consumed the tempfile (it IS now `config_path`); the
+  // tempfile path no longer exists, so don't try to `unlink` it on Drop.
+  staged.cleanup_on_drop = false;
   Ok(())
 }
 
 /// Save a model — weights and config — into `dst_path`, mirroring the
 /// local-directory core of `mlx_lm.utils.save` (`utils.py:925-950`).
 ///
-/// This wires the save primitives together, in reference order:
+/// The ordering differs from the reference's `save_model` → `save_config`
+/// sequence in service of the **same** atomicity guarantee [`save_model`]
+/// provides for the weights, extended to the config:
 ///
-/// 1. [`save_model`] writes the sharded `.safetensors` + the
-///    `model.safetensors.index.json` index (`utils.py:942`).
-/// 2. [`save_config`] writes `<dst_path>/config.json` (`utils.py:943`).
+/// 1. `dst_path.mkdir(parents=True, exist_ok=True)` is performed up front
+///    so the same-directory tempfiles in steps 2 and 3 have a directory
+///    to land in even on a brand-new destination.
+/// 2. The config body is **parsed + validated + staged** to a same-
+///    directory `O_EXCL` tempfile and fsynced (the staging step of
+///    [`save_config`]). An invalid JSON / non-object config errors HERE,
+///    **before** any weight file is touched — so a malformed config never
+///    publishes a partial checkpoint over a previously-valid one.
+/// 3. [`save_model`] writes the sharded `.safetensors` + the
+///    `model.safetensors.index.json` index, with the index rename as the
+///    single observable commit point (`utils.py:942` plus the structural
+///    atomicity fix; see [`save_model`]).
+/// 4. The staged config is **atomically renamed** over
+///    `<dst_path>/config.json` LAST (`utils.py:943`).
+///
+/// Failure semantics:
+///
+/// - A config validation / staging failure in step 2 aborts BEFORE any
+///   weight or config file is touched — the entire previous checkpoint
+///   (weights, index, config) is byte-identical to the pre-save state.
+/// - A `save_model` failure in step 3 leaves the previous weights+index
+///   intact (the index rename single-commit-point — see [`save_model`]);
+///   the staged config tempfile is removed by the staging-guard `Drop`.
+/// - A config-rename failure in step 4 is the one residual mismatch
+///   window: the new weights+index are committed but the OLD `config.json`
+///   survives, so a subsequent load sees the NEW weights against the OLD
+///   config. This is rare (it would take a transient ENOENT/EBUSY on the
+///   final rename of a fsynced, exclusively-created tempfile) and is
+///   accepted as the ceiling without a true cross-file transaction.
 ///
 /// **Deliberately not ported** from `utils.save`:
 ///
@@ -1305,7 +1588,7 @@ pub fn save_config(config: &str, config_path: &Path) -> Result<()> {
 ///
 /// `quant` supplies the per-layer [`Quantization`] [`save_model`] needs
 /// (pass [`PerLayerQuantization::default`](crate::lm::quant::PerLayerQuantization)
-/// for an unquantized model). Either step's recoverable failure is the
+/// for an unquantized model). Any step's recoverable failure is the
 /// [`Error::Backend`] that step produced.
 pub fn save(
   dst_path: &Path,
@@ -1313,8 +1596,33 @@ pub fn save(
   config: &str,
   quant: &crate::lm::quant::PerLayerQuantization,
 ) -> Result<()> {
+  // 1. Create the destination directory up front so step 2's same-dir
+  //    tempfile open can land in it even on a brand-new destination.
+  //    `save_model` would otherwise be the first step to create it.
+  std::fs::create_dir_all(dst_path).map_err(|e| Error::Backend {
+    message: format!(
+      "save: cannot create destination directory {}: {e}",
+      dst_path.display()
+    ),
+  })?;
+
+  // 2. Validate + stage the config FIRST so an invalid JSON aborts BEFORE
+  //    `save_model` touches any weight. The staging guard's `Drop` removes
+  //    the tempfile on any failure between here and the final commit, so
+  //    a `save_model` failure leaves no leftover config tempfile either.
+  let config_path = dst_path.join("config.json");
+  let staged_config = stage_config(config, &config_path)?;
+
+  // 3. Save the weights + index (the index rename is the single observable
+  //    commit point for the weights — see `save_model`).
   save_model(dst_path, weights, quant)?;
-  save_config(config, &dst_path.join("config.json"))?;
+
+  // 4. Atomically rename the staged config LAST. The single residual
+  //    mismatch window is right here: if this rename fails, the NEW
+  //    weights are visible against the OLD config. Acceptable without a
+  //    true cross-file transaction (an `fs::rename` of a fsynced O_EXCL
+  //    tempfile inside the same directory is very unlikely to fail).
+  commit_staged_config(staged_config, &config_path)?;
   Ok(())
 }
 
@@ -1746,7 +2054,8 @@ mod save_tests {
   /// (it hard-codes [`MAX_FILE_SIZE_GB`]), so this exercises the multi-shard
   /// *file naming + index* through `shard_file_name` +
   /// [`crate::io::save_safetensors_view`] directly, then confirms a
-  /// hand-built 2-shard layout reloads via [`load_weights`].
+  /// hand-built 2-shard layout — published with its `weight_map` index —
+  /// reloads via [`load_weights`] (index-honoring path).
   #[test]
   fn save_model_multi_shard_naming_and_index_reload() {
     let dir = fresh_dir("save-model-multi");
@@ -1758,6 +2067,7 @@ mod save_tests {
     let count = shards.len();
     let mut meta: HashMap<String, String> = HashMap::new();
     meta.insert("format".to_string(), "mlx".to_string());
+    let mut weight_map: BTreeMap<String, String> = BTreeMap::new();
     for (i, s) in shards.iter().enumerate() {
       let name = shard_file_name(i + 1, count);
       assert_eq!(
@@ -1766,8 +2076,24 @@ mod save_tests {
       );
       crate::io::save_safetensors_view(&dir.join(&name), s.iter().map(|(&k, &v)| (k, v)), &meta)
         .unwrap();
+      for &k in s.keys() {
+        weight_map.insert(k.to_string(), name.clone());
+      }
     }
-    // Both shard files reload + merge via `load_weights` (`model*.safetensors`).
+    // The index makes the shard set discoverable by the index-honoring
+    // [`load_weights`] path (without it, an absent `model.safetensors` /
+    // `weights.safetensors` / `*.gguf` would error — and the bare-glob
+    // resurrection of pre-index code is intentionally gone).
+    write_json_pretty(
+      &dir.join("model.safetensors.index.json"),
+      &serde_json::json!({
+        "metadata": { "total_size": 12, "total_parameters": 3 },
+        "weight_map": weight_map,
+      }),
+      "test: 2-shard index",
+    )
+    .unwrap();
+    // Both shard files reload + merge via the index-honoring `load_weights`.
     let mut loaded = load_weights(&dir).unwrap();
     assert_eq!(loaded.len(), 2);
     assert_eq!(
@@ -2211,6 +2537,524 @@ mod save_tests {
       !leftover_tmp,
       "no partial tempfile may remain after a failed config write"
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  // ────────── load_weights: index-honoring + fallback resolution ──────────
+
+  /// `load_weights` only loads shards listed in
+  /// `model.safetensors.index.json` — a stale `model-*.safetensors` left
+  /// on disk that is NOT in the index is invisible (the structural fix
+  /// that makes the [`save_model`] index-rename single-commit-point safe).
+  /// Hand-wires a single `model.safetensors` published via the
+  /// `weight_map`, plus a stale `model-00099-of-00099.safetensors` carrying
+  /// an extra weight; `load_weights` must return ONLY the indexed weight.
+  #[test]
+  fn load_weights_ignores_stale_shards_not_in_index() {
+    let dir = fresh_dir("load-ignores-stale");
+    let mut meta: HashMap<String, String> = HashMap::new();
+    meta.insert("format".to_string(), "mlx".to_string());
+
+    // The "real" indexed shard — a single `model.safetensors`.
+    let real = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &(3usize,)).unwrap();
+    crate::io::save_safetensors_view(
+      &dir.join("model.safetensors"),
+      std::iter::once(("real.weight", &real)),
+      &meta,
+    )
+    .unwrap();
+    // The stale shard — present on disk, but NOT in the index. The
+    // pre-structural-fix `load_weights` (which globbed
+    // `model*.safetensors`) would have resurrected this tensor; the
+    // index-honoring `load_weights` must NOT.
+    let stale = Array::from_slice::<f32>(&[99.0], &(1usize,)).unwrap();
+    crate::io::save_safetensors_view(
+      &dir.join("model-00099-of-00099.safetensors"),
+      std::iter::once(("stale.weight", &stale)),
+      &meta,
+    )
+    .unwrap();
+    // An index that names ONLY the real shard.
+    let mut weight_map: BTreeMap<String, String> = BTreeMap::new();
+    weight_map.insert("real.weight".to_string(), "model.safetensors".to_string());
+    write_json_pretty(
+      &dir.join("model.safetensors.index.json"),
+      &serde_json::json!({
+        "metadata": { "total_size": 12, "total_parameters": 3 },
+        "weight_map": weight_map,
+      }),
+      "test: index ignores stale",
+    )
+    .unwrap();
+
+    let mut loaded = load_weights(&dir).unwrap();
+    assert_eq!(
+      loaded.len(),
+      1,
+      "only the indexed weight loads; the stale shard is invisible"
+    );
+    assert!(loaded.contains_key("real.weight"));
+    assert!(
+      !loaded.contains_key("stale.weight"),
+      "an out-of-index shard must NOT resurrect tensors on load"
+    );
+    assert_eq!(
+      loaded
+        .get_mut("real.weight")
+        .unwrap()
+        .to_vec::<f32>()
+        .unwrap(),
+      vec![1.0, 2.0, 3.0]
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// An un-sharded checkpoint that has only `model.safetensors` (no index
+  /// file at all — the simple HF single-file convention) still loads via
+  /// the second-tier fallback. Back-compat for fresh-from-`huggingface_hub`
+  /// directories that don't carry an index.
+  #[test]
+  fn load_weights_no_index_single_model_safetensors_loads() {
+    let dir = fresh_dir("load-single-no-index");
+    let mut meta: HashMap<String, String> = HashMap::new();
+    meta.insert("format".to_string(), "mlx".to_string());
+
+    let w = Array::from_slice::<f32>(&[7.0, 8.0], &(2usize,)).unwrap();
+    crate::io::save_safetensors_view(
+      &dir.join("model.safetensors"),
+      std::iter::once(("only.weight", &w)),
+      &meta,
+    )
+    .unwrap();
+    // No `model.safetensors.index.json`.
+    assert!(!dir.join("model.safetensors.index.json").exists());
+
+    let mut loaded = load_weights(&dir).unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(
+      loaded
+        .get_mut("only.weight")
+        .unwrap()
+        .to_vec::<f32>()
+        .unwrap(),
+      vec![7.0, 8.0]
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// Legacy `weights.safetensors`-only directory (pre-HF naming) still
+  /// loads via the third-tier fallback. No index, no `model.safetensors`,
+  /// just `weights.safetensors`. Back-compat for older hand-rolled or
+  /// pre-HF-convention checkpoints.
+  #[test]
+  fn load_weights_legacy_weights_safetensors_fallback_loads() {
+    let dir = fresh_dir("load-legacy-weights");
+    let mut meta: HashMap<String, String> = HashMap::new();
+    meta.insert("format".to_string(), "mlx".to_string());
+
+    let w = Array::from_slice::<f32>(&[42.0], &(1usize,)).unwrap();
+    crate::io::save_safetensors_view(
+      &dir.join("weights.safetensors"),
+      std::iter::once(("legacy.weight", &w)),
+      &meta,
+    )
+    .unwrap();
+    assert!(!dir.join("model.safetensors").exists());
+    assert!(!dir.join("model.safetensors.index.json").exists());
+
+    let mut loaded = load_weights(&dir).unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(
+      loaded
+        .get_mut("legacy.weight")
+        .unwrap()
+        .to_vec::<f32>()
+        .unwrap(),
+      vec![42.0]
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// `load_weights` errors when the index lists a shard that does NOT exist
+  /// on disk (the load-side counterpart to a torn-publish scenario where
+  /// only some shards were renamed). The message names the missing shard.
+  #[test]
+  fn load_weights_index_lists_missing_shard_errors() {
+    let dir = fresh_dir("load-index-missing-shard");
+    // Index references `model-00001-of-00002.safetensors` +
+    // `model-00002-of-00002.safetensors`, but only the first is on disk.
+    let mut meta: HashMap<String, String> = HashMap::new();
+    meta.insert("format".to_string(), "mlx".to_string());
+    let w = Array::from_slice::<f32>(&[1.0], &(1usize,)).unwrap();
+    crate::io::save_safetensors_view(
+      &dir.join("model-00001-of-00002.safetensors"),
+      std::iter::once(("a.weight", &w)),
+      &meta,
+    )
+    .unwrap();
+
+    let mut weight_map: BTreeMap<String, String> = BTreeMap::new();
+    weight_map.insert(
+      "a.weight".to_string(),
+      "model-00001-of-00002.safetensors".to_string(),
+    );
+    weight_map.insert(
+      "b.weight".to_string(),
+      "model-00002-of-00002.safetensors".to_string(),
+    );
+    write_json_pretty(
+      &dir.join("model.safetensors.index.json"),
+      &serde_json::json!({
+        "metadata": { "total_size": 8, "total_parameters": 2 },
+        "weight_map": weight_map,
+      }),
+      "test: missing-shard index",
+    )
+    .unwrap();
+
+    let r = load_weights(&dir);
+    let Err(Error::Backend { message }) = r else {
+      panic!("a missing indexed shard must be an Error::Backend, got {r:?}");
+    };
+    assert!(
+      message.contains("model-00002-of-00002.safetensors"),
+      "error must name the missing shard, got: {message}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// `load_weights` rejects an index whose `weight_map` value carries a
+  /// path component (an absolute or `..`-traversing shard name would
+  /// escape `dir`; HF convention is bare basenames in the same directory).
+  #[test]
+  fn load_weights_index_with_path_traversal_errors() {
+    let dir = fresh_dir("load-index-path-traversal");
+    let mut weight_map: BTreeMap<String, String> = BTreeMap::new();
+    weight_map.insert("evil.weight".to_string(), "../../etc/passwd".to_string());
+    write_json_pretty(
+      &dir.join("model.safetensors.index.json"),
+      &serde_json::json!({
+        "metadata": { "total_size": 0, "total_parameters": 0 },
+        "weight_map": weight_map,
+      }),
+      "test: path-traversal index",
+    )
+    .unwrap();
+
+    let r = load_weights(&dir);
+    let Err(Error::Backend { message }) = r else {
+      panic!("a path-traversal shard name must be an Error::Backend, got {r:?}");
+    };
+    assert!(
+      message.contains("bare shard basename"),
+      "error must call out the basename rule, got: {message}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// `load_weights` rejects a malformed (non-JSON) index file rather than
+  /// silently falling through to the next tier — an unparseable index is a
+  /// genuine corruption signal.
+  #[test]
+  fn load_weights_malformed_index_errors() {
+    let dir = fresh_dir("load-index-malformed");
+    std::fs::write(
+      dir.join("model.safetensors.index.json"),
+      b"this is not valid JSON {{{",
+    )
+    .unwrap();
+    let r = load_weights(&dir);
+    assert!(matches!(r, Err(Error::Backend { .. })));
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// An empty model directory (no index, no safetensors, no GGUF) is the
+  /// final fall-through to an error. Lists every layout the resolver
+  /// considered in the message.
+  #[test]
+  fn load_weights_empty_dir_errors_listing_layouts() {
+    let dir = fresh_dir("load-empty");
+    let r = load_weights(&dir);
+    let Err(Error::Backend { message }) = r else {
+      panic!("an empty dir must be an Error::Backend, got {r:?}");
+    };
+    // Lists each resolver tier.
+    assert!(
+      message.contains("model.safetensors.index.json")
+        && message.contains("model.safetensors")
+        && message.contains("weights.safetensors"),
+      "the error must list each resolver tier, got: {message}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  // ────────── save_model: index-rename single commit point ──────────
+
+  /// **The structural atomicity test.** A save that fails AFTER the shards
+  /// rename but BEFORE the index rename must leave the OLD checkpoint
+  /// loadable EXACTLY (every weight key + value byte-identical), with the
+  /// OLD `model.safetensors.index.json` untouched. The failure is injected
+  /// by pre-creating `model.safetensors.index.json` as a *directory* so the
+  /// final atomic `rename(file -> dir)` fails after every shard has been
+  /// renamed into place. The OLD shards have non-colliding names (a
+  /// 2-shard old layout is overwritten by a 1-shard new layout, so the
+  /// new `model.safetensors` rename creates a brand-new file — the OLD
+  /// `model-00001-of-00002.safetensors` and
+  /// `model-00002-of-00002.safetensors` are untouched).
+  #[test]
+  fn save_model_torn_publish_before_index_rename_keeps_old_checkpoint() {
+    let dir = fresh_dir("torn-publish-before-index-rename");
+    // 1. Write an OLD 2-shard checkpoint with NON-colliding names.
+    let mut meta: HashMap<String, String> = HashMap::new();
+    meta.insert("format".to_string(), "mlx".to_string());
+    let old_a = Array::from_slice::<f32>(&[1.0, 2.0], &(2usize,)).unwrap();
+    let old_b = Array::from_slice::<f32>(&[3.0, 4.0, 5.0], &(3usize,)).unwrap();
+    crate::io::save_safetensors_view(
+      &dir.join("model-00001-of-00002.safetensors"),
+      std::iter::once(("old.a.weight", &old_a)),
+      &meta,
+    )
+    .unwrap();
+    crate::io::save_safetensors_view(
+      &dir.join("model-00002-of-00002.safetensors"),
+      std::iter::once(("old.b.weight", &old_b)),
+      &meta,
+    )
+    .unwrap();
+    // The OLD index file — to be left untouched after the failed save.
+    let mut old_wm: BTreeMap<String, String> = BTreeMap::new();
+    old_wm.insert(
+      "old.a.weight".to_string(),
+      "model-00001-of-00002.safetensors".to_string(),
+    );
+    old_wm.insert(
+      "old.b.weight".to_string(),
+      "model-00002-of-00002.safetensors".to_string(),
+    );
+    // We DELIBERATELY do NOT write `model.safetensors.index.json` as a
+    // file yet — we'll plant a directory at that name so the final index
+    // rename fails. The OLD index lives in `model.safetensors.index.json.OLD`
+    // for the test's reference comparison.
+    let old_index_text = serde_json::to_string(&serde_json::json!({
+      "metadata": { "total_size": 20, "total_parameters": 5 },
+      "weight_map": old_wm,
+    }))
+    .unwrap();
+    // Sanity: confirm the OLD shards are loadable when we put the OLD
+    // index in place.
+    std::fs::write(
+      dir.join("model.safetensors.index.json"),
+      old_index_text.as_bytes(),
+    )
+    .unwrap();
+    let mut sanity = load_weights(&dir).unwrap();
+    assert_eq!(sanity.len(), 2);
+    assert_eq!(
+      sanity
+        .get_mut("old.a.weight")
+        .unwrap()
+        .to_vec::<f32>()
+        .unwrap(),
+      vec![1.0, 2.0]
+    );
+    drop(sanity);
+    // 2. Remove the OLD index file and plant a directory in its place so
+    //    the final atomic `rename(file -> dir)` of the NEW index fails
+    //    AFTER every NEW shard has been renamed into place. We will assert
+    //    that after the failed save, restoring the OLD index file lets
+    //    load follow it to the still-intact OLD shards.
+    std::fs::remove_file(dir.join("model.safetensors.index.json")).unwrap();
+    std::fs::create_dir_all(dir.join("model.safetensors.index.json")).unwrap();
+
+    // 3. Attempt the new save — a smaller single-shard checkpoint.
+    let mut new_w: Weights = HashMap::new();
+    new_w.insert(
+      "new.x.weight".to_string(),
+      Array::from_slice::<f32>(&[100.0], &(1usize,)).unwrap(),
+    );
+    let r = save_model(&dir, &new_w, &PerLayerQuantization::default());
+    assert!(
+      r.is_err(),
+      "the index rename onto an existing directory must fail"
+    );
+
+    // 4. The OLD shards must be untouched (their names didn't collide
+    //    with the NEW `model.safetensors`, which the rename DID create).
+    let old_a_path = dir.join("model-00001-of-00002.safetensors");
+    let old_b_path = dir.join("model-00002-of-00002.safetensors");
+    assert!(
+      old_a_path.is_file(),
+      "OLD shard 1 must survive the failed save"
+    );
+    assert!(
+      old_b_path.is_file(),
+      "OLD shard 2 must survive the failed save"
+    );
+    // The NEW `model.safetensors` was renamed into place before the
+    // failed index rename; load ignores it as long as it isn't indexed.
+    // The OLD index doesn't list it, so it's invisible to a load via
+    // the OLD index — exactly the design's promise.
+    assert!(
+      dir.join("model.safetensors").is_file(),
+      "the NEW shard rename SHOULD have succeeded (it's the index rename that fails); this asserts the torn-publish scenario the test is targeting"
+    );
+    // No staged tempfile remains.
+    let leftover_tmp = std::fs::read_dir(&dir)
+      .unwrap()
+      .filter_map(|e| e.ok())
+      .any(|e| {
+        e.file_name()
+          .to_string_lossy()
+          .ends_with(".tmp.safetensors")
+      });
+    assert!(
+      !leftover_tmp,
+      "every staged tempfile must be removed when the index rename fails"
+    );
+
+    // 5. Restore the OLD index file (replacing the directory we used as
+    //    the failure lever) and confirm load follows it to the still-
+    //    intact OLD shards. The NEW `model.safetensors` is on disk but
+    //    is invisible — load only sees the OLD-indexed shards.
+    std::fs::remove_dir_all(dir.join("model.safetensors.index.json")).unwrap();
+    std::fs::write(
+      dir.join("model.safetensors.index.json"),
+      old_index_text.as_bytes(),
+    )
+    .unwrap();
+    let mut loaded = load_weights(&dir).unwrap();
+    assert_eq!(
+      loaded.len(),
+      2,
+      "the OLD checkpoint loads EXACTLY (both weights)"
+    );
+    assert_eq!(
+      loaded
+        .get_mut("old.a.weight")
+        .unwrap()
+        .to_vec::<f32>()
+        .unwrap(),
+      vec![1.0, 2.0],
+      "old.a is byte-identical"
+    );
+    assert_eq!(
+      loaded
+        .get_mut("old.b.weight")
+        .unwrap()
+        .to_vec::<f32>()
+        .unwrap(),
+      vec![3.0, 4.0, 5.0],
+      "old.b is byte-identical"
+    );
+    assert!(
+      !loaded.contains_key("new.x.weight"),
+      "the NEW shard is on disk but the OLD index ignores it"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  // ────────── save: config-staging cheap fix ──────────
+
+  /// `save` validates + stages the config BEFORE [`save_model`] touches any
+  /// weight. An invalid config (malformed JSON) over an existing checkpoint
+  /// leaves the checkpoint **byte-identical** to its pre-save state — every
+  /// weight, the index, and the `config.json` are untouched.
+  #[test]
+  fn save_invalid_config_keeps_existing_checkpoint_byte_identical() {
+    let dir = fresh_dir("save-invalid-config-intact");
+
+    // 1. Write a valid initial checkpoint via the public `save` driver.
+    let mut w: Weights = HashMap::new();
+    w.insert(
+      "orig.a.weight".to_string(),
+      Array::from_slice::<f32>(&[10.0, 20.0], &(2usize,)).unwrap(),
+    );
+    w.insert(
+      "orig.b.weight".to_string(),
+      Array::from_slice::<f32>(&[30.0], &(1usize,)).unwrap(),
+    );
+    let good_config = r#"{"model_type": "qwen3", "hidden_size": 64}"#;
+    save(&dir, &w, good_config, &PerLayerQuantization::default()).unwrap();
+
+    // Capture the pre-failed-save byte snapshot of every file.
+    let snapshot = |dir: &Path| -> BTreeMap<String, Vec<u8>> {
+      let mut m: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+      for e in std::fs::read_dir(dir).unwrap().flatten() {
+        if e.file_type().unwrap().is_file() {
+          let name = e.file_name().to_string_lossy().into_owned();
+          let bytes = std::fs::read(e.path()).unwrap();
+          m.insert(name, bytes);
+        }
+      }
+      m
+    };
+    let before = snapshot(&dir);
+    assert!(before.contains_key("model.safetensors"));
+    assert!(before.contains_key("model.safetensors.index.json"));
+    assert!(before.contains_key("config.json"));
+
+    // 2. Attempt a second save with an INVALID config — must fail.
+    let bad_config = "this is not valid JSON at all";
+    let other_weights: Weights = {
+      let mut m: Weights = HashMap::new();
+      m.insert(
+        "SHOULD.NOT.WIN.weight".to_string(),
+        Array::from_slice::<f32>(&[999.0], &(1usize,)).unwrap(),
+      );
+      m
+    };
+    let r = save(
+      &dir,
+      &other_weights,
+      bad_config,
+      &PerLayerQuantization::default(),
+    );
+    assert!(r.is_err(), "an invalid config must abort the save");
+
+    // 3. EVERY file is byte-identical to the pre-failed-save state — the
+    //    cheap config-staging fix's promise.
+    let after = snapshot(&dir);
+    // Filter out any tempfile (there should be none, but if any leaks
+    // we want to assert separately and not have it pollute the byte-equal
+    // comparison).
+    let strip_tmp = |m: BTreeMap<String, Vec<u8>>| -> BTreeMap<String, Vec<u8>> {
+      m.into_iter()
+        .filter(|(k, _)| !k.ends_with(".tmp.safetensors"))
+        .collect()
+    };
+    let leftover_tmp = after.keys().any(|k| k.ends_with(".tmp.safetensors"));
+    assert_eq!(
+      strip_tmp(before),
+      strip_tmp(after),
+      "every file under {} must be byte-identical after an invalid-config save",
+      dir.display()
+    );
+    assert!(
+      !leftover_tmp,
+      "no staged config tempfile may remain after an invalid-config save"
+    );
+
+    // 4. The original checkpoint still loads cleanly.
+    let mut loaded = load_weights(&dir).unwrap();
+    assert_eq!(loaded.len(), 2);
+    assert_eq!(
+      loaded
+        .get_mut("orig.a.weight")
+        .unwrap()
+        .to_vec::<f32>()
+        .unwrap(),
+      vec![10.0, 20.0]
+    );
+    assert!(!loaded.contains_key("SHOULD.NOT.WIN.weight"));
 
     let _ = std::fs::remove_dir_all(&dir);
   }
