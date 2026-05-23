@@ -1289,11 +1289,13 @@ const _: () = assert!(AWQ_BITS == 4 && AWQ_SHIFTS[1] == 4 * AWQ_BITS);
 /// caller (`utils.py:79-80`); `transform_awq_weights` casts to `uint32`
 /// explicitly before its repack.
 ///
-/// The shift table [`AWQ_SHIFTS`] folds the AutoAWQ packing-reorder
+/// The internal `AWQ_SHIFTS` table folds the AutoAWQ packing-reorder
 /// into the unpack: a single `(qweight >> shifts) & mask` over the
-/// scaled inverse permutation yields the nibbles in their natural
-/// sequential order. See [`AWQ_SHIFTS`] for the algebra and the
-/// equivalent two-step swift form.
+/// scaled inverse permutation `[0, 4, 1, 5, 2, 6, 3, 7] * bits` yields
+/// the nibbles in their natural sequential order. The swift
+/// `ParoQuantLoader.unpackAndReorder` form does it in two steps
+/// (`unpack with arange(8) * bits` then `take(inverseReorder)`) — the
+/// algebraic result is identical.
 ///
 /// Mirrors the mlx-lm 2-D contract verbatim; non-2D inputs are a
 /// [`Error::ShapeMismatch`] (the python version would `ValueError`
@@ -1402,7 +1404,8 @@ fn is_floating(d: Dtype) -> bool {
 ///    `bias = -zero * scale`.
 /// 6. **Floating-dtype unification** (`utils.py:163-165`): every transformed
 ///    floating weight is cast to the resolved `model_dtype` (the last
-///    iterated layer's `scales.dtype` — see [`resolve_awq_model_dtype`]).
+///    iterated layer's `scales.dtype`; see `resolve_awq_model_dtype` in
+///    this module).
 ///
 /// Returns the converted [`Weights`] map plus a [`PerLayerQuantization`]
 /// carrying the resolved `(group_size, bits)` MLX quant params
