@@ -228,15 +228,15 @@ pub fn recommended_working_set_bytes() -> Result<Option<u64>> {
 ///   [`recommended_working_set_bytes`] returns `Ok(None)`). Mirrors the
 ///   Python helper's `if not mx.metal.is_available(): yield` early return.
 /// - another `WiredLimitGuard` is currently active on any thread. We
-///   serialize ownership of the process-global wired-memory limit (see
-///   [`WIRED_LIMIT_OWNER`]) for race-safety; the currently-active guard's
-///   `Drop` correctly restores the prior limit, so a second install is a
-///   no-op that does not corrupt the captured state. This deviates from
-///   Python's implicit-stacking semantics — Python's GIL hides the same
-///   race, but under real concurrency the stacking design corrupts the
-///   limit (`F2` in the L6 design notes). Callers that need stacking must
-///   coordinate at a higher level (e.g. a single long-lived install
-///   wrapping the whole concurrent region).
+///   serialize ownership of the process-global wired-memory limit (via
+///   the crate-private `WIRED_LIMIT_OWNER` mutex) for race-safety; the
+///   currently-active guard's `Drop` correctly restores the prior limit,
+///   so a second install is a no-op that does not corrupt the captured
+///   state. This deviates from Python's implicit-stacking semantics —
+///   Python's GIL hides the same race, but under real concurrency the
+///   stacking design corrupts the limit (`F2` in the L6 design notes).
+///   Callers that need stacking must coordinate at a higher level (e.g.
+///   a single long-lived install wrapping the whole concurrent region).
 ///
 /// Emits a `[WARNING]` to stderr (via [`eprintln`]) when `model_bytes >
 /// 0.9 * max_rec_size`, matching the Python helper's near-OOM warning
