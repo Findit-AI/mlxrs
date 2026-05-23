@@ -1390,15 +1390,33 @@ pub fn unpack_awq_weights(qweight: &Array) -> Result<Array> {
 /// (e.g. some layers f16, some bf16) the lex-last pick is arbitrary and
 /// would silently downcast the higher-precision layers.
 ///
-/// Tiebreaker: **highest precision wins** — `F32 > BF16 ~ F16`. Rationale:
-/// the dtype unification step (`utils.py:163-165`) CASTS every floating
-/// weight to the chosen target. Picking the highest precision present
-/// preserves the most information; picking lower would discard the high-
-/// precision layers' mantissa bits irrecoverably. (BF16 and F16 are both
-/// 16-bit, but BF16 wins the bf16-vs-f16 tie because its dynamic range
-/// matches f32's exponent — fewer overflow surprises during cast. F64 is
-/// not a valid `.scales` dtype but is included in the ordering for
-/// completeness if a checkpoint ever carries it.)
+/// Resolution policy: **highest precision wins** in HIERARCHICAL cases —
+/// `F64 > F32 > BF16 / F16` (a wider format is a superset, so the cast
+/// is lossless from the lower formats up). For ties at the same rank
+/// (e.g. all bf16) the result is the first dtype with that rank — stable
+/// across runs.
+///
+/// **F5 [HIGH] — F16 + BF16 mixed escalation**: F16 and BF16 are NOT
+/// mutually-convertible without loss. Neither is a superset of the other:
+/// - F16 has 10 mantissa bits + a 5-bit exponent (high precision, narrow range).
+/// - BF16 has 7 mantissa bits + an 8-bit exponent (F32-equivalent range, low precision).
+///
+/// Example: the F16 value `1.0009765625` (= 1 + 2⁻¹⁰, exactly representable
+/// in F16) rounds to `1.0` in BF16 — BF16's smallest delta near 1 is
+/// 2⁻⁷ ≈ 0.0078. Conversely, BF16 magnitudes outside ±65 504 overflow F16.
+///
+/// So when a checkpoint mixes F16 and BF16 `.scales` with no F32/F64
+/// present, neither half can losslessly hold the other; we **escalate to
+/// F32** (a superset of both). This is a deliberate divergence from
+/// mlx-lm's "last layer wins" — mlx-lm doesn't address heterogeneous
+/// precision at all (`utils.py:156` overwrites unconditionally), so the
+/// choice falls to mlxrs. F32 is chosen because it is the only common
+/// superset that preserves every value from both formats.
+///
+/// Tested by `resolve_awq_model_dtype_escalates_f16_plus_bf16_to_f32`
+/// (resolution path) and
+/// `transform_awq_weights_preserves_f16_precision_when_mixed_with_bf16`
+/// (end-to-end value preservation via the unification cast).
 ///
 /// Validation: assumes every `.scales` dtype was already gated as
 /// floating by [`validate_awq_scales_are_floating`] — this fn does NOT
@@ -1413,9 +1431,17 @@ fn resolve_awq_model_dtype(
   // Walk every `.scales` (preflight validator already gated them as
   // floating + present) and pick the highest-precision one. Deterministic
   // tiebreaker via `floating_dtype_precision_rank` (higher rank = more
-  // precision; F32 > BF16 > F16). For ties (e.g. all bf16) the result is
-  // the first dtype with that rank — stable across runs.
+  // precision; F64 > F32 > BF16 > F16). For ties at the same rank
+  // (e.g. all bf16) the result is the first dtype with that rank —
+  // stable across runs.
+  //
+  // Also track whether BOTH F16 and BF16 are present: in that case the
+  // hierarchical "highest rank" answer (BF16) is LOSSY for the F16
+  // layers, so we escalate to F32 unless an even-wider format
+  // (F32/F64) is already present and wins on rank.
   let mut best: Option<Dtype> = None;
+  let mut has_f16 = false;
+  let mut has_bf16 = false;
   for prefix in qweight_prefixes {
     let scales_key = format!("{prefix}.scales");
     let scales = weights.get(&scales_key).ok_or_else(|| Error::Backend {
@@ -1426,6 +1452,11 @@ fn resolve_awq_model_dtype(
       ),
     })?;
     let d = scales.dtype()?;
+    match d {
+      Dtype::F16 => has_f16 = true,
+      Dtype::BF16 => has_bf16 = true,
+      _ => {}
+    }
     match best {
       None => best = Some(d),
       Some(prev) => {
@@ -1435,14 +1466,34 @@ fn resolve_awq_model_dtype(
       }
     }
   }
+  // F5 escalation: F16+BF16 mixed without F32/F64 → promote to F32 to
+  // avoid the lossy F16 → BF16 cast (see doc-comment above for the
+  // bit-layout reason). When F32 or F64 is already present, its higher
+  // rank wins via the loop above and is a superset of both halves —
+  // no escalation needed.
+  if let Some(b) = best
+    && has_f16
+    && has_bf16
+    && b != Dtype::F32
+    && b != Dtype::F64
+  {
+    best = Some(Dtype::F32);
+  }
   Ok(best)
 }
 
 /// Fix 3 [HIGH]: precision rank for the floating dtypes that may appear as
-/// AWQ `.scales`. Higher rank = more precision. Tiebreaker rationale lives
-/// on [`resolve_awq_model_dtype`].
+/// AWQ `.scales`. Higher rank = more precision.
 ///
 /// Order: `F64 > F32 > BF16 > F16 > anything-else (sentinel 0)`.
+///
+/// **Caveat (F5 [HIGH])**: this rank treats BF16 > F16 because BF16 has
+/// the wider exponent (F32-equivalent dynamic range), but BF16 has
+/// FEWER mantissa bits (7 vs F16's 10). Neither half is a superset of
+/// the other, so when both appear together [`resolve_awq_model_dtype`]
+/// must NOT just take the higher-rank one — it escalates to F32. The
+/// rank order remains useful for hierarchical cases (F32 > F16,
+/// F64 > BF16, etc., where each step IS a true superset).
 fn floating_dtype_precision_rank(d: Dtype) -> u8 {
   match d {
     Dtype::F64 => 4,
@@ -3897,20 +3948,288 @@ mod tests {
     }
   }
 
-  /// Fix 3: heterogeneous-precision `.scales` (some `f16`, some `bf16`) —
-  /// the resolved `model_dtype` must pick the highest-precision (BF16,
-  /// which outranks F16 in the tiebreaker). Confirms the precision-rank
-  /// resolution is order-independent (no longer "lex-last wins").
+  /// Fix 3 / F5: HIERARCHICAL heterogeneous-precision `.scales` (mixing
+  /// dtypes where one IS a true superset of the others) must resolve to
+  /// the higher-precision target. This covers F32+F16 → F32 and F64+BF16
+  /// → F64. The F5 fix carved out the F16+BF16 case (no superset relation,
+  /// see `..._escalates_f16_plus_bf16_to_f32`) — this test guards the
+  /// remaining cases where the simple "highest rank wins" answer IS still
+  /// correct (and lossless).
   #[test]
-  fn resolve_awq_model_dtype_picks_highest_precision_for_heterogeneous_scales() {
+  fn resolve_awq_model_dtype_uses_highest_when_hierarchical() {
     let in_features = 8usize;
     let out_features = 8usize;
     let n_groups = 2usize;
 
-    // Build two layers — one with f16 .scales, one with bf16 .scales.
+    // Case 1: F32 + F16 → F32 (F32 is a strict superset of F16).
     let f16_scales_data: Vec<half::f16> = (0..n_groups * out_features)
       .map(|i| half::f16::from_f32(0.1 * (i + 1) as f32))
       .collect();
+    let f32_scales_data: Vec<f32> = (0..n_groups * out_features)
+      .map(|i| 0.5 + 0.01 * (i as f32))
+      .collect();
+
+    let qw_a = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+    let sc_a = Array::from_slice::<half::f16>(&f16_scales_data, &(n_groups, out_features)).unwrap();
+    let qw_b = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+    let sc_b = Array::from_slice::<f32>(&f32_scales_data, &(n_groups, out_features)).unwrap();
+
+    let weights: Weights = HashMap::from([
+      ("layer_a.qweight".to_string(), qw_a),
+      ("layer_a.scales".to_string(), sc_a),
+      ("layer_b.qweight".to_string(), qw_b),
+      ("layer_b.scales".to_string(), sc_b),
+    ]);
+    let mut prefixes: Vec<String> = vec!["layer_a".to_string(), "layer_b".to_string()];
+    prefixes.sort();
+
+    validate_awq_scales_are_floating(&weights, &prefixes).expect("both floating, must pass");
+    let resolved = resolve_awq_model_dtype(&weights, &prefixes)
+      .unwrap()
+      .expect("some dtype");
+    assert_eq!(
+      resolved,
+      Dtype::F32,
+      "F32+F16 hierarchical must resolve to F32 (superset), got {resolved:?}"
+    );
+
+    // Case 2: F64 + BF16 → F64 (F64 is a strict superset of BF16:
+    // more mantissa bits AND more exponent bits).
+    let bf16_scales_data: Vec<half::bf16> = (0..n_groups * out_features)
+      .map(|i| half::bf16::from_f32(0.5 + 0.01 * (i as f32)))
+      .collect();
+    let f64_scales_data: Vec<f64> = (0..n_groups * out_features)
+      .map(|i| 0.5 + 0.001 * (i as f64))
+      .collect();
+
+    let qw_c = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+    let sc_c =
+      Array::from_slice::<half::bf16>(&bf16_scales_data, &(n_groups, out_features)).unwrap();
+    let qw_d = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+    let sc_d = Array::from_slice::<f64>(&f64_scales_data, &(n_groups, out_features)).unwrap();
+
+    let weights2: Weights = HashMap::from([
+      ("layer_c.qweight".to_string(), qw_c),
+      ("layer_c.scales".to_string(), sc_c),
+      ("layer_d.qweight".to_string(), qw_d),
+      ("layer_d.scales".to_string(), sc_d),
+    ]);
+    let mut prefixes2: Vec<String> = vec!["layer_c".to_string(), "layer_d".to_string()];
+    prefixes2.sort();
+
+    validate_awq_scales_are_floating(&weights2, &prefixes2).expect("both floating, must pass");
+    let resolved2 = resolve_awq_model_dtype(&weights2, &prefixes2)
+      .unwrap()
+      .expect("some dtype");
+    assert_eq!(
+      resolved2,
+      Dtype::F64,
+      "F64+BF16 hierarchical must resolve to F64 (superset), got {resolved2:?}"
+    );
+  }
+
+  /// F5 [HIGH]: F16 and BF16 mixed alone (no F32/F64 present) must
+  /// escalate to F32. Neither half-float is a superset of the other —
+  /// F16 has more mantissa bits, BF16 has more exponent bits — so any
+  /// pick within the halves would be lossy for one side. The escalation
+  /// to F32 is order-independent (HashMap iteration may visit them in
+  /// either order via `prefixes`).
+  #[test]
+  fn resolve_awq_model_dtype_escalates_f16_plus_bf16_to_f32() {
+    let in_features = 8usize;
+    let out_features = 8usize;
+    let n_groups = 2usize;
+
+    let f16_scales_data: Vec<half::f16> = (0..n_groups * out_features)
+      .map(|i| half::f16::from_f32(0.1 * (i + 1) as f32))
+      .collect();
+    let bf16_scales_data: Vec<half::bf16> = (0..n_groups * out_features)
+      .map(|i| half::bf16::from_f32(0.5 + 0.01 * (i as f32)))
+      .collect();
+
+    let build = || {
+      let qw_a = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+      let sc_a =
+        Array::from_slice::<half::f16>(&f16_scales_data, &(n_groups, out_features)).unwrap();
+      let qw_b = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+      let sc_b =
+        Array::from_slice::<half::bf16>(&bf16_scales_data, &(n_groups, out_features)).unwrap();
+      let weights: Weights = HashMap::from([
+        ("layer_a.qweight".to_string(), qw_a),
+        ("layer_a.scales".to_string(), sc_a),
+        ("layer_b.qweight".to_string(), qw_b),
+        ("layer_b.scales".to_string(), sc_b),
+      ]);
+      weights
+    };
+
+    // Forward order: [layer_a (F16), layer_b (BF16)].
+    let weights = build();
+    let prefixes: Vec<String> = vec!["layer_a".to_string(), "layer_b".to_string()];
+    validate_awq_scales_are_floating(&weights, &prefixes).expect("both floating, must pass");
+    let resolved = resolve_awq_model_dtype(&weights, &prefixes)
+      .unwrap()
+      .expect("some dtype");
+    assert_eq!(
+      resolved,
+      Dtype::F32,
+      "F16+BF16 must escalate to F32 (no half is a superset), got {resolved:?}"
+    );
+
+    // Reverse order: [layer_b (BF16), layer_a (F16)]. Result must be
+    // identical — escalation does not depend on iteration order.
+    let weights_r = build();
+    let prefixes_r: Vec<String> = vec!["layer_b".to_string(), "layer_a".to_string()];
+    validate_awq_scales_are_floating(&weights_r, &prefixes_r).expect("both floating, must pass");
+    let resolved_r = resolve_awq_model_dtype(&weights_r, &prefixes_r)
+      .unwrap()
+      .expect("some dtype");
+    assert_eq!(
+      resolved_r,
+      Dtype::F32,
+      "F16+BF16 reversed order must still escalate to F32, got {resolved_r:?}"
+    );
+  }
+
+  /// F5: when F32 is already present alongside F16+BF16, it short-circuits
+  /// the escalation — F32 wins on rank and is already a superset of both
+  /// halves, no need to "escalate" further.
+  #[test]
+  fn resolve_awq_model_dtype_escalates_f16_plus_bf16_plus_f32_stays_at_f32() {
+    let in_features = 8usize;
+    let out_features = 8usize;
+    let n_groups = 2usize;
+
+    let f16_scales_data: Vec<half::f16> = (0..n_groups * out_features)
+      .map(|i| half::f16::from_f32(0.1 * (i + 1) as f32))
+      .collect();
+    let bf16_scales_data: Vec<half::bf16> = (0..n_groups * out_features)
+      .map(|i| half::bf16::from_f32(0.5 + 0.01 * (i as f32)))
+      .collect();
+    let f32_scales_data: Vec<f32> = (0..n_groups * out_features)
+      .map(|i| 0.25 + 0.001 * (i as f32))
+      .collect();
+
+    let qw_a = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+    let sc_a = Array::from_slice::<half::f16>(&f16_scales_data, &(n_groups, out_features)).unwrap();
+    let qw_b = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+    let sc_b =
+      Array::from_slice::<half::bf16>(&bf16_scales_data, &(n_groups, out_features)).unwrap();
+    let qw_c = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+    let sc_c = Array::from_slice::<f32>(&f32_scales_data, &(n_groups, out_features)).unwrap();
+
+    let weights: Weights = HashMap::from([
+      ("layer_a.qweight".to_string(), qw_a),
+      ("layer_a.scales".to_string(), sc_a),
+      ("layer_b.qweight".to_string(), qw_b),
+      ("layer_b.scales".to_string(), sc_b),
+      ("layer_c.qweight".to_string(), qw_c),
+      ("layer_c.scales".to_string(), sc_c),
+    ]);
+    let prefixes: Vec<String> = vec![
+      "layer_a".to_string(),
+      "layer_b".to_string(),
+      "layer_c".to_string(),
+    ];
+    validate_awq_scales_are_floating(&weights, &prefixes).expect("all floating, must pass");
+    let resolved = resolve_awq_model_dtype(&weights, &prefixes)
+      .unwrap()
+      .expect("some dtype");
+    assert_eq!(
+      resolved,
+      Dtype::F32,
+      "F16+BF16+F32 must stay at F32 (F32 already > BF16 rank, no escalation), got {resolved:?}"
+    );
+  }
+
+  /// F5: when F64 is already present alongside F16+BF16, it stays at F64
+  /// (F64 outranks F32; F64 is also a superset of both halves so no
+  /// escalation is needed).
+  #[test]
+  fn resolve_awq_model_dtype_escalates_f16_plus_bf16_with_f64_stays_at_f64() {
+    let in_features = 8usize;
+    let out_features = 8usize;
+    let n_groups = 2usize;
+
+    let f16_scales_data: Vec<half::f16> = (0..n_groups * out_features)
+      .map(|i| half::f16::from_f32(0.1 * (i + 1) as f32))
+      .collect();
+    let bf16_scales_data: Vec<half::bf16> = (0..n_groups * out_features)
+      .map(|i| half::bf16::from_f32(0.5 + 0.01 * (i as f32)))
+      .collect();
+    let f64_scales_data: Vec<f64> = (0..n_groups * out_features)
+      .map(|i| 0.25 + 0.001 * (i as f64))
+      .collect();
+
+    let qw_a = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+    let sc_a = Array::from_slice::<half::f16>(&f16_scales_data, &(n_groups, out_features)).unwrap();
+    let qw_b = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+    let sc_b =
+      Array::from_slice::<half::bf16>(&bf16_scales_data, &(n_groups, out_features)).unwrap();
+    let qw_c = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+    let sc_c = Array::from_slice::<f64>(&f64_scales_data, &(n_groups, out_features)).unwrap();
+
+    let weights: Weights = HashMap::from([
+      ("layer_a.qweight".to_string(), qw_a),
+      ("layer_a.scales".to_string(), sc_a),
+      ("layer_b.qweight".to_string(), qw_b),
+      ("layer_b.scales".to_string(), sc_b),
+      ("layer_c.qweight".to_string(), qw_c),
+      ("layer_c.scales".to_string(), sc_c),
+    ]);
+    let prefixes: Vec<String> = vec![
+      "layer_a".to_string(),
+      "layer_b".to_string(),
+      "layer_c".to_string(),
+    ];
+    validate_awq_scales_are_floating(&weights, &prefixes).expect("all floating, must pass");
+    let resolved = resolve_awq_model_dtype(&weights, &prefixes)
+      .unwrap()
+      .expect("some dtype");
+    assert_eq!(
+      resolved,
+      Dtype::F64,
+      "F16+BF16+F64 must stay at F64 (F64 already > BF16 rank, no escalation), got {resolved:?}"
+    );
+  }
+
+  /// F5 [HIGH] END-TO-END value preservation: a checkpoint with F16
+  /// `.scales` carrying the value `1.0009765625` (= 1 + 2⁻¹⁰, exactly
+  /// representable in F16 but NOT in BF16 — BF16's smallest delta near
+  /// 1 is 2⁻⁷ ≈ 0.0078) and a sibling BF16 `.scales` layer must round-
+  /// trip through `transform_awq_weights` with that F16 value PRESERVED.
+  ///
+  /// Under the pre-fix policy, the resolver returned BF16, the unification
+  /// loop cast F16 → BF16, and `1.0009765625` collapsed to `1.0`
+  /// (silently corrupting every F16 scale value). Under F5 the resolver
+  /// escalates to F32, the cast is F16 → F32 (lossless), and the original
+  /// value survives.
+  #[test]
+  fn transform_awq_weights_preserves_f16_precision_when_mixed_with_bf16() {
+    let in_features = 8usize;
+    let out_features = 8usize;
+    let n_groups = 2usize;
+
+    // F16 layer: every scale = 1.0009765625 (= 1 + 2⁻¹⁰), exactly
+    // representable in F16 (bits 0x3C01). BF16 has 7 mantissa bits so
+    // its smallest delta near 1.0 is 2⁻⁷ ≈ 0.0078125 — the value
+    // would round to 1.0 if cast to BF16.
+    let f16_value = half::f16::from_bits(0x3C01);
+    assert_eq!(
+      f16_value.to_f32(),
+      1.0 + (2.0_f32).powi(-10),
+      "F16 fixture value must be exactly 1 + 2^-10"
+    );
+    // Sanity-check the BF16 truncation the test catches:
+    let bf_round = half::bf16::from_f32(f16_value.to_f32());
+    assert_eq!(
+      bf_round.to_f32(),
+      1.0,
+      "pre-condition: casting F16 1.0009765625 → BF16 must truncate to 1.0 \
+       (this is the lossy behavior F5 prevents)"
+    );
+
+    let f16_scales_data: Vec<half::f16> = vec![f16_value; n_groups * out_features];
     let bf16_scales_data: Vec<half::bf16> = (0..n_groups * out_features)
       .map(|i| half::bf16::from_f32(0.5 + 0.01 * (i as f32)))
       .collect();
@@ -3927,21 +4246,114 @@ mod tests {
       ("layer_b.qweight".to_string(), qw_b),
       ("layer_b.scales".to_string(), sc_b),
     ]);
-    let mut prefixes: Vec<String> = vec!["layer_a".to_string(), "layer_b".to_string()];
-    prefixes.sort();
+    let cfg = AwqLoadConfig {
+      bits: 4,
+      group_size: 4,
+      zero_point: false, // symmetric — no qzeros required.
+      version: "gemm".into(),
+    };
 
-    // Validator passes (both floating).
-    validate_awq_scales_are_floating(&weights, &prefixes).expect("both floating, must pass");
+    let (out, _) = transform_awq_weights(weights, &cfg).expect("transform must succeed");
 
-    // Resolver picks the higher-precision dtype: BF16 > F16 in the rank.
-    let resolved = resolve_awq_model_dtype(&weights, &prefixes)
-      .unwrap()
-      .expect("some dtype");
+    // The resolved/unified dtype must be F32 (escalation kicked in).
+    let mut sc_a_out = out
+      .get("layer_a.scales")
+      .expect("converted layer_a.scales present")
+      .try_clone()
+      .unwrap();
     assert_eq!(
-      resolved,
-      Dtype::BF16,
-      "heterogeneous f16+bf16 must resolve to BF16 (precision-rank tiebreaker), got {resolved:?}"
+      sc_a_out.dtype().unwrap(),
+      Dtype::F32,
+      "unified dtype must be F32 under F5 escalation (was BF16 pre-fix)"
     );
+
+    // Read back as F32 and verify EVERY element still holds 1.0009765625.
+    let vals: Vec<f32> = sc_a_out.to_vec().expect("read back as F32");
+    for (i, &v) in vals.iter().enumerate() {
+      assert_eq!(
+        v,
+        1.0 + (2.0_f32).powi(-10),
+        "layer_a.scales[{i}] = {v} (bits 0x{:08X}) — F16 1.0009765625 must NOT have \
+         been truncated through BF16 (would land at 1.0 == 0x3F800000)",
+        v.to_bits()
+      );
+    }
+
+    // layer_b (originally BF16) was also unified to F32 (lossless from
+    // BF16 → F32 — BF16 mantissa fits in F32's 23 bits trivially).
+    let sc_b_out = out
+      .get("layer_b.scales")
+      .expect("converted layer_b.scales present");
+    assert_eq!(
+      sc_b_out.dtype().unwrap(),
+      Dtype::F32,
+      "layer_b.scales must also be unified to F32"
+    );
+  }
+
+  /// F5 [HIGH] END-TO-END order-independence: same as the preservation
+  /// test above, but with prefix names swapped lexicographically (BF16
+  /// layer named to sort BEFORE the F16 layer). Guards against any
+  /// regression that would reintroduce the lex-last-wins behavior — the
+  /// resolver must still escalate to F32 and the F16 value must still
+  /// survive regardless of which prefix iterates last.
+  #[test]
+  fn transform_awq_weights_preserves_f16_precision_with_bf16_in_reversed_prefix_order() {
+    let in_features = 8usize;
+    let out_features = 8usize;
+    let n_groups = 2usize;
+
+    // Same F16 fixture value as the forward-order test (= 1 + 2⁻¹⁰).
+    let f16_value = half::f16::from_bits(0x3C01);
+
+    let f16_scales_data: Vec<half::f16> = vec![f16_value; n_groups * out_features];
+    let bf16_scales_data: Vec<half::bf16> = (0..n_groups * out_features)
+      .map(|i| half::bf16::from_f32(0.5 + 0.01 * (i as f32)))
+      .collect();
+
+    // Naming: "alpha" (BF16) sorts BEFORE "zeta" (F16). Under the old
+    // lex-last policy this would have picked F16 (zeta last); under
+    // the rank-only policy it would pick BF16. Under F5 it MUST be F32.
+    let qw_alpha = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+    let sc_alpha =
+      Array::from_slice::<half::bf16>(&bf16_scales_data, &(n_groups, out_features)).unwrap();
+    let qw_zeta = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+    let sc_zeta =
+      Array::from_slice::<half::f16>(&f16_scales_data, &(n_groups, out_features)).unwrap();
+
+    let weights: Weights = HashMap::from([
+      ("alpha.qweight".to_string(), qw_alpha),
+      ("alpha.scales".to_string(), sc_alpha),
+      ("zeta.qweight".to_string(), qw_zeta),
+      ("zeta.scales".to_string(), sc_zeta),
+    ]);
+    let cfg = AwqLoadConfig {
+      bits: 4,
+      group_size: 4,
+      zero_point: false,
+      version: "gemm".into(),
+    };
+
+    let (out, _) = transform_awq_weights(weights, &cfg).expect("transform must succeed");
+
+    let mut sc_zeta_out = out
+      .get("zeta.scales")
+      .expect("converted zeta.scales present")
+      .try_clone()
+      .unwrap();
+    assert_eq!(
+      sc_zeta_out.dtype().unwrap(),
+      Dtype::F32,
+      "unified dtype must be F32 regardless of prefix order"
+    );
+    let vals: Vec<f32> = sc_zeta_out.to_vec().expect("read back as F32");
+    for (i, &v) in vals.iter().enumerate() {
+      assert_eq!(
+        v,
+        1.0 + (2.0_f32).powi(-10),
+        "zeta.scales[{i}] = {v} — F16 precision must be preserved in reversed-order layout"
+      );
+    }
   }
 
   // ──────────────── Fix 4 [HIGH]: collision with stale `.weight`/`.biases` ────────────────
