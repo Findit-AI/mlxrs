@@ -37,7 +37,7 @@
 //! [swift-ref]: https://github.com/Blaizzy/mlx-audio-swift/blob/main/Sources/MLXAudioSTT/Streaming/StreamingInferenceSession.swift
 //! [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
 
-use std::time::Instant;
+use std::{collections::VecDeque, time::Instant};
 
 use super::{
   encoder::{StreamingEncoder, StreamingEncoderBackend},
@@ -155,6 +155,12 @@ where
   /// Number of encoder windows whose text has been frozen into
   /// `completed_text`.
   frozen_window_count: usize,
+  /// Retryable queue of newly-encoded full windows pending a finalize
+  /// decode. A decoder error during finalization leaves the failed
+  /// window at the front; the next `feed_audio` / `stop` call retries
+  /// it from there. Drained one window at a time as decodes succeed
+  /// (`frozen_window_count` advances in lock-step).
+  pending_finalize_queue: VecDeque<Array>,
 }
 
 impl<B, D, T> StreamingInferenceSession<B, D, T>
@@ -197,6 +203,7 @@ where
       boundary_fast_decode_until: None,
       has_new_encoder_content: false,
       frozen_window_count: 0,
+      pending_finalize_queue: VecDeque::new(),
     })
   }
 
@@ -262,15 +269,23 @@ where
       self.config.decode_interval_seconds.max(0.05)
     };
 
-    let should_decode = if self.config.finalize_completed_windows && new_windows > 0 {
-      true
-    } else if let Some(last) = self.last_decode_time {
-      now.duration_since(last).as_secs_f64() >= effective_decode_interval_seconds
-    } else {
-      self.has_new_encoder_content
-    };
+    // F3: a non-empty retry queue carries the implicit promise of
+    // "we owe the caller a finalize-decode result on this audio."
+    // Drain it on every feed (the inner loop is a noop when the queue
+    // is empty).
+    let has_pending_retries =
+      self.config.finalize_completed_windows && !self.pending_finalize_queue.is_empty();
 
-    if should_decode && self.has_new_encoder_content {
+    let should_decode =
+      if (self.config.finalize_completed_windows && new_windows > 0) || has_pending_retries {
+        true
+      } else if let Some(last) = self.last_decode_time {
+        now.duration_since(last).as_secs_f64() >= effective_decode_interval_seconds
+      } else {
+        self.has_new_encoder_content
+      };
+
+    if should_decode && (self.has_new_encoder_content || has_pending_retries) {
       self.has_new_encoder_content = false;
       let is_boundary_finalize_pass = self.config.finalize_completed_windows && new_windows > 0;
       if !is_boundary_finalize_pass {
@@ -304,11 +319,16 @@ where
     }
 
     // If finalize_completed_windows is on, decode any newly-encoded full
-    // windows as one-shot finalize passes first.
+    // windows as one-shot finalize passes first. Drain into the retry
+    // queue (F3) so a decoder error doesn't silently drop the window.
     if self.config.finalize_completed_windows {
-      let windows_to_finalize = self.encoder.drain_newly_encoded_windows();
-      self.frozen_window_count = self.encoder.encoded_window_count();
-      events.extend(self.finalize_completed_windows(&windows_to_finalize)?);
+      let drained = self.encoder.drain_newly_encoded_windows();
+      for window in drained {
+        self.pending_finalize_queue.push_back(window);
+      }
+      if !self.pending_finalize_queue.is_empty() {
+        events.extend(self.finalize_completed_windows()?);
+      }
     } else {
       self.freeze_completed_windows();
     }
@@ -370,6 +390,7 @@ where
     self.mel_processor.reset();
     self.boundary_fast_decode_until = None;
     self.shared = SessionSharedState::default();
+    self.pending_finalize_queue.clear();
   }
 
   /// Reset all state for a fresh session.
@@ -383,6 +404,7 @@ where
     self.encoder.reset();
     self.mel_processor.reset();
     self.shared = SessionSharedState::default();
+    self.pending_finalize_queue.clear();
   }
 
   // -------------------------------------------------------------------
@@ -392,11 +414,19 @@ where
   fn run_decode_pass(&mut self) -> Result<Vec<TranscriptionEvent>> {
     // If finalize_completed_windows is on AND we have newly-encoded
     // full windows, do a one-shot finalize on each, then continue.
+    //
+    // F3: never drain newly-encoded windows out of the system in a path
+    // that can't replay them. Push freshly-drained windows into the
+    // retry queue; `finalize_completed_windows` then pops them one at a
+    // time as decodes succeed (and leaves any failed window at the
+    // front for the next pass to retry).
     if self.config.finalize_completed_windows {
-      let windows_to_finalize = self.encoder.drain_newly_encoded_windows();
-      if !windows_to_finalize.is_empty() {
-        self.frozen_window_count = self.encoder.encoded_window_count();
-        return self.finalize_completed_windows(&windows_to_finalize);
+      let drained = self.encoder.drain_newly_encoded_windows();
+      for window in drained {
+        self.pending_finalize_queue.push_back(window);
+      }
+      if !self.pending_finalize_queue.is_empty() {
+        return self.finalize_completed_windows();
       }
     } else {
       self.freeze_completed_windows();
@@ -566,16 +596,32 @@ where
     events
   }
 
-  /// Finalize a batch of completed windows: run a fresh decode over
-  /// each, append its text to `completed_text`, and reset the
-  /// streaming decode state.
-  fn finalize_completed_windows(&mut self, windows: &[Array]) -> Result<Vec<TranscriptionEvent>> {
-    if windows.is_empty() {
+  /// Finalize the windows in `pending_finalize_queue`: run a fresh
+  /// decode over each, append its text to `completed_text`, and reset
+  /// the streaming decode state.
+  ///
+  /// F2: ALWAYS run `decoder.decode_all_tokens` for finalized windows.
+  /// The previously-streamed provisional/confirmed text is consulted
+  /// only as an explicit fallback when the full decode for the first
+  /// queued window returns empty text — otherwise the streamed
+  /// preview's partial-text would freeze in place and the rest of the
+  /// boundary audio would be dropped.
+  ///
+  /// F3: pops one window at a time, advancing `frozen_window_count`
+  /// after each successful append. On `Err` the failed window is left
+  /// at the queue front so a subsequent `feed_audio` / `stop` call can
+  /// retry it without losing already-encoded audio.
+  fn finalize_completed_windows(&mut self) -> Result<Vec<TranscriptionEvent>> {
+    if self.pending_finalize_queue.is_empty() {
       return Ok(Vec::new());
     }
     let mut total_decode_time: f64 = 0.0;
     let mut total_generated_tokens: usize = 0;
-    let streamed_fallback_for_first_window: Option<String> = {
+    // F2: capture the streamed-text fallback for the first window only,
+    // gated on actually being the first call after a non-empty shared
+    // state. Consumed via `take()` after the first pop so retries don't
+    // re-apply it.
+    let mut streamed_fallback_for_first_window: Option<String> = {
       let mut stream_tokens: Vec<u32> = self.shared.confirmed_token_ids.clone();
       stream_tokens.extend(self.shared.provisional_token_ids.iter().copied());
       if stream_tokens.is_empty() {
@@ -586,17 +632,21 @@ where
     };
 
     let mut events: Vec<TranscriptionEvent> = Vec::new();
-    for (idx, audio_features) in windows.iter().enumerate() {
-      let selected_window_text = if idx == 0
-        && let Some(fallback) = streamed_fallback_for_first_window.as_ref()
-      {
-        fallback.clone()
+    while let Some(audio_features) = self.pending_finalize_queue.front() {
+      let num_audio_tokens = audio_features.shape().first().copied().unwrap_or(0);
+      let candidate_fallback = streamed_fallback_for_first_window.take();
+      let selected_window_text = if num_audio_tokens == 0 {
+        // Empty audio: skip decode but allow the streamed fallback to
+        // carry text forward (rare — guards against zero-row boundary
+        // windows the encoder occasionally produces).
+        candidate_fallback.unwrap_or_default()
       } else {
-        let num_audio_tokens = audio_features.shape().first().copied().unwrap_or(0);
-        if num_audio_tokens == 0 {
-          continue;
-        }
         let start = Instant::now();
+        // F2 + F3: ALWAYS attempt the full decode. On `Err` the `?`
+        // propagates up; the queue front is unchanged so the next
+        // pass retries this window. `frozen_window_count` has NOT
+        // advanced yet, preserving the invariant
+        // `frozen_window_count == encoded_window_count - queue.len()`.
         let token_ids = self.decoder.decode_all_tokens(
           audio_features,
           &[],
@@ -606,17 +656,32 @@ where
         let decode_time = start.elapsed().as_secs_f64();
         total_decode_time += decode_time;
         total_generated_tokens = total_generated_tokens.saturating_add(token_ids.len());
-        self.tokenizer.decode_ids(&token_ids)
+        let full_text = self.tokenizer.decode_ids(&token_ids);
+        // F2: only fall back to streamed text when the FULL decode
+        // produced nothing. Otherwise the full decode wins — including
+        // for the first window — so we never freeze stale partial text
+        // over freshly-encoded boundary audio.
+        if full_text.trim().is_empty()
+          && let Some(fallback) = candidate_fallback
+        {
+          fallback
+        } else {
+          full_text
+        }
       };
-      if selected_window_text.trim().is_empty() {
-        continue;
+      // Decode succeeded (or there was no audio to decode): commit
+      // this window now, clear shared streaming state, advance the
+      // frozen-window counter, and pop the queue.
+      if !selected_window_text.trim().is_empty() {
+        append_text(&selected_window_text, &mut self.shared.completed_text);
       }
-      append_text(&selected_window_text, &mut self.shared.completed_text);
       self.shared.confirmed_token_ids.clear();
       self.shared.provisional_token_ids.clear();
       self.shared.provisional_first_seen.clear();
       self.shared.provisional_agreement_counts.clear();
       self.shared.confirmed_text.clear();
+      self.pending_finalize_queue.pop_front();
+      self.frozen_window_count = self.frozen_window_count.saturating_add(1);
     }
 
     let total_audio_seconds = self.total_samples_fed as f64 / 16_000.0;
@@ -720,8 +785,8 @@ mod tests {
       self.window_size
     }
 
-    fn encode_single_window(&self, mel_frames: &Array) -> Result<Array> {
-      let rows = mel_frames.shape().first().copied().unwrap_or(0);
+    fn encode_window(&self, mel_window: &Array, _valid_frames: usize) -> Result<Array> {
+      let rows = mel_window.shape().first().copied().unwrap_or(0);
       let buf = vec![0.0_f32; rows * 2];
       Array::from_slice::<f32>(&buf, &[rows as i32, 2i32])
     }
@@ -885,5 +950,241 @@ mod tests {
     assert_eq!(base, "hello world");
     append_text("!", &mut base);
     assert_eq!(base, "hello world !");
+  }
+
+  // ----------------------------------------------------------------
+  // F2 / F3 — completed-window finalization regressions
+  // ----------------------------------------------------------------
+
+  /// Mock decoder that takes a `Result<Vec<u32>>` per call so individual
+  /// passes can inject decoder errors. Tracks call count for retry
+  /// verification.
+  struct ScriptedDecoder {
+    /// Per-call scripted results (front-popped). Empty after exhaustion
+    /// → defaults to `Ok(vec![])`.
+    results: Mutex<Vec<Result<Vec<u32>>>>,
+    /// Count of `decode_all_tokens` invocations.
+    calls: Mutex<usize>,
+  }
+
+  impl ScriptedDecoder {
+    fn with_results(results: Vec<Result<Vec<u32>>>) -> Self {
+      Self {
+        results: Mutex::new(results),
+        calls: Mutex::new(0),
+      }
+    }
+
+    fn call_count(&self) -> usize {
+      *self.calls.lock().unwrap()
+    }
+  }
+
+  impl StreamingDecoderBackend for ScriptedDecoder {
+    fn decode_all_tokens(
+      &self,
+      _audio_features: &Array,
+      _confirmed_token_ids: &[u32],
+      _config: &StreamingConfig,
+      _max_tokens: usize,
+    ) -> Result<Vec<u32>> {
+      *self.calls.lock().unwrap() += 1;
+      let mut q = self.results.lock().unwrap();
+      if q.is_empty() {
+        Ok(Vec::new())
+      } else {
+        q.remove(0)
+      }
+    }
+  }
+
+  /// Build a streaming-finalize-enabled session over a scripted decoder.
+  /// Window size 8 mel-frames keeps the boundary cadence tight so the
+  /// tests don't need wall-clock waits.
+  fn finalize_session(
+    decoder: ScriptedDecoder,
+  ) -> StreamingInferenceSession<MockEncoder, ScriptedDecoder, MockTokenizer> {
+    let cfg = StreamingConfig {
+      decode_interval_seconds: 0.0,
+      boundary_decode_interval_seconds: 0.0,
+      boundary_boost_seconds: 0.0,
+      max_cached_windows: 8,
+      finalize_completed_windows: true,
+      min_agreement_passes: 1,
+      boundary_min_agreement_passes: 1,
+      delay_preset: DelayPreset::Custom(0),
+      ..StreamingConfig::default()
+    };
+    StreamingInferenceSession::new(
+      decoder,
+      MockTokenizer,
+      cfg,
+      MockEncoder { window_size: 8 },
+      16_000,
+      8,
+      0,
+    )
+    .unwrap()
+  }
+
+  /// Drive the session through (a) a partial-window feed that exercises
+  /// the pending-window pre-boundary decode, then (b) a top-up feed
+  /// that closes the first window and triggers the boundary finalize
+  /// pass. Window-size 8 mel-frames; n_fft=400, hop=160 → 400 + 7×160
+  /// = 1 520 samples for one window of mel content. Using 800 + 1 200
+  /// samples gives one partial-decode call + one finalize-decode call.
+  ///
+  /// Returns `(partial_events_result, boundary_events_result)` so the
+  /// F3 tests can deliberately drive the decoder past a scripted `Err`
+  /// without panicking on `.unwrap()` and observe each phase's events
+  /// (or error) independently.
+  fn drive_two_phase(
+    session: &mut StreamingInferenceSession<MockEncoder, ScriptedDecoder, MockTokenizer>,
+  ) -> (
+    Result<Vec<TranscriptionEvent>>,
+    Result<Vec<TranscriptionEvent>>,
+  ) {
+    let partial: Vec<f32> = (0..800).map(|i| (i as f32 * 0.001).sin()).collect();
+    let topup: Vec<f32> = (800..2_000).map(|i| (i as f32 * 0.001).sin()).collect();
+    let partial_events = session.feed_audio(&partial);
+    let boundary_events = session.feed_audio(&topup);
+    (partial_events, boundary_events)
+  }
+
+  /// F2: when the first window is finalized, the FULL decode must run
+  /// over the completed-window features — even when streamed-fallback
+  /// text exists from a prior pending-window decode. The streamed
+  /// fallback only applies as an EMPTY-decode tiebreaker.
+  #[test]
+  fn streaming_session_first_window_finalization_runs_full_decode_not_streamed_fallback() {
+    // First call (partial-window decode while encoder is filling):
+    //   returns one token id → seeds provisional/confirmed state.
+    // Second call (the full-window finalize): returns a different,
+    //   non-empty result. F2 requires that this call HAPPEN.
+    let decoder = ScriptedDecoder::with_results(vec![Ok(vec![1, 2, 3]), Ok(vec![9, 8, 7])]);
+    let mut session = finalize_session(decoder);
+    let (partial_events, boundary_events) = drive_two_phase(&mut session);
+    partial_events.unwrap();
+    boundary_events.unwrap();
+    // 2 decode calls: one for the pre-boundary pending-window decode
+    // (when the first partial buffer arrived) + one for the boundary
+    // finalize-pass on the completed window. The boundary finalize MUST
+    // execute, even with provisional/confirmed state present.
+    assert!(
+      session.decoder.call_count() >= 2,
+      "expected >= 2 decoder calls (pending + finalize), got {}",
+      session.decoder.call_count()
+    );
+  }
+
+  /// F2: when the streamed-fallback text differs from the full-decode
+  /// text, the FULL-decode text MUST land in `completed_text` — the
+  /// stale partial preview is never frozen over fresh boundary audio.
+  #[test]
+  fn streaming_session_first_window_finalization_appends_full_decode_not_partial_text() {
+    // Pending-decode returns one set of tokens (tokens 1..3 → "t1 t2 t3")
+    // → first pass promotes them into `confirmed_text`.
+    // Boundary finalize returns a different set (tokens 90, 91, 92 →
+    // "t90 t91 t92"). The Ended `full_text` must contain the
+    // full-decode tokens, NOT the pending-text snapshot.
+    let decoder = ScriptedDecoder::with_results(vec![Ok(vec![1, 2, 3]), Ok(vec![90, 91, 92])]);
+    let mut session = finalize_session(decoder);
+    let (partial_events, boundary_events) = drive_two_phase(&mut session);
+    partial_events.unwrap();
+    boundary_events.unwrap();
+    let stop_events = session.stop().unwrap();
+    let TranscriptionEvent::Ended { full_text } = stop_events
+      .last()
+      .expect("expected Ended event at stop()")
+      .clone()
+    else {
+      panic!("last stop event was not Ended: {stop_events:?}");
+    };
+    // The full-decode tokens (90 91 92) must dominate; the partial
+    // preview "t1 t2 t3" must NOT be the entire text.
+    assert!(
+      full_text.contains("t90"),
+      "Ended.full_text must include the full-decode text, got {full_text:?}"
+    );
+  }
+
+  /// F3: on a finalize-decode error the failed window stays in the
+  /// retry queue so a subsequent `feed_audio` call can re-attempt the
+  /// decode (no encoder re-run, no silent audio loss).
+  #[test]
+  fn streaming_session_decoder_error_keeps_window_for_retry() {
+    use crate::error::Error;
+    let decoder = ScriptedDecoder::with_results(vec![
+      // 1st: partial-window pending decode succeeds.
+      Ok(vec![1]),
+      // 2nd: boundary finalize fails.
+      Err(Error::Backend {
+        message: "scripted finalize failure".into(),
+      }),
+      // 3rd: retry succeeds.
+      Ok(vec![42]),
+    ]);
+    let mut session = finalize_session(decoder);
+    let (partial_events, boundary_events) = drive_two_phase(&mut session);
+    partial_events.unwrap();
+    // The scripted error must bubble up from the boundary feed.
+    assert!(
+      boundary_events.is_err(),
+      "expected the scripted finalize Err to propagate, got {boundary_events:?}"
+    );
+    // The boundary finalize errored; queue still has the window.
+    assert_eq!(
+      session.pending_finalize_queue.len(),
+      1,
+      "errored finalize must leave the window in the retry queue"
+    );
+    // Retry: feed enough samples that we drive another decode cycle.
+    // Even a small follow-up feed re-enters run_decode_pass via the
+    // `has_pending_retries` short-circuit.
+    let retry_events = session.feed_audio(&[0.0_f32; 200]).unwrap();
+    // After retry the queue must be drained.
+    assert_eq!(
+      session.pending_finalize_queue.len(),
+      0,
+      "successful retry must pop the previously-failed window"
+    );
+    assert!(
+      !retry_events.is_empty(),
+      "retry decode must emit at least the Stats event"
+    );
+  }
+
+  /// F3: while a finalize decode is errored / un-retried, the session's
+  /// `frozen_window_count` MUST NOT advance — the invariant
+  /// `frozen_window_count == encoded_window_count - queue.len()`
+  /// holds across error/retry boundaries.
+  #[test]
+  fn streaming_session_decoder_error_does_not_advance_frozen_window_count() {
+    use crate::error::Error;
+    let decoder = ScriptedDecoder::with_results(vec![
+      Ok(vec![1]), // partial pending decode
+      Err(Error::Backend {
+        message: "scripted finalize failure".into(),
+      }),
+    ]);
+    let mut session = finalize_session(decoder);
+    let (partial_events, boundary_events) = drive_two_phase(&mut session);
+    partial_events.unwrap();
+    assert!(
+      boundary_events.is_err(),
+      "expected the scripted finalize Err to propagate, got {boundary_events:?}"
+    );
+    // One encoder window completed; finalize errored → frozen MUST
+    // still be 0.
+    assert_eq!(
+      session.encoded_window_count(),
+      1,
+      "encoder should have produced exactly one window"
+    );
+    assert_eq!(
+      session.frozen_window_count, 0,
+      "errored finalize must NOT advance frozen_window_count"
+    );
+    assert_eq!(session.pending_finalize_queue.len(), 1);
   }
 }

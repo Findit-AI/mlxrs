@@ -44,8 +44,8 @@ impl StreamingEncoderBackend for MockEncoder {
     self.window_size
   }
 
-  fn encode_single_window(&self, mel_frames: &Array) -> Result<Array> {
-    let rows = mel_frames.shape().first().copied().unwrap_or(0);
+  fn encode_window(&self, mel_window: &Array, _valid_frames: usize) -> Result<Array> {
+    let rows = mel_window.shape().first().copied().unwrap_or(0);
     self.calls.lock().unwrap().push(rows);
     let buf = vec![0.0_f32; rows * 2];
     Array::from_slice::<f32>(&buf, &[rows as i32, 2i32])

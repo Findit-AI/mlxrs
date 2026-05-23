@@ -6,7 +6,7 @@
 //! accumulates mel frames until a full window (e.g. 800 frames =
 //! ~8 s of audio at 100 fps) is ready, then encodes the window via
 //! the per-model
-//! [`StreamingEncoderBackend::encode_single_window`] hook. Consecutive
+//! [`StreamingEncoderBackend::encode_window`] hook. Consecutive
 //! windows can overlap by a configurable number of mel frames.
 //!
 //! Per the project's [no per-model arch porting][noarch] rule, mlxrs
@@ -21,7 +21,7 @@
 use crate::{
   Array,
   error::{Error, Result},
-  ops::shape::concatenate,
+  ops::shape::{concatenate, pad},
 };
 
 /// Per-architecture streaming-encoder hook.
@@ -34,17 +34,39 @@ use crate::{
 /// this trait deliberately surfaces no per-call state.
 ///
 /// `window_size` carries the encoder's mel-frame budget per window.
+///
+/// # Contract
+///
+/// [`encode_window`](Self::encode_window) is **always** called with a
+/// mel-window padded to exactly `(window_size, n_mels)`. For partial
+/// windows (early-feedback decode at session start + the trailing
+/// short window flushed at session stop) the accumulator
+/// zero-pads the buffer to `window_size` rows along axis 0 BEFORE the
+/// call, and supplies `valid_frames < window_size` to signal how many
+/// leading rows are real audio. Backends that need to attend only over
+/// the real frames (causal masks, attention masks) MUST honor
+/// `valid_frames`. Backends that don't care (block-attention with no
+/// mask, the Swift `Qwen3ASR` default) can ignore it — the zero padding
+/// is a no-op for their math.
 pub trait StreamingEncoderBackend {
   /// Mel-frame window size — `n_window_infer` in the Swift reference
   /// (Qwen3ASR = `800`).
   fn window_size(&self) -> usize;
 
-  /// Encode a `(window_size, n_mels)` mel-frame window into encoder
-  /// hidden states of shape `(num_tokens, hidden_dim)`.
+  /// Encode a zero-padded `(window_size, n_mels)` mel-frame window into
+  /// encoder hidden states of shape `(num_tokens, hidden_dim)`.
+  ///
+  /// `valid_frames` (always `<= window_size`) is the number of leading
+  /// rows in `mel_window` that are real audio; the remainder is
+  /// zero-padding the accumulator added so the encoder always sees a
+  /// uniform shape. Implementations that build an attention mask on the
+  /// encoder side should use `valid_frames` to mask out the padding;
+  /// implementations that don't (block-attention encoders without a
+  /// mask, e.g. Qwen3ASR's default) can ignore it.
   ///
   /// # Errors
   /// Implementation-defined — propagate via [`Result`].
-  fn encode_single_window(&self, mel_frames: &Array) -> Result<Array>;
+  fn encode_window(&self, mel_window: &Array, valid_frames: usize) -> Result<Array>;
 }
 
 /// Streaming wrapper around a [`StreamingEncoderBackend`] that
@@ -136,7 +158,7 @@ impl<B: StreamingEncoderBackend> StreamingEncoder<B> {
   ///
   /// # Errors
   /// [`Error::Backend`] for a non-2-D input or a propagated error from
-  /// the backend's `encode_single_window`.
+  /// the backend's [`StreamingEncoderBackend::encode_window`].
   pub fn feed(&mut self, mel_frames: &Array) -> Result<usize> {
     if mel_frames.ndim() != 2 {
       return Err(Error::Backend {
@@ -164,9 +186,10 @@ impl<B: StreamingEncoderBackend> StreamingEncoder<B> {
       let window_size_i32 = i32::try_from(self.window_size).map_err(|_| Error::Backend {
         message: "StreamingEncoder::feed: window_size does not fit i32".into(),
       })?;
-      // Take rows `[0, window_size)` for the encode pass.
+      // Take rows `[0, window_size)` for the encode pass — full window,
+      // valid_frames == window_size, no padding needed.
       let window = frames.slice(&[0i32, 0i32], &[window_size_i32, i32::MAX], &[1i32, 1i32])?;
-      let mut encoded = self.encoder.encode_single_window(&window)?;
+      let mut encoded = self.encoder.encode_window(&window, self.window_size)?;
       encoded.eval()?;
 
       self.cached_windows.push(encoded.try_clone()?);
@@ -205,10 +228,12 @@ impl<B: StreamingEncoderBackend> StreamingEncoder<B> {
     let Some(frames) = self.pending_frames.take() else {
       return Ok(0);
     };
-    if self.pending_frame_count == 0 {
+    let valid_frames = self.pending_frame_count;
+    if valid_frames == 0 {
       return Ok(0);
     }
-    let mut encoded = self.encoder.encode_single_window(&frames)?;
+    let padded = pad_to_window_size(&frames, valid_frames, self.window_size)?;
+    let mut encoded = self.encoder.encode_window(&padded, valid_frames)?;
     encoded.eval()?;
     self.cached_windows.push(encoded);
 
@@ -245,14 +270,21 @@ impl<B: StreamingEncoderBackend> StreamingEncoder<B> {
   /// Does NOT consume the pending frames — they stay in the buffer and
   /// will be re-encoded as part of the full window when it completes.
   /// Returns `None` when there are no pending frames.
+  ///
+  /// The partial buffer is zero-padded to `window_size` before being
+  /// passed to the backend, with `valid_frames` set to the number of
+  /// real (non-padding) rows — see
+  /// [`StreamingEncoderBackend::encode_window`]'s contract.
   pub fn encode_pending(&self) -> Result<Option<Array>> {
     let Some(frames) = self.pending_frames.as_ref() else {
       return Ok(None);
     };
-    if self.pending_frame_count == 0 {
+    let valid_frames = self.pending_frame_count;
+    if valid_frames == 0 {
       return Ok(None);
     }
-    let mut encoded = self.encoder.encode_single_window(frames)?;
+    let padded = pad_to_window_size(frames, valid_frames, self.window_size)?;
+    let mut encoded = self.encoder.encode_window(&padded, valid_frames)?;
     encoded.eval()?;
     Ok(Some(encoded))
   }
@@ -289,17 +321,47 @@ impl<B: StreamingEncoderBackend> StreamingEncoder<B> {
   }
 }
 
+/// Zero-pad a `(valid_frames, n_mels)` mel buffer along axis 0 to
+/// `(window_size, n_mels)`. Returns the input unchanged when
+/// `valid_frames == window_size` (the buffer is already the right size).
+///
+/// Lives free-standing (no `B` parameter) so [`flush_partial`] and
+/// [`encode_pending`] can share the same padding path without monomorphizing
+/// twice per backend.
+fn pad_to_window_size(frames: &Array, valid_frames: usize, window_size: usize) -> Result<Array> {
+  if valid_frames >= window_size {
+    return frames.try_clone();
+  }
+  let high = window_size - valid_frames;
+  let high_i32 = i32::try_from(high).map_err(|_| Error::Backend {
+    message: format!(
+      "StreamingEncoder: pad-high count {high} exceeds i32::MAX for window-size padding"
+    ),
+  })?;
+  // 0-D scalar zero — `pad` casts it to the input dtype for the constant
+  // fill (matches the convention used by `audio::dsp::place_window`).
+  let pad_value = Array::zeros::<f32>(&[0i32; 0])?;
+  pad(
+    frames,
+    &[0_i32],
+    &[0_i32],
+    &[high_i32],
+    &pad_value,
+    c"constant",
+  )
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
   use std::sync::Mutex;
 
-  /// Mock encoder that records the row counts of every window it is
-  /// asked to encode and returns a deterministic `(rows, 2)` array
+  /// Mock encoder that records `(rows, valid_frames)` of every window it
+  /// is asked to encode and returns a deterministic `(rows, 2)` array
   /// where each row is filled with its row-index in the window.
   struct MockEncoder {
     window_size: usize,
-    calls: Mutex<Vec<usize>>,
+    calls: Mutex<Vec<(usize, usize)>>,
   }
 
   impl MockEncoder {
@@ -315,7 +377,11 @@ mod tests {
     }
 
     fn last_call_rows(&self) -> Option<usize> {
-      self.calls.lock().unwrap().last().copied()
+      self.calls.lock().unwrap().last().map(|(rows, _)| *rows)
+    }
+
+    fn last_call_valid_frames(&self) -> Option<usize> {
+      self.calls.lock().unwrap().last().map(|(_, valid)| *valid)
     }
   }
 
@@ -324,9 +390,9 @@ mod tests {
       self.window_size
     }
 
-    fn encode_single_window(&self, mel_frames: &Array) -> Result<Array> {
-      let rows = mel_frames.shape().first().copied().unwrap_or(0);
-      self.calls.lock().unwrap().push(rows);
+    fn encode_window(&self, mel_window: &Array, valid_frames: usize) -> Result<Array> {
+      let rows = mel_window.shape().first().copied().unwrap_or(0);
+      self.calls.lock().unwrap().push((rows, valid_frames));
       // Output `(rows, 2)` with each row = `[row_index, 0]`.
       let mut buf: Vec<f32> = Vec::with_capacity(rows * 2);
       for i in 0..rows {
@@ -353,10 +419,12 @@ mod tests {
     assert_eq!(stream.backend().call_count(), 0);
     assert!(stream.has_pending_frames());
 
-    // Second chunk: 8 more — fills the window, one encode.
+    // Second chunk: 8 more — fills the window, one encode with the full
+    // contract: rows == window_size AND valid_frames == window_size.
     assert_eq!(stream.feed(&zero_mel(8, 4)).unwrap(), 1);
     assert_eq!(stream.backend().call_count(), 1);
     assert_eq!(stream.backend().last_call_rows(), Some(16));
+    assert_eq!(stream.backend().last_call_valid_frames(), Some(16));
     assert!(!stream.has_pending_frames());
     assert_eq!(stream.encoded_window_count(), 1);
   }
@@ -404,7 +472,10 @@ mod tests {
     let flushed = stream.flush_partial().unwrap();
     assert_eq!(flushed, 1);
     assert_eq!(stream.backend().call_count(), 1);
-    assert_eq!(stream.backend().last_call_rows(), Some(5));
+    // Backend always sees a window_size-row buffer (padded);
+    // valid_frames signals the real prefix length.
+    assert_eq!(stream.backend().last_call_rows(), Some(8));
+    assert_eq!(stream.backend().last_call_valid_frames(), Some(5));
     assert!(!stream.has_pending_frames());
   }
 
@@ -454,12 +525,16 @@ mod tests {
     assert!(pending_before);
 
     let out = stream.encode_pending().unwrap().unwrap();
-    assert_eq!(out.shape()[0], 5);
+    // Backend now receives a window_size-row padded buffer; the
+    // (rows, 2) passthrough mock reflects that shape.
+    assert_eq!(out.shape()[0], 8);
     // Buffer is still intact.
     assert!(stream.has_pending_frames());
     // Encode was called once (for the partial), no full-window encodes
     // yet.
     assert_eq!(stream.backend().call_count(), 1);
+    assert_eq!(stream.backend().last_call_rows(), Some(8));
+    assert_eq!(stream.backend().last_call_valid_frames(), Some(5));
   }
 
   #[test]
@@ -472,5 +547,95 @@ mod tests {
     assert_eq!(stream.encoded_window_count(), 0);
     assert_eq!(stream.total_cached_tokens(), 0);
     assert!(!stream.has_pending_frames());
+  }
+
+  /// Strict-contract mock: asserts shape == `(window_size, n_mels)` on
+  /// every call. Fails fast if the accumulator ever passes a non-padded
+  /// partial buffer through.
+  struct StrictContractEncoder {
+    window_size: usize,
+    n_mels: usize,
+    calls: Mutex<Vec<(usize, usize)>>,
+  }
+
+  impl StrictContractEncoder {
+    fn new(window_size: usize, n_mels: usize) -> Self {
+      Self {
+        window_size,
+        n_mels,
+        calls: Mutex::new(Vec::new()),
+      }
+    }
+  }
+
+  impl StreamingEncoderBackend for StrictContractEncoder {
+    fn window_size(&self) -> usize {
+      self.window_size
+    }
+
+    fn encode_window(&self, mel_window: &Array, valid_frames: usize) -> Result<Array> {
+      let shape = mel_window.shape();
+      assert_eq!(
+        shape.len(),
+        2,
+        "strict contract: window must be 2-D, got shape={shape:?}"
+      );
+      assert_eq!(
+        shape[0], self.window_size,
+        "strict contract: window row count must equal window_size={}, got {}",
+        self.window_size, shape[0]
+      );
+      assert_eq!(
+        shape[1], self.n_mels,
+        "strict contract: window col count must equal n_mels={}, got {}",
+        self.n_mels, shape[1]
+      );
+      assert!(
+        valid_frames <= self.window_size,
+        "strict contract: valid_frames {valid_frames} must be <= window_size {}",
+        self.window_size
+      );
+      self.calls.lock().unwrap().push((shape[0], valid_frames));
+      Array::from_slice::<f32>(&vec![0.0_f32; shape[0] * 2], &[shape[0] as i32, 2i32])
+    }
+  }
+
+  /// F1 regression: a strict-contract backend that demands shape ==
+  /// `(window_size, n_mels)` MUST accept a partial-window flush — the
+  /// accumulator zero-pads the buffer and signals the real prefix length
+  /// via `valid_frames`.
+  #[test]
+  fn streaming_encoder_pads_partial_window_with_zeros_and_signals_valid_frames() {
+    let mut stream = StreamingEncoder::new(StrictContractEncoder::new(8, 4), 4, 0);
+    // Feed 3 partial rows (< window_size == 8).
+    let _ = stream.feed(&zero_mel(3, 4)).unwrap();
+    // encode_pending must pad to 8 rows + report valid_frames == 3.
+    let _ = stream.encode_pending().unwrap().unwrap();
+    let calls = stream.backend().calls.lock().unwrap();
+    let (rows, valid_frames) = calls[0];
+    assert_eq!(rows, 8, "rows must be padded to window_size");
+    assert_eq!(valid_frames, 3, "valid_frames must equal the partial count");
+    assert!(
+      valid_frames < rows,
+      "partial case: valid_frames < rows; got valid_frames={valid_frames} rows={rows}"
+    );
+  }
+
+  /// F1 regression: the full-window path passes `valid_frames ==
+  /// window_size` so backends can disambiguate "padded partial" from
+  /// "real full window".
+  #[test]
+  fn streaming_encoder_full_window_passes_valid_frames_equals_window_size() {
+    let mut stream = StreamingEncoder::new(StrictContractEncoder::new(8, 4), 4, 0);
+    // Feed exactly one full window.
+    let new_windows = stream.feed(&zero_mel(8, 4)).unwrap();
+    assert_eq!(new_windows, 1);
+    let calls = stream.backend().calls.lock().unwrap();
+    let (rows, valid_frames) = calls[0];
+    assert_eq!(rows, 8);
+    assert_eq!(
+      valid_frames, 8,
+      "full-window path must pass valid_frames == window_size"
+    );
   }
 }
