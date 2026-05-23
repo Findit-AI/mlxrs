@@ -735,22 +735,52 @@ pub fn convert(args: ConvertArgs) -> Result<()> {
   // Runs unconditionally on a committed save — including the committed-
   // durability-warning branch — so the destination dir is fully
   // populated before we propagate the warning to the caller.
-  copy_tokenizer_and_extras(&hf_path, &mlx_path)?;
+  //
+  // F7 R2 Finding-1: the previous `copy_tokenizer_and_extras(...)?`
+  // discarded an already-stashed committed-DurabilityWarning on copy
+  // failure — the `?` early-return surfaced the copy IO error, hiding
+  // the only signal that the checkpoint was already on disk. A caller
+  // would then see a plain `Error::Backend` and treat the `mlx_path`
+  // as uncommitted/retryable, even though `save` had already returned
+  // `committed: true` and the index + weights + config were visible.
+  // Match BOTH outcomes (the stashed warning AND the copy result) and
+  // explicitly fold them so the caller always retains the committed
+  // signal whenever it existed; on copy failure, the copy IO error is
+  // folded INTO the DurabilityWarning's source message so the caller
+  // can disambiguate (both errors are reported, neither is lost).
+  let copy_result = copy_tokenizer_and_extras(&hf_path, &mlx_path);
 
   // ─── 7. (Hub upload — `convert.py:174-175`) — REJECTED at step 1. ───
 
-  // Re-surface any committed-DurabilityWarning AFTER the tokenizer /
-  // extras copy ran (step 6). The on-disk dir is logically complete;
-  // the caller's contract on `Err(DurabilityWarning { committed: true,
-  // .. })` is "the save IS visible but the parent-dir fsync didn't
-  // return success" — same shape [`load::save`] surfaces.
-  if let Some(source) = committed_warning {
-    return Err(Error::DurabilityWarning {
+  match (committed_warning, copy_result) {
+    // Save committed-with-warning + copy succeeded → re-surface the
+    // warning. On-disk dir is logically complete; the caller's contract
+    // on `Err(DurabilityWarning { committed: true, .. })` is "the save
+    // IS visible but the parent-dir fsync didn't return success" — same
+    // shape [`load::save`] surfaces.
+    (Some(source), Ok(())) => Err(Error::DurabilityWarning {
       committed: true,
       source,
-    });
+    }),
+    // Save committed-with-warning + copy failed → preserve committed=
+    // true; FOLD the copy failure into the warning source/message so
+    // the caller has BOTH signals (the save is committed, AND the
+    // tokenizer copy partially failed). Without this, the `?` early-
+    // return on the copy would have hidden the durability warning and
+    // a retry would see `mlx_path.exists()` and reject — losing the
+    // already-committed checkpoint.
+    (Some(save_source), Err(copy_err)) => Err(Error::DurabilityWarning {
+      committed: true,
+      source: std::io::Error::other(format!(
+        "convert: save committed but post-save warnings — \
+         fsync_dir: {save_source}; copy_tokenizer_and_extras: {copy_err}"
+      )),
+    }),
+    // No warning + copy succeeded → normal Ok.
+    (None, Ok(())) => Ok(()),
+    // No warning + copy failed → propagate the copy failure normally.
+    (None, Err(e)) => Err(e),
   }
-  Ok(())
 }
 
 // ─────────────────────── helpers ───────────────────────
@@ -1765,6 +1795,204 @@ mod unit {
     }
 
     // Cleanup.
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  // ─── Finding 1 (Codex F7 R2) — DurabilityWarning preserved across
+  //     a post-save tokenizer-copy failure ────────────────────────────
+  //
+  // The R1 fix stashed the committed-DurabilityWarning into a local
+  // and then called `copy_tokenizer_and_extras(...)?` — the `?`
+  // discarded the stashed warning on copy failure, surfacing the copy
+  // IO error instead. The caller then loses the only signal that the
+  // checkpoint is already committed: `mlx_path` exists on disk, and a
+  // retry's `mlx_path.exists()` gate would reject — silently dropping
+  // the already-committed save.
+  //
+  // This test exercises BOTH faults together:
+  //   (1) Arm the F6 `fsync_dir` injector (`skip=1`) so save returns
+  //       `Err(DurabilityWarning { committed: true, .. })` — the same
+  //       branch the R1 test drives.
+  //   (2) `chmod 000` one of the tokenizer-extras files in `src` so
+  //       `copy_tokenizer_and_extras` hits an EACCES on `fs::copy` for
+  //       that file (a real OS-level copy failure, not an injector).
+  //       The chosen file is `special_tokens_map.json` because
+  //       [`Tokenizer::from_path`] does NOT read it (it reads
+  //       `tokenizer.json` + `tokenizer_config.json`) — so the load
+  //       step earlier in `convert` doesn't trip over the permission.
+  //
+  // Asserts:
+  //   (a) The final return is `Err(DurabilityWarning { committed:
+  //       true, .. })` — NOT a plain `Error::Backend` from the copy.
+  //   (b) The folded message names BOTH `fsync_dir` AND
+  //       `copy_tokenizer_and_extras` so the caller can disambiguate
+  //       the two failures (and tooling can match on either marker).
+  //   (c) The destination dir still has the committed-before-warning
+  //       artifacts (weights + index + config). The tokenizer-extras
+  //       copy is best-effort post-commit — some tokenizer files MAY
+  //       have been copied (depending on iteration order), but the
+  //       chmod-000 file itself MUST NOT have been copied (the
+  //       source's perm prevents the read).
+  //
+  // Unix-only: relies on `chmod 000` to produce the EACCES; the F6
+  // `fsync_dir` injector is also a Unix-only meaningful path (the
+  // injector is `#[cfg(test)]` but `fsync_dir` itself is a no-op on
+  // non-Unix). Keep the test gated to `#[cfg(unix)]` to match.
+  #[cfg(unix)]
+  #[test]
+  fn convert_durability_warning_then_tokenizer_copy_failure_preserves_committed_signal() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!(
+      "mlxrs_convert_durability_then_copyfail_{}",
+      std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let src = dir.join("src");
+    let dst = dir.join("dst");
+    std::fs::create_dir_all(&src).unwrap();
+
+    let plain_config = r#"{
+      "model_type":"qwen3","hidden_size":16,"num_hidden_layers":1,
+      "num_attention_heads":2,"num_key_value_heads":2,"head_dim":8,
+      "rope_theta":10000.0,"vocab_size":128,"tie_word_embeddings":false
+    }"#;
+    std::fs::write(src.join("config.json"), plain_config).unwrap();
+    let blob: Vec<f32> = (0..128).map(|i| (i as f32) * 0.01).collect();
+    let mut weights: Weights = HashMap::new();
+    weights.insert(
+      "layer.weight".to_string(),
+      Array::from_slice::<f32>(&blob, &(2usize, 64usize)).unwrap(),
+    );
+    crate::io::save_safetensors(&src.join("model.safetensors"), &weights).unwrap();
+
+    // Same tokenizer fixtures the R1 test uses — `load_tokenizer`
+    // succeeds because both files are readable.
+    let tokenizer_json = include_str!("../../tests/fixtures/tokenizer.json");
+    let tokenizer_config_json = include_str!("../../tests/fixtures/tokenizer_config.json");
+    std::fs::write(src.join("tokenizer.json"), tokenizer_json).unwrap();
+    std::fs::write(src.join("tokenizer_config.json"), tokenizer_config_json).unwrap();
+    // A plain tokenizer-extras file that `copy_tokenizer_and_extras`
+    // WILL try to copy. `Tokenizer::from_path` does NOT read it, so
+    // the chmod-000 below doesn't break the earlier `load_tokenizer`
+    // step inside `convert`.
+    let chmod_target = src.join("special_tokens_map.json");
+    std::fs::write(&chmod_target, br#"{"eos_token":"</s>"}"#).unwrap();
+    // Also plant `generation_config.json` (readable) so we can sanity-
+    // check that the iteration ORDER doesn't matter — at least one
+    // readable extras file may or may not have been copied; the
+    // failing file is the assertion target.
+    std::fs::write(src.join("generation_config.json"), br#"{"max_length":32}"#).unwrap();
+
+    // Make the chosen extras file unreadable. `fs::copy` will hit
+    // EACCES on the read side; `is_file()` still returns true (perm-
+    // ission bits don't affect a stat).
+    let mut perm = std::fs::metadata(&chmod_target).unwrap().permissions();
+    perm.set_mode(0o000);
+    std::fs::set_permissions(&chmod_target, perm).unwrap();
+
+    // Drop guard restores permissions even on test panic so cleanup +
+    // any future test run isn't blocked by an undeletable file.
+    struct PermRestore(std::path::PathBuf);
+    impl Drop for PermRestore {
+      fn drop(&mut self) {
+        if let Ok(meta) = std::fs::metadata(&self.0) {
+          let mut p = meta.permissions();
+          p.set_mode(0o644);
+          let _ = std::fs::set_permissions(&self.0, p);
+        }
+      }
+    }
+    let _perm_guard = PermRestore(chmod_target);
+
+    // Arm fsync-dir fault: `skip=1` → shard fsync passes, index fsync
+    // fails → save_model returns CommittedWithDurabilityWarning,
+    // save() surfaces a final Err(DurabilityWarning { committed:true }).
+    let _guard = crate::lm::load::arm_fsync_dir_fault(1);
+
+    let r = convert(ConvertArgs {
+      hf_path: src,
+      mlx_path: dst.clone(),
+      ..Default::default()
+    });
+    drop(_guard);
+
+    // (a) Final return is `Err(DurabilityWarning { committed: true })`
+    //     — NOT a plain IO/Backend error from the copy. This is the
+    //     R2 contract: a post-commit copy failure MUST NOT erase the
+    //     stashed durability warning.
+    match &r {
+      Err(Error::DurabilityWarning { committed, source }) => {
+        assert!(
+          *committed,
+          "convert's DurabilityWarning must carry committed=true even \
+           when the post-save tokenizer copy fails"
+        );
+        // (b) The folded message names BOTH the original fsync_dir
+        //     failure AND the tokenizer-copy failure so the caller
+        //     can disambiguate (the committed-save signal stays, AND
+        //     the partial-tokenizer-copy signal is recoverable).
+        let msg = source.to_string();
+        assert!(
+          msg.contains("fsync_dir"),
+          "folded source must name fsync_dir; got: {msg}"
+        );
+        assert!(
+          msg.contains("copy_tokenizer_and_extras"),
+          "folded source must name copy_tokenizer_and_extras; got: {msg}"
+        );
+        // The committed-save marker is preserved too (the original
+        // `injected fsync_dir failure ...` message string).
+        assert!(
+          msg.contains("injected fsync_dir failure"),
+          "underlying fsync_dir io::Error preserved verbatim: {msg}"
+        );
+      }
+      other => panic!(
+        "expected Err(DurabilityWarning), got {other:?} — the post-save \
+         copy failure must NOT erase the stashed committed-warning"
+      ),
+    }
+
+    // (c) Destination dir has the committed-before-warning artifacts:
+    //     weights + index + config — these are what `save` actually
+    //     committed before the index-fsync warning fired.
+    assert!(dst.join("config.json").is_file(), "config.json on disk");
+    assert!(
+      dst.join("model.safetensors.index.json").is_file(),
+      "index.json on disk"
+    );
+    let any_shard = std::fs::read_dir(&dst)
+      .unwrap()
+      .filter_map(|e| e.ok())
+      .any(|e| {
+        e.path()
+          .file_name()
+          .and_then(|n| n.to_str())
+          .map(|n| n.ends_with(".safetensors"))
+          .unwrap_or(false)
+      });
+    assert!(any_shard, "at least one shard committed on disk");
+
+    // (d) The chmod-000 source file MUST NOT have been copied — its
+    //     read failed before any byte landed at dst. The OTHER
+    //     extras files MAY or may not have been copied depending on
+    //     iteration order: `copy_tokenizer_and_extras` walks the
+    //     TOKENIZER_EXTRA_FILES const-array in order, so any file
+    //     iterated BEFORE the chmod-000 entry WAS copied; any file
+    //     iterated AFTER it was skipped by the early-return — both
+    //     are best-effort post-commit. This is intentionally NOT
+    //     asserted (it's iteration-order-dependent and not part of
+    //     the committed-signal contract).
+    assert!(
+      !dst.join("special_tokens_map.json").is_file(),
+      "the chmod-000 source file MUST NOT have been copied (its \
+       read failed before any bytes were written to dst)"
+    );
+
+    // Restore perms BEFORE the dir-wide remove so the cleanup
+    // succeeds even if the guard hasn't run yet.
+    drop(_perm_guard);
     let _ = std::fs::remove_dir_all(&dir);
   }
 }
