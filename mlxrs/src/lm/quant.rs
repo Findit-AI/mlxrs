@@ -104,7 +104,7 @@
 //! `nvfp4` requires `(16, 4)` — `mlx/mlx/ops.cpp:4808-4823`) are upstream of
 //! this module.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use serde::{Deserialize, Deserializer};
 
@@ -1418,6 +1418,20 @@ pub fn unpack_awq_weights(qweight: &Array) -> Result<Array> {
 /// `transform_awq_weights_preserves_f16_precision_when_mixed_with_bf16`
 /// (end-to-end value preservation via the unification cast).
 ///
+/// **F5 \[MEDIUM\] R3 — scope**: the dtype this fn resolves applies to the
+/// AWQ-generated `.scales` / `.biases` outputs ONLY, **not** to the
+/// pass-through floating tensors in the same checkpoint (embeddings, LM
+/// head, norms, etc.). Earlier revisions ran the unification cast over
+/// every floating key in `new_weights`, which for a large quantized model
+/// with BF16/F16 embeddings + one mixed-half AWQ pair could DOUBLE the
+/// resident size of those pass-through tensors and add a full-size cast
+/// allocation during load — capable of turning a fitting model into OOM.
+/// [`transform_awq_weights`] now iterates the unification loop over a
+/// `BTreeSet<String>` of generated keys only; pass-through tensors retain
+/// their on-disk dtype. See
+/// `transform_awq_weights_does_not_widen_passthrough_bf16_tensor` and
+/// siblings for the regression coverage.
+///
 /// Validation: assumes every `.scales` dtype was already gated as
 /// floating by [`validate_awq_scales_are_floating`] — this fn does NOT
 /// re-check (its caller MUST call the validator first).
@@ -1570,10 +1584,17 @@ fn is_floating(d: Dtype) -> bool {
 ///    implicit-zero (symmetric, `utils.py:148-151`). MLX dequantization is
 ///    `w * scale + bias`; AWQ's is `(w - zero) * scale`. The algebra makes
 ///    `bias = -zero * scale`.
-/// 6. **Floating-dtype unification** (`utils.py:163-165`): every transformed
-///    floating weight is cast to the resolved `model_dtype` (the last
-///    iterated layer's `scales.dtype`; see `resolve_awq_model_dtype` in
-///    this module).
+/// 6. **Floating-dtype unification** (`utils.py:163-165`): every AWQ-
+///    generated `.scales` / `.biases` is cast to the resolved
+///    `model_dtype` (see `resolve_awq_model_dtype` in this module).
+///    **F5 \[MEDIUM\] R3** — scope: the cast walks only the keys this
+///    function INSERTED into `new_weights` (the generated `.scales` +
+///    `.biases` per converted prefix), tracked in a `BTreeSet<String>`
+///    during the conversion pass. Pass-through floating tensors
+///    (embeddings, LM head, norms, etc.) keep their original on-disk
+///    dtype; they are not touched by the unification cast and so do not
+///    inflate their resident size when a mixed-half checkpoint escalates
+///    to F32.
 ///
 /// Returns the converted [`Weights`] map plus a [`PerLayerQuantization`]
 /// carrying the resolved `(group_size, bits)` MLX quant params
@@ -1827,6 +1848,18 @@ pub fn transform_awq_weights(
   // Now do the conversion. Move every key out of the input map exactly
   // once — non-AWQ keys flow straight through.
   let mut new_weights: Weights = HashMap::with_capacity(weights.len());
+  // F5 R3 [MEDIUM] — track the AWQ-generated `.scales` / `.biases` keys
+  // INSERTED by the conversion pass below. The post-loop unification cast
+  // walks only this set, so pass-through floating tensors (embeddings, LM
+  // head, norms, etc.) keep their on-disk dtype and are not widened when a
+  // mixed-half checkpoint escalates `model_dtype` to F32. Without this
+  // scoping, a single F16+BF16 AWQ pair could double the resident size of
+  // every BF16/F16 pass-through tensor in the checkpoint — capable of
+  // turning a fitting model into OOM during load. (The generated
+  // `.weight` is U32, not floating, so it is never a unification target
+  // either way; we still leave it out of the set to make the
+  // "only generated FLOATING outputs" contract explicit.)
+  let mut awq_generated_floating_keys: BTreeSet<String> = BTreeSet::new();
   // First, pull out every AWQ triple component so the pass-through walk
   // can move the remainder verbatim. Mirrors mlx-lm's
   // `if key.endswith(".qweight"): ... elif not any(key.endswith(...)): ...`
@@ -1953,29 +1986,43 @@ pub fn transform_awq_weights(
       symmetric_biases(&scales_c, scales_dtype)?
     };
 
+    let scales_key = format!("{prefix}.scales");
+    let biases_key = format!("{prefix}.biases");
     new_weights.insert(format!("{prefix}.weight"), new_weight);
-    new_weights.insert(format!("{prefix}.scales"), scales_c);
-    new_weights.insert(format!("{prefix}.biases"), biases);
+    new_weights.insert(scales_key.clone(), scales_c);
+    new_weights.insert(biases_key.clone(), biases);
+    // F5 R3 [MEDIUM]: record the AWQ-generated floating outputs so the
+    // unification cast below can scope itself to them. (`.weight` is U32,
+    // not in scope for floating unification.)
+    awq_generated_floating_keys.insert(scales_key);
+    awq_generated_floating_keys.insert(biases_key);
   }
 
-  // Pass-through pass for non-AWQ keys (`utils.py:158-161`). After the
-  // AWQ pass, apply the floating-dtype unification (`utils.py:163-165`)
-  // to every floating weight — but only when we resolved a model_dtype
-  // (i.e. at least one AWQ triple was converted; otherwise this is a
-  // no-op input and there's no target dtype to enforce).
+  // Pass-through pass for non-AWQ keys (`utils.py:158-161`). The
+  // remainder flows verbatim; we deliberately do NOT touch its dtype.
   for (key, arr) in remainder {
     new_weights.insert(key, arr);
   }
+  // F5 R3 [MEDIUM] — Floating-dtype unification (`utils.py:163-165`)
+  // scoped to AWQ-generated `.scales` / `.biases` ONLY. mlx-lm runs this
+  // cast over every floating key in the resulting dict, but doing so in a
+  // Rust port (where the input map carries every pass-through tensor —
+  // embeddings, LM head, norms, etc.) means a single mixed-half AWQ pair
+  // (F16+BF16 → F32 escalation, see `resolve_awq_model_dtype` F5 [HIGH])
+  // can double the resident size of every BF16/F16 pass-through tensor
+  // plus allocate a full-size cast buffer per tensor during load. For
+  // large quantized models that turns a fitting checkpoint into OOM.
+  // Walk only the keys this fn inserted; pass-through tensors keep their
+  // on-disk dtype.
   if let Some(target) = model_dtype {
-    let keys: Vec<String> = new_weights.keys().cloned().collect();
-    for key in keys {
+    for key in &awq_generated_floating_keys {
       let arr = new_weights
-        .get(&key)
-        .expect("key just enumerated from new_weights");
+        .get(key)
+        .expect("AWQ-generated key inserted moments ago must still be present");
       let d = arr.dtype()?;
       if is_floating(d) && d != target {
         let cast = ops::misc::astype(arr, target)?;
-        new_weights.insert(key, cast);
+        new_weights.insert(key.clone(), cast);
       }
     }
   }
@@ -4493,6 +4540,364 @@ mod tests {
       }
       other => panic!("expected Error::Backend, got: {other:?}"),
     }
+  }
+
+  // ──────────────── F5 R3 [MEDIUM]: scoped unification ────────────────
+
+  /// F5 R3: a BF16 pass-through tensor (e.g. `embed_tokens.weight`) sitting
+  /// next to a single AWQ-quantized layer with BF16 `.scales` must keep its
+  /// ORIGINAL dtype (BF16) after `transform_awq_weights`. The unification
+  /// cast applies only to the AWQ-generated `.scales` / `.biases`, not to
+  /// pass-through floating tensors. (Pre-fix, the unification loop walked
+  /// every floating key in the output map, so for a checkpoint whose
+  /// pass-through tensors were already at the resolved dtype this was a
+  /// no-op — but the *bytes-equivalence* contract is what we want: the
+  /// pass-through value is not touched at all.)
+  #[test]
+  fn transform_awq_weights_does_not_widen_passthrough_bf16_tensor() {
+    let in_features = 8usize;
+    let out_features = 8usize;
+    let n_groups = 2usize;
+
+    // BF16 scales — resolves to BF16 (single dtype, no escalation).
+    let bf16_scales_data: Vec<half::bf16> = (0..n_groups * out_features)
+      .map(|i| half::bf16::from_f32(0.5 + 0.01 * (i as f32)))
+      .collect();
+    let qw = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+    let sc = Array::from_slice::<half::bf16>(&bf16_scales_data, &(n_groups, out_features)).unwrap();
+
+    // Large-ish BF16 pass-through tensor (`embed_tokens.weight`). The
+    // exact value pattern doesn't matter — we just need it READABLE so the
+    // post-transform comparison can confirm byte-equivalence.
+    let pt_shape = (100usize, 100usize);
+    let pt_data: Vec<half::bf16> = (0..pt_shape.0 * pt_shape.1)
+      .map(|i| half::bf16::from_f32(0.001 * (i as f32 % 1000.0)))
+      .collect();
+    let pt = Array::from_slice::<half::bf16>(&pt_data, &pt_shape).unwrap();
+
+    let weights: Weights = HashMap::from([
+      ("layer.qweight".to_string(), qw),
+      ("layer.scales".to_string(), sc),
+      ("embed_tokens.weight".to_string(), pt),
+    ]);
+    let cfg = AwqLoadConfig {
+      bits: 4,
+      group_size: 4,
+      zero_point: false,
+      version: "gemm".into(),
+    };
+
+    let (out, _) = transform_awq_weights(weights, &cfg).expect("transform");
+
+    // Generated `.scales` is BF16 (resolved model_dtype, no escalation).
+    let sc_out = out.get("layer.scales").expect("layer.scales generated");
+    assert_eq!(
+      sc_out.dtype().unwrap(),
+      Dtype::BF16,
+      "BF16-only AWQ scales must resolve to BF16, got {:?}",
+      sc_out.dtype().unwrap()
+    );
+
+    // Pass-through embed_tokens.weight keeps BF16 dtype + shape.
+    let mut pt_out = out
+      .get("embed_tokens.weight")
+      .expect("pass-through embed_tokens.weight preserved")
+      .try_clone()
+      .unwrap();
+    assert_eq!(
+      pt_out.dtype().unwrap(),
+      Dtype::BF16,
+      "pass-through BF16 tensor must NOT be widened by unification"
+    );
+    assert_eq!(
+      pt_out.shape(),
+      vec![pt_shape.0, pt_shape.1],
+      "pass-through shape preserved"
+    );
+    // Byte-equivalence: every value identical to the source.
+    let pt_back: Vec<half::bf16> = pt_out.to_vec().expect("read pass-through as BF16");
+    assert_eq!(
+      pt_back.len(),
+      pt_data.len(),
+      "pass-through element count preserved"
+    );
+    for (i, (&got, &want)) in pt_back.iter().zip(pt_data.iter()).enumerate() {
+      assert_eq!(
+        got.to_bits(),
+        want.to_bits(),
+        "pass-through value at index {i} must be byte-identical (got 0x{:04X}, want 0x{:04X})",
+        got.to_bits(),
+        want.to_bits()
+      );
+    }
+  }
+
+  /// F5 R3: a F16 pass-through `lm_head.weight` next to TWO AWQ layers
+  /// (one F16 scales, one BF16 scales — triggers the F5 [HIGH] F32
+  /// escalation per `resolve_awq_model_dtype`) must STILL be F16 after
+  /// `transform_awq_weights`. The escalation only applies to the
+  /// AWQ-generated `.scales` / `.biases`, NOT to pass-through tensors.
+  /// Pre-fix this would have cast `lm_head.weight` from F16 to F32,
+  /// doubling its resident size + adding a full-size cast allocation.
+  #[test]
+  fn transform_awq_weights_does_not_widen_passthrough_f16_tensor_when_mixed_with_bf16_awq_scales() {
+    let in_features = 8usize;
+    let out_features = 8usize;
+    let n_groups = 2usize;
+
+    let f16_scales_data: Vec<half::f16> = (0..n_groups * out_features)
+      .map(|i| half::f16::from_f32(0.1 * (i + 1) as f32))
+      .collect();
+    let bf16_scales_data: Vec<half::bf16> = (0..n_groups * out_features)
+      .map(|i| half::bf16::from_f32(0.5 + 0.01 * (i as f32)))
+      .collect();
+
+    let qw_a = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+    let sc_a = Array::from_slice::<half::f16>(&f16_scales_data, &(n_groups, out_features)).unwrap();
+    let qw_b = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+    let sc_b =
+      Array::from_slice::<half::bf16>(&bf16_scales_data, &(n_groups, out_features)).unwrap();
+
+    // F16 pass-through `lm_head.weight`.
+    let lm_head_shape = (32usize, 16usize);
+    let lm_head_data: Vec<half::f16> = (0..lm_head_shape.0 * lm_head_shape.1)
+      .map(|i| half::f16::from_f32(0.01 * (i as f32 % 100.0)))
+      .collect();
+    let lm_head = Array::from_slice::<half::f16>(&lm_head_data, &lm_head_shape).unwrap();
+
+    let weights: Weights = HashMap::from([
+      ("layer_a.qweight".to_string(), qw_a),
+      ("layer_a.scales".to_string(), sc_a),
+      ("layer_b.qweight".to_string(), qw_b),
+      ("layer_b.scales".to_string(), sc_b),
+      ("lm_head.weight".to_string(), lm_head),
+    ]);
+    let cfg = AwqLoadConfig {
+      bits: 4,
+      group_size: 4,
+      zero_point: false,
+      version: "gemm".into(),
+    };
+
+    let (out, _) = transform_awq_weights(weights, &cfg).expect("transform");
+
+    // AWQ-generated outputs ESCALATED to F32 (per F5 [HIGH]).
+    let sc_a_out = out.get("layer_a.scales").expect("layer_a.scales");
+    assert_eq!(
+      sc_a_out.dtype().unwrap(),
+      Dtype::F32,
+      "AWQ-generated layer_a.scales must be cast to F32 under mixed-half escalation"
+    );
+    let sc_b_out = out.get("layer_b.scales").expect("layer_b.scales");
+    assert_eq!(
+      sc_b_out.dtype().unwrap(),
+      Dtype::F32,
+      "AWQ-generated layer_b.scales must be cast to F32 under mixed-half escalation"
+    );
+    let bi_a_out = out.get("layer_a.biases").expect("layer_a.biases");
+    assert_eq!(
+      bi_a_out.dtype().unwrap(),
+      Dtype::F32,
+      "AWQ-generated layer_a.biases must be cast to F32 under mixed-half escalation"
+    );
+    let bi_b_out = out.get("layer_b.biases").expect("layer_b.biases");
+    assert_eq!(
+      bi_b_out.dtype().unwrap(),
+      Dtype::F32,
+      "AWQ-generated layer_b.biases must be cast to F32 under mixed-half escalation"
+    );
+
+    // BUT pass-through lm_head.weight is STILL F16 (NOT cast to F32).
+    let mut lm_head_out = out
+      .get("lm_head.weight")
+      .expect("pass-through lm_head.weight preserved")
+      .try_clone()
+      .unwrap();
+    assert_eq!(
+      lm_head_out.dtype().unwrap(),
+      Dtype::F16,
+      "pass-through F16 tensor must NOT be widened to F32 by the AWQ \
+       mixed-half escalation — only the AWQ-generated .scales/.biases get widened"
+    );
+    assert_eq!(
+      lm_head_out.shape(),
+      vec![lm_head_shape.0, lm_head_shape.1],
+      "pass-through lm_head shape preserved"
+    );
+    // Byte-equivalence: every F16 value identical to the source.
+    let lm_back: Vec<half::f16> = lm_head_out.to_vec().expect("read lm_head as F16");
+    for (i, (&got, &want)) in lm_back.iter().zip(lm_head_data.iter()).enumerate() {
+      assert_eq!(
+        got.to_bits(),
+        want.to_bits(),
+        "lm_head.weight[{i}] must be byte-identical (got 0x{:04X}, want 0x{:04X})",
+        got.to_bits(),
+        want.to_bits()
+      );
+    }
+  }
+
+  /// F5 R3: explicit contrast — with 1 AWQ layer (BF16 scales, no
+  /// escalation: resolves to BF16) + 1 F16 pass-through key, the
+  /// AWQ-generated `.scales` IS cast (to the resolved BF16) but the
+  /// pass-through F16 tensor is left at F16. Confirms the cast is
+  /// **scoped** to AWQ-generated keys and not blanket-applied to every
+  /// floating output.
+  #[test]
+  fn transform_awq_weights_widens_only_generated_scales_and_biases() {
+    let in_features = 8usize;
+    let out_features = 8usize;
+    let n_groups = 2usize;
+
+    let bf16_scales_data: Vec<half::bf16> = (0..n_groups * out_features)
+      .map(|i| half::bf16::from_f32(0.5 + 0.01 * (i as f32)))
+      .collect();
+    let qw = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+    let sc = Array::from_slice::<half::bf16>(&bf16_scales_data, &(n_groups, out_features)).unwrap();
+
+    // F16 pass-through.
+    let pt_shape = (16usize, 8usize);
+    let pt_data: Vec<half::f16> = (0..pt_shape.0 * pt_shape.1)
+      .map(|i| half::f16::from_f32(0.01 * (i as f32)))
+      .collect();
+    let pt = Array::from_slice::<half::f16>(&pt_data, &pt_shape).unwrap();
+
+    let weights: Weights = HashMap::from([
+      ("layer.qweight".to_string(), qw),
+      ("layer.scales".to_string(), sc),
+      ("model.norm.weight".to_string(), pt),
+    ]);
+    let cfg = AwqLoadConfig {
+      bits: 4,
+      group_size: 4,
+      zero_point: false,
+      version: "gemm".into(),
+    };
+
+    let (out, _) = transform_awq_weights(weights, &cfg).expect("transform");
+
+    // AWQ-generated .scales: BF16 (resolved model_dtype, no escalation).
+    let sc_out = out.get("layer.scales").expect("layer.scales");
+    assert_eq!(
+      sc_out.dtype().unwrap(),
+      Dtype::BF16,
+      "AWQ-generated .scales is at the resolved BF16 model_dtype"
+    );
+    let bi_out = out.get("layer.biases").expect("layer.biases");
+    assert_eq!(
+      bi_out.dtype().unwrap(),
+      Dtype::BF16,
+      "AWQ-generated .biases is at the resolved BF16 model_dtype"
+    );
+
+    // Pass-through F16: still F16, NOT widened to BF16.
+    let mut pt_out = out
+      .get("model.norm.weight")
+      .expect("pass-through model.norm.weight")
+      .try_clone()
+      .unwrap();
+    assert_eq!(
+      pt_out.dtype().unwrap(),
+      Dtype::F16,
+      "pass-through F16 tensor must NOT be cast to the resolved BF16 — \
+       unification is scoped to AWQ-generated outputs only"
+    );
+    // Byte-equivalence.
+    let pt_back: Vec<half::f16> = pt_out.to_vec().expect("read pass-through as F16");
+    for (i, (&got, &want)) in pt_back.iter().zip(pt_data.iter()).enumerate() {
+      assert_eq!(
+        got.to_bits(),
+        want.to_bits(),
+        "pass-through value at index {i} must be byte-identical"
+      );
+    }
+  }
+
+  /// F5 R3: resident-size proxy — a large-ish pass-through tensor next to
+  /// a single AWQ layer triggering F32 escalation (via a mixed F16+BF16
+  /// pair). The pass-through `Array::size()` × `dtype_size()` must be
+  /// IDENTICAL pre- vs post-transform (same shape, same dtype → identical
+  /// resident bytes). Pre-fix, the pass-through would have been cast from
+  /// BF16 → F32, doubling its resident size.
+  #[test]
+  fn transform_awq_weights_preserves_resident_size_for_passthrough() {
+    fn dtype_size(d: Dtype) -> usize {
+      match d {
+        Dtype::Bool | Dtype::U8 | Dtype::I8 => 1,
+        Dtype::U16 | Dtype::I16 | Dtype::F16 | Dtype::BF16 => 2,
+        Dtype::U32 | Dtype::I32 | Dtype::F32 => 4,
+        Dtype::U64 | Dtype::I64 | Dtype::F64 | Dtype::Complex64 => 8,
+      }
+    }
+    let in_features = 8usize;
+    let out_features = 8usize;
+    let n_groups = 2usize;
+
+    // Mixed F16+BF16 AWQ pair → resolver escalates to F32 (per F5 [HIGH]).
+    let f16_scales_data: Vec<half::f16> = (0..n_groups * out_features)
+      .map(|i| half::f16::from_f32(0.1 * (i + 1) as f32))
+      .collect();
+    let bf16_scales_data: Vec<half::bf16> = (0..n_groups * out_features)
+      .map(|i| half::bf16::from_f32(0.5 + 0.01 * (i as f32)))
+      .collect();
+    let qw_a = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+    let sc_a = Array::from_slice::<half::f16>(&f16_scales_data, &(n_groups, out_features)).unwrap();
+    let qw_b = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+    let sc_b =
+      Array::from_slice::<half::bf16>(&bf16_scales_data, &(n_groups, out_features)).unwrap();
+
+    // Large-ish BF16 pass-through. Record pre-transform resident size.
+    let pt_shape = (256usize, 256usize);
+    let pt_data: Vec<half::bf16> = (0..pt_shape.0 * pt_shape.1)
+      .map(|i| half::bf16::from_f32((i as f32) * 1e-4))
+      .collect();
+    let pt = Array::from_slice::<half::bf16>(&pt_data, &pt_shape).unwrap();
+    let pt_size_pre = pt.size() * dtype_size(pt.dtype().unwrap());
+    assert_eq!(
+      pt_size_pre,
+      pt_shape.0 * pt_shape.1 * 2,
+      "pre-transform BF16 pass-through resident size sanity"
+    );
+
+    let weights: Weights = HashMap::from([
+      ("layer_a.qweight".to_string(), qw_a),
+      ("layer_a.scales".to_string(), sc_a),
+      ("layer_b.qweight".to_string(), qw_b),
+      ("layer_b.scales".to_string(), sc_b),
+      ("embed_tokens.weight".to_string(), pt),
+    ]);
+    let cfg = AwqLoadConfig {
+      bits: 4,
+      group_size: 4,
+      zero_point: false,
+      version: "gemm".into(),
+    };
+
+    let (out, _) = transform_awq_weights(weights, &cfg).expect("transform");
+
+    let pt_out = out
+      .get("embed_tokens.weight")
+      .expect("pass-through preserved");
+    // Same dtype + same shape ⇒ same resident size. (BF16 = 2 bytes;
+    // had it been cast to F32 the size would have doubled to 4 bytes/elem.)
+    assert_eq!(
+      pt_out.dtype().unwrap(),
+      Dtype::BF16,
+      "pass-through must remain BF16 (not widened to F32 by the mixed-half escalation)"
+    );
+    assert_eq!(
+      pt_out.shape(),
+      vec![pt_shape.0, pt_shape.1],
+      "pass-through shape preserved"
+    );
+    let pt_size_post = pt_out.size() * dtype_size(pt_out.dtype().unwrap());
+    assert_eq!(
+      pt_size_post,
+      pt_size_pre,
+      "pass-through resident size must be IDENTICAL post-transform \
+       (pre-fix this would have doubled from {pt_size_pre} to {} bytes)",
+      pt_size_pre * 2
+    );
   }
 
   // ──────────────── AwqLoadConfig ────────────────
