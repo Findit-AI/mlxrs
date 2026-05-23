@@ -1180,13 +1180,18 @@ pub enum CommitOutcome {
 /// `{ts_us}-{pid:hex}-{ctr:hex}` built once at save start from the
 /// microsecond timestamp, the PID, and a process-global atomic counter)
 /// so a new save's shards can never overwrite an older checkpoint's
-/// shards on disk regardless of clock or process; (3) before every shard
-/// / index rename a `symlink_metadata` check refuses to overwrite an
-/// existing final path (fail-closed defense-in-depth — the collision-
-/// resistant `gen_id` is the real protection, but rather than trust the
-/// rename behavior under a hostile / racing peer, the save errors with
-/// [`crate::Error::ShardPathCollision`] on any pre-existing final
-/// target).
+/// shards on disk regardless of clock or process; (3) the shard publish
+/// uses an **atomic no-replace `hard_link`** rather than a `rename` —
+/// `link(2)` succeeds creating a second directory entry for the
+/// tempfile's inode or fails `EEXIST`, with no replace window, so a
+/// pre-existing final path (collision-resistant `gen_id` collision,
+/// stale leftover, or hostile / racing peer) surfaces as
+/// [`crate::Error::ShardPathCollision`] in a single syscall — a
+/// `symlink_metadata` + `rename` pre-check would have a TOCTOU gap
+/// where `rename(2)` silently REPLACES the racing peer's bytes between
+/// the stat and the rename. The index continues to use `rename` (its
+/// commit semantics ARE "the latest rename wins"; it intentionally
+/// overwrites the OLD index).
 ///
 /// Steps, in reference order:
 ///
@@ -1205,38 +1210,44 @@ pub enum CommitOutcome {
 ///    The `index.json` body is likewise serialized to its own same-
 ///    directory `O_EXCL` tempfile and fsynced. **Nothing is written to a
 ///    final path yet.** Any failure here removes every staged tempfile.
-/// 5. **Publish — single commit point.** Every shard tempfile is atomically
-///    renamed over its final shard name FIRST (each rename preceded by a
-///    `symlink_metadata` fail-closed existence check on the target); the
-///    parent directory is `fsync`ed so those rename entries are durable;
-///    the staged index is atomically renamed over
-///    `model.safetensors.index.json` LAST (again preceded by a
-///    `symlink_metadata` check — `NotFound` proceeds, anything else
-///    errors; the loader IS allowed to read the OLD `index.json`, and
-///    that file is the ONE final path we intentionally overwrite). The
-///    parent directory is `fsync`ed again to make the index rename
-///    durable. The index rename is THE observable commit point: before
-///    it, load follows the OLD index (if any) to the OLD shards (any
-///    new-named shards on disk are invisible — [`load_weights`] only
-///    loads what the index lists); after it, load follows the NEW index
-///    to the new shards. POSIX `rename(2)` is atomic-within-fs (same-dir
-///    tempfiles keep it single-fs); the new checkpoint becomes visible
-///    only at that final rename. Because every NEW shard's basename
-///    carries the collision-resistant `gen_id` it can never overwrite an
-///    OLD shard — a failure between the shard renames and the index
-///    rename leaves the OLD index → OLD shards untouched and still
-///    loadable; the not-yet-published staged index is removed, and the
-///    renamed new-named shards become silently-orphan files (load
-///    ignores them).
+/// 5. **Publish — single commit point.** Every shard tempfile is
+///    published to its final shard name FIRST via an **atomic no-
+///    replace `hard_link`** (`link(2)`): a second directory entry is
+///    created for the tempfile's inode, or the call fails `EEXIST` and
+///    the save aborts with [`crate::Error::ShardPathCollision`] (no
+///    silent-replace window — unlike `rename(2)`); the tempfile is then
+///    unlinked, freeing the temp name while the inode survives via the
+///    final-path entry. The parent directory is `fsync`ed so those
+///    `link` + unlink entries are durable. The staged index is then
+///    atomically `rename`d over `model.safetensors.index.json` LAST
+///    (preceded by a `symlink_metadata` check — `NotFound` proceeds,
+///    anything else errors; the loader IS allowed to read the OLD
+///    `index.json`, and that file is the ONE final path we
+///    intentionally overwrite). The parent directory is `fsync`ed again
+///    to make the index rename durable. The index rename is THE
+///    observable commit point: before it, load follows the OLD index
+///    (if any) to the OLD shards (any new-named shards on disk are
+///    invisible — [`load_weights`] only loads what the index lists);
+///    after it, load follows the NEW index to the new shards. POSIX
+///    `rename(2)` is atomic-within-fs and `link(2)` is atomic no-
+///    replace (same-dir tempfiles keep both single-fs — `EXDEV` is
+///    impossible by construction); the new checkpoint becomes visible
+///    only at that final index rename. Because every NEW shard's
+///    basename carries the collision-resistant `gen_id` it can never
+///    collide with an OLD shard — a failure between the shard publish
+///    and the index rename leaves the OLD index → OLD shards untouched
+///    and still loadable; the not-yet-published staged index is
+///    removed, and the linked new-named shards become silently-orphan
+///    files (load ignores them).
 ///
 /// **Failure-vs-commit boundary (`CommitOutcome`).** `save_model` returns
 /// `Result<CommitOutcome, Error>`:
 ///
 /// - `Err(_)` is returned **only** for pre-commit failures (directory
-///   create, staging, shard rename, the existence-check defense-in-depth
-///   that catches a colliding final path, the index rename itself). On
-///   any such failure the OLD checkpoint is byte-identical to its
-///   pre-save state.
+///   create, staging, shard publish — including the atomic no-replace
+///   `hard_link` defense-in-depth that catches a colliding final path,
+///   the index rename itself). On any such failure the OLD checkpoint
+///   is byte-identical to its pre-save state.
 /// - Once the index rename succeeds the NEW checkpoint IS observable and
 ///   `save_model` returns `Ok(_)`:
 ///   - `Ok(CommitOutcome::Committed)` — the post-commit parent-directory
@@ -1391,30 +1402,49 @@ pub fn save_model(
 
   // 5. Publish — single commit point.
   //
-  //    a. Rename every shard tempfile over its final shard name FIRST.
-  //       Because each shard basename carries a collision-resistant
-  //       `gen_id` (`model-gen-{ts_us}-{pid}-{ctr}-…`) the rename target
-  //       statistically cannot pre-exist. As defense-in-depth — fail-
-  //       closed on the residual hostile / racing case — every rename is
-  //       preceded by a `symlink_metadata` check on the final path: if it
-  //       returns `Ok(_)` (path exists) the save aborts with
-  //       [`crate::Error::ShardPathCollision`] rather than overwriting; a
-  //       `NotFound` proceeds (the normal path). A rename failure (or a
-  //       collision) here leaves any still-staged shard + the staged
-  //       index as tempfiles, which are cleaned up before propagating.
-  //       Already-renamed shards remain on disk as silently-invisible
-  //       files (the OLD index, if any, still points to its OLD shard
-  //       names — which are untouched).
+  //    a. Publish every shard tempfile to its final shard name FIRST via
+  //       an **atomic no-replace `hard_link`**. `link(2)` (`std::fs::
+  //       hard_link`) creates a new directory entry pointing at the same
+  //       inode as the tempfile, or fails with `EEXIST` (`ErrorKind::
+  //       AlreadyExists`) — atomically, with no replace window. Unlike a
+  //       `symlink_metadata` pre-check + `rename` sequence (which has a
+  //       TOCTOU gap where a concurrent writer can race in between the
+  //       stat and the rename; `rename(2)` then SILENTLY replaces the
+  //       racing peer's bytes), `hard_link` cannot overwrite — it either
+  //       creates the final directory entry or returns the collision
+  //       error in a single syscall. The tempfile is then unlinked: the
+  //       inode survives via the new final-path entry (refcount stays at
+  //       1), so no bytes are lost. Each shard basename also carries a
+  //       collision-resistant `gen_id`
+  //       (`model-gen-{ts_us}-{pid}-{ctr}-…`) making the collision
+  //       statistically unreachable; `hard_link`'s atomic no-replace is
+  //       the fail-closed defense in depth on the residual hostile /
+  //       racing case. A collision (or other IO failure) here leaves any
+  //       still-staged shard + the staged index as tempfiles, which are
+  //       cleaned up before propagating. Already-published shards remain
+  //       on disk as silently-invisible files (the OLD index, if any,
+  //       still points to its OLD shard names — which are untouched).
+  //
+  //       Same-filesystem guarantee: `open_excl_temp_shard` creates the
+  //       tempfile in `final_path.parent()` (so tmp + final_path always
+  //       share a directory), so `EXDEV` cross-device errors from
+  //       `hard_link` are impossible by construction.
   for idx in 0..staged_shards.len() {
     let (tmp, final_path) = &staged_shards[idx];
-    // Fail-closed existence check: defense in depth on top of the
-    // collision-resistant `gen_id`. `symlink_metadata` does NOT follow
-    // symlinks, so it sees a planted symlink as itself (and a `NotFound`
-    // means the path truly does not exist as any kind of inode). Anything
-    // other than `NotFound` is a collision (`Ok(_)`) or an unexpected
-    // stat error — both abort the save before the rename overwrites.
-    match std::fs::symlink_metadata(final_path) {
-      Ok(_) => {
+    match std::fs::hard_link(tmp, final_path) {
+      Ok(()) => {
+        // The bytes are now reachable via `final_path` (a second name
+        // for the same inode). Best-effort unlink the tmp name; the
+        // inode survives via the final-path entry, so no data loss
+        // even if the unlink fails.
+        let _ = std::fs::remove_file(tmp);
+      }
+      Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+        // Atomic no-replace caught a colliding final path (the
+        // statistically-unreachable `gen_id` collision, a stale
+        // leftover, or a hostile / racing peer). Clean every still-
+        // unpublished shard tempfile (including this one) + the
+        // staged index, then surface the collision.
         for (leftover, _) in &staged_shards[idx..] {
           let _ = std::fs::remove_file(leftover);
         }
@@ -1425,10 +1455,9 @@ pub fn save_model(
           path: final_path.clone(),
         });
       }
-      Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-        // expected — proceed with the rename
-      }
       Err(e) => {
+        // Clean every still-unpublished shard tempfile + the staged
+        // index, then surface the IO failure.
         for (leftover, _) in &staged_shards[idx..] {
           let _ = std::fs::remove_file(leftover);
         }
@@ -1437,36 +1466,22 @@ pub fn save_model(
         }
         return Err(Error::Backend {
           message: format!(
-            "save_model: cannot stat shard final path {} before rename: {e}",
+            "save_model: cannot hard_link shard {} -> {}: {e}",
+            tmp.display(),
             final_path.display()
           ),
         });
       }
     }
-    if let Err(e) = std::fs::rename(tmp, final_path) {
-      // Clean every still-unpublished shard tempfile + the staged index.
-      for (leftover, _) in &staged_shards[idx..] {
-        let _ = std::fs::remove_file(leftover);
-      }
-      if let Some((index_tmp, _)) = &staged_index {
-        let _ = std::fs::remove_file(index_tmp);
-      }
-      return Err(Error::Backend {
-        message: format!(
-          "save_model: cannot rename shard {} -> {}: {e}",
-          tmp.display(),
-          final_path.display()
-        ),
-      });
-    }
   }
 
-  //    a'. fsync the parent directory so all shard rename entries are
-  //        durable on disk before we publish the index. Without this, a
-  //        crash between the shard renames and the index rename can lose
-  //        the rename metadata, leaving the index referencing shards that
-  //        appear missing on the next mount. A no-op on platforms where
-  //        directory fsync is not supported.
+  //    a'. fsync the parent directory so all shard `hard_link` + unlink
+  //        entries are durable on disk before we publish the index.
+  //        Without this, a crash between the shard publish and the
+  //        index rename can lose the directory entries, leaving the
+  //        index referencing shards that appear missing on the next
+  //        mount. A no-op on platforms where directory fsync is not
+  //        supported.
   //
   //        This fsync is BEFORE the observable commit point (the index
   //        rename), so a failure here is a genuine pre-commit error and
@@ -1474,7 +1489,7 @@ pub fn save_model(
   //        that gets demoted to a `CommitOutcome` warning.
   fsync_dir(save_path).map_err(|e| Error::Backend {
     message: format!(
-      "save_model: fsync parent directory {} after shard renames failed: {e}",
+      "save_model: fsync parent directory {} after shard publish failed: {e}",
       save_path.display()
     ),
   })?;
@@ -4000,10 +4015,13 @@ mod save_tests {
   /// predicted final shard paths (the collision-resistant `gen_id`
   /// makes this statistically unreachable, so the test plants the file
   /// by hand after forcing the gen_id via the test-only
-  /// `force_next_gen_id` helper) `save_model` MUST refuse to overwrite
-  /// it — returning [`crate::Error::ShardPathCollision`] naming the
-  /// offending path — and leave the planted file byte-identical and no
-  /// staged tempfiles behind.
+  /// `force_next_gen_id` helper) `save_model`'s atomic no-replace
+  /// `std::fs::hard_link` MUST fail with `ErrorKind::AlreadyExists`
+  /// and the save MUST surface that as
+  /// [`crate::Error::ShardPathCollision`] naming the offending path —
+  /// the planted file is byte-identical (the no-replace primitive
+  /// cannot overwrite, unlike `rename(2)`) and no staged tempfiles
+  /// leak.
   #[test]
   fn save_model_refuses_to_overwrite_existing_shard_basename() {
     let dir = fresh_dir("save-refuses-overwrite");
@@ -4023,7 +4041,8 @@ mod save_tests {
     let r = save_model(&dir, &w, &PerLayerQuantization::default());
 
     // 3. The save aborts with `Error::ShardPathCollision` naming the
-    //    offending path.
+    //    offending path — the atomic no-replace `hard_link` mapped
+    //    `ErrorKind::AlreadyExists` to this variant.
     match r {
       Err(Error::ShardPathCollision { path }) => {
         assert_eq!(
@@ -4034,7 +4053,8 @@ mod save_tests {
       other => panic!("expected Err(ShardPathCollision), got {other:?}"),
     }
 
-    // 4. The decoy file is byte-identical — no overwrite occurred.
+    // 4. The decoy file is byte-identical — `hard_link`'s no-replace
+    //    semantics guarantee no overwrite.
     assert!(
       collision_path.is_file(),
       "the planted decoy at {} must still be a file",
@@ -4043,7 +4063,7 @@ mod save_tests {
     assert_eq!(
       std::fs::read(&collision_path).unwrap(),
       decoy_bytes,
-      "the planted decoy must be byte-identical (the rename was refused)"
+      "the planted decoy must be byte-identical (hard_link refused to replace)"
     );
 
     // 5. No staged `.tmp.safetensors` leaks (every staged tempfile was
@@ -4059,6 +4079,109 @@ mod save_tests {
     assert!(
       !leftover_tmp,
       "no staged tempfile may remain after a ShardPathCollision abort"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// F6 R7: the shard publish primitive must be **atomic no-replace**,
+  /// not a `symlink_metadata` + `rename` pre-check. A check-then-act
+  /// has a TOCTOU window: the stat returns `NotFound`, a concurrent
+  /// writer creates the final path, then `rename(2)` SILENTLY replaces
+  /// the racing peer's bytes. With `std::fs::hard_link` the race is
+  /// closed at the syscall boundary — the call either creates the new
+  /// directory entry or fails `AlreadyExists`, never overwriting.
+  ///
+  /// The simplest faithful simulation of the race is to plant the
+  /// colliding file BEFORE calling `save_model`: from `hard_link`'s
+  /// perspective the final path already exists when the syscall runs,
+  /// which is exactly the state a TOCTOU race would leave the
+  /// filesystem in. (A `symlink_metadata` + `rename` implementation
+  /// would also catch this specific pre-plant via the pre-check, but
+  /// the contract under test is "the primitive is atomic no-replace",
+  /// not "the pre-check happens to catch a pre-plant". Together with
+  /// the original-test pre-plant case both arms are exercised: this
+  /// test ALSO asserts no-tempfile-leak + no-NEW-index-commit, which
+  /// the original does not.) Contract:
+  ///
+  /// 1. `save_model` returns `Err(Error::ShardPathCollision { path })`
+  ///    naming the planted path.
+  /// 2. The planted file is byte-identical — `hard_link` cannot
+  ///    overwrite, so no bytes are clobbered.
+  /// 3. No `.tmp.safetensors` leaks — the collision-cleanup path
+  ///    removed every staged tempfile.
+  /// 4. No NEW `model.safetensors.index.json` exists in the directory
+  ///    — the index rename is the observable commit point and the
+  ///    save aborted BEFORE it; the directory has no index file at
+  ///    all (we started from a `fresh_dir`).
+  #[test]
+  fn save_model_concurrent_create_at_final_path_returns_collision_error_not_silent_overwrite() {
+    let dir = fresh_dir("save-toctou-no-silent-overwrite");
+
+    // Predict the final shard path from a forced gen_id and plant a
+    // file there — equivalent to a concurrent peer winning the race
+    // against a `symlink_metadata` + `rename` pre-check (from
+    // `hard_link`'s perspective the path is already there when the
+    // syscall runs).
+    let forced_gen_id = "7777777777777-feedface-00000000beefcafe";
+    let final_shard = dir.join(shard_file_name(forced_gen_id, 1, 1));
+    let racer_bytes = b"racer-bytes: a concurrent writer's payload that MUST survive";
+    std::fs::write(&final_shard, racer_bytes).unwrap();
+
+    force_next_gen_id(forced_gen_id);
+
+    let mut w: Weights = HashMap::new();
+    w.insert("z.weight".to_string(), f32_weight(3));
+    let r = save_model(&dir, &w, &PerLayerQuantization::default());
+
+    // (1) `Err(ShardPathCollision { path: final_shard })`.
+    match r {
+      Err(Error::ShardPathCollision { path }) => {
+        assert_eq!(
+          path, final_shard,
+          "collision error names the planted (racer) path"
+        );
+      }
+      other => {
+        panic!("expected Err(ShardPathCollision) from atomic no-replace hard_link, got {other:?}")
+      }
+    }
+
+    // (2) Planted bytes survive byte-identical — `hard_link` is no-
+    // replace; a silent overwrite would have clobbered these.
+    assert!(
+      final_shard.is_file(),
+      "the racer file at {} must still be a regular file",
+      final_shard.display()
+    );
+    assert_eq!(
+      std::fs::read(&final_shard).unwrap(),
+      racer_bytes,
+      "racer bytes must be byte-identical — atomic no-replace forbids silent overwrite"
+    );
+
+    // (3) No leftover tempfile in the dir.
+    let leftover_tmp = std::fs::read_dir(&dir)
+      .unwrap()
+      .filter_map(|e| e.ok())
+      .any(|e| {
+        e.file_name()
+          .to_string_lossy()
+          .ends_with(".tmp.safetensors")
+      });
+    assert!(
+      !leftover_tmp,
+      "no staged .tmp.safetensors may remain after a ShardPathCollision"
+    );
+
+    // (4) No NEW index — the save aborted before the index rename
+    // (the observable commit point). Directory was fresh, so the
+    // index file must not exist.
+    let index_path = dir.join("model.safetensors.index.json");
+    assert!(
+      !index_path.exists(),
+      "no index commit may occur when shard publish fails: {} exists",
+      index_path.display()
     );
 
     let _ = std::fs::remove_dir_all(&dir);

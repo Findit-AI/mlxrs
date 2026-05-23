@@ -82,19 +82,24 @@ pub enum Error {
     message: String,
   },
 
-  /// Defense-in-depth shard-path collision: [`crate::lm::load::save_model`]
-  /// observed a pre-existing file at one of its predicted final shard paths
-  /// before the atomic rename. The collision-resistant
-  /// `gen_id` (timestamp µs + PID + per-process counter) makes this
-  /// statistically unreachable in normal operation; surfacing it as a hard
-  /// `Err` keeps the save fail-closed (never silently overwrite a foreign
-  /// file). Constructed only when the `lm` feature is enabled.
+  /// Defense-in-depth shard-path collision:
+  /// [`crate::lm::load::save_model`]'s atomic no-replace
+  /// `std::fs::hard_link` of a shard tempfile onto its final shard path
+  /// failed with [`std::io::ErrorKind::AlreadyExists`], meaning a file
+  /// already occupies that final path. `link(2)` is atomic + no-replace
+  /// by spec, so this surfaces in a single syscall with no silent-
+  /// replace window (a `rename`-based publish would race a concurrent
+  /// writer here). The collision-resistant `gen_id` (timestamp µs,
+  /// PID, per-process counter) makes this statistically unreachable in
+  /// normal operation; surfacing it as a hard `Err` keeps the save
+  /// fail-closed (never silently overwrite a foreign file). Constructed
+  /// only when the `lm` feature is enabled.
   #[cfg(feature = "lm")]
   #[cfg_attr(docsrs, doc(cfg(feature = "lm")))]
   #[error("shard path collision: {path}")]
   ShardPathCollision {
-    /// The pre-existing final shard path that the rename refused to
-    /// overwrite.
+    /// The pre-existing final shard path that the atomic no-replace
+    /// `hard_link` refused to overwrite.
     path: std::path::PathBuf,
   },
 
