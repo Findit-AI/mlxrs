@@ -1456,6 +1456,36 @@ pub fn transform_awq_weights(
   weights: Weights,
   config: &AwqLoadConfig,
 ) -> Result<(Weights, PerLayerQuantization)> {
+  // Fix 2 [HIGH]: reject `version = "gemv"` and any other non-GEMM version
+  // BEFORE any processing. AwqLoadConfig advertises {"gemm" / "gemv"} but
+  // the converter unconditionally assumes GEMM layout. GEMV has different
+  // qweight shape + scales layout + sequential packing — a GEMV checkpoint
+  // either rejects at an unrelated shape-check OR silently mis-converts.
+  // Gate it here so the failure mode is a clear "not supported" error
+  // instead of corrupt inference. Empty `""` accepts the serde default
+  // (the field's `#[serde(default)]` is `String::new()` — older AutoAWQ
+  // checkpoints + mlxrs-internal construction both leave it empty, and
+  // historically that has meant "any" / "gemm").
+  match config.version.as_str() {
+    "" | "gemm" => { /* proceed */ }
+    "gemv" => {
+      return Err(Error::Backend {
+        message: "AWQ version 'gemv' not yet supported — only 'gemm' is implemented. \
+                  GEMV checkpoints use a different qweight shape, scales layout, and \
+                  sequential packing; converting one through the GEMM path would silently \
+                  produce corrupt weights. See upstream AutoAWQ for GEMV-layout details. \
+                  Re-quantize with `awq --version gemm` if possible."
+          .to_string(),
+      });
+    }
+    other => {
+      return Err(Error::Backend {
+        message: format!(
+          "transform_awq_weights: AWQ version '{other}' not recognized (expected 'gemm' or empty)"
+        ),
+      });
+    }
+  }
   // Faithful to mlx-lm's `if bits != 4: raise ValueError` (`utils.py:88`).
   if config.bits != AWQ_BITS {
     return Err(Error::Backend {
@@ -3389,6 +3419,106 @@ mod tests {
     assert_eq!(g.bits, 4);
     assert_eq!(g.group_size, 128);
     assert_eq!(g.mode, QuantMode::Affine);
+  }
+
+  // ──────────────── Fix 2 [HIGH]: version validation ────────────────
+
+  /// Helper: build a minimal valid GEMM-shaped weights map (in=8, out=8,
+  /// gs=4, ng=2). Lets the F2 tests focus on the version field without
+  /// re-deriving the shape arithmetic each time.
+  fn awq_gemm_fixture_weights() -> Weights {
+    let in_features = 8usize;
+    let out_features = 8usize;
+    let n_groups = 2usize;
+    let qw = Array::from_slice::<u32>(&vec![0u32; in_features], &(in_features, 1)).unwrap();
+    let qz = Array::from_slice::<u32>(&vec![0u32; n_groups], &(n_groups, 1)).unwrap();
+    let scales_data: Vec<f32> = vec![1.0_f32; n_groups * out_features];
+    let sc = Array::from_slice::<f32>(&scales_data, &(n_groups, out_features)).unwrap();
+    let mut w: Weights = HashMap::new();
+    w.insert("layer.qweight".to_string(), qw);
+    w.insert("layer.qzeros".to_string(), qz);
+    w.insert("layer.scales".to_string(), sc);
+    w
+  }
+
+  /// Fix 2: `version = "gemv"` is REJECTED at the top of transform_awq_weights
+  /// (before any conversion work). The error message must name the offending
+  /// version and call out "not yet supported" — the spec-required signal.
+  #[test]
+  fn transform_awq_weights_rejects_gemv_version() {
+    let config = AwqLoadConfig {
+      bits: 4,
+      group_size: 4,
+      zero_point: true,
+      version: "gemv".into(),
+    };
+    let err = transform_awq_weights(awq_gemm_fixture_weights(), &config).unwrap_err();
+    match err {
+      Error::Backend { message } => {
+        assert!(
+          message.contains("gemv"),
+          "error must name the offending 'gemv' version, got: {message}"
+        );
+        assert!(
+          message.contains("not yet supported"),
+          "error must say 'not yet supported', got: {message}"
+        );
+      }
+      other => panic!("expected Error::Backend, got: {other:?}"),
+    }
+  }
+
+  /// Fix 2: an unknown version string is REJECTED with the version named
+  /// in the message.
+  #[test]
+  fn transform_awq_weights_rejects_unknown_version() {
+    let config = AwqLoadConfig {
+      bits: 4,
+      group_size: 4,
+      zero_point: true,
+      version: "unsupported".into(),
+    };
+    let err = transform_awq_weights(awq_gemm_fixture_weights(), &config).unwrap_err();
+    match err {
+      Error::Backend { message } => {
+        assert!(
+          message.contains("unsupported"),
+          "error must name the offending version, got: {message}"
+        );
+        assert!(
+          message.contains("not recognized"),
+          "error must say 'not recognized', got: {message}"
+        );
+      }
+      other => panic!("expected Error::Backend, got: {other:?}"),
+    }
+  }
+
+  /// Fix 2: empty version (the serde default) is ACCEPTED — older AutoAWQ
+  /// checkpoints + mlxrs-internal construction both leave it empty.
+  #[test]
+  fn transform_awq_weights_accepts_empty_version() {
+    let config = AwqLoadConfig {
+      bits: 4,
+      group_size: 4,
+      zero_point: true,
+      version: String::new(),
+    };
+    transform_awq_weights(awq_gemm_fixture_weights(), &config)
+      .expect("empty version (serde default) must be accepted");
+  }
+
+  /// Fix 2: explicit `"gemm"` is ACCEPTED.
+  #[test]
+  fn transform_awq_weights_accepts_gemm_version() {
+    let config = AwqLoadConfig {
+      bits: 4,
+      group_size: 4,
+      zero_point: true,
+      version: "gemm".into(),
+    };
+    transform_awq_weights(awq_gemm_fixture_weights(), &config)
+      .expect("explicit 'gemm' version must be accepted");
   }
 
   // ──────────────── Fix 1 [CRITICAL]: I32 qweight/qzeros acceptance ────────────────
