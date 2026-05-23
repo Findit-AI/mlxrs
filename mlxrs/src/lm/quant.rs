@@ -1627,6 +1627,40 @@ pub fn transform_awq_weights(
   for prefix in &qweight_prefixes {
     let qweight_key = format!("{prefix}.qweight");
     let scales_key = format!("{prefix}.scales");
+    // Fix 4 [HIGH]: collision check with `<prefix>.weight` / `<prefix>.biases`
+    // siblings. The converter emits `<prefix>.weight` + `<prefix>.scales`
+    // (+ `<prefix>.biases` for affine) and then unconditionally inserts the
+    // remainder keys into the output map. If the input ALSO carries a stale
+    // `<prefix>.weight` (a dense weight left over from a partial conversion,
+    // a misnamed pair of files, or hostile content) the remainder pass would
+    // OVERWRITE the freshly-generated AWQ output — yielding corrupt inference
+    // or a deferred load failure. The pre-existing non-AWQ `quantize_weights`
+    // path already refuses analogous orphan/stale collisions (see
+    // `classify_triple` / `TripleClass::Invalid` — "refusing to silently
+    // overwrite the generated bias"). Mirror that contract here so the
+    // failure mode is a clear preflight error, not silent corruption.
+    let weight_key = format!("{prefix}.weight");
+    if weights.contains_key(&weight_key) {
+      return Err(Error::Backend {
+        message: format!(
+          "AWQ conversion collision: input contains both `{qweight_key}` (to be converted) and \
+           `{weight_key}` (would be overwritten by the generated AWQ output). Remove the stale \
+           dense weight before fusing. (Precedent: the non-AWQ `quantize_weights` path also \
+           refuses analogous orphan/stale collisions — see `classify_triple` in this module.)"
+        ),
+      });
+    }
+    let biases_key = format!("{prefix}.biases");
+    if weights.contains_key(&biases_key) {
+      return Err(Error::Backend {
+        message: format!(
+          "AWQ conversion collision: input contains both `{qweight_key}` (to be converted) and \
+           `{biases_key}` (would be overwritten by the generated AWQ output). Remove the stale \
+           biases before fusing. (Precedent: the non-AWQ `quantize_weights` path also refuses \
+           analogous orphan/stale collisions — see `classify_triple` in this module.)"
+        ),
+      });
+    }
     let Some(qweight) = weights.get(&qweight_key) else {
       // Should be unreachable (we built the prefix list FROM the keys),
       // but guard defensively.
@@ -3908,6 +3942,145 @@ mod tests {
       Dtype::BF16,
       "heterogeneous f16+bf16 must resolve to BF16 (precision-rank tiebreaker), got {resolved:?}"
     );
+  }
+
+  // ──────────────── Fix 4 [HIGH]: collision with stale `.weight`/`.biases` ────────────────
+
+  /// Fix 4: input carries `<prefix>.qweight + .scales + .qzeros + .weight` —
+  /// a stale dense `.weight` next to a valid AWQ triple. The converter would
+  /// emit `<prefix>.weight` from the AWQ conversion, then the remainder pass
+  /// would OVERWRITE it with the stale input. Preflight collision check
+  /// must REJECT this with a clear message naming the prefix + "collision".
+  #[test]
+  fn transform_awq_weights_rejects_collision_with_stale_weight() {
+    let mut weights = awq_gemm_fixture_weights();
+    // Add a stale dense `.weight` next to the AWQ triple. The exact shape
+    // doesn't matter — the collision check fires at preflight, before any
+    // shape validation.
+    let stale = Array::from_slice::<f32>(&[0.0_f32; 16], &(2usize, 8)).unwrap();
+    weights.insert("layer.weight".to_string(), stale);
+    let cfg = AwqLoadConfig {
+      bits: 4,
+      group_size: 4,
+      zero_point: true,
+      version: "gemm".into(),
+    };
+    let err = transform_awq_weights(weights, &cfg).unwrap_err();
+    match err {
+      Error::Backend { message } => {
+        assert!(
+          message.contains("layer.qweight"),
+          "error must name the offending qweight, got: {message}"
+        );
+        assert!(
+          message.contains("collision"),
+          "error must call out 'collision', got: {message}"
+        );
+        assert!(
+          message.contains("layer.weight"),
+          "error must name the colliding stale .weight, got: {message}"
+        );
+      }
+      other => panic!("expected Error::Backend, got: {other:?}"),
+    }
+  }
+
+  /// Fix 4: same collision, but with `<prefix>.biases` instead of `.weight`.
+  #[test]
+  fn transform_awq_weights_rejects_collision_with_stale_biases() {
+    let mut weights = awq_gemm_fixture_weights();
+    let stale = Array::from_slice::<f32>(&[0.0_f32; 8], &(8usize,)).unwrap();
+    weights.insert("layer.biases".to_string(), stale);
+    let cfg = AwqLoadConfig {
+      bits: 4,
+      group_size: 4,
+      zero_point: true,
+      version: "gemm".into(),
+    };
+    let err = transform_awq_weights(weights, &cfg).unwrap_err();
+    match err {
+      Error::Backend { message } => {
+        assert!(
+          message.contains("layer.qweight"),
+          "error must name the offending qweight, got: {message}"
+        );
+        assert!(
+          message.contains("collision"),
+          "error must call out 'collision', got: {message}"
+        );
+        assert!(
+          message.contains("layer.biases"),
+          "error must name the colliding stale .biases, got: {message}"
+        );
+      }
+      other => panic!("expected Error::Backend, got: {other:?}"),
+    }
+  }
+
+  /// Fix 4: an UNRELATED `.weight` key (different prefix) must NOT trigger
+  /// the collision check — the conversion proceeds and the unrelated dense
+  /// key passes through verbatim.
+  #[test]
+  fn transform_awq_weights_accepts_unrelated_weight_keys() {
+    let mut weights = awq_gemm_fixture_weights();
+    // Distinct prefix — embed_tokens.weight is the canonical pass-through.
+    let pt = Array::from_slice::<f32>(&[1.0_f32, 2.0, 3.0, 4.0], &(2usize, 2)).unwrap();
+    weights.insert("embed_tokens.weight".to_string(), pt);
+    let cfg = AwqLoadConfig {
+      bits: 4,
+      group_size: 4,
+      zero_point: true,
+      version: "gemm".into(),
+    };
+    let (out, _) = transform_awq_weights(weights, &cfg).expect("unrelated .weight must pass");
+    // AWQ output present + pass-through preserved.
+    assert!(
+      out.contains_key("layer.weight"),
+      "AWQ-converted .weight must be present"
+    );
+    assert!(
+      out.contains_key("embed_tokens.weight"),
+      "unrelated .weight must be preserved"
+    );
+  }
+
+  /// Fix 4: BOTH stale `.weight` + `.biases` present → still errors (the
+  /// first detected one is fine; this confirms the second one wouldn't
+  /// somehow be quiet either, by removing the first and re-running).
+  #[test]
+  fn transform_awq_weights_rejects_collision_with_both_stale_keys() {
+    let mut weights = awq_gemm_fixture_weights();
+    let stale_w = Array::from_slice::<f32>(&[0.0_f32; 16], &(2usize, 8)).unwrap();
+    let stale_b = Array::from_slice::<f32>(&[0.0_f32; 8], &(8usize,)).unwrap();
+    weights.insert("layer.weight".to_string(), stale_w);
+    weights.insert("layer.biases".to_string(), stale_b);
+    let cfg = AwqLoadConfig {
+      bits: 4,
+      group_size: 4,
+      zero_point: true,
+      version: "gemm".into(),
+    };
+    let err = transform_awq_weights(weights, &cfg).unwrap_err();
+    assert!(
+      matches!(err, Error::Backend { .. }),
+      "must reject with Backend, got: {err:?}"
+    );
+
+    // Now drop the .weight collision; the .biases collision alone must
+    // still fire. (Confirms the gate is per-sibling, not "first-only".)
+    let mut weights2 = awq_gemm_fixture_weights();
+    let stale_b2 = Array::from_slice::<f32>(&[0.0_f32; 8], &(8usize,)).unwrap();
+    weights2.insert("layer.biases".to_string(), stale_b2);
+    let err2 = transform_awq_weights(weights2, &cfg).unwrap_err();
+    match err2 {
+      Error::Backend { message } => {
+        assert!(
+          message.contains("layer.biases"),
+          "must name the .biases collision when .weight is absent, got: {message}"
+        );
+      }
+      other => panic!("expected Error::Backend, got: {other:?}"),
+    }
   }
 
   // ──────────────── AwqLoadConfig ────────────────
