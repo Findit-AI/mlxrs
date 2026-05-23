@@ -1116,13 +1116,25 @@ mod tests {
   /// emitting 200-sample + 100-sample frames would attribute the
   /// 100-sample frame's silence the same 12.5 ms the 200-sample
   /// frame deserves, double-counting the second frame's silence).
+  ///
+  /// To make the per-chunk semantics OBSERVABLE (and so a pre-fix
+  /// regression cannot pass by accident — both pre-fix and post-fix
+  /// happen to cross a coarse threshold or deliver the same final
+  /// audio length), this test installs a recording
+  /// [`TurnTakingPolicy`] that captures every `silence_ms` value the
+  /// orchestrator passes to it and asserts the FULL SEQUENCE. Under
+  /// the fix the sequence is `[20, 30]`; the pre-fix code (which
+  /// reused `chunks[0].len()` for every chunk) would produce
+  /// `[20, 40]`.
   #[test]
   fn voice_session_silence_accounting_uses_per_chunk_duration_not_first_chunk() {
     // Two speech chunks (320 samples each, 20 ms each) to open the
     // turn, then two SILENCE chunks of DIFFERENT sizes: 320 (20 ms)
-    // + 160 (10 ms). Total silence-ms must be 20 + 10 = 30 ms (NOT
-    // 20 + 20 = 40 ms which the pre-fix would have computed if both
-    // were emitted in the same step batch).
+    // + 160 (10 ms). Per-chunk silence-ms must be observed as
+    // `[20, 30]` (the 30 ms is the 20 ms accumulated from the first
+    // silence chunk plus 10 ms from the second). The pre-fix code
+    // would have produced `[20, 40]` (re-using chunks[0]'s 320
+    // samples / 20 ms for the second silence chunk too).
     //
     // We use a one-shot chunker that emits all four pre-queued
     // chunks in a SINGLE push_samples call (the bug was
@@ -1148,6 +1160,26 @@ mod tests {
         self.chunks = None;
       }
     }
+
+    /// Records every `silence_ms` value the orchestrator passes to
+    /// `user_finished`, then defers to a configurable threshold. We
+    /// use a high threshold (so neither chunk finalizes the turn)
+    /// and assert the recorded SEQUENCE — that is the observable
+    /// divergence between per-chunk (fix) and chunks[0] (pre-fix).
+    ///
+    /// `RefCell` because [`TurnTakingPolicy::user_finished`] takes
+    /// `&self` and the test is single-threaded.
+    struct RecordingTurnTaking {
+      observed_silence_ms: RefCell<Vec<u32>>,
+      threshold_ms: u32,
+    }
+    impl TurnTakingPolicy for RecordingTurnTaking {
+      fn user_finished(&self, _recent_audio: &[f32], silence_ms: u32) -> bool {
+        self.observed_silence_ms.borrow_mut().push(silence_ms);
+        silence_ms >= self.threshold_ms
+      }
+    }
+
     let one_shot = OneShotChunker {
       chunks: Some(vec![
         speech_chunk.clone(),
@@ -1180,25 +1212,122 @@ mod tests {
       },
       one_shot,
       EnergyBargeInDetector::default(),
-      // Threshold = 25 ms — 20 + 10 = 30 ms crosses it, 20 + 20 = 40
-      // ms also crosses (so a finalize either way) but the
-      // silence_ms_accum value at finalize must be 30, not 40.
-      // We assert the in_progress_audio LENGTH at finalize: it must
-      // be 2 × 320 (speech) + 320 + 160 (silence) = 1120 samples.
-      SilenceTurnTakingPolicy::new(25),
+      // Threshold = 100 ms — well above both the fix's max (30) and
+      // the pre-fix's max (40), so neither finalizes the turn. The
+      // sequence of observed silence_ms values is the WHOLE assertion;
+      // by NOT finalizing we keep the test focused on the per-chunk
+      // accumulation (no confounding finalize-side effects).
+      RecordingTurnTaking {
+        observed_silence_ms: RefCell::new(Vec::new()),
+        threshold_ms: 100,
+      },
     )
     .unwrap();
 
     let mut sink = MockSink::new();
     sess.step(&[], &mut sink, false).unwrap();
-    assert_eq!(sess.turn_events().len(), 1);
-    // STT saw exactly: 2 × 320 speech + 320 + 160 trailing silence
-    // = 1120 samples. The fix is about the silence-ms ACCOUNTING;
-    // here we lock that the audio that reached STT is the full
-    // variable-frame stream (per-chunk semantics) and ALSO that the
-    // turn finalizes after the second silence chunk (silence_ms =
-    // 30 ≥ 25), not after the first (which would only give 20).
-    let stt_len = *sess.stt.last_audio_len.borrow();
-    assert_eq!(stt_len, 2 * 320 + 320 + 160);
+    // No finalize fired (threshold = 100 ms > max observed 30 ms).
+    assert_eq!(
+      sess.turn_events().len(),
+      0,
+      "high threshold (100 ms) must NOT finalize on a 30 ms silence run",
+    );
+
+    let observed = sess.turn_policy.observed_silence_ms.borrow().clone();
+    // CRITICAL: assert the FULL SEQUENCE `[20, 30]`, not just the
+    // final value. The pre-fix code would record `[20, 40]` (it
+    // re-uses chunks[0].len() = 320 samples / 20 ms for every chunk
+    // in the batch, so the 160-sample second silence chunk would be
+    // double-counted as another 20 ms instead of its actual 10 ms).
+    assert_eq!(
+      observed,
+      vec![20, 30],
+      "per-chunk silence_ms must accumulate as variable-frame durations \
+       [20, 30]; pre-fix (chunks[0].len()) would produce [20, 40]; got {observed:?}",
+    );
+  }
+
+  /// Sanity sibling to the per-chunk-duration test: when EVERY
+  /// silence chunk is the same size as chunks[0], the per-chunk and
+  /// chunks[0] computations agree — both produce a [20, 40] sequence
+  /// over two 320-sample silence chunks. This locks the single-size
+  /// case so a future regression that "fixes" the per-chunk path the
+  /// other way (e.g., always using a hard-coded frame_duration_ms)
+  /// is still caught.
+  #[test]
+  fn voice_session_silence_accounting_records_uniform_chunk_size_correctly() {
+    let speech_chunk: Vec<f32> = (0..320).map(|i| 0.3 * ((i as f32).sin())).collect();
+    let silence_chunk: Vec<f32> = vec![0.0; 320];
+    struct OneShotChunker {
+      chunks: Option<Vec<Vec<f32>>>,
+    }
+    impl AudioChunker for OneShotChunker {
+      fn push_samples(&mut self, _samples: &[f32]) -> Result<Vec<Vec<f32>>> {
+        Ok(self.chunks.take().unwrap_or_default())
+      }
+      fn drain_residual(&mut self) -> Vec<f32> {
+        Vec::new()
+      }
+      fn reset(&mut self) {
+        self.chunks = None;
+      }
+    }
+    struct RecordingTurnTaking {
+      observed_silence_ms: RefCell<Vec<u32>>,
+      threshold_ms: u32,
+    }
+    impl TurnTakingPolicy for RecordingTurnTaking {
+      fn user_finished(&self, _recent_audio: &[f32], silence_ms: u32) -> bool {
+        self.observed_silence_ms.borrow_mut().push(silence_ms);
+        silence_ms >= self.threshold_ms
+      }
+    }
+
+    let one_shot = OneShotChunker {
+      chunks: Some(vec![
+        speech_chunk.clone(),
+        speech_chunk,
+        silence_chunk.clone(),
+        silence_chunk,
+      ]),
+    };
+    let config = VoicePipelineConfig {
+      input_sample_rate: 16_000,
+      frame_duration_ms: 20,
+      preroll_ms: 0,
+      vad_end_silence_ms: 200,
+      turn_max_incomplete_silence_ms: 200,
+      ..VoicePipelineConfig::default()
+    };
+    let mut sess = VoiceSession::new(
+      config,
+      MockVad { threshold: 0.05 },
+      MockStt {
+        last_audio_len: RefCell::new(0),
+        text: "x".to_string(),
+      },
+      MockLlm {
+        seen: RefCell::new(Vec::new()),
+      },
+      MockTts {
+        seen: RefCell::new(Vec::new()),
+        samples_per_word: 1,
+      },
+      one_shot,
+      EnergyBargeInDetector::default(),
+      RecordingTurnTaking {
+        observed_silence_ms: RefCell::new(Vec::new()),
+        threshold_ms: 100,
+      },
+    )
+    .unwrap();
+
+    let mut sink = MockSink::new();
+    sess.step(&[], &mut sink, false).unwrap();
+    let observed = sess.turn_policy.observed_silence_ms.borrow().clone();
+    // Two 320-sample silence chunks at 16 kHz → 20 ms each, so the
+    // sequence is [20, 40] under both the fix and the pre-fix; this
+    // test fixes the uniform-chunk case as a sanity sibling.
+    assert_eq!(observed, vec![20, 40], "uniform 320-sample silence chunks");
   }
 }
