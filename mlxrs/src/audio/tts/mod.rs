@@ -27,8 +27,10 @@
 //!   whitespace collapse).
 //! - [`g2p`] — grapheme-to-phoneme subsystem (the [`g2p::Phonemizer`]
 //!   trait, in-memory [`g2p::CMUDict`] lexicon + local-file loader,
-//!   ARPAbet→IPA mapper). A separate `NeuralPhonemizer` orchestrator
-//!   ships in a follow-up commit on this branch.
+//!   ARPAbet→IPA mapper, [`g2p::NeuralPhonemizer`] orchestrator). The
+//!   underlying ByT5 model architecture is excluded
+//!   per the no-per-model-arch rule — `NeuralPhonemizer` takes any
+//!   `Fn(&str, &str) -> Result<String>` backend closure.
 //!
 //! This mirrors the existing [`crate::audio::stt`] STT support surface:
 //! `stt` ships the [`Model`](crate::audio::stt::model::Model) trait + the

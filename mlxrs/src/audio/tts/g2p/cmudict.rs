@@ -83,7 +83,10 @@ pub fn parse_line(line: &str, line_number: usize) -> Result<Option<RawEntry>> {
 
   // Split `WORD(n)` into (word, variant).
   let (word, variant) = if let Some(paren_start) = word_part.find('(') {
-    if let Some(paren_end) = word_part[paren_start + 1..].find(')').map(|i| paren_start + 1 + i) {
+    if let Some(paren_end) = word_part[paren_start + 1..]
+      .find(')')
+      .map(|i| paren_start + 1 + i)
+    {
       let var_str = &word_part[paren_start + 1..paren_end];
       let var = var_str.parse::<u32>().ok();
       (word_part[..paren_start].to_lowercase(), var)
@@ -94,14 +97,22 @@ pub fn parse_line(line: &str, line_number: usize) -> Result<Option<RawEntry>> {
     (word_part.to_lowercase(), None)
   };
 
-  let arpabet: Vec<String> = pron_part.split(' ').filter(|s| !s.is_empty()).map(String::from).collect();
+  let arpabet: Vec<String> = pron_part
+    .split(' ')
+    .filter(|s| !s.is_empty())
+    .map(String::from)
+    .collect();
   if arpabet.is_empty() {
     return Err(Error::Backend {
       message: format!("CMUDict line {line_number}: empty pronunciation"),
     });
   }
 
-  Ok(Some(RawEntry { word, arpabet, variant }))
+  Ok(Some(RawEntry {
+    word,
+    arpabet,
+    variant,
+  }))
 }
 
 /// Parse a CMUDict text blob into a list of [`RawEntry`]. Comment / blank
@@ -229,7 +240,9 @@ mod tests {
   // Mirrors `parsesBasicEntry`.
   #[test]
   fn parses_basic_entry() {
-    let entry = parse_line("hello  HH AH0 L OW1", 1).unwrap().expect("entry");
+    let entry = parse_line("hello  HH AH0 L OW1", 1)
+      .unwrap()
+      .expect("entry");
     assert_eq!(entry.word, "hello");
     assert_eq!(entry.arpabet, vec!["HH", "AH0", "L", "OW1"]);
     assert_eq!(entry.variant, None);
@@ -446,6 +459,9 @@ mod tests {
 
     let dict = CMUDictLoader::load(&dir).unwrap();
     // After Latin-1 decode the word is "café" lowercased → "café".
-    assert!(dict.lookup("café").is_some(), "café should be present after Latin-1 fallback");
+    assert!(
+      dict.lookup("café").is_some(),
+      "café should be present after Latin-1 fallback"
+    );
   }
 }

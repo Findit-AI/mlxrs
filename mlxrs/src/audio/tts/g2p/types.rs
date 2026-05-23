@@ -21,7 +21,9 @@ pub struct PhonemeUnit {
 impl PhonemeUnit {
   /// Construct a [`PhonemeUnit`] from any string-like value.
   pub fn new(symbol: impl Into<String>) -> Self {
-    Self { symbol: symbol.into() }
+    Self {
+      symbol: symbol.into(),
+    }
   }
 }
 
@@ -38,7 +40,10 @@ pub struct LexiconEntry {
 impl LexiconEntry {
   /// Construct a [`LexiconEntry`] from owned strings.
   pub fn new(grapheme: impl Into<String>, phonemes: Vec<String>) -> Self {
-    Self { grapheme: grapheme.into(), phonemes }
+    Self {
+      grapheme: grapheme.into(),
+      phonemes,
+    }
   }
 }
 

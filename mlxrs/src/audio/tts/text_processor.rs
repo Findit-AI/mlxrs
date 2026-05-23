@@ -189,7 +189,10 @@ mod tests {
     let out = BasicTextProcessor::normalize(decomposed);
     // After NFC compose + lowercase: "café" (5 chars: c, a, f, é, but lowercase)
     // The é codepoint is U+00E9.
-    assert!(out.contains('\u{00E9}'), "expected NFC-composed é in {out:?}");
+    assert!(
+      out.contains('\u{00E9}'),
+      "expected NFC-composed é in {out:?}"
+    );
     // No standalone combining acute should remain after NFC.
     assert!(
       !out.contains('\u{0301}'),

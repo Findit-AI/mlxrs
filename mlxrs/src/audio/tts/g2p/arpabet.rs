@@ -48,10 +48,18 @@ pub fn to_ipa(arpabet: &str) -> Option<String> {
   // Special cases (vowel-with-stress-dependent IPA).
   match base {
     "AH" => {
-      return Some(if stress == Some(0) { "ə".into() } else { "ʌ".into() });
+      return Some(if stress == Some(0) {
+        "ə".into()
+      } else {
+        "ʌ".into()
+      });
     }
     "ER" => {
-      return Some(if stress == Some(0) { "ɚ".into() } else { "ɝ".into() });
+      return Some(if stress == Some(0) {
+        "ɚ".into()
+      } else {
+        "ɝ".into()
+      });
     }
     _ => {}
   }
@@ -222,7 +230,11 @@ mod tests {
       ("ZH", "ʒ"),
     ];
     for (arpa, ipa) in pairs {
-      assert_eq!(to_ipa(arpa).as_deref(), Some(*ipa), "consonant {arpa} → {ipa}");
+      assert_eq!(
+        to_ipa(arpa).as_deref(),
+        Some(*ipa),
+        "consonant {arpa} → {ipa}"
+      );
     }
   }
 
