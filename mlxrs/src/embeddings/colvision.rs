@@ -870,31 +870,40 @@ mod tests {
     );
   }
 
-  /// REGRESSION (Codex finding, round 3): when the zero-token query is
-  /// at a *non-zero* position whose tile-local index differs from the
-  /// global index, the message must report the GLOBAL index. With
-  /// `batch_size = 128` and `qs.len() = 4`, every query sits in the
-  /// same first tile, so the tile-local index equals the global index
-  /// here — but the path tag (`queries`) and 0-vs-N distinction would
-  /// still have been lost with the old inner-helper message
-  /// (`array 2`). Asserts `queries[2]` and `zero tokens`.
+  /// REGRESSION (Codex finding, round 4): the distinguishing global-
+  /// vs-tile-local fixture for the QUERY path. With `qs.len() = 4`
+  /// and `batch_size = 2`, the offending zero-token query at global
+  /// index 3 lives in the SECOND tile and would have been reported by
+  /// a tile-local-only impl as `array 1` (tile-local within tile #1).
+  /// The pre-validate fix reports the global `queries[3]` instead.
   #[test]
   fn score_multi_vector_rejects_zero_token_query_at_non_zero_global_index() {
-    let q0 = Array::from_slice::<f32>(&[1.0, 0.0], &(1, 2)).unwrap();
-    let q1 = Array::from_slice::<f32>(&[0.0, 1.0], &(1, 2)).unwrap();
+    let q_valid_0 = Array::from_slice::<f32>(&[1.0, 0.0], &(1, 2)).unwrap();
+    let q_valid_1 = Array::from_slice::<f32>(&[0.0, 1.0], &(1, 2)).unwrap();
+    let q_valid_2 = Array::from_slice::<f32>(&[1.0, 1.0], &(1, 2)).unwrap();
     let q_empty = Array::from_slice::<f32>(&[], &(0, 2)).unwrap();
-    let q3 = Array::from_slice::<f32>(&[1.0, 1.0], &(1, 2)).unwrap();
     let p = Array::from_slice::<f32>(&[1.0, 0.0, 0.0, 1.0], &(2, 2)).unwrap();
-    let err =
-      score_multi_vector(&[q0, q1, q_empty, q3], std::slice::from_ref(&p), 128).unwrap_err();
+    // Empty query at global #3 (NOT first tile when batch_size=2): tiles
+    // {q_valid_0, q_valid_1} and {q_valid_2, q_empty}. q_empty is
+    // tile-local index 1 within tile #1 but global index 3.
+    let qs = vec![q_valid_0, q_valid_1, q_valid_2, q_empty];
+    let result = score_multi_vector(&qs, std::slice::from_ref(&p), 2);
+    let msg = match result {
+      Err(Error::ShapeMismatch { message }) => message,
+      other => panic!("expected ShapeMismatch, got {other:?}"),
+    };
     assert!(
-      matches!(err, Error::ShapeMismatch { .. }),
-      "expected ShapeMismatch from pre-validation, got {err:?}"
+      msg.contains("zero tokens"),
+      "expected 'zero tokens' in message, got: {msg}"
     );
-    let msg = format!("{err}");
     assert!(
-      msg.contains("zero tokens") && msg.contains("queries[2]"),
-      "expected 'zero tokens' + 'queries[2]' (GLOBAL index) in message, got {msg}"
+      msg.contains("queries[3]"),
+      "expected global index 3, got: {msg}"
+    );
+    // Defense-in-depth: assert the tile-local forms are absent.
+    assert!(
+      !msg.contains("queries[1]") && !msg.contains("array 1"),
+      "tile-local index leaked: {msg}"
     );
   }
 
