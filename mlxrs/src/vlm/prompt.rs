@@ -1455,26 +1455,31 @@ impl MessageFormatter {
   /// `PROMPT_WITH_IMAGE_TOKEN` — python lines 265–267: `"<image>" *
   /// num_images + prompt`.
   ///
-  /// Allocation hardening: caller-controlled `num_images` is gated
-  /// against [`MAX_MESSAGE_FORMAT_ITEMS`] BEFORE the reserve, and the
-  /// reserve itself is fallible (`try_reserve_exact`). The image-token
-  /// prefix is only built when `role=="user"` and
-  /// `!opts.skip_image_token` so a skip=true / role=assistant path
-  /// returns the bare prompt without touching `num_images`.
+  /// Faithful 1:1 port: the python lambda at `prompt_utils.py:265-269`
+  /// emits `"<image>" * num_images + prompt` **unconditionally** — it
+  /// does NOT gate on `role` or `skip_image_token`. The lambda only
+  /// closes over `num_images` and `prompt`, ignoring the `role` /
+  /// `skip_image_token` / `skip_audio_token` positional args entirely.
+  /// Paligemma maps to this format and relies on the `<image>` prefix
+  /// being emitted for ALL roles (including `assistant`) and when
+  /// `skip_image_token=true`.
+  ///
+  /// Allocation hardening (caller-controlled `num_images`):
+  /// [`MAX_MESSAGE_FORMAT_ITEMS`] cap via `check_format_count` BEFORE
+  /// allocation, `checked_mul` / `checked_add` overflow guards on the
+  /// reserve size, and `try_reserve_exact` for the fallible host-side
+  /// reservation.
   fn format_prompt_with_image_token(
     &self,
     prompt: &str,
     opts: &FormatOpts,
   ) -> Result<FormattedMessage> {
-    // Role / skip gate BEFORE the count-scaled allocation: skip=true
-    // OR role≠user means we never expand `num_images` placeholders,
-    // so a pathological count cannot reach the reserve.
-    let effective_n = if opts.role == "user" && !opts.skip_image_token {
-      check_format_count(opts.num_images, "num_images", &self.model_name)?;
-      opts.num_images
-    } else {
-      0
-    };
+    // Unconditional effective_n — see python `prompt_utils.py:265-267`.
+    // The cap (`check_format_count`) still bounds the allocation budget
+    // regardless of `role` / `skip_image_token`, so a pathological count
+    // cannot drive an OOM through this path.
+    check_format_count(opts.num_images, "num_images", &self.model_name)?;
+    let effective_n = opts.num_images;
     let cap = effective_n
       .checked_mul(7) // "<image>".len()
       .and_then(|n| n.checked_add(prompt.len()))
@@ -1497,20 +1502,24 @@ impl MessageFormatter {
   /// `PROMPT_WITH_START_IMAGE_TOKEN` — python lines 268–269: `prompt +
   /// "<start_of_image>" * num_images`.
   ///
+  /// Faithful 1:1 port: same unconditional behavior as
+  /// [`Self::format_prompt_with_image_token`] — the python lambda at
+  /// `prompt_utils.py:265-269` emits the token-suffix `unconditionally`
+  /// (no `role` / `skip_image_token` gating). No model in `MODEL_CONFIG`
+  /// currently maps to this format, but the helper is kept faithful for
+  /// completeness and forward-compatibility.
+  ///
   /// Allocation hardening: same pattern as
-  /// [`Self::format_prompt_with_image_token`] (cap + role/skip gate +
+  /// [`Self::format_prompt_with_image_token`] (cap + overflow guards +
   /// fallible reserve).
   fn format_prompt_with_start_image_token(
     &self,
     prompt: &str,
     opts: &FormatOpts,
   ) -> Result<FormattedMessage> {
-    let effective_n = if opts.role == "user" && !opts.skip_image_token {
-      check_format_count(opts.num_images, "num_images", &self.model_name)?;
-      opts.num_images
-    } else {
-      0
-    };
+    // Unconditional effective_n — see python `prompt_utils.py:268-269`.
+    check_format_count(opts.num_images, "num_images", &self.model_name)?;
+    let effective_n = opts.num_images;
     let cap = effective_n
       .checked_mul(16) // "<start_of_image>".len()
       .and_then(|n| n.checked_add(prompt.len()))

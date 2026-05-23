@@ -1351,3 +1351,249 @@ fn format_message_video_count_above_cap_returns_error() {
     "expected video.len() in error message, got: {msg}"
   );
 }
+
+// ──────────────── PROMPT_WITH_IMAGE_TOKEN / PROMPT_WITH_START_IMAGE_TOKEN ────────────────
+//
+// Regression coverage for the role/skip-image-token gating bug
+// reported by Codex R2 medium on V4 R2:
+// `mlxrs/src/vlm/prompt.rs:1455-1495` had wrongly suppressed the
+// `<image>` marker when `role != "user"` or `skip_image_token=true`.
+// Python ref (`mlx-vlm/mlx_vlm/prompt_utils.py:265-269`) emits the
+// marker **unconditionally** for both PROMPT_WITH_IMAGE_TOKEN and
+// PROMPT_WITH_START_IMAGE_TOKEN: the lambda only closes over
+// `num_images` and `prompt`. These tests pin the unconditional
+// behavior and assert the allocation cap is still in place.
+
+#[test]
+fn format_message_paligemma_with_skip_image_token_still_emits_image_marker() {
+  // paligemma → PROMPT_WITH_IMAGE_TOKEN. Even with skip_image_token=true
+  // the python lambda emits `<image>` * num_images + prompt.
+  let f = MessageFormatter::for_model("paligemma").unwrap();
+  let out = f
+    .format_message(
+      "describe",
+      &FormatOpts {
+        role: "user".to_string(),
+        skip_image_token: true,
+        num_images: 1,
+        ..Default::default()
+      },
+    )
+    .unwrap();
+  match out {
+    FormattedMessage::String(s) => assert_eq!(s, "<image>describe"),
+    other => panic!("expected String branch, got: {other:?}"),
+  }
+}
+
+#[test]
+fn format_message_paligemma_assistant_role_still_emits_image_marker() {
+  // paligemma → PROMPT_WITH_IMAGE_TOKEN. role="assistant" must NOT
+  // suppress the marker — python lambda is unconditional.
+  let f = MessageFormatter::for_model("paligemma").unwrap();
+  let out = f
+    .format_message(
+      "describe",
+      &FormatOpts {
+        role: "assistant".to_string(),
+        skip_image_token: false,
+        num_images: 1,
+        ..Default::default()
+      },
+    )
+    .unwrap();
+  match out {
+    FormattedMessage::String(s) => assert_eq!(s, "<image>describe"),
+    other => panic!("expected String branch, got: {other:?}"),
+  }
+}
+
+#[test]
+fn format_message_paligemma_extreme_num_images_returns_cap_error() {
+  // paligemma → PROMPT_WITH_IMAGE_TOKEN. num_images=1_000_000 must hit
+  // the SINGLE_IMAGE_ONLY_MODELS guard FIRST (paligemma is single-
+  // image-only, so num_images > 1 short-circuits before the helper's
+  // own cap). Either way the result is `Err(ShapeMismatch)` for the
+  // single-image guard, or `Err(Backend)` had the model not been in
+  // SINGLE_IMAGE_ONLY_MODELS. We test the helper cap directly via
+  // a non-single-image-only synthetic formatter below.
+  let f = MessageFormatter::for_model("paligemma").unwrap();
+  let err = f
+    .format_message(
+      "describe",
+      &FormatOpts {
+        num_images: 1_000_000,
+        ..Default::default()
+      },
+    )
+    .unwrap_err();
+  // paligemma is in SINGLE_IMAGE_ONLY_MODELS, so the
+  // num_images > 1 guard fires first as ShapeMismatch.
+  assert!(
+    matches!(err, Error::ShapeMismatch { .. }),
+    "expected ShapeMismatch (single-image guard), got: {err:?}"
+  );
+
+  // Now exercise the helper's own cap by synthesizing a formatter
+  // whose model_name is NOT in SINGLE_IMAGE_ONLY_MODELS so the cap
+  // check (1024 < 1_000_000) is reached.
+  let synth = MessageFormatter {
+    model_name: "synthetic_pwit".to_string(),
+    format_type: MessageFormat::PromptWithImageToken,
+  };
+  let err = synth
+    .format_message(
+      "describe",
+      &FormatOpts {
+        num_images: 1_000_000,
+        ..Default::default()
+      },
+    )
+    .unwrap_err();
+  assert!(
+    matches!(err, Error::Backend { .. }),
+    "expected Backend (cap-exceeded) on PromptWithImageToken cap, got: {err:?}"
+  );
+  let msg = format!("{err}");
+  assert!(
+    msg.contains("num_images"),
+    "expected num_images in error message, got: {msg}"
+  );
+}
+
+#[test]
+fn format_message_paligemma_num_images_overflow_returns_error() {
+  // PROMPT_WITH_IMAGE_TOKEN: num_images = usize::MAX / 2 must NOT
+  // panic — either the cap fires (Backend) or, in a hypothetical
+  // future where the cap is raised past usize::MAX / 2, the
+  // checked_mul(7).checked_add(prompt.len()) guard fires
+  // (Backend overflow). With the current cap (1024) this fires as
+  // Backend cap-exceeded. Test via a synthetic non-single-image-only
+  // formatter (paligemma's single-image guard would short-circuit).
+  let synth = MessageFormatter {
+    model_name: "synthetic_pwit".to_string(),
+    format_type: MessageFormat::PromptWithImageToken,
+  };
+  let err = synth
+    .format_message(
+      "describe",
+      &FormatOpts {
+        num_images: usize::MAX / 2,
+        ..Default::default()
+      },
+    )
+    .unwrap_err();
+  assert!(
+    matches!(err, Error::Backend { .. } | Error::OutOfMemory),
+    "expected Backend or OutOfMemory (no panic), got: {err:?}"
+  );
+}
+
+// PROMPT_WITH_START_IMAGE_TOKEN — no model in MODEL_CONFIG currently
+// maps to this format, so the tests synthesize a MessageFormatter
+// directly via the public struct fields. The helper is still kept
+// faithful for completeness with the python ref.
+
+#[test]
+fn format_message_prompt_with_start_image_token_with_skip_still_emits_marker() {
+  // PROMPT_WITH_START_IMAGE_TOKEN. skip_image_token=true must NOT
+  // suppress the suffix — python ref `prompt_utils.py:268-269` is
+  // unconditional.
+  let f = MessageFormatter {
+    model_name: "synthetic_pwsit".to_string(),
+    format_type: MessageFormat::PromptWithStartImageToken,
+  };
+  let out = f
+    .format_message(
+      "describe",
+      &FormatOpts {
+        role: "user".to_string(),
+        skip_image_token: true,
+        num_images: 1,
+        ..Default::default()
+      },
+    )
+    .unwrap();
+  match out {
+    FormattedMessage::String(s) => assert_eq!(s, "describe<start_of_image>"),
+    other => panic!("expected String branch, got: {other:?}"),
+  }
+}
+
+#[test]
+fn format_message_prompt_with_start_image_token_assistant_role_still_emits_marker() {
+  // PROMPT_WITH_START_IMAGE_TOKEN. role="assistant" must NOT suppress
+  // the suffix.
+  let f = MessageFormatter {
+    model_name: "synthetic_pwsit".to_string(),
+    format_type: MessageFormat::PromptWithStartImageToken,
+  };
+  let out = f
+    .format_message(
+      "describe",
+      &FormatOpts {
+        role: "assistant".to_string(),
+        skip_image_token: false,
+        num_images: 1,
+        ..Default::default()
+      },
+    )
+    .unwrap();
+  match out {
+    FormattedMessage::String(s) => assert_eq!(s, "describe<start_of_image>"),
+    other => panic!("expected String branch, got: {other:?}"),
+  }
+}
+
+#[test]
+fn format_message_prompt_with_start_image_token_extreme_num_images_returns_cap_error() {
+  // PROMPT_WITH_START_IMAGE_TOKEN. num_images=1_000_000 → cap error
+  // (Backend). Synthetic model is NOT in SINGLE_IMAGE_ONLY_MODELS, so
+  // the helper's own cap check fires.
+  let f = MessageFormatter {
+    model_name: "synthetic_pwsit".to_string(),
+    format_type: MessageFormat::PromptWithStartImageToken,
+  };
+  let err = f
+    .format_message(
+      "describe",
+      &FormatOpts {
+        num_images: 1_000_000,
+        ..Default::default()
+      },
+    )
+    .unwrap_err();
+  assert!(
+    matches!(err, Error::Backend { .. }),
+    "expected Backend (cap-exceeded), got: {err:?}"
+  );
+  let msg = format!("{err}");
+  assert!(
+    msg.contains("num_images"),
+    "expected num_images in error message, got: {msg}"
+  );
+}
+
+#[test]
+fn format_message_prompt_with_start_image_token_num_images_overflow_returns_error() {
+  // PROMPT_WITH_START_IMAGE_TOKEN. num_images = usize::MAX / 2 must
+  // NOT panic — cap (Backend) or checked_mul overflow guard
+  // (Backend / OutOfMemory) catches it.
+  let f = MessageFormatter {
+    model_name: "synthetic_pwsit".to_string(),
+    format_type: MessageFormat::PromptWithStartImageToken,
+  };
+  let err = f
+    .format_message(
+      "describe",
+      &FormatOpts {
+        num_images: usize::MAX / 2,
+        ..Default::default()
+      },
+    )
+    .unwrap_err();
+  assert!(
+    matches!(err, Error::Backend { .. } | Error::OutOfMemory),
+    "expected Backend or OutOfMemory (no panic), got: {err:?}"
+  );
+}
