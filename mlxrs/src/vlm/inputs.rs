@@ -115,18 +115,48 @@ pub struct PrepareInputsOpts {
   /// supply one because no in-process tokenizer is mandatory.
   pub pad_token_id: u32,
   /// `padding` — whether to pad varying-length sequences. Mirrors
-  /// `padding: bool = True` (line 1182).
+  /// `padding: bool = True` (line 1182). `Default::default()` resolves
+  /// to `true` via [`PrepareInputsOpts::default`] (see the impl
+  /// override below).
   pub padding: bool,
   /// `padding_side` — see [`PaddingSide`]. Mirrors line 1183.
   pub padding_side: PaddingSide,
+  /// Optional caller-supplied per-batch `attention_mask`. **When
+  /// `Some(masks)`**: `masks` must have shape `[B][T_b]` with
+  /// `masks.len() == text_token_batches.len()` AND
+  /// `masks[i].len() == text_token_batches[i].len()` for each `i` —
+  /// the supplied mask is treated as already authoritative and is
+  /// padded with `false` (per [`PaddingSide`]) to match the padded
+  /// `input_ids` shape (so any `false` positions inside the caller's
+  /// mask survive into the output).
+  ///
+  /// **When `None` (default)**: the mask is computed from the internal
+  /// padding step (positions filled with `pad_token_id` are marked
+  /// `false`, all caller-supplied tokens are marked `true`).
+  ///
+  /// Mirrors HuggingFace's `tokenizer(..., return_tensors="pt",
+  /// padding=True)` pattern where the tokenizer can EITHER autopad
+  /// (the default branch) OR accept a pre-padded batch + an explicit
+  /// `attention_mask` from the caller. Without this knob, a caller who
+  /// pre-padded their batches upstream (uniform lengths) would have
+  /// every position — including the pre-pads — marked `true` by the
+  /// internal step, which silently corrupts model semantics (the
+  /// padded positions get attended to). The explicit-mask path closes
+  /// that hole.
+  pub attention_mask: Option<Vec<Vec<bool>>>,
 }
 
 impl Default for PrepareInputsOpts {
+  /// Mirrors the python `prepare_inputs` kwargs defaults:
+  /// `pad_token_id=0`, `padding=true` (line 1182),
+  /// `padding_side="left"` (line 1183), `attention_mask=None`
+  /// (compute from the internal padding step).
   fn default() -> Self {
     Self {
       pad_token_id: 0,
       padding: true,
       padding_side: PaddingSide::Left,
+      attention_mask: None,
     }
   }
 }
@@ -162,6 +192,21 @@ impl Default for PrepareInputsOpts {
 /// - `padding=false`: the batches must all be the same length already
 ///   (otherwise `Error::ShapeMismatch`).
 ///
+/// ## Attention-mask semantics
+///
+/// - `opts.attention_mask = None` (default): mask is computed from the
+///   internal padding step — `false` at padded positions (filled with
+///   `opts.pad_token_id`), `true` at every caller-supplied token.
+/// - `opts.attention_mask = Some(masks)`: caller-supplied per-batch
+///   per-token mask is used directly. Required to have
+///   `masks.len() == text_token_batches.len()` and
+///   `masks[i].len() == text_token_batches[i].len()` for every `i`
+///   (otherwise `Error::ShapeMismatch`); the supplied mask is then
+///   padded with `false` (per [`PaddingSide`]) to match the padded
+///   `input_ids` shape. Use this path when you pre-padded the batches
+///   yourself upstream and you need padding positions to be marked
+///   `false` (the internal step has no way to detect pre-padding).
+///
 /// # Errors
 ///
 /// - `Error::ShapeMismatch` if `text_token_batches` is empty.
@@ -169,6 +214,8 @@ impl Default for PrepareInputsOpts {
 ///   varying lengths.
 /// - `Error::ShapeMismatch` if any per-batch `T_b > i32::MAX` (mlx
 ///   dimension limit).
+/// - `Error::ShapeMismatch` if `opts.attention_mask` is `Some(masks)`
+///   and `masks` has the wrong outer or inner dimensions.
 /// - `Error::OutOfMemory` if the row buffers cannot be allocated.
 pub fn prepare_inputs(
   text_token_batches: &[&[u32]],
@@ -181,6 +228,32 @@ pub fn prepare_inputs(
     return Err(Error::ShapeMismatch {
       message: "prepare_inputs: text_token_batches is empty (need >= 1 batch entry)".into(),
     });
+  }
+
+  // Validate caller-supplied attention_mask shape if present. We do
+  // this BEFORE any allocation so a dimension-mismatch path is cheap.
+  if let Some(masks) = &opts.attention_mask {
+    if masks.len() != text_token_batches.len() {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "prepare_inputs: opts.attention_mask outer length {} != text_token_batches.len() {}",
+          masks.len(),
+          text_token_batches.len()
+        ),
+      });
+    }
+    for (i, (m, b)) in masks.iter().zip(text_token_batches.iter()).enumerate() {
+      if m.len() != b.len() {
+        return Err(Error::ShapeMismatch {
+          message: format!(
+            "prepare_inputs: opts.attention_mask[{i}] length {} != text_token_batches[{i}] \
+             length {}",
+            m.len(),
+            b.len()
+          ),
+        });
+      }
+    }
   }
 
   // Determine target T. With padding, this is max(T_b); without, it's
@@ -224,26 +297,33 @@ pub fn prepare_inputs(
     })?;
 
   // Row-major fill — `i32` ids (mlx convention: token ids are i32),
-  // padded per opts.padding_side.
+  // padded per opts.padding_side. The mask is either the caller's
+  // per-token mask (padded with false in the pad positions) or the
+  // internal "everything-true-except-pads" mask.
   let mut ids_buf: Vec<i32> = try_with_capacity(total)?;
   let mut mask_buf: Vec<bool> = try_with_capacity(total)?;
+  let caller_mask = opts.attention_mask.as_deref();
   for (b, batch) in text_token_batches.iter().enumerate() {
     let pad_count = target_t - lens[b];
+    // Resolve the mask source for this row: caller's per-token slice
+    // (length already validated == batch.len()) OR `None` → fill
+    // `true` at every caller-token position.
+    let row_mask: Option<&[bool]> = caller_mask.map(|m| m[b].as_slice());
     match opts.padding_side {
       PaddingSide::Left => {
         for _ in 0..pad_count {
           ids_buf.push(opts.pad_token_id as i32);
           mask_buf.push(false);
         }
-        for &t in *batch {
+        for (i, &t) in batch.iter().enumerate() {
           ids_buf.push(t as i32);
-          mask_buf.push(true);
+          mask_buf.push(row_mask.is_none_or(|m| m[i]));
         }
       }
       PaddingSide::Right => {
-        for &t in *batch {
+        for (i, &t) in batch.iter().enumerate() {
           ids_buf.push(t as i32);
-          mask_buf.push(true);
+          mask_buf.push(row_mask.is_none_or(|m| m[i]));
         }
         for _ in 0..pad_count {
           ids_buf.push(opts.pad_token_id as i32);

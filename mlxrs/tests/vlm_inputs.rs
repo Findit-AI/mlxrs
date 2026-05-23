@@ -7,7 +7,7 @@
 #![cfg(feature = "vlm")]
 
 use mlxrs::{
-  Array,
+  Array, Error,
   vlm::inputs::{PaddingSide, PrepareInputsOpts, prepare_inputs},
 };
 
@@ -130,6 +130,7 @@ fn prepare_inputs_padding_side_left_default() {
     pad_token_id: 0,
     padding: true,
     padding_side: PaddingSide::Left,
+    attention_mask: None,
   };
   let mut out = prepare_inputs(batches, None, None, None, &opts).unwrap();
   assert_eq!(out.input_ids.shape(), vec![2, 4]);
@@ -154,6 +155,7 @@ fn prepare_inputs_padding_side_right_vs_left() {
     pad_token_id: 7,
     padding: true,
     padding_side: PaddingSide::Right,
+    attention_mask: None,
   };
   let mut out = prepare_inputs(batches, None, None, None, &opts).unwrap();
   let ids = out.input_ids.to_vec::<i32>().unwrap();
@@ -175,6 +177,7 @@ fn prepare_inputs_padding_disabled_requires_uniform_length() {
     pad_token_id: 0,
     padding: false,
     padding_side: PaddingSide::Left,
+    attention_mask: None,
   };
   let err = prepare_inputs(batches, None, None, None, &opts).unwrap_err();
   let msg = format!("{err}");
@@ -201,6 +204,136 @@ fn prepare_inputs_uniform_no_padding_needed() {
   assert_eq!(ids, vec![10, 20, 30, 40, 50, 60]);
   let mask = out.attention_mask.to_vec::<bool>().unwrap();
   assert!(mask.iter().all(|&b| b));
+}
+
+// ──────────────────────── V4 R1: attention_mask threading ─────────────────
+//
+// Finding 3 regressions — caller-supplied attention_mask must override
+// the internal "every-token-true" computation so pre-padded uniform
+// batches survive into the output with their padding positions marked
+// `false`.
+
+#[test]
+fn prepare_inputs_caller_supplied_attention_mask_overrides_default() {
+  // Pre-padded uniform batches (length 4) with the LAST 2 positions of
+  // batch a being pre-pads (caller's mask: [true,true,false,false]).
+  // Pre-fix: the internal step marked every position true. Post-fix:
+  // the caller's mask is threaded through.
+  let a = [10_u32, 20, 0, 0]; // last 2 = caller's pre-pads
+  let b = [30_u32, 40, 50, 60]; // all real tokens
+  let batches: &[&[u32]] = &[&a, &b];
+  let caller_mask = vec![vec![true, true, false, false], vec![true, true, true, true]];
+  let opts = PrepareInputsOpts {
+    pad_token_id: 0,
+    padding: true,
+    padding_side: PaddingSide::Left,
+    attention_mask: Some(caller_mask),
+  };
+  let mut out = prepare_inputs(batches, None, None, None, &opts).unwrap();
+  assert_eq!(out.attention_mask.shape(), vec![2, 4]);
+  let mask = out.attention_mask.to_vec::<bool>().unwrap();
+  // Row 0 (uniform-length → no extra padding step) → caller's mask
+  // directly.
+  assert_eq!(&mask[0..4], &[true, true, false, false]);
+  // Row 1 → caller's mask directly (all true).
+  assert_eq!(&mask[4..8], &[true, true, true, true]);
+}
+
+#[test]
+fn prepare_inputs_caller_mask_left_pads_with_false() {
+  // With padding_side=Left and varying-length batches, the caller's
+  // mask is applied AT the token positions (post-pad), and the leading
+  // pad positions are marked `false` per the contract.
+  let a = [10_u32, 20]; // len 2 — caller's mask: [true, false] (the second token is a pre-pad they want masked)
+  let b = [30_u32, 40, 50, 60]; // len 4
+  let batches: &[&[u32]] = &[&a, &b];
+  let caller_mask = vec![vec![true, false], vec![true, true, true, true]];
+  let opts = PrepareInputsOpts {
+    pad_token_id: 0,
+    padding: true,
+    padding_side: PaddingSide::Left,
+    attention_mask: Some(caller_mask),
+  };
+  let mut out = prepare_inputs(batches, None, None, None, &opts).unwrap();
+  let mask = out.attention_mask.to_vec::<bool>().unwrap();
+  // Row 0 left-padded to length 4:
+  //   leading pad position (1) → false
+  //   leading pad position (2) → false
+  //   caller's mask[0] = true
+  //   caller's mask[1] = false (caller marked this token as a pre-pad)
+  assert_eq!(&mask[0..4], &[false, false, true, false]);
+  assert_eq!(&mask[4..8], &[true, true, true, true]);
+}
+
+#[test]
+fn prepare_inputs_caller_mask_right_pads_with_false() {
+  // padding_side=Right symmetric counterpart.
+  let a = [10_u32, 20]; // len 2
+  let b = [30_u32, 40, 50, 60]; // len 4
+  let batches: &[&[u32]] = &[&a, &b];
+  let caller_mask = vec![vec![true, false], vec![true, true, true, true]];
+  let opts = PrepareInputsOpts {
+    pad_token_id: 0,
+    padding: true,
+    padding_side: PaddingSide::Right,
+    attention_mask: Some(caller_mask),
+  };
+  let mut out = prepare_inputs(batches, None, None, None, &opts).unwrap();
+  let mask = out.attention_mask.to_vec::<bool>().unwrap();
+  // Row 0 right-padded: caller's mask [true, false] then 2 trailing
+  // pad positions (false).
+  assert_eq!(&mask[0..4], &[true, false, false, false]);
+  assert_eq!(&mask[4..8], &[true, true, true, true]);
+}
+
+#[test]
+fn prepare_inputs_caller_mask_dimension_mismatch_errors() {
+  // Outer-dim mismatch: caller supplies 1 mask, batch has 2 entries.
+  let a = [10_u32, 20];
+  let b = [30_u32, 40];
+  let batches: &[&[u32]] = &[&a, &b];
+  let bad_mask = vec![vec![true, true]]; // outer len 1 != 2
+  let opts = PrepareInputsOpts {
+    pad_token_id: 0,
+    padding: true,
+    padding_side: PaddingSide::Left,
+    attention_mask: Some(bad_mask),
+  };
+  let err = prepare_inputs(batches, None, None, None, &opts).unwrap_err();
+  assert!(
+    matches!(err, Error::ShapeMismatch { .. }),
+    "expected ShapeMismatch, got: {err:?}"
+  );
+  let msg = format!("{err}");
+  assert!(
+    msg.contains("attention_mask outer length") && msg.contains("1") && msg.contains("2"),
+    "expected outer-length mismatch text, got: {msg}"
+  );
+}
+
+#[test]
+fn prepare_inputs_caller_mask_inner_dimension_mismatch_errors() {
+  // Inner-dim mismatch: caller's mask[1] has the wrong length.
+  let a = [10_u32, 20];
+  let b = [30_u32, 40, 50];
+  let batches: &[&[u32]] = &[&a, &b];
+  let bad_mask = vec![vec![true, true], vec![true, true]]; // mask[1] len 2 != 3
+  let opts = PrepareInputsOpts {
+    pad_token_id: 0,
+    padding: true,
+    padding_side: PaddingSide::Left,
+    attention_mask: Some(bad_mask),
+  };
+  let err = prepare_inputs(batches, None, None, None, &opts).unwrap_err();
+  assert!(
+    matches!(err, Error::ShapeMismatch { .. }),
+    "expected ShapeMismatch, got: {err:?}"
+  );
+  let msg = format!("{err}");
+  assert!(
+    msg.contains("attention_mask[1]"),
+    "expected attention_mask[1] index in error message, got: {msg}"
+  );
 }
 
 // ──────────────────────── audio/video glue (cfg-gated) ───────────────────

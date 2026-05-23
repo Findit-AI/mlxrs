@@ -592,9 +592,13 @@ fn assemble_multimodal_prompt_required_rejects_missing_marker() {
 // (`MessageBuilder`), 192–441 (`MessageFormatter`), 444–480
 // (`get_message_json`).
 
-use mlxrs::vlm::prompt::{
-  ContentItem, FormatOpts, FormattedMessage, MESSAGE_FORMAT_VARIANTS, MODEL_CONFIG, MessageBuilder,
-  MessageContent, MessageFormat, MessageFormatter, SINGLE_IMAGE_ONLY_MODELS, get_message_json,
+use mlxrs::{
+  Error,
+  vlm::prompt::{
+    ContentItem, FormatOpts, FormattedMessage, MAX_MESSAGE_FORMAT_ITEMS, MESSAGE_FORMAT_VARIANTS,
+    MODEL_CONFIG, MessageBuilder, MessageContent, MessageFormat, MessageFormatter,
+    SINGLE_IMAGE_ONLY_MODELS, get_message_json,
+  },
 };
 
 // ──────────────────────── MessageFormat 18-variant table ────────────────────
@@ -717,10 +721,10 @@ fn get_message_json_text_only_shape() {
   let out = get_message_json(
     "florence2",
     "describe this",
-    &FormatOpts {
+    Some(&FormatOpts {
       num_images: 0,
       ..Default::default()
-    },
+    }),
   )
   .unwrap();
   match out {
@@ -736,10 +740,10 @@ fn get_message_json_image_content_embedded() {
   let out = get_message_json(
     "qwen2_vl",
     "describe this",
-    &FormatOpts {
+    Some(&FormatOpts {
       num_images: 1,
       ..Default::default()
-    },
+    }),
   )
   .unwrap();
   match out {
@@ -767,10 +771,10 @@ fn get_message_json_image_first_shape() {
   let out = get_message_json(
     "qwen2_5_vl",
     "describe this",
-    &FormatOpts {
+    Some(&FormatOpts {
       num_images: 1,
       ..Default::default()
-    },
+    }),
   )
   .unwrap();
   let items = match out {
@@ -794,10 +798,10 @@ fn get_message_json_image_url_first_shape() {
   let out = get_message_json(
     "ernie4_5_moe_vl",
     "describe",
-    &FormatOpts {
+    Some(&FormatOpts {
       num_images: 1,
       ..Default::default()
-    },
+    }),
   )
   .unwrap();
   let items = match out {
@@ -819,11 +823,11 @@ fn get_message_json_image_token_inline() {
   let out = get_message_json(
     "minicpmo",
     "what is this",
-    &FormatOpts {
+    Some(&FormatOpts {
       num_images: 2,
       num_audios: 0,
       ..Default::default()
-    },
+    }),
   )
   .unwrap();
   match out {
@@ -842,11 +846,11 @@ fn get_message_json_start_image_token_suffixed() {
   let out = get_message_json(
     "gemma3",
     "what is this",
-    &FormatOpts {
+    Some(&FormatOpts {
       num_images: 1,
       num_audios: 0,
       ..Default::default()
-    },
+    }),
   )
   .unwrap();
   match out {
@@ -865,11 +869,11 @@ fn get_message_json_numbered_image_tokens_phi() {
   let out = get_message_json(
     "phi3_v",
     "describe",
-    &FormatOpts {
+    Some(&FormatOpts {
       num_images: 2,
       num_audios: 1,
       ..Default::default()
-    },
+    }),
   )
   .unwrap();
   match out {
@@ -890,10 +894,10 @@ fn get_message_json_prompt_with_image_token_paligemma() {
   let out = get_message_json(
     "paligemma",
     "describe",
-    &FormatOpts {
+    Some(&FormatOpts {
       num_images: 1,
       ..Default::default()
-    },
+    }),
   )
   .unwrap();
   match out {
@@ -908,10 +912,10 @@ fn get_message_json_single_image_only_rejects_multi() {
   let err = get_message_json(
     "paligemma",
     "describe",
-    &FormatOpts {
+    Some(&FormatOpts {
       num_images: 2,
       ..Default::default()
-    },
+    }),
   )
   .unwrap_err();
   let msg = format!("{err}");
@@ -929,13 +933,13 @@ fn get_message_json_video_message_qwen2_vl() {
   let out = get_message_json(
     "qwen2_vl",
     "what's in this video",
-    &FormatOpts {
+    Some(&FormatOpts {
       num_images: 0,
       video: vec!["video.mp4".to_string()],
       max_pixels: 224 * 224,
       fps: vec![],
       ..Default::default()
-    },
+    }),
   )
   .unwrap();
   let items = match out {
@@ -1087,4 +1091,263 @@ fn message_formatter_list_with_image_type_text_image_last_variant() {
     other => panic!("expected Text at [0], got: {other:?}"),
   }
   assert_eq!(items[1], ContentItem::Image);
+}
+
+// =================================================================
+// V4 R1 regressions: Codex round-1 findings (FormatOpts split,
+// allocation hardening, attention_mask threading).
+// =================================================================
+
+// ──────────────────────── Finding 1: defaults split ───────────────────────
+
+#[test]
+fn get_message_json_text_only_with_qwen2_vl_default_emits_no_image() {
+  // FormatOpts::get_message_default (the public-API defaults at python
+  // prompt_utils.py:444–480, num_images=0 num_audios=0) MUST be used
+  // by `get_message_json(_, _, None)`, so a text-only call to a model
+  // whose normal format would inject an image entry (qwen2_vl uses
+  // LIST_WITH_IMAGE) emits NO image-content entry. The pre-fix bug
+  // was: get_message_json forwarded `&FormatOpts::default()` which used
+  // num_images=1 (the formatter-internal default), spuriously
+  // injecting an image entry into a text-only call.
+  let out = get_message_json("qwen2_vl", "describe this", None).unwrap();
+  match out {
+    FormattedMessage::Message(m) => {
+      assert_eq!(m.role, "user");
+      let items = match m.content {
+        MessageContent::Items(v) => v,
+        other => panic!("expected Items branch, got: {other:?}"),
+      };
+      // Text-only call → exactly one Text item, NO Image entries.
+      assert_eq!(items.len(), 1, "expected only text item, got: {items:?}");
+      assert!(
+        matches!(items[0], ContentItem::Text { .. }),
+        "expected Text at [0], got: {:?}",
+        items[0]
+      );
+      assert!(
+        !items
+          .iter()
+          .any(|c| matches!(c, ContentItem::Image | ContentItem::ImageUrl)),
+        "no Image/ImageUrl entries expected for text-only call, got: {items:?}"
+      );
+    }
+    other => panic!("expected Message branch, got: {other:?}"),
+  }
+}
+
+#[test]
+fn get_message_json_text_only_with_internvl_chat_default_emits_no_audio() {
+  // internvl_chat uses LIST_WITH_IMAGE_TYPE which is the formatter
+  // path that appends `num_audios` ContentItem::Audio entries. With
+  // the public-API defaults (num_audios=0), a text-only call must NOT
+  // emit any audio entries.
+  let out = get_message_json("internvl_chat", "describe this", None).unwrap();
+  match out {
+    FormattedMessage::Message(m) => {
+      assert_eq!(m.role, "user");
+      let items = match m.content {
+        MessageContent::Items(v) => v,
+        other => panic!("expected Items branch, got: {other:?}"),
+      };
+      // Text-only call → exactly one ContentText item, NO Audio entries.
+      assert_eq!(items.len(), 1, "expected only text item, got: {items:?}");
+      assert!(
+        !items.iter().any(|c| matches!(c, ContentItem::Audio)),
+        "no Audio entries expected for text-only call, got: {items:?}"
+      );
+    }
+    other => panic!("expected Message branch, got: {other:?}"),
+  }
+}
+
+#[test]
+fn format_message_internal_default_keeps_one_image() {
+  // FormatOpts::formatter_default() preserves the python in-class
+  // kwarg defaults (num_images=1, num_audios=1) at line 207-208 so a
+  // direct `MessageFormatter::format_message` call with
+  // formatter_default() still emits the one-image structure. This
+  // pins the per-API split: changing the public-API default to
+  // num_images=0 must NOT change the formatter-internal default.
+  let f = MessageFormatter::for_model("qwen2_vl").unwrap();
+  let out = f
+    .format_message("describe this", &FormatOpts::formatter_default())
+    .unwrap();
+  match out {
+    FormattedMessage::Message(m) => {
+      let items = match m.content {
+        MessageContent::Items(v) => v,
+        other => panic!("expected Items branch, got: {other:?}"),
+      };
+      // qwen2_vl LIST_WITH_IMAGE puts text first then images; with
+      // num_images=1 we expect exactly one image entry.
+      assert_eq!(items.len(), 2, "expected text + 1 image, got: {items:?}");
+      assert_eq!(
+        items
+          .iter()
+          .filter(|c| matches!(c, ContentItem::Image))
+          .count(),
+        1,
+        "expected exactly one Image entry under formatter_default, got: {items:?}"
+      );
+    }
+    other => panic!("expected Message branch, got: {other:?}"),
+  }
+}
+
+// ──────────────────────── Finding 2: allocation hardening ─────────────────
+
+#[test]
+fn get_message_json_extreme_num_images_returns_oom_error() {
+  // num_images = usize::MAX / 2 → must return Err (cap-exceeded or
+  // OOM, NOT a panic). Pre-fix: format_list_with_image's
+  // `Vec::with_capacity(1 + opts.num_images)` would attempt a
+  // catastrophic allocation. Post-fix: the count is cap-checked
+  // against MAX_MESSAGE_FORMAT_ITEMS first → Error::Backend.
+  let err = get_message_json(
+    "qwen2_vl",
+    "describe",
+    Some(&FormatOpts {
+      num_images: usize::MAX / 2,
+      ..Default::default()
+    }),
+  )
+  .unwrap_err();
+  // Must be either Backend (cap-exceeded) or OutOfMemory — both are
+  // recoverable, neither panics.
+  assert!(
+    matches!(err, Error::Backend { .. } | Error::OutOfMemory),
+    "expected Backend/OutOfMemory, got: {err:?}"
+  );
+  let msg = format!("{err}");
+  // The cap-exceeded path is the expected one (the value is way above
+  // MAX_MESSAGE_FORMAT_ITEMS = 1024); the message should reference
+  // the cap or num_images for triage.
+  assert!(
+    msg.contains("num_images") || msg.contains("MAX_MESSAGE_FORMAT_ITEMS"),
+    "expected cap/num_images in error message, got: {msg}"
+  );
+}
+
+#[test]
+fn get_message_json_with_skip_image_token_does_not_allocate_for_num_images() {
+  // skip_image_token=true with a pathological num_images MUST NOT
+  // touch the count-scaled reserve — the gate is BEFORE the cap
+  // check. qwen2_vl uses LIST_WITH_IMAGE (Vec<ContentItem>), so the
+  // pre-fix bug was that `Vec::with_capacity(1 + num_images)` would
+  // panic on 1_000_000 long before reaching the skip-gate.
+  //
+  // Post-fix: the skip-gate sets `effective_n = 0`, bypassing the
+  // cap check entirely. Test asserts the call succeeds cheaply with
+  // a single text item.
+  let out = get_message_json(
+    "qwen2_vl",
+    "describe",
+    Some(&FormatOpts {
+      num_images: 1_000_000, // would blow up the unhardened reserve
+      skip_image_token: true,
+      ..Default::default()
+    }),
+  )
+  .unwrap();
+  match out {
+    FormattedMessage::Message(m) => {
+      let items = match m.content {
+        MessageContent::Items(v) => v,
+        other => panic!("expected Items branch, got: {other:?}"),
+      };
+      // skip_image_token=true → NO image entries, just text.
+      assert_eq!(items.len(), 1, "skip_image_token must suppress images");
+      assert!(
+        matches!(items[0], ContentItem::Text { .. }),
+        "expected Text only, got: {items:?}"
+      );
+    }
+    other => panic!("expected Message branch, got: {other:?}"),
+  }
+}
+
+#[test]
+fn format_with_token_skip_image_does_not_allocate_for_num_images() {
+  // Same skip-gate behavior on the IMAGE_TOKEN family
+  // (`<image>` * num_images + prompt) — minicpmo. Pre-fix:
+  // `String::with_capacity(token.len() * num_images)` would blow up
+  // on 1_000_000. Post-fix: skip gate sets effective_n=0.
+  let out = get_message_json(
+    "minicpmo",
+    "describe",
+    Some(&FormatOpts {
+      num_images: 1_000_000,
+      num_audios: 0,
+      skip_image_token: true,
+      ..Default::default()
+    }),
+  )
+  .unwrap();
+  match out {
+    FormattedMessage::Message(m) => match m.content {
+      MessageContent::Text(s) => {
+        // No `<image>` prefix because skip_image_token=true.
+        assert_eq!(s, "describe");
+      }
+      other => panic!("expected Text branch, got: {other:?}"),
+    },
+    other => panic!("expected Message branch, got: {other:?}"),
+  }
+}
+
+#[test]
+fn format_message_extreme_num_audios_returns_cap_error() {
+  // num_audios above cap → Error::Backend. Same shape as the
+  // num_images case but exercises the audio gate on LIST_WITH_IMAGE_TYPE
+  // (internvl_chat) which is the formatter path that allocates per
+  // num_audios.
+  let f = MessageFormatter::for_model("internvl_chat").unwrap();
+  let err = f
+    .format_message(
+      "describe",
+      &FormatOpts {
+        num_audios: MAX_MESSAGE_FORMAT_ITEMS + 1,
+        ..Default::default()
+      },
+    )
+    .unwrap_err();
+  assert!(
+    matches!(err, Error::Backend { .. }),
+    "expected Backend (cap-exceeded), got: {err:?}"
+  );
+  let msg = format!("{err}");
+  assert!(
+    msg.contains("num_audios"),
+    "expected num_audios in error message, got: {msg}"
+  );
+}
+
+#[test]
+fn format_message_video_count_above_cap_returns_error() {
+  // opts.video.len() above MAX_MESSAGE_FORMAT_ITEMS → cap error.
+  // Use the format_video_message path on qwen2_vl with a video list
+  // longer than the cap.
+  let videos: Vec<String> = (0..MAX_MESSAGE_FORMAT_ITEMS + 1)
+    .map(|i| format!("v{i}.mp4"))
+    .collect();
+  let err = get_message_json(
+    "qwen2_vl",
+    "describe",
+    Some(&FormatOpts {
+      num_images: 0,
+      video: videos,
+      ..Default::default()
+    }),
+  )
+  .unwrap_err();
+  assert!(
+    matches!(err, Error::Backend { .. }),
+    "expected Backend (cap-exceeded), got: {err:?}"
+  );
+  let msg = format!("{err}");
+  assert!(
+    msg.contains("video.len()"),
+    "expected video.len() in error message, got: {msg}"
+  );
 }

@@ -71,6 +71,42 @@ use crate::{
   error::{Error, Result, try_to_vec, try_with_capacity},
 };
 
+/// Defensive upper bound on the number of items (image / audio / video
+/// entries) that [`MessageFormatter::format_message`] and
+/// [`get_message_json`] will allocate for in a single call. Caller-
+/// supplied `num_images` / `num_audios` / `video.len()` above this cap
+/// return `Error::Backend` with an actionable cap message; below it the
+/// allocation goes through fallible `try_reserve_exact` (so even within
+/// the cap a hostile input fails recoverably rather than aborting).
+///
+/// 1024 was chosen as a multi-image / multi-modal upper bound that is
+/// well beyond any realistic VLM chat-turn (the largest documented
+/// HF VLM image batch we've seen is ~64) but small enough that even a
+/// pathological caller (e.g. an attacker-controlled token count) cannot
+/// drive an OOM by walking up to the cap on every dispatch site.
+pub const MAX_MESSAGE_FORMAT_ITEMS: usize = 1024;
+
+/// Validate a caller-controlled item count for a `format_*` helper
+/// against [`MAX_MESSAGE_FORMAT_ITEMS`].
+///
+/// Returns `Err(Error::Backend)` (cap-exceeded — caller-supplied count
+/// is too large to allocate) when `count > MAX_MESSAGE_FORMAT_ITEMS`,
+/// else `Ok(())`. `label` is interpolated into the error message
+/// (e.g. `"num_images"`, `"num_audios"`, `"video.len()"`) for caller
+/// triage.
+fn check_format_count(count: usize, label: &str, model_name: &str) -> Result<()> {
+  if count > MAX_MESSAGE_FORMAT_ITEMS {
+    return Err(Error::Backend {
+      message: format!(
+        "MessageFormatter::format_message: {label}={count} exceeds the cap \
+         MAX_MESSAGE_FORMAT_ITEMS={MAX_MESSAGE_FORMAT_ITEMS} (model {model_name}); \
+         reduce the per-turn count or raise the cap"
+      ),
+    });
+  }
+  Ok(())
+}
+
 /// Inclusive-start / exclusive-end half-open token-index ranges marking
 /// contiguous runs of an image placeholder token. One entry per image span
 /// (a single image typically occupies one run of `num_tokens_per_image`
@@ -1189,12 +1225,21 @@ pub enum FormattedMessage {
   String(String),
 }
 
-/// Per-call options for [`MessageFormatter::format_message`] — faithful
-/// 1:1 port of the keyword arguments at
-/// `mlx-vlm/mlx_vlm/prompt_utils.py:201–209`.
+/// Per-call options for [`MessageFormatter::format_message`] and
+/// [`get_message_json`] — faithful 1:1 port of the keyword arguments at
+/// `mlx-vlm/mlx_vlm/prompt_utils.py:201–209` (formatter) and `:444–480`
+/// (`get_message_json` free function).
 ///
-/// Defaulted to match the python defaults exactly so a caller passing
-/// `..Default::default()` matches a Python call that omits all kwargs.
+/// **Two different default sets exist in the python reference**:
+/// `MessageFormatter::format_message` defaults `num_images=1,
+/// num_audios=1` (lines 207–208), while the `get_message_json` free
+/// function defaults `num_images=0, num_audios=0` (lines 450–451). Use
+/// [`Self::formatter_default`] for the formatter-internal defaults and
+/// [`Self::get_message_default`] for the public-API defaults; the
+/// blanket `Default::default()` matches `formatter_default()` (the
+/// in-class defaults at python line 207–208) — callers of
+/// [`get_message_json`] should pass `None` (which substitutes
+/// `get_message_default()`) or build a `FormatOpts` explicitly.
 #[derive(Debug, Clone)]
 pub struct FormatOpts {
   /// `role` — defaults to `"user"`.
@@ -1204,9 +1249,15 @@ pub struct FormatOpts {
   pub skip_image_token: bool,
   /// `skip_audio_token` — defaults to `false`.
   pub skip_audio_token: bool,
-  /// `num_images` — defaults to `1` (mirrors python line 207).
+  /// `num_images` — formatter-internal default `1` (python
+  /// `prompt_utils.py:207`); `get_message_json` public-API default `0`
+  /// (python `prompt_utils.py:450`). Use [`Self::formatter_default`] or
+  /// [`Self::get_message_default`] explicitly.
   pub num_images: usize,
-  /// `num_audios` — defaults to `1` (mirrors python line 208).
+  /// `num_audios` — formatter-internal default `1` (python
+  /// `prompt_utils.py:208`); `get_message_json` public-API default `0`
+  /// (python `prompt_utils.py:451`). Use [`Self::formatter_default`] or
+  /// [`Self::get_message_default`] explicitly.
   pub num_audios: usize,
   /// `video` — paths for the [`MessageFormat::VideoWithText`] /
   /// `_format_video_message` branch. Empty when there is no video.
@@ -1223,8 +1274,13 @@ pub struct FormatOpts {
   pub fps: Vec<u32>,
 }
 
-impl Default for FormatOpts {
-  fn default() -> Self {
+impl FormatOpts {
+  /// Formatter-internal defaults (`num_images=1, num_audios=1`) —
+  /// matches `MessageFormatter::format_message` at
+  /// `mlx-vlm/mlx_vlm/prompt_utils.py:201–209` (specifically lines
+  /// 207–208). Use when calling [`MessageFormatter::format_message`]
+  /// directly and you want the python in-class kwarg defaults.
+  pub fn formatter_default() -> Self {
     Self {
       role: "user".to_string(),
       skip_image_token: false,
@@ -1235,6 +1291,44 @@ impl Default for FormatOpts {
       max_pixels: 224 * 224,
       fps: Vec::new(),
     }
+  }
+
+  /// Public-API defaults (`num_images=0, num_audios=0`) — matches the
+  /// `get_message_json` free function at
+  /// `mlx-vlm/mlx_vlm/prompt_utils.py:444–480` (specifically lines
+  /// 450–451). Use when calling [`get_message_json`] and you want the
+  /// python public-API kwarg defaults; pass `None` to
+  /// [`get_message_json`] for this to be applied automatically.
+  ///
+  /// Why the split: the python free function's signature has
+  /// `num_images=0, num_audios=0` because the public-API caller is
+  /// often text-only and shouldn't get a spurious image/audio entry
+  /// injected by default. The formatter's own kwargs default to 1
+  /// because once you're inside the formatter you usually want exactly
+  /// one image/audio for the common per-turn case.
+  pub fn get_message_default() -> Self {
+    Self {
+      role: "user".to_string(),
+      skip_image_token: false,
+      skip_audio_token: false,
+      num_images: 0,
+      num_audios: 0,
+      video: Vec::new(),
+      max_pixels: 224 * 224,
+      fps: Vec::new(),
+    }
+  }
+}
+
+/// `Default::default()` mirrors the **formatter-internal** defaults
+/// (python `prompt_utils.py:201–209`, lines 207–208 → `num_images=1,
+/// num_audios=1`). Callers of [`get_message_json`] who want the
+/// public-API defaults (python lines 450–451 → `num_images=0,
+/// num_audios=0`) must use [`FormatOpts::get_message_default`] or pass
+/// `None` to [`get_message_json`].
+impl Default for FormatOpts {
+  fn default() -> Self {
+    Self::formatter_default()
   }
 }
 
@@ -1293,6 +1387,12 @@ impl MessageFormatter {
   ///   `IndexError`).
   /// - `Error::ShapeMismatch` if [`FormatOpts::fps`] length differs from
   ///   [`FormatOpts::video`] length (mirrors python lines 431–434).
+  /// - `Error::Backend` if `opts.num_images`, `opts.num_audios`, or
+  ///   `opts.video.len()` exceeds [`MAX_MESSAGE_FORMAT_ITEMS`] (caller-
+  ///   controlled-count allocation cap — see
+  ///   [`MAX_MESSAGE_FORMAT_ITEMS`]).
+  /// - `Error::OutOfMemory` if a host-side `Vec` / `String` reservation
+  ///   fails (the request-scaled allocations use `try_reserve_exact`).
   pub fn format_message(&self, prompt: &str, opts: &FormatOpts) -> Result<FormattedMessage> {
     // Single-image guard — python lines 214–218.
     if opts.num_images > 1
@@ -1323,7 +1423,7 @@ impl MessageFormatter {
     }
 
     // Main dispatch — python lines 234–271.
-    Ok(match self.format_type {
+    match self.format_type {
       MessageFormat::ListWithImage => self.format_list_with_image(prompt, opts, false, false),
       MessageFormat::ListWithImageFirst => self.format_list_with_image(prompt, opts, true, false),
       MessageFormat::ListWithImageUrlFirst => self.format_list_with_image(prompt, opts, true, true),
@@ -1343,27 +1443,91 @@ impl MessageFormatter {
       }
       MessageFormat::ImageTokenNewline => self.format_with_token(prompt, opts, "<image>\n", true),
       MessageFormat::NumberedImageTokens => self.format_numbered_tokens(prompt, opts),
-      MessageFormat::PromptOnly => FormattedMessage::String(prompt.to_string()),
-      MessageFormat::PromptWithImageToken => {
-        // python line 265–267: "<image>" * num_images + prompt.
-        let mut s = String::with_capacity(7 * opts.num_images + prompt.len());
-        for _ in 0..opts.num_images {
-          s.push_str("<image>");
-        }
-        s.push_str(prompt);
-        FormattedMessage::String(s)
-      }
+      MessageFormat::PromptOnly => Ok(FormattedMessage::String(prompt.to_string())),
+      MessageFormat::PromptWithImageToken => self.format_prompt_with_image_token(prompt, opts),
       MessageFormat::PromptWithStartImageToken => {
-        // python line 268–269: prompt + "<start_of_image>" * num_images.
-        let mut s = String::with_capacity(prompt.len() + 16 * opts.num_images);
-        s.push_str(prompt);
-        for _ in 0..opts.num_images {
-          s.push_str("<start_of_image>");
-        }
-        FormattedMessage::String(s)
+        self.format_prompt_with_start_image_token(prompt, opts)
       }
-      MessageFormat::VideoWithText => self.format_video_message(prompt, opts)?,
-    })
+      MessageFormat::VideoWithText => self.format_video_message(prompt, opts),
+    }
+  }
+
+  /// `PROMPT_WITH_IMAGE_TOKEN` — python lines 265–267: `"<image>" *
+  /// num_images + prompt`.
+  ///
+  /// Allocation hardening: caller-controlled `num_images` is gated
+  /// against [`MAX_MESSAGE_FORMAT_ITEMS`] BEFORE the reserve, and the
+  /// reserve itself is fallible (`try_reserve_exact`). The image-token
+  /// prefix is only built when `role=="user"` and
+  /// `!opts.skip_image_token` so a skip=true / role=assistant path
+  /// returns the bare prompt without touching `num_images`.
+  fn format_prompt_with_image_token(
+    &self,
+    prompt: &str,
+    opts: &FormatOpts,
+  ) -> Result<FormattedMessage> {
+    // Role / skip gate BEFORE the count-scaled allocation: skip=true
+    // OR role≠user means we never expand `num_images` placeholders,
+    // so a pathological count cannot reach the reserve.
+    let effective_n = if opts.role == "user" && !opts.skip_image_token {
+      check_format_count(opts.num_images, "num_images", &self.model_name)?;
+      opts.num_images
+    } else {
+      0
+    };
+    let cap = effective_n
+      .checked_mul(7) // "<image>".len()
+      .and_then(|n| n.checked_add(prompt.len()))
+      .ok_or_else(|| Error::Backend {
+        message: format!(
+          "MessageFormatter::format_prompt_with_image_token: 7*num_images + prompt.len() \
+           overflows usize (num_images={effective_n}, prompt.len()={})",
+          prompt.len()
+        ),
+      })?;
+    let mut s = String::new();
+    s.try_reserve_exact(cap).map_err(|_| Error::OutOfMemory)?;
+    for _ in 0..effective_n {
+      s.push_str("<image>");
+    }
+    s.push_str(prompt);
+    Ok(FormattedMessage::String(s))
+  }
+
+  /// `PROMPT_WITH_START_IMAGE_TOKEN` — python lines 268–269: `prompt +
+  /// "<start_of_image>" * num_images`.
+  ///
+  /// Allocation hardening: same pattern as
+  /// [`Self::format_prompt_with_image_token`] (cap + role/skip gate +
+  /// fallible reserve).
+  fn format_prompt_with_start_image_token(
+    &self,
+    prompt: &str,
+    opts: &FormatOpts,
+  ) -> Result<FormattedMessage> {
+    let effective_n = if opts.role == "user" && !opts.skip_image_token {
+      check_format_count(opts.num_images, "num_images", &self.model_name)?;
+      opts.num_images
+    } else {
+      0
+    };
+    let cap = effective_n
+      .checked_mul(16) // "<start_of_image>".len()
+      .and_then(|n| n.checked_add(prompt.len()))
+      .ok_or_else(|| Error::Backend {
+        message: format!(
+          "MessageFormatter::format_prompt_with_start_image_token: 16*num_images + prompt.len() \
+           overflows usize (num_images={effective_n}, prompt.len()={})",
+          prompt.len()
+        ),
+      })?;
+    let mut s = String::new();
+    s.try_reserve_exact(cap).map_err(|_| Error::OutOfMemory)?;
+    s.push_str(prompt);
+    for _ in 0..effective_n {
+      s.push_str("<start_of_image>");
+    }
+    Ok(FormattedMessage::String(s))
   }
 
   /// `_format_list_with_image` — python lines 284–308.
@@ -1371,43 +1535,59 @@ impl MessageFormatter {
   /// Builds `content = [text]` plus, if `role=="user"` and not skipped,
   /// `num_images` image entries (`ContentItem::Image` or
   /// `ContentItem::ImageUrl`), placed first or last per `image_first`.
+  ///
+  /// Allocation hardening: the role / skip-token gate runs BEFORE the
+  /// count-scaled `try_reserve_exact`, so a `skip_image_token=true` or
+  /// `role="assistant"` call with a pathological `num_images` allocates
+  /// for only the single text item. `num_images` is capped at
+  /// [`MAX_MESSAGE_FORMAT_ITEMS`] (`Error::Backend`); within the cap the
+  /// reserve is fallible (`Error::OutOfMemory`).
   fn format_list_with_image(
     &self,
     prompt: &str,
     opts: &FormatOpts,
     image_first: bool,
     use_image_url: bool,
-  ) -> FormattedMessage {
-    let mut content = Vec::with_capacity(1 + opts.num_images);
-    content.push(MessageBuilder::text_message(prompt));
+  ) -> Result<FormattedMessage> {
+    // Role / skip gate BEFORE the count-scaled allocation.
+    let effective_n = if opts.role == "user" && !opts.skip_image_token {
+      check_format_count(opts.num_images, "num_images", &self.model_name)?;
+      opts.num_images
+    } else {
+      0
+    };
+    let cap = 1usize
+      .checked_add(effective_n)
+      .ok_or_else(|| Error::Backend {
+        message: format!(
+          "MessageFormatter::format_list_with_image: 1 + num_images overflows usize \
+           (num_images={effective_n})"
+        ),
+      })?;
+    let mut content: Vec<ContentItem> = try_with_capacity(cap)?;
+    let text_first = !image_first || effective_n == 0;
+    if text_first {
+      content.push(MessageBuilder::text_message(prompt));
+    }
 
-    if opts.role == "user" && !opts.skip_image_token && opts.num_images > 0 {
+    if effective_n > 0 {
       let image_builder = if use_image_url {
         MessageBuilder::image_url_message
       } else {
         MessageBuilder::image_message
       };
-      // image_tokens = [image_builder()] * num_images
-      if image_first {
-        // content = images + content
-        let mut new_content = Vec::with_capacity(opts.num_images + content.len());
-        for _ in 0..opts.num_images {
-          new_content.push(image_builder());
-        }
-        new_content.extend(content);
-        content = new_content;
-      } else {
-        // content = content + images
-        for _ in 0..opts.num_images {
-          content.push(image_builder());
-        }
+      for _ in 0..effective_n {
+        content.push(image_builder());
       }
     }
+    if !text_first {
+      content.push(MessageBuilder::text_message(prompt));
+    }
 
-    FormattedMessage::Message(Message {
+    Ok(FormattedMessage::Message(Message {
       role: opts.role.clone(),
       content: MessageContent::Items(content),
-    })
+    }))
   }
 
   /// `_format_list_with_image_type` — python lines 310–348.
@@ -1417,64 +1597,88 @@ impl MessageFormatter {
   /// for `Text`); then, if `role=="user"`, prepends/appends image
   /// entries and appends audio entries. If `role=="assistant"`,
   /// collapses content to a flat string (line 343–346).
+  ///
+  /// Allocation hardening: image / audio role + skip-token gates run
+  /// BEFORE the count-scaled `try_reserve_exact`, so an assistant /
+  /// skip-true call with pathological `num_images` / `num_audios`
+  /// allocates only the single text item. Both counts are capped at
+  /// [`MAX_MESSAGE_FORMAT_ITEMS`] each; within the cap the reserve is
+  /// fallible.
   fn format_list_with_image_type(
     &self,
     prompt: &str,
     opts: &FormatOpts,
     msg_kind: ContentMessageKind,
     image_first: bool,
-  ) -> FormattedMessage {
+  ) -> Result<FormattedMessage> {
+    // Assistant role → collapse-to-string fast path BEFORE any
+    // multi-item allocation. The python ref at lines 343–346 returns
+    // `{role: "assistant", content: str}` regardless of image / audio
+    // counts; honoring that here means a pathological num_images +
+    // role="assistant" call allocates only the text string.
+    if opts.role == "assistant" {
+      let s = match msg_kind {
+        ContentMessageKind::Content | ContentMessageKind::Text => prompt.to_string(),
+      };
+      return Ok(FormattedMessage::Message(Message {
+        role: opts.role.clone(),
+        content: MessageContent::Text(s),
+      }));
+    }
+
+    // Role / skip gates BEFORE allocation.
+    let n_img = if opts.role == "user" && !opts.skip_image_token {
+      check_format_count(opts.num_images, "num_images", &self.model_name)?;
+      opts.num_images
+    } else {
+      0
+    };
+    let n_aud = if opts.role == "user" && !opts.skip_audio_token {
+      check_format_count(opts.num_audios, "num_audios", &self.model_name)?;
+      opts.num_audios
+    } else {
+      0
+    };
+
+    // Total cells: 1 text + n_img images + n_aud audios.
+    let cap = 1usize
+      .checked_add(n_img)
+      .and_then(|n| n.checked_add(n_aud))
+      .ok_or_else(|| Error::Backend {
+        message: format!(
+          "MessageFormatter::format_list_with_image_type: 1 + num_images + num_audios overflows \
+           usize (num_images={n_img}, num_audios={n_aud})"
+        ),
+      })?;
+
     let msg = match msg_kind {
       ContentMessageKind::Content => MessageBuilder::content_message(prompt),
       ContentMessageKind::Text => MessageBuilder::text_message(prompt),
     };
-    let mut content: Vec<ContentItem> = vec![msg];
+    let mut content: Vec<ContentItem> = try_with_capacity(cap)?;
 
-    if opts.role == "user" {
-      if !opts.skip_image_token && opts.num_images > 0 {
-        if image_first {
-          let mut new_content = Vec::with_capacity(opts.num_images + content.len());
-          for _ in 0..opts.num_images {
-            new_content.push(MessageBuilder::image_message());
-          }
-          new_content.extend(content);
-          content = new_content;
-        } else {
-          for _ in 0..opts.num_images {
-            content.push(MessageBuilder::image_message());
-          }
-        }
+    // Build content with the image_first ordering, applied directly
+    // (no temp-Vec + concat dance).
+    let text_first = !image_first || n_img == 0;
+    if text_first {
+      content.push(msg);
+      for _ in 0..n_img {
+        content.push(MessageBuilder::image_message());
       }
-      if !opts.skip_audio_token && opts.num_audios > 0 {
-        for _ in 0..opts.num_audios {
-          content.push(MessageBuilder::audio_message());
-        }
+    } else {
+      for _ in 0..n_img {
+        content.push(MessageBuilder::image_message());
       }
+      content.push(msg);
+    }
+    for _ in 0..n_aud {
+      content.push(MessageBuilder::audio_message());
     }
 
-    if opts.role == "assistant" {
-      // python lines 343–346: collapse to a flat string.
-      // Take `content[0]`'s text (it's always `Text` or `ContentText` —
-      // we constructed it so).
-      let s = match &content[0] {
-        ContentItem::Text { text } | ContentItem::ContentText { text } => text.clone(),
-        // Defensive: shouldn't happen because we just constructed
-        // content[0] from msg_func(prompt). Fall back to empty string
-        // (matches `content[0].get("content", content[0].get("text"))`
-        // returning None → KeyError, but `dict.get` returns None and
-        // python returns None — we choose empty string for fail-soft).
-        _ => String::new(),
-      };
-      return FormattedMessage::Message(Message {
-        role: opts.role.clone(),
-        content: MessageContent::Text(s),
-      });
-    }
-
-    FormattedMessage::Message(Message {
+    Ok(FormattedMessage::Message(Message {
       role: opts.role.clone(),
       content: MessageContent::Items(content),
-    })
+    }))
   }
 
   /// `_format_with_token` — python lines 350–373.
@@ -1482,75 +1686,178 @@ impl MessageFormatter {
   /// Builds `content = f"{token*N}{prompt}"` (or `{prompt}{token*N}` if
   /// `image_first=false`), then prepends `<|audio_1|><|audio_2|>...` for
   /// audio.
+  ///
+  /// Allocation hardening: image / audio role + skip-token gates apply
+  /// BEFORE the count-scaled `try_reserve_exact`; counts are capped at
+  /// [`MAX_MESSAGE_FORMAT_ITEMS`] each.
   fn format_with_token(
     &self,
     prompt: &str,
     opts: &FormatOpts,
     token: &str,
     image_first: bool,
-  ) -> FormattedMessage {
-    let mut content = prompt.to_string();
+  ) -> Result<FormattedMessage> {
+    // Image / audio role + skip-token gates BEFORE the count-scaled
+    // allocation. n=0 means we never expand the loop, so a pathological
+    // count cannot reach the reserve.
+    let n_img = if opts.role == "user" && !opts.skip_image_token {
+      check_format_count(opts.num_images, "num_images", &self.model_name)?;
+      opts.num_images
+    } else {
+      0
+    };
+    let n_aud = if opts.role == "user" && !opts.skip_audio_token {
+      check_format_count(opts.num_audios, "num_audios", &self.model_name)?;
+      opts.num_audios
+    } else {
+      0
+    };
 
-    if opts.role == "user" && !opts.skip_image_token && opts.num_images > 0 {
-      let mut prefix = String::with_capacity(token.len() * opts.num_images);
-      for _ in 0..opts.num_images {
-        prefix.push_str(token);
+    // The audio prefix is `<|audio_{i+1}|>` per audio — width grows
+    // with the digit count of i+1, conservatively bounded by
+    // `12 + ceil(log10(n_aud+1))` (12 = "<|audio_|>"). For the cap of
+    // 1024 audios, the digits are at most 4, so 16-byte/audio is a
+    // tight upper bound; we use 32-byte/audio for safety (still well
+    // under the cap).
+    const AUDIO_BYTES_PER_AUDIO: usize = 32;
+    let token_bytes = token
+      .len()
+      .checked_mul(n_img)
+      .ok_or_else(|| Error::Backend {
+        message: format!(
+          "MessageFormatter::format_with_token: token.len() * num_images overflows usize \
+           (token.len()={}, num_images={n_img})",
+          token.len()
+        ),
+      })?;
+    let audio_bytes = AUDIO_BYTES_PER_AUDIO
+      .checked_mul(n_aud)
+      .ok_or_else(|| Error::Backend {
+        message: format!(
+          "MessageFormatter::format_with_token: audio prefix bytes overflow usize \
+           (num_audios={n_aud})"
+        ),
+      })?;
+    let cap = token_bytes
+      .checked_add(audio_bytes)
+      .and_then(|n| n.checked_add(prompt.len()))
+      .ok_or_else(|| Error::Backend {
+        message: format!(
+          "MessageFormatter::format_with_token: total content bytes overflow usize \
+           (token_bytes={token_bytes}, audio_bytes={audio_bytes}, prompt.len()={})",
+          prompt.len()
+        ),
+      })?;
+
+    let mut content = String::new();
+    content
+      .try_reserve_exact(cap)
+      .map_err(|_| Error::OutOfMemory)?;
+
+    // Audio prefix first (matches python's `f"{audio_prefix}{content}"`
+    // wrap), then image-prefix-or-suffix relative to the prompt.
+    for i in 0..n_aud {
+      content.push_str(&format!("<|audio_{}|>", i + 1));
+    }
+    if image_first {
+      for _ in 0..n_img {
+        content.push_str(token);
       }
-      content = if image_first {
-        format!("{prefix}{content}")
-      } else {
-        format!("{content}{prefix}")
-      };
+      content.push_str(prompt);
+    } else {
+      content.push_str(prompt);
+      for _ in 0..n_img {
+        content.push_str(token);
+      }
     }
 
-    if opts.role == "user" && !opts.skip_audio_token && opts.num_audios > 0 {
-      let mut audio_prefix = String::with_capacity(12 * opts.num_audios);
-      for i in 0..opts.num_audios {
-        audio_prefix.push_str(&format!("<|audio_{}|>", i + 1));
-      }
-      content = format!("{audio_prefix}{content}");
-    }
-
-    FormattedMessage::Message(Message {
+    Ok(FormattedMessage::Message(Message {
       role: opts.role.clone(),
       content: MessageContent::Text(content),
-    })
+    }))
   }
 
   /// `_format_numbered_tokens` — python lines 375–405.
   ///
   /// Builds `content = "<|image_1|><|image_2|>...<|audio_1|>...prompt"`
   /// (images first, then audio, matching the Phi-4 convention).
-  fn format_numbered_tokens(&self, prompt: &str, opts: &FormatOpts) -> FormattedMessage {
-    let mut content = prompt.to_string();
+  ///
+  /// Allocation hardening: role + skip-token gates BEFORE the
+  /// count-scaled `try_reserve_exact`; both image / audio counts capped
+  /// at [`MAX_MESSAGE_FORMAT_ITEMS`].
+  fn format_numbered_tokens(&self, prompt: &str, opts: &FormatOpts) -> Result<FormattedMessage> {
+    let n_img = if opts.role == "user" && !opts.skip_image_token {
+      check_format_count(opts.num_images, "num_images", &self.model_name)?;
+      opts.num_images
+    } else {
+      0
+    };
+    let n_aud = if opts.role == "user" && !opts.skip_audio_token {
+      check_format_count(opts.num_audios, "num_audios", &self.model_name)?;
+      opts.num_audios
+    } else {
+      0
+    };
 
-    if opts.role == "user" {
-      let mut prefix = String::new();
-      if !opts.skip_image_token && opts.num_images > 0 {
-        for i in 0..opts.num_images {
-          prefix.push_str(&format!("<|image_{}|>", i + 1));
-        }
-      }
-      if !opts.skip_audio_token && opts.num_audios > 0 {
-        for i in 0..opts.num_audios {
-          prefix.push_str(&format!("<|audio_{}|>", i + 1));
-        }
-      }
-      if !prefix.is_empty() {
-        content = format!("{prefix}{content}");
-      }
+    // Token widths: `<|image_N|>` = 11 bytes for N <= 9; for N up to
+    // MAX_MESSAGE_FORMAT_ITEMS (1024) the digits are at most 4, so the
+    // worst-case width is `<|image_1024|>` = 14 bytes. We use a
+    // conservative 16-byte upper bound per token (and per audio token,
+    // `<|audio_N|>` = 12 bytes, same width concern).
+    const BYTES_PER_TOKEN: usize = 16;
+    let img_bytes = BYTES_PER_TOKEN
+      .checked_mul(n_img)
+      .ok_or_else(|| Error::Backend {
+        message: format!(
+          "MessageFormatter::format_numbered_tokens: image-prefix bytes overflow usize \
+           (num_images={n_img})"
+        ),
+      })?;
+    let aud_bytes = BYTES_PER_TOKEN
+      .checked_mul(n_aud)
+      .ok_or_else(|| Error::Backend {
+        message: format!(
+          "MessageFormatter::format_numbered_tokens: audio-prefix bytes overflow usize \
+           (num_audios={n_aud})"
+        ),
+      })?;
+    let cap = img_bytes
+      .checked_add(aud_bytes)
+      .and_then(|n| n.checked_add(prompt.len()))
+      .ok_or_else(|| Error::Backend {
+        message: format!(
+          "MessageFormatter::format_numbered_tokens: total content bytes overflow usize \
+           (img_bytes={img_bytes}, aud_bytes={aud_bytes}, prompt.len()={})",
+          prompt.len()
+        ),
+      })?;
+
+    let mut content = String::new();
+    content
+      .try_reserve_exact(cap)
+      .map_err(|_| Error::OutOfMemory)?;
+    for i in 0..n_img {
+      content.push_str(&format!("<|image_{}|>", i + 1));
     }
+    for i in 0..n_aud {
+      content.push_str(&format!("<|audio_{}|>", i + 1));
+    }
+    content.push_str(prompt);
 
-    FormattedMessage::Message(Message {
+    Ok(FormattedMessage::Message(Message {
       role: opts.role.clone(),
       content: MessageContent::Text(content),
-    })
+    }))
   }
 
   /// `_format_video_message` — python lines 407–441.
   ///
   /// Emits one [`ContentItem::Video`] entry per video path, followed by
   /// a text item.
+  ///
+  /// Allocation hardening: `opts.video.len()` is capped at
+  /// [`MAX_MESSAGE_FORMAT_ITEMS`] BEFORE the `try_reserve_exact`; the
+  /// fps_list and content `Vec`s both use fallible reservation.
   fn format_video_message(&self, prompt: &str, opts: &FormatOpts) -> Result<FormattedMessage> {
     if opts.video.is_empty() {
       return Err(Error::ShapeMismatch {
@@ -1561,25 +1868,44 @@ impl MessageFormatter {
         ),
       });
     }
+
+    // Cap the video count BEFORE the count-scaled reserves.
+    check_format_count(opts.video.len(), "video.len()", &self.model_name)?;
+
+    let n_vid = opts.video.len();
+
     // fps_list (python lines 430–434): scalar applied to all, or
     // per-video. Empty → use the python default (1) for every entry.
+    // Allocation is bounded by the cap-checked n_vid above.
     let fps_list: Vec<u32> = if opts.fps.is_empty() {
-      vec![1u32; opts.video.len()]
+      let mut v: Vec<u32> = try_with_capacity(n_vid)?;
+      v.resize(n_vid, 1u32);
+      v
     } else if opts.fps.len() == 1 {
-      vec![opts.fps[0]; opts.video.len()]
-    } else if opts.fps.len() == opts.video.len() {
-      opts.fps.clone()
+      let mut v: Vec<u32> = try_with_capacity(n_vid)?;
+      v.resize(n_vid, opts.fps[0]);
+      v
+    } else if opts.fps.len() == n_vid {
+      let mut v: Vec<u32> = try_with_capacity(n_vid)?;
+      v.extend_from_slice(&opts.fps);
+      v
     } else {
       return Err(Error::ShapeMismatch {
         message: format!(
           "MessageFormatter::format_video_message: got {} fps values for {} videos.",
           opts.fps.len(),
-          opts.video.len()
+          n_vid
         ),
       });
     };
 
-    let mut content = Vec::with_capacity(opts.video.len() + 1);
+    let cap = n_vid.checked_add(1).ok_or_else(|| Error::Backend {
+      message: format!(
+        "MessageFormatter::format_video_message: video.len() + 1 overflows usize \
+         (video.len()={n_vid})"
+      ),
+    })?;
+    let mut content: Vec<ContentItem> = try_with_capacity(cap)?;
     for (v, f) in opts.video.iter().zip(fps_list.iter()) {
       content.push(MessageBuilder::video_message(
         v.clone(),
@@ -1613,16 +1939,38 @@ enum ContentMessageKind {
 /// Returns a [`FormattedMessage`] (the `Union[str, Dict[str, Any]]`
 /// branch of the python signature).
 ///
+/// ## Defaults
+///
+/// `opts = None` substitutes [`FormatOpts::get_message_default`], which
+/// matches the python free-function defaults at
+/// `prompt_utils.py:444–480` (specifically lines 450–451 →
+/// `num_images=0, num_audios=0`). This is intentionally different from
+/// [`FormatOpts::default`] / [`FormatOpts::formatter_default`] (which
+/// matches the in-class defaults at lines 207–208 → `num_images=1,
+/// num_audios=1`); the public-API caller is often text-only and
+/// shouldn't get a spurious image/audio entry injected by default.
+///
+/// Pass `Some(&FormatOpts { num_images: N, .. })` to opt in to the
+/// image branch, mirroring a python caller passing `num_images=N`.
+///
 /// # Errors
 ///
 /// Propagates from [`MessageFormatter::for_model`] (unsupported model)
 /// and [`MessageFormatter::format_message`] (multi-image / video
-/// validation).
+/// validation / allocation cap).
 pub fn get_message_json(
   model_name: &str,
   prompt: &str,
-  opts: &FormatOpts,
+  opts: Option<&FormatOpts>,
 ) -> Result<FormattedMessage> {
   let formatter = MessageFormatter::for_model(model_name)?;
-  formatter.format_message(prompt, opts)
+  let defaults;
+  let resolved = match opts {
+    Some(o) => o,
+    None => {
+      defaults = FormatOpts::get_message_default();
+      &defaults
+    }
+  };
+  formatter.format_message(prompt, resolved)
 }
