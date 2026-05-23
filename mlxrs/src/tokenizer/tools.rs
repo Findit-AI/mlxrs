@@ -584,11 +584,25 @@ impl ToolParser for Qwen3Coder {
   /// `parse` does `text.find("<function=")` then `after.rfind("</function>")`
   /// — the **LAST** `</function>` in the section is the real close, because
   /// parameter VALUES legitimately carry `</function>` (and `</tool_call>`)
-  /// literals (L9 R10 finding). For the streaming buffer we mirror that:
-  /// rfind the wrapper `end_tag` (the section's outermost close), then
-  /// rfind `</function>` strictly inside that span, then verify a
-  /// `<function=` opens before it. This keeps `try_parse_one_call`
-  /// byte-identical to what `parse` would extract from the buffer slice.
+  /// literals (L9 R10 finding). For the streaming buffer we cannot mirror
+  /// `parse`'s rfind over the WHOLE buffer (L9 R11 finding-1): the buffer
+  /// can carry trailing display text containing a `</tool_call>` literal, or
+  /// a back-to-back second section — both let a whole-buffer rfind pick the
+  /// LATER close, swallowing trailing display or collapsing two sections
+  /// into one.
+  ///
+  /// Forward-scan that is **prefix-bounded** to the first section:
+  /// 1. Find the FIRST `<function=` in the buffer.
+  /// 2. Scan forward for the FIRST `</function>` that is **outside** every
+  ///    `<parameter=…>…</parameter>` region (because parameter VALUES can
+  ///    legitimately contain a `</function>` literal — the R10 case).
+  /// 3. From after that real `</function>`, find the FIRST `</tool_call>`.
+  ///    After the function close the only remaining buffer-controlled bytes
+  ///    are the wrapper close itself, so a plain substring search is sound.
+  ///
+  /// `parse()` is then delegated the EXACT first-section slice — its rfind
+  /// chain operates over a single legitimate section so the in-value literals
+  /// stay safely inside `<parameter=…>…</parameter>`.
   fn try_parse_one_call(
     &self,
     buffer: &str,
@@ -599,27 +613,56 @@ impl ToolParser for Qwen3Coder {
     let Some((payload_at, payload)) = locate_tagged_payload(buffer, start_tag) else {
       return Ok(None);
     };
-    // The function block must open before the rfind chain can validate.
-    let Some(fn_open_rel) = payload.find("<function=") else {
+    let function_open = "<function=";
+    let function_close = "</function>";
+    let parameter_open = "<parameter=";
+    let parameter_close = "</parameter>";
+
+    // (1) Find the section's `<function=`.
+    let Some(fn_open_rel) = payload.find(function_open) else {
       return Ok(None);
     };
-    // rfind the wrapper end_tag — the LAST `</tool_call>` in the buffer is
-    // the section close (R10: in-value `</tool_call>` literals appear
-    // EARLIER, so they cannot win an rfind race).
-    let Some(end_rel) = payload.rfind(end_tag) else {
+
+    // (2) Forward-scan for the first `</function>` OUTSIDE any
+    //     `<parameter=…>…</parameter>` region. Within a parameter region the
+    //     VALUE is opaque text and can carry a literal `</function>` — that
+    //     occurrence MUST be skipped (R10 case).
+    let mut cursor = fn_open_rel + function_open.len();
+    let fn_close_rel = loop {
+      let next_fclose = payload[cursor..].find(function_close);
+      let next_popen = payload[cursor..].find(parameter_open);
+      match (next_fclose, next_popen) {
+        // No more `</function>` candidate — incomplete buffer (the wrapper
+        // hasn't arrived yet).
+        (None, _) => return Ok(None),
+        // `</function>` appears before any further parameter open (or no more
+        // parameter opens): that's the real function close.
+        (Some(f), None) => break cursor + f,
+        (Some(f), Some(p)) if f <= p => break cursor + f,
+        // A parameter opens before the next `</function>` — jump past its
+        // matching `</parameter>` and continue. If the close hasn't arrived
+        // yet, the buffer is incomplete.
+        (Some(_), Some(p)) => {
+          let region_after_open = cursor + p + parameter_open.len();
+          let Some(rel) = payload[region_after_open..].find(parameter_close) else {
+            return Ok(None);
+          };
+          let next_cursor = region_after_open + rel + parameter_close.len();
+          // Forward progress is guaranteed because `parameter_close` is a
+          // non-empty substring strictly after `region_after_open` — no
+          // infinite loop is possible on a malformed buffer.
+          debug_assert!(next_cursor > cursor);
+          cursor = next_cursor;
+        }
+      }
+    };
+
+    // (3) From after the real `</function>`, find the first `</tool_call>`.
+    let after_function = fn_close_rel + function_close.len();
+    let Some(end_rel) = payload[after_function..].find(end_tag) else {
       return Ok(None);
     };
-    if end_rel < fn_open_rel + "<function=".len() {
-      // The wrapper close precedes the function content — incomplete buffer.
-      return Ok(None);
-    }
-    // Within the slice up to the wrapper end, rfind `</function>` (R10's
-    // anchor — same rfind that `parse` uses on the section payload).
-    let span = &payload[..end_rel];
-    let Some(_fn_close_rel) = span.rfind("</function>") else {
-      return Ok(None);
-    };
-    let end_pos = payload_at + end_rel + end_tag.len();
+    let end_pos = payload_at + after_function + end_rel + end_tag.len();
     let inner = strip_section_markers(&buffer[..end_pos], start_tag, end_tag);
     match self.parse(inner, tools) {
       Ok(calls) if !calls.is_empty() => Ok(Some((calls, end_pos))),
@@ -2074,6 +2117,22 @@ impl ToolCallProcessor {
     }
   }
 
+  /// Unconditional reset after a parser returns `Err` from
+  /// [`ToolParser::try_parse_one_call`] (L9 R11 finding-2).
+  ///
+  /// Mirrors [`Self::recover_at_cap`]'s flush logic — `pending_display` is
+  /// surfaced as display text, `tool_call_buffer` is dropped (a confirmed
+  /// tool call that the parser rejected is not valid display text) — but
+  /// without the [`MAX_TOOL_CALL_BUFFER_BYTES`] gate. The buffer is
+  /// structurally malformed for THIS parser, so holding onto it until the cap
+  /// fires would suppress every subsequent output token until cap or EOS.
+  /// Resetting eagerly lets the next chunk start fresh in [`State::Normal`].
+  fn reset_on_malformed(&mut self, display: &mut Option<String>) {
+    if let Some(flushed) = self.recover_at_cap() {
+      push_display(display, &flushed);
+    }
+  }
+
   /// Process a chunk for inline formats (no wrapper tags).
   ///
   /// Uses a JSON-string-aware balanced-object scan to decide when output
@@ -2325,9 +2384,12 @@ impl ToolCallProcessor {
           return display;
         }
         Err(_) => {
-          // Malformed section — same cap-recovery semantics as the
-          // never-terminated case: drop tool content, surface nothing.
-          self.cap_recover_into(&mut display);
+          // Malformed section (L9 R11 finding-2): reset state UNCONDITIONALLY
+          // — `cap_recover_into` is a no-op below `MAX_TOOL_CALL_BUFFER_BYTES`,
+          // which would suppress every later output token until the cap fires
+          // or EOS. `reset_on_malformed` drains immediately so the next chunk
+          // starts fresh in `State::Normal`.
+          self.reset_on_malformed(&mut display);
           return display;
         }
       }
@@ -3310,7 +3372,7 @@ mod tests {
       ));
     }
 
-    // -- qwen3_coder: rfind `</function>` then end tag --------------------
+    // -- qwen3_coder: forward-scan `</function>` then first end tag ------
     {
       let buf =
         "<tool_call><function=echo><parameter=s></tool_call></parameter></function></tool_call>";
@@ -3951,7 +4013,7 @@ mod tests {
     // | longcat         | `{` object fast-path; else value-aware XML scan                           |
     // | pythonic        | quote/bracket aware `)]` then plain-substring                             |
     // | mistral         | EOS-closed; try_parse_one_call mirrors parse via `[ARGS]{json}`           |
-    // | qwen3_coder     | rfind `</function>` (R10: in-VALUE `</function>` literal skipped)         |
+    // | qwen3_coder     | forward-scan `</function>` outside `<parameter=…>…</parameter>` (R11)    |
     // | minimax_m2      | walk `<invoke …>…</invoke>` blocks; opener-vs-end race                    |
     // | kimi_k2         | walk per-call `<|tool_call_begin|>...{json}<|tool_call_end|>`; opener-vs-end race |
     // | function_gemma  | `call:name{...}` with `<escape>` aware `}` then plain-substring           |
@@ -4884,5 +4946,345 @@ mod tests {
     for c in cases {
       assert_try_parse_one_call_matches_parse(&Gemma4, "gemma4", c);
     }
+  }
+
+  // --- L9 R11 finding-1 regression coverage -------------------------------
+  // The R10 qwen3_coder `try_parse_one_call` rfound the wrapper end_tag over
+  // the whole accumulated buffer. For batch `parse()` (input is the section
+  // payload) that is fine; for the STREAMING buffer it picks the LATER
+  // `</tool_call>` whenever trailing display text or a back-to-back section
+  // is present, swallowing past the real close. R11 replaces it with a
+  // forward-scan that is prefix-bounded to the first section: find the first
+  // `</function>` outside any `<parameter=…>…</parameter>` region (parameter
+  // VALUES can carry `</function>` literals — R10), then the FIRST
+  // `</tool_call>` after that real `</function>`.
+
+  #[test]
+  fn streaming_qwen3_coder_trailing_display_with_tool_call_close_literal_does_not_consume_past_real_close()
+   {
+    // Trailing display after the real `</tool_call>` itself contains a
+    // literal `</tool_call>` token. A whole-buffer rfind would pick the
+    // LATER `</tool_call>` and corrupt both the section span and the
+    // trailing-token displayed downstream. The forward-scan must pick the
+    // FIRST `</tool_call>` after the real `</function>`.
+    let payload = concat!(
+      "<tool_call><function=f></function></tool_call>",
+      " some text containing </tool_call>",
+    );
+    // (i) Single-chunk.
+    let (d, c) = run_with_parser(Box::new(Qwen3Coder), &[payload]);
+    assert_eq!(
+      c.len(),
+      1,
+      "exactly one tool call extracted (got {})",
+      c.len()
+    );
+    assert_eq!(c[0].name, "f");
+    assert_eq!(
+      d, " some text containing </tool_call>",
+      "trailing display reaches output byte-for-byte"
+    );
+
+    // (ii) Split-across-chunks: boundary inside the trailing display.
+    let (d2, c2) = run_with_parser(
+      Box::new(Qwen3Coder),
+      &[
+        "<tool_call><function=f></function></tool_call> some text ",
+        "containing </tool_call>",
+      ],
+    );
+    assert_eq!(c2.len(), 1);
+    assert_eq!(c2[0].name, "f");
+    assert_eq!(d2, " some text containing </tool_call>");
+  }
+
+  #[test]
+  fn streaming_qwen3_coder_back_to_back_calls_extracted_separately() {
+    // Back-to-back sections: a whole-buffer rfind would pick the SECOND
+    // `</tool_call>` and collapse both calls into ONE (the second
+    // `<function=` is past the first `</function>`, so `parse()`'s own rfind
+    // chain on the combined slice would still see only the LAST function
+    // close). The forward-scan must stop at the first section's real close
+    // so the processor loop peels off two separate calls.
+    let payload = concat!(
+      "<tool_call><function=f></function></tool_call>",
+      "<tool_call><function=g></function></tool_call>",
+    );
+    // (i) Single-chunk.
+    let (d, c) = run_with_parser(Box::new(Qwen3Coder), &[payload]);
+    assert_eq!(d, "", "no display leak between back-to-back calls");
+    assert_eq!(c.len(), 2, "exactly two tool calls extracted");
+    assert_eq!(c[0].name, "f");
+    assert_eq!(c[1].name, "g");
+
+    // (ii) Split-across-chunks: boundary in the middle of the first
+    // `</tool_call>`, before the second `<tool_call>` opens.
+    let (d2, c2) = run_with_parser(
+      Box::new(Qwen3Coder),
+      &[
+        "<tool_call><function=f></function></tool_",
+        "call><tool_call><function=g></function></tool_call>",
+      ],
+    );
+    assert_eq!(d2, "");
+    assert_eq!(c2.len(), 2);
+    assert_eq!(c2[0].name, "f");
+    assert_eq!(c2[1].name, "g");
+  }
+
+  // --- L9 R11 per-parser audit-lock: try_parse_one_call is prefix-bounded
+  // (back-to-back sections must extract only the FIRST, not collapse) ------
+
+  #[test]
+  fn try_parse_one_call_back_to_back_per_parser_audit() {
+    // For every tagged parser (mistral has no end_tag and is EOS-closed, so
+    // it's excluded as in the R10 audit table), feed a buffer containing
+    // TWO complete sections back-to-back. The parser's try_parse_one_call
+    // must return ONLY the first section's calls AND an end_pos that lands
+    // exactly at the byte one past the FIRST section's last byte — the
+    // streaming processor relies on this to peel off subsequent sections.
+
+    struct Row {
+      label: &'static str,
+      parser: Box<dyn ToolParser>,
+      buffer: &'static str,
+      // Byte position one past the FIRST section's close tag.
+      expect_end_pos: usize,
+      expect_first_name: &'static str,
+    }
+    let rows = [
+      Row {
+        label: "json_tools",
+        parser: Box::new(JsonTools),
+        buffer: concat!(
+          r#"<tool_call>{"name":"a","arguments":{}}</tool_call>"#,
+          r#"<tool_call>{"name":"b","arguments":{}}</tool_call>"#,
+        ),
+        expect_end_pos: r#"<tool_call>{"name":"a","arguments":{}}</tool_call>"#.len(),
+        expect_first_name: "a",
+      },
+      Row {
+        label: "glm47 (object)",
+        parser: Box::new(Glm47),
+        buffer: concat!(
+          r#"<tool_call>{"name":"a","arguments":{}}</tool_call>"#,
+          r#"<tool_call>{"name":"b","arguments":{}}</tool_call>"#,
+        ),
+        expect_end_pos: r#"<tool_call>{"name":"a","arguments":{}}</tool_call>"#.len(),
+        expect_first_name: "a",
+      },
+      Row {
+        label: "longcat (object)",
+        parser: Box::new(Longcat),
+        buffer: concat!(
+          r#"<longcat_tool_call>{"name":"a","arguments":{}}</longcat_tool_call>"#,
+          r#"<longcat_tool_call>{"name":"b","arguments":{}}</longcat_tool_call>"#,
+        ),
+        expect_end_pos: r#"<longcat_tool_call>{"name":"a","arguments":{}}</longcat_tool_call>"#
+          .len(),
+        expect_first_name: "a",
+      },
+      Row {
+        label: "pythonic",
+        parser: Box::new(Pythonic),
+        buffer: concat!(
+          "<|tool_call_start|>[a()]<|tool_call_end|>",
+          "<|tool_call_start|>[b()]<|tool_call_end|>",
+        ),
+        expect_end_pos: "<|tool_call_start|>[a()]<|tool_call_end|>".len(),
+        expect_first_name: "a",
+      },
+      Row {
+        label: "qwen3_coder",
+        parser: Box::new(Qwen3Coder),
+        buffer: concat!(
+          "<tool_call><function=a></function></tool_call>",
+          "<tool_call><function=b></function></tool_call>",
+        ),
+        expect_end_pos: "<tool_call><function=a></function></tool_call>".len(),
+        expect_first_name: "a",
+      },
+      Row {
+        label: "minimax_m2",
+        parser: Box::new(MinimaxM2),
+        buffer: concat!(
+          r#"<minimax:tool_call><invoke name="a"></invoke></minimax:tool_call>"#,
+          r#"<minimax:tool_call><invoke name="b"></invoke></minimax:tool_call>"#,
+        ),
+        expect_end_pos: r#"<minimax:tool_call><invoke name="a"></invoke></minimax:tool_call>"#
+          .len(),
+        expect_first_name: "a",
+      },
+      Row {
+        label: "kimi_k2",
+        parser: Box::new(KimiK2),
+        buffer: concat!(
+          "<|tool_calls_section_begin|>",
+          "<|tool_call_begin|>functions.a:0<|tool_call_argument_begin|>{}<|tool_call_end|>",
+          "<|tool_calls_section_end|>",
+          "<|tool_calls_section_begin|>",
+          "<|tool_call_begin|>functions.b:1<|tool_call_argument_begin|>{}<|tool_call_end|>",
+          "<|tool_calls_section_end|>",
+        ),
+        expect_end_pos: concat!(
+          "<|tool_calls_section_begin|>",
+          "<|tool_call_begin|>functions.a:0<|tool_call_argument_begin|>{}<|tool_call_end|>",
+          "<|tool_calls_section_end|>",
+        )
+        .len(),
+        expect_first_name: "a",
+      },
+      Row {
+        label: "function_gemma",
+        parser: Box::new(FunctionGemma),
+        buffer: concat!(
+          "<start_function_call>call:a{}<end_function_call>",
+          "<start_function_call>call:b{}<end_function_call>",
+        ),
+        expect_end_pos: "<start_function_call>call:a{}<end_function_call>".len(),
+        expect_first_name: "a",
+      },
+      Row {
+        label: "gemma4",
+        parser: Box::new(Gemma4),
+        buffer: concat!(
+          r#"<|tool_call>call:a{}<tool_call|>"#,
+          r#"<|tool_call>call:b{}<tool_call|>"#,
+        ),
+        expect_end_pos: r#"<|tool_call>call:a{}<tool_call|>"#.len(),
+        expect_first_name: "a",
+      },
+    ];
+    for row in &rows {
+      let result = row
+        .parser
+        .try_parse_one_call(row.buffer, None)
+        .unwrap_or_else(|e| panic!("{}: try_parse_one_call errored: {e}", row.label));
+      let (calls, end_pos) =
+        result.unwrap_or_else(|| panic!("{}: first section not detected complete", row.label));
+      assert_eq!(
+        end_pos, row.expect_end_pos,
+        "{}: end_pos must land one past the FIRST section's close, not the second's",
+        row.label
+      );
+      assert!(
+        !calls.is_empty(),
+        "{}: at least one call from the first section",
+        row.label
+      );
+      assert_eq!(
+        calls[0].name, row.expect_first_name,
+        "{}: first section's first call name",
+        row.label
+      );
+    }
+    // Mistral is the empty-end-tag exception (mirror R10 audit table).
+    assert!(Mistral.tool_call_end().is_empty());
+  }
+
+  // --- L9 R11 finding-2 regression coverage -------------------------------
+  // The R10 Err arm of process_tagged_chunk called `cap_recover_into`, which
+  // is a no-op below MAX_TOOL_CALL_BUFFER_BYTES. An Err result therefore left
+  // the malformed buffer in CollectingToolCall, suppressing every subsequent
+  // output token until cap or EOS. R11 introduces `reset_on_malformed` which
+  // drains UNCONDITIONALLY so the next chunk starts fresh in Normal.
+
+  /// Tagged-format test parser that returns `Err` from `try_parse_one_call`
+  /// once a complete `<tc>...</tc>` section is present in the buffer. Used
+  /// to exercise the Err arm of `process_tagged_chunk` deterministically.
+  struct AlwaysErrParser;
+
+  impl ToolParser for AlwaysErrParser {
+    fn parse(&self, _text: &str, _tools: Option<&Value>) -> Result<Vec<ToolCall>, Error> {
+      Err(err("always_err: malformed"))
+    }
+    fn name(&self) -> &'static str {
+      "always_err_test_parser"
+    }
+    fn tool_call_start(&self) -> &'static str {
+      "<tc>"
+    }
+    fn tool_call_end(&self) -> &'static str {
+      "</tc>"
+    }
+    fn try_parse_one_call(
+      &self,
+      buffer: &str,
+      _tools: Option<&Value>,
+    ) -> Result<Option<(Vec<ToolCall>, usize)>, Error> {
+      // Complete section detected (start + end both present): return Err so
+      // the processor exercises its Err arm. Otherwise None (incomplete).
+      if buffer.contains("<tc>") && buffer.contains("</tc>") {
+        Err(err("always_err: rejected"))
+      } else {
+        Ok(None)
+      }
+    }
+  }
+
+  #[test]
+  fn processor_err_from_try_parse_one_call_clears_buffer_immediately() {
+    // Feed a complete malformed-section chunk, then a plain chunk. The R10
+    // Err arm would hold the malformed bytes in tool_call_buffer (cap not
+    // reached), forcing the plain chunk through `process_tagged_chunk`'s
+    // collecting branch where its `<` would re-arm a tool-call detection.
+    // R11 resets unconditionally — buffer drained, state Normal, next plain
+    // chunk passes through untouched.
+    let mut p = ToolCallProcessor::new(Box::new(AlwaysErrParser), None);
+    // Chunk 1: a complete `<tc>...</tc>` section that the parser rejects.
+    // Per `recover_at_cap` semantics for CollectingToolCall, the tool buffer
+    // is dropped (it's not valid display text) and any pre-confirmation
+    // pending_display is surfaced. Here there's no pre-confirmation prose,
+    // so this chunk produces no display.
+    let out1 = p.process_chunk("<tc>malformed</tc>");
+    assert_eq!(out1, None, "no display leak from the Err recovery itself");
+    assert!(
+      p.tool_call_buffer.is_empty(),
+      "tool_call_buffer drained immediately after Err (got {} bytes)",
+      p.tool_call_buffer.len()
+    );
+    assert!(
+      p.pending_display.is_empty(),
+      "pending_display cleared after Err",
+    );
+    assert_eq!(
+      p.state,
+      State::Normal,
+      "state reset to Normal after Err — next chunk starts fresh",
+    );
+    assert_eq!(p.tool_calls.len(), 0, "no tool calls extracted");
+
+    // Chunk 2: plain text with no start char. Must pass through untouched.
+    let out2 = p.process_chunk("hello world");
+    assert_eq!(
+      out2.as_deref(),
+      Some("hello world"),
+      "subsequent plain chunk passes through immediately (not suppressed until cap)",
+    );
+  }
+
+  #[test]
+  fn processor_err_does_not_suppress_output_until_cap() {
+    // Companion of the previous test: feed a SHORT malformed section then a
+    // SHORT trailing chunk; without R11's unconditional reset, the
+    // malformed bytes would sit under the cap (no flush), and the next
+    // chunk's bytes would be appended to tool_call_buffer (or otherwise
+    // mishandled) until the cap eventually fires. R11 returns the trailing
+    // chunk verbatim on the same call.
+    let mut p = ToolCallProcessor::new(Box::new(AlwaysErrParser), None);
+    p.process_chunk("<tc>x</tc>");
+    // Sanity: buffer is well under MAX_TOOL_CALL_BUFFER_BYTES.
+    assert!(
+      "<tc>x</tc>".len() < MAX_TOOL_CALL_BUFFER_BYTES,
+      "test premise: malformed section is below the cap",
+    );
+    // Confirm the buffer is empty BEFORE the next chunk (the unconditional
+    // reset already fired; if the R10 cap_recover_into had been called the
+    // buffer would still hold `<tc>x</tc>` because it's below the cap).
+    assert!(p.tool_call_buffer.is_empty());
+    assert_eq!(p.state, State::Normal);
+    // Plain text passes through normally.
+    let out = p.process_chunk("plain");
+    assert_eq!(out.as_deref(), Some("plain"));
   }
 }
