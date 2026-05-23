@@ -795,13 +795,23 @@ fn auto_detect(data: &[Value], config: &DatasetConfig) -> Result<DatasetType> {
 /// - HuggingFace Hub paths (`hf://...`-prefixed) are rejected with a clear
 ///   [`Error::Backend`] message — they are out of scope per the project's
 ///   local-only policy (see [the module docs](self#scope-boundary)).
+/// - A non-regular file (directory, socket, …) is rejected after open;
+///   the [`Path`] must point at an actual file.
 /// - An oversized file (above [`MAX_DATASET_FILE_BYTES`]) is rejected
-///   before any read; a hostile mount cannot push an unbounded blob into
-///   memory.
+///   on a metadata check bound to the OPEN file handle (TOCTOU-safe),
+///   AND a cumulative byte counter enforces the same cap DURING the
+///   read loop in case the file grows mid-read; a hostile mount cannot
+///   push an unbounded blob into memory.
+/// - A blank line in the jsonl file is rejected with line-number context
+///   (matches Python's `json.loads(l)` which errors on `""`); silently
+///   dropping blanks would shift every subsequent record's index and
+///   mask data-corruption upstream.
+/// - An empty file is rejected with the path in the error message;
+///   silently constructing an empty dataset would mask a missing-shard
+///   bug downstream in training. Callers wanting "skip absent splits"
+///   should check for file presence themselves.
 /// - A malformed jsonl line surfaces as [`Error::Backend`] with the line
-///   number; an empty file returns a [`CacheDataset`] wrapping an
-///   empty inner dataset (consistent with Python `load_subset` returning
-///   `[]` for an absent `valid.jsonl` / `test.jsonl`).
+///   number.
 pub fn load_dataset<'a>(
   path: &Path,
   tokenizer: &'a Tokenizer,
@@ -828,9 +838,24 @@ pub fn load_dataset<'a>(
     });
   }
 
-  let meta = std::fs::metadata(path).map_err(|e| Error::Backend {
+  // Open FIRST, then validate against the handle's own metadata. This
+  // closes a TOCTOU window where a metadata() check could be bypassed
+  // by a symlink swap or by an append between the check and the read.
+  let file = std::fs::File::open(path).map_err(|e| Error::Backend {
+    message: format!("open jsonl {}: {e}", path.display()),
+  })?;
+  let meta = file.metadata().map_err(|e| Error::Backend {
     message: format!("stat jsonl {}: {e}", path.display()),
   })?;
+  if !meta.is_file() {
+    return Err(Error::Backend {
+      message: format!(
+        "jsonl path is not a regular file: {} (directories, sockets, \
+         FIFOs etc. are not accepted)",
+        path.display(),
+      ),
+    });
+  }
   if meta.len() > MAX_DATASET_FILE_BYTES {
     return Err(Error::Backend {
       message: format!(
@@ -843,68 +868,101 @@ pub fn load_dataset<'a>(
     });
   }
 
-  let file = std::fs::File::open(path).map_err(|e| Error::Backend {
-    message: format!("open jsonl {}: {e}", path.display()),
-  })?;
-  let mut reader = BufReader::new(file);
+  // Delegate the read+parse loop to a path-agnostic helper so that
+  // tests can drive it through any `BufRead` (e.g. an in-memory cursor
+  // backed by a small synthetic cap) without having to materialize a
+  // cap-sized file on disk.
+  let data = read_jsonl_with_cap(BufReader::new(file), path, MAX_DATASET_FILE_BYTES)?;
+
+  if data.is_empty() {
+    return Err(Error::Backend {
+      message: format!(
+        "jsonl {} is empty — refusing to construct an empty dataset; \
+         non-empty jsonl is required (skip absent valid.jsonl/test.jsonl \
+         at the caller level)",
+        path.display(),
+      ),
+    });
+  }
+
+  let inner = create_dataset(data, tokenizer, config, dataset_type)?;
+  Ok(CacheDataset::new(inner))
+}
+
+/// Read a jsonl stream and parse each line, enforcing a cumulative
+/// byte cap DURING the read loop. This is the path-agnostic core
+/// invoked by [`load_dataset`]; tests drive it through an in-memory
+/// `Cursor` with a small synthetic `max_bytes` to exercise the
+/// in-loop overflow path without materializing a cap-sized fixture.
+///
+/// `path_for_errors` is interpolated into error messages only — it
+/// does NOT have to point at an actual file. A blank line is rejected
+/// (silently dropping blanks would shift every subsequent record's
+/// 1-based index and could mask data corruption).
+fn read_jsonl_with_cap<R: BufRead>(
+  reader: R,
+  path_for_errors: &Path,
+  max_bytes: u64,
+) -> Result<Vec<Value>> {
   let mut data: Vec<Value> = Vec::new();
-  let mut buf = String::new();
-  let mut lineno: usize = 0;
-  loop {
-    buf.clear();
-    let n = reader.read_line(&mut buf).map_err(|e| Error::Backend {
-      message: format!("read jsonl {} line {}: {e}", path.display(), lineno + 1),
+  let mut total_bytes: u64 = 0;
+  for (i, line_result) in reader.lines().enumerate() {
+    let lineno = i + 1; // 1-based for human-facing errors
+    let line = line_result.map_err(|e| Error::Backend {
+      message: format!(
+        "read jsonl {} line {}: {e}",
+        path_for_errors.display(),
+        lineno,
+      ),
     })?;
-    if n == 0 {
-      break;
+    // Cumulative cap, enforced INSIDE the read loop so that a file
+    // which grows between the pre-open metadata check and the actual
+    // read (or a custom reader that streams more bytes than its
+    // metadata advertised) cannot bypass the cap. `BufRead::lines()`
+    // strips the trailing newline, so the `+1` is a conservative
+    // estimate of the on-disk byte cost per iteration; this only
+    // OVER-counts (never under-counts), so the cap remains a strict
+    // upper bound on bytes actually read into memory.
+    total_bytes = total_bytes
+      .saturating_add(line.len() as u64)
+      .saturating_add(1);
+    if total_bytes > max_bytes {
+      return Err(Error::Backend {
+        message: format!(
+          "jsonl {} exceeded the {}-byte cap during read (cumulative \
+           bytes after line {} reached at least {}); the file may have \
+           grown mid-read, or the per-line size is unexpectedly large",
+          path_for_errors.display(),
+          max_bytes,
+          lineno,
+          total_bytes,
+        ),
+      });
     }
-    lineno += 1;
-    // Skip blank lines defensively — jsonl files commonly end with a
-    // trailing newline that BufRead would surface as an extra empty
-    // line; the Python loader's `[json.loads(l) for l in fid]` would
-    // error on the empty string, so a stricter port would too, but a
-    // trailing newline is universal enough that swallowing it cleanly
-    // is the friendlier behavior. A NON-trailing blank line is also
-    // skipped on the same grounds.
-    let trimmed = buf.trim();
+    let trimmed = line.trim();
     if trimmed.is_empty() {
-      continue;
+      // Python `tuner/datasets.py` does `[json.loads(l) for l in fid]`,
+      // which raises on an empty string. Silently dropping a blank
+      // would shift subsequent indices and mask corruption.
+      return Err(Error::Backend {
+        message: format!(
+          "jsonl {} line {} is blank — every line must be a valid JSON \
+           record (matches Python `json.loads(l)` failing on \"\")",
+          path_for_errors.display(),
+          lineno,
+        ),
+      });
     }
     let v: Value = serde_json::from_str(trimmed).map_err(|e| Error::Backend {
-      message: format!("parse jsonl {} line {}: {e}", path.display(), lineno),
+      message: format!(
+        "parse jsonl {} line {}: {e}",
+        path_for_errors.display(),
+        lineno,
+      ),
     })?;
     data.push(v);
   }
-
-  let inner = if data.is_empty() {
-    // An empty file yields an empty dataset of the explicit type (or
-    // [`DatasetType::Text`] when [`DatasetType::Auto`] is requested
-    // and there is no sample to dispatch on — the friendlier mirror of
-    // Python's `load_subset` returning `[]`).
-    match dataset_type {
-      DatasetType::Auto | DatasetType::Text => Box::new(TextDataset::new(
-        Vec::new(),
-        tokenizer,
-        config.text_feature.clone(),
-      )) as Box<dyn Dataset + 'a>,
-      DatasetType::Chat => Box::new(ChatDataset::new(
-        Vec::new(),
-        tokenizer,
-        config.chat_feature.clone(),
-        config.mask_prompt,
-      )) as Box<dyn Dataset + 'a>,
-      DatasetType::Completions => Box::new(CompletionsDataset::new(
-        Vec::new(),
-        tokenizer,
-        config.prompt_feature.clone(),
-        config.completion_feature.clone(),
-        config.mask_prompt,
-      )) as Box<dyn Dataset + 'a>,
-    }
-  } else {
-    create_dataset(data, tokenizer, config, dataset_type)?
-  };
-  Ok(CacheDataset::new(inner))
+  Ok(data)
 }
 
 // ───────────────────────────── helpers ─────────────────────────────
@@ -1413,14 +1471,87 @@ mod tests {
   }
 
   #[test]
-  fn load_dataset_empty_file_returns_empty_iterator() {
+  fn load_dataset_empty_file_errors_with_path() {
     let tok = tokenizer_fixture("load_empty");
     let dir = fresh_dir("load_empty_data");
     let p = dir.join("train.jsonl");
     std::fs::write(&p, "").unwrap();
-    let ds = load_dataset(&p, &tok, DatasetType::Auto, &DatasetConfig::default()).unwrap();
-    assert_eq!(ds.len(), 0);
-    assert!(ds.is_empty());
+    let err = load_dataset(&p, &tok, DatasetType::Auto, &DatasetConfig::default()).unwrap_err();
+    let s = err.to_string();
+    assert!(
+      s.contains("is empty"),
+      "expected empty-file rejection, got: {s}",
+    );
+    assert!(
+      s.contains("train.jsonl"),
+      "expected path in error message, got: {s}",
+    );
+  }
+
+  #[test]
+  fn load_dataset_blank_line_errors_with_line_number() {
+    let tok = tokenizer_fixture("load_blank");
+    let dir = fresh_dir("load_blank_data");
+    let p = dir.join("train.jsonl");
+    // A valid record, then a literal blank line, then another valid
+    // record — the blank in the middle must surface as a hard error
+    // with the correct 1-based line number, not be silently dropped.
+    std::fs::write(&p, "{\"text\": \"hello\"}\n\n{\"text\": \"world\"}\n").unwrap();
+    let err = load_dataset(&p, &tok, DatasetType::Text, &DatasetConfig::default()).unwrap_err();
+    let s = err.to_string();
+    assert!(
+      s.contains("line 2"),
+      "expected line 2 in blank-line error, got: {s}",
+    );
+    assert!(
+      s.contains("blank"),
+      "expected 'blank' in blank-line error, got: {s}",
+    );
+  }
+
+  #[test]
+  fn load_dataset_rejects_non_regular_file() {
+    let tok = tokenizer_fixture("load_dir");
+    let dir = fresh_dir("load_dir_data");
+    // Pass the directory itself (which `exists()` and has metadata,
+    // but is not a regular file).
+    let err = load_dataset(&dir, &tok, DatasetType::Auto, &DatasetConfig::default()).unwrap_err();
+    let s = err.to_string();
+    assert!(
+      s.contains("not a regular file"),
+      "expected non-regular-file rejection, got: {s}",
+    );
+  }
+
+  #[test]
+  fn load_dataset_cap_enforced_during_read_loop() {
+    use std::io::Cursor;
+    // Drive the path-agnostic helper directly so we can simulate a
+    // file whose cumulative bytes exceed the cap mid-read WITHOUT
+    // having to materialize a multi-GiB fixture (the prod constant
+    // is 2 GiB). The helper is the single chokepoint, so this is
+    // sufficient to prove the in-loop check fires after the file
+    // is already "open".
+    let cap: u64 = 40;
+    // Three valid lines: each is ~18 bytes incl. the trailing \n
+    // accounted for as `len() + 1`. After line 2 the cumulative is
+    // ~36 (under cap); after line 3 it crosses 40.
+    let body = "{\"text\": \"aaa\"}\n{\"text\": \"bbb\"}\n{\"text\": \"ccc\"}\n";
+    let path = std::path::PathBuf::from("/synthetic/grows.jsonl");
+    let err = read_jsonl_with_cap(Cursor::new(body), &path, cap).unwrap_err();
+    let s = err.to_string();
+    assert!(
+      s.contains("exceeded the 40-byte cap"),
+      "expected in-loop cap error, got: {s}",
+    );
+    assert!(
+      s.contains("during read"),
+      "expected 'during read' phrasing in cap error, got: {s}",
+    );
+    assert!(
+      s.contains("/synthetic/grows.jsonl"),
+      "expected synthetic path in cap error, got: {s}",
+    );
   }
 
   #[test]
