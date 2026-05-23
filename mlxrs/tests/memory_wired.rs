@@ -294,6 +294,32 @@ fn recommended_working_set_bytes_returns_ok() {
   }
 }
 
+/// CODEX R1 [HIGH] F1 regression guard — `recommended_working_set_bytes`
+/// on macOS (every CI mac runner has Metal) MUST return `Ok(Some(bytes > 0))`,
+/// not `Ok(None)`. The prior implementation gated on the empty `mlx_device_info`
+/// handle's NULL ctx immediately after `_new()` and returned `None` *always*
+/// (because `_new()` is the handle constructor — see
+/// `mlxrs-sys/vendor/mlx-c/mlx/c/private/device.h::mlx_device_info_new_`),
+/// silently turning the entire wired-memory feature into a no-op (every
+/// `WiredLimitGuard::install`, every `WiredSumPolicy`/`WiredBudgetPolicy`
+/// with `cap = None` skipped clamping).
+///
+/// Gated `#[cfg(target_os = "macos")]` because Metal is mac-only; non-Metal
+/// hosts legitimately get `Ok(None)` from the unchanged graceful-None path.
+#[cfg(target_os = "macos")]
+#[test]
+fn recommended_working_set_bytes_returns_some_on_metal() {
+  let result = recommended_working_set_bytes().expect("FFI rc on healthy mac");
+  let bytes = result.expect(
+    "macOS host MUST surface Some(bytes) from the populated mlx_device_info \
+     map — None here means the F1 regression (always-None) has reappeared",
+  );
+  assert!(
+    bytes > 0,
+    "Metal max_recommended_working_set_size must be > 0 (got {bytes})"
+  );
+}
+
 // ──────────────────────────── tune() stub ──────────────────────────────────
 
 /// `tune()` returns an actionable `Err` until the LM concurrency surface

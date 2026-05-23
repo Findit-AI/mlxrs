@@ -74,22 +74,34 @@ pub fn recommended_working_set_bytes() -> Result<Option<u64>> {
     return Ok(None);
   };
 
-  // SAFETY: `mlx_device_info_new()` returns a fresh empty out-param handle
-  // (NULL ctx) per the mlx-c convention. Freed via the local RAII guard
-  // below before any early return.
+  // SAFETY: `mlx_device_info_new()` is the *handle constructor* — it returns
+  // a fresh `mlx_device_info { ctx: nullptr }` (see
+  // `mlxrs-sys/vendor/mlx-c/mlx/c/private/device.h::mlx_device_info_new_`).
+  // The NULL ctx here is EXPECTED, not an error: the actual context is
+  // allocated + populated by `mlx_device_info_get` below
+  // (`mlxrs-sys/vendor/mlx-c/mlx/c/device.cpp::mlx_device_info_get` calls
+  // `mlx_device_info_set_` which `new`s the heap map). Wrap in the local
+  // RAII guard FIRST so `mlx_device_info_free` runs on every early-return
+  // path (the free path is null-safe — see `mlx_device_info_free_`).
+  //
+  // CODEX R1 [HIGH] regression fix: the prior code branched
+  // `if info.ctx.is_null() { return Ok(None); }` immediately after
+  // `_new()`, making this function ALWAYS return None on every host
+  // (because `_new()` *always* returns NULL ctx). That silently turned the
+  // entire wired-memory feature into a no-op on supported Metal systems.
+  // Don't reintroduce that check here; the populated-ctx check happens via
+  // `has_key` / `get_size`'s rc surface below.
   let info = unsafe { mlxrs_sys::mlx_device_info_new() };
-  if info.ctx.is_null() {
-    return Ok(None);
-  }
   // RAII guard so the info handle is freed on every exit path (including
   // panics inside `check`).
   struct InfoGuard(mlxrs_sys::mlx_device_info);
   impl Drop for InfoGuard {
     fn drop(&mut self) {
-      // SAFETY: frees a handle this guard owns exactly once. Runs during
-      // `Drop` / thread teardown: must not touch TLS, call `check()`,
-      // panic, or unwind across `extern "C"`; the rc is discarded silently
-      // per the crate's Drop convention.
+      // SAFETY: frees a handle this guard owns exactly once (null-safe per
+      // `mlx_device_info_free_`). Runs during `Drop` / thread teardown:
+      // must not touch TLS, call `check()`, panic, or unwind across
+      // `extern "C"`; the rc is discarded silently per the crate's Drop
+      // convention.
       unsafe {
         let _ = mlxrs_sys::mlx_device_info_free(self.0);
       }
@@ -100,7 +112,9 @@ pub fn recommended_working_set_bytes() -> Result<Option<u64>> {
   // SAFETY: `&mut guard.0` is a valid writable handle out-param; `device.0`
   // is a valid borrowed device handle for the duration of the call; mlx-c
   // does not retain either past the call; the backend rc is surfaced via
-  // `check()`.
+  // `check()`. This call allocates + populates the underlying
+  // `mlx_device_info_cpp` map (the `_new()` above only built the empty
+  // handle box).
   check(unsafe { mlxrs_sys::mlx_device_info_get(&mut guard.0, device.0) })?;
 
   // mlx-c key for the recommended working-set size — see
