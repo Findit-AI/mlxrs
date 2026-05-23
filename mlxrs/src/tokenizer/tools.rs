@@ -121,6 +121,19 @@ pub trait ToolParser: Send + Sync {
   ///   section yet). The streaming caller appends the next chunk and
   ///   retries; the buffered bytes are preserved.
   ///
+  ///   **L9 R13 `Ok(None)` invariant:** return `Ok(None)` ONLY when the
+  ///   wrapper end-tag (`tool_call_end()`) is NOT yet locatable in `buffer`
+  ///   at any position after the start tag. If the end-tag IS in the buffer,
+  ///   the section is bounded — return
+  ///   `Ok(Some((Vec::new(), end_pos)))` even when the body is unparseable.
+  ///   This preserves any same-chunk suffix bytes after the close (R13's
+  ///   `<tool_call>bad</tool_call>visible` truncation: an early `Ok(None)`
+  ///   on the malformed body keeps the entire buffer, silently dropping
+  ///   `visible` until cap/EOS). Parsers with an empty `tool_call_end` (e.g.
+  ///   `mistral`) are exempt because the streaming processor short-circuits
+  ///   them on the empty-end branch in [`ToolCallProcessor`] before
+  ///   `try_parse_one_call` is ever invoked.
+  ///
   /// - **`Err(_)`** — RESERVED for *truly indeterminate* failures with NO
   ///   recoverable `end_pos` (e.g. an internal error from the parser itself
   ///   or an input shape that defies even section-boundary detection). The
@@ -221,6 +234,131 @@ fn strip_section_markers<'a>(section: &'a str, start_tag: &str, end_tag: &str) -
     text = &text[..idx];
   }
   text.trim()
+}
+
+/// Helper for the L9 R13 [`ToolParser::try_parse_one_call`] `Ok(None)`
+/// invariant: if `payload[payload_at..]` (within `buffer`) contains `end_tag`
+/// somewhere, return `Some(end_pos)` — the byte offset one past that end_tag
+/// — so an early-return path with an unparseable body can surface the
+/// confirmed-bounded section as `Ok(Some((Vec::new(), end_pos)))` instead of
+/// the same-chunk-suffix-dropping `Ok(None)`. Returns `None` when `end_tag`
+/// is empty (e.g. mistral — that parser is short-circuited by the streaming
+/// processor before this helper would be invoked) or genuinely absent (the
+/// buffer is incomplete, `Ok(None)` is correct).
+///
+/// This plain-substring variant is intended for callers whose body grammar
+/// cannot legitimately host an in-value `end_tag` literal (e.g. when the
+/// body did not open with a structured shape at all — `bad</tool_call>`).
+/// JSON-body parsers must use [`closed_but_malformed_end_pos_json_aware`]
+/// instead.
+fn closed_but_malformed_end_pos(buffer: &str, payload_at: usize, end_tag: &str) -> Option<usize> {
+  if end_tag.is_empty() {
+    return None;
+  }
+  let rel = buffer.get(payload_at..)?.find(end_tag)?;
+  Some(payload_at + rel + end_tag.len())
+}
+
+/// Variant of [`closed_but_malformed_end_pos`] that scans `payload` while
+/// skipping bytes inside paired multi-byte "value" delimiters (used for
+/// `gemma4`'s `<|"|>STR<|"|>` regions and `function_gemma`'s
+/// `<escape>STR<escape>` regions). Returns the absolute `end_pos` of the
+/// FIRST `end_tag` occurrence OUTSIDE any open value region; `None` if no
+/// such occurrence exists (either the end-tag is genuinely absent OR every
+/// candidate is inside an open value region — body is mid-streaming).
+fn closed_but_malformed_end_pos_value_aware(
+  buffer: &str,
+  payload_at: usize,
+  end_tag: &str,
+  value_open: &str,
+  value_close: &str,
+) -> Option<usize> {
+  if end_tag.is_empty() || value_open.is_empty() || value_close.is_empty() {
+    return None;
+  }
+  let payload = buffer.get(payload_at..)?;
+  let end_bytes = end_tag.as_bytes();
+  let bytes = payload.as_bytes();
+  let mut i = 0;
+  while i < bytes.len() {
+    // Skip a balanced `value_open ... value_close` region whole. An
+    // unterminated `value_open` opens a region that swallows the rest of
+    // the buffer — any in-buffer end-tag inside it is in-VALUE text and
+    // MUST NOT close the section; return `None` so the streaming caller
+    // waits for more bytes.
+    if payload.get(i..).is_some_and(|s| s.starts_with(value_open)) {
+      let after_open = i + value_open.len();
+      let close_rel = payload.get(after_open..)?.find(value_close)?;
+      i = after_open + close_rel + value_close.len();
+      continue;
+    }
+    if i + end_bytes.len() <= bytes.len() && &bytes[i..i + end_bytes.len()] == end_bytes {
+      return Some(payload_at + i + end_bytes.len());
+    }
+    i += 1;
+  }
+  None
+}
+
+/// String-quote-aware variant of [`closed_but_malformed_end_pos`] for parsers
+/// whose body grammar can host an in-string `end_tag` literal inside a
+/// `"..."` or `'...'` region (JSON for `json_tools` / `glm47` / `longcat` /
+/// `kimi_k2` args; Python literals for `pythonic`). Walks `payload` tracking
+/// active quote state (escape-aware: `\"`, `\'`, `\\`) and returns the
+/// absolute `end_pos` of the FIRST `end_tag` occurrence OUTSIDE any quoted
+/// region. Returns `None` when no such occurrence exists — either the
+/// end-tag is genuinely absent OR every candidate is inside a still-open
+/// quoted region (the body is mid-streaming; `Ok(None)` is correct).
+///
+/// `quotes` is the set of opening quote characters (e.g. `b"\""` for JSON,
+/// `b"\"'"` for Python). The closing quote must equal the opening (the
+/// usual case for both grammars).
+///
+/// This distinguishes the L9 R13 motivating case (`<tool_call>{</tool_call>
+/// visible` — end-tag outside any string, section closed-but-malformed)
+/// from the existing in-string-literal contract (`<tool_call>{"s":"
+/// </tool_call>` — end-tag inside a still-open string, genuinely incomplete;
+/// locked by `per_parser_try_parse_one_call_routing`).
+fn closed_but_malformed_end_pos_quote_aware(
+  buffer: &str,
+  payload_at: usize,
+  end_tag: &str,
+  quotes: &[u8],
+) -> Option<usize> {
+  if end_tag.is_empty() {
+    return None;
+  }
+  let payload = buffer.get(payload_at..)?;
+  let end_bytes = end_tag.as_bytes();
+  let bytes = payload.as_bytes();
+  let mut active_quote: Option<u8> = None;
+  let mut escaped = false;
+  let mut i = 0;
+  while i < bytes.len() {
+    let b = bytes[i];
+    if let Some(q) = active_quote {
+      if escaped {
+        escaped = false;
+      } else if b == b'\\' {
+        escaped = true;
+      } else if b == q {
+        active_quote = None;
+      }
+      i += 1;
+      continue;
+    }
+    if quotes.contains(&b) {
+      active_quote = Some(b);
+      i += 1;
+      continue;
+    }
+    // Outside any quoted region — check for `end_tag` here.
+    if i + end_bytes.len() <= bytes.len() && &bytes[i..i + end_bytes.len()] == end_bytes {
+      return Some(payload_at + i + end_bytes.len());
+    }
+    i += 1;
+  }
+  None
 }
 
 /// Approximates Python `ast.literal_eval` enough for tool-arg coercion:
@@ -348,7 +486,30 @@ impl ToolParser for JsonTools {
       return Ok(None);
     };
     let Some((_, obj_end)) = balanced_json_object_prefix(payload) else {
-      return Ok(None);
+      // L9 R13 closed-but-malformed: the JSON body did not balance. Sub-cases
+      // split on the body's leading shape so an in-string `</tool_call>`
+      // literal in a mid-streaming JSON cannot falsely close the section:
+      //   - Non-JSON-shaped (no `{`/`[` opener): plain substring is sound.
+      //     `<tool_call>bad</tool_call>visible` surfaces `visible`.
+      //   - `{`-shaped: the JSON is mid-streaming. Use the JSON-string-aware
+      //     scan so an end-tag OUTSIDE any JSON string (e.g.
+      //     `<tool_call>{</tool_call>visible`) closes the section, but an
+      //     in-string literal (`<tool_call>{"s":"</tool_call>` — locked by
+      //     `per_parser_try_parse_one_call_routing`) stays `Ok(None)` so
+      //     more chunks can complete the call legitimately.
+      //   - `[`-shaped: same JSON-aware reasoning — json_tools requires a
+      //     top-level OBJECT but the body's opening `[` could still close
+      //     itself as a balanced array; until then in-string literals must
+      //     be respected.
+      return Ok(match classify_json_payload_start(payload) {
+        JsonPayloadStart::None => {
+          closed_but_malformed_end_pos(buffer, payload_at, end_tag).map(|ep| (Vec::new(), ep))
+        }
+        JsonPayloadStart::Object | JsonPayloadStart::Array => {
+          closed_but_malformed_end_pos_quote_aware(buffer, payload_at, end_tag, b"\"")
+            .map(|ep| (Vec::new(), ep))
+        }
+      });
     };
     let Some(rel) = payload[obj_end..].find(end_tag) else {
       return Ok(None);
@@ -403,7 +564,17 @@ impl ToolParser for Pythonic {
       return Ok(None);
     };
     let Some(call_close_rel) = pythonic_call_close(payload) else {
-      return Ok(None);
+      // L9 R13 closed-but-malformed: `[name(args)]` didn't close. Use the
+      // quote-aware helper tracking both `'` and `"` so an in-string
+      // `<|tool_call_end|>` literal (the `per_parser_try_parse_one_call_
+      // routing` `[echo(s='[` case) cannot falsely close the section while
+      // a truly-bounded malformed body
+      // (`<|tool_call_start|>BAD<|tool_call_end|>visible`) still surfaces
+      // the same-chunk suffix.
+      return Ok(
+        closed_but_malformed_end_pos_quote_aware(buffer, payload_at, end_tag, b"\"'")
+          .map(|ep| (Vec::new(), ep)),
+      );
     };
     let Some(end_rel) = payload[call_close_rel..].find(end_tag) else {
       return Ok(None);
@@ -539,16 +710,27 @@ impl ToolParser for Mistral {
     tools: Option<&Value>,
   ) -> Result<Option<(Vec<ToolCall>, usize)>, Error> {
     let start_tag = self.tool_call_start();
+    let end_tag = self.tool_call_end();
     let Some((payload_at, payload)) = locate_tagged_payload(buffer, start_tag) else {
       return Ok(None);
     };
     let Some(args_rel) = payload.find("[ARGS]") else {
-      return Ok(None);
+      // L9 R13: mistral has an EMPTY end_tag and is short-circuited by the
+      // streaming processor (the `end_tag.is_empty()` branch in
+      // [`process_tagged_chunk`] flushes via `cap_recover_into` before
+      // `try_parse_one_call` is reached). The helper returns `None` for an
+      // empty end_tag so this preserves the existing batch/audit behaviour
+      // while keeping the R13 contract uniform across parsers.
+      return Ok(
+        closed_but_malformed_end_pos(buffer, payload_at, end_tag).map(|ep| (Vec::new(), ep)),
+      );
     };
     let after_args = args_rel + "[ARGS]".len();
     let Some((obj_start_in, obj_end_in)) = balanced_json_object_prefix(&payload[after_args..])
     else {
-      return Ok(None);
+      return Ok(
+        closed_but_malformed_end_pos(buffer, payload_at, end_tag).map(|ep| (Vec::new(), ep)),
+      );
     };
     // Absolute end_pos = (payload start) + (offset to `[ARGS]` + len) +
     // (offset of `}`+1 within the post-[ARGS] slice).
@@ -648,32 +830,58 @@ impl ToolParser for Qwen3Coder {
 
     // (1) Find the section's `<function=`.
     let Some(fn_open_rel) = payload.find(function_open) else {
-      return Ok(None);
+      // L9 R13: no `<function=` anywhere in the payload — the body is
+      // structurally invalid (not a qwen3_coder call). If the wrapper
+      // end-tag is already in the buffer the section is closed-but-malformed
+      // — return an empty-calls Ok with end_pos so the streaming processor
+      // preserves the same-chunk suffix. We use a PLAIN substring search
+      // here because there is no `<function=`/`<parameter=` structure that
+      // could legitimately host an in-value `</tool_call>` literal: every
+      // byte between `payload_at` and the candidate end-tag is unstructured.
+      return Ok(
+        closed_but_malformed_end_pos(buffer, payload_at, end_tag).map(|ep| (Vec::new(), ep)),
+      );
     };
 
     // (2) Forward-scan for the first `</function>` OUTSIDE any
     //     `<parameter=…>…</parameter>` region. Within a parameter region the
     //     VALUE is opaque text and can carry a literal `</function>` — that
     //     occurrence MUST be skipped (R10 case).
+    //
+    // L9 R13: the early `Ok(None)` returns INSIDE this loop fall back to the
+    // parameter-value-aware scan, NOT a plain-substring search. A streaming
+    // `</tool_call>` substring hit could be the real wrapper close OR an
+    // in-value literal inside a not-yet-closed `<parameter=…>…</parameter>`
+    // region (the R10 case). The value-aware helper skips every
+    // `<parameter=...></parameter>` region whole so it returns Some only
+    // when the end-tag is OUTSIDE every parameter region; otherwise None
+    // (waiting for more bytes is the correct contract).
+    let r13_value_aware = || -> Option<(Vec<ToolCall>, usize)> {
+      xml_value_aware_end_tag_scan(payload, parameter_open, parameter_close, end_tag)
+        .map(|rel| (Vec::new(), payload_at + rel + end_tag.len()))
+    };
+
     let mut cursor = fn_open_rel + function_open.len();
     let fn_close_rel = loop {
       let next_fclose = payload[cursor..].find(function_close);
       let next_popen = payload[cursor..].find(parameter_open);
       match (next_fclose, next_popen) {
-        // No more `</function>` candidate — incomplete buffer (the wrapper
-        // hasn't arrived yet).
-        (None, _) => return Ok(None),
+        // No more `</function>` candidate — incomplete buffer UNLESS the
+        // wrapper end-tag is already in the buffer outside every parameter
+        // region (L9 R13).
+        (None, _) => return Ok(r13_value_aware()),
         // `</function>` appears before any further parameter open (or no more
         // parameter opens): that's the real function close.
         (Some(f), None) => break cursor + f,
         (Some(f), Some(p)) if f <= p => break cursor + f,
         // A parameter opens before the next `</function>` — jump past its
         // matching `</parameter>` and continue. If the close hasn't arrived
-        // yet, the buffer is incomplete.
+        // yet, the buffer is incomplete (L9 R13: unless end-tag already
+        // arrived outside every parameter region).
         (Some(_), Some(p)) => {
           let region_after_open = cursor + p + parameter_open.len();
           let Some(rel) = payload[region_after_open..].find(parameter_close) else {
-            return Ok(None);
+            return Ok(r13_value_aware());
           };
           let next_cursor = region_after_open + rel + parameter_close.len();
           // Forward progress is guaranteed because `parameter_close` is a
@@ -839,7 +1047,14 @@ impl ToolParser for Glm47 {
     let end_rel = match classify_json_payload_start(payload) {
       JsonPayloadStart::Object => {
         let Some((_, obj_end)) = balanced_json_object_prefix(payload) else {
-          return Ok(None);
+          // L9 R13: malformed object body. Use the JSON-string-aware helper
+          // so `<tool_call>{</tool_call>visible` surfaces `visible` while
+          // `<tool_call>{"s":"</tool_call>` (in-string literal locked by
+          // `per_parser_try_parse_one_call_routing`) stays `Ok(None)`.
+          return Ok(
+            closed_but_malformed_end_pos_quote_aware(buffer, payload_at, end_tag, b"\"")
+              .map(|ep| (Vec::new(), ep)),
+          );
         };
         let Some(rel) = payload[obj_end..].find(end_tag) else {
           return Ok(None);
@@ -848,7 +1063,11 @@ impl ToolParser for Glm47 {
       }
       JsonPayloadStart::Array => {
         let Some((_, arr_end)) = balanced_json_array_prefix(payload) else {
-          return Ok(None);
+          // L9 R13: same JSON-aware reasoning as the `Object` branch.
+          return Ok(
+            closed_but_malformed_end_pos_quote_aware(buffer, payload_at, end_tag, b"\"")
+              .map(|ep| (Vec::new(), ep)),
+          );
         };
         let Some(rel) = payload[arr_end..].find(end_tag) else {
           return Ok(None);
@@ -868,6 +1087,11 @@ impl ToolParser for Glm47 {
             let Some(rel) =
               xml_value_aware_end_tag_scan(payload, "<arg_value>", "</arg_value>", end_tag)
             else {
+              // L9 R13 note: xml scan returned None because we are inside an
+              // open `<arg_value>` region whose `</arg_value>` close has not
+              // arrived. The end-tag (if any) is in-VALUE text — keeping
+              // `Ok(None)` is the correct contract; a plain-substring R13
+              // fallback would falsely close a streaming-mid-value section.
               return Ok(None);
             };
             rel
@@ -1104,6 +1328,21 @@ impl ToolParser for KimiK2 {
     let call_begin = "<|tool_call_begin|>";
     let arg_begin = "<|tool_call_argument_begin|>";
     let call_end = "<|tool_call_end|>";
+
+    // L9 R13 helpers for the inner-block early returns. The section end-tag
+    // is `<|tool_calls_section_end|>`; we only fall into these branches once
+    // a `<|tool_call_begin|>` opener has been seen, so any in-buffer
+    // section end after the opener is either the genuine section close OR
+    // sits inside the JSON args of an in-flight inner block. The
+    // quote-aware variant disambiguates by skipping `"..."` regions.
+    let r13_plain = || -> Option<(Vec<ToolCall>, usize)> {
+      closed_but_malformed_end_pos(buffer, payload_at, end_tag).map(|ep| (Vec::new(), ep))
+    };
+    let r13_json = || -> Option<(Vec<ToolCall>, usize)> {
+      closed_but_malformed_end_pos_quote_aware(buffer, payload_at, end_tag, b"\"")
+        .map(|ep| (Vec::new(), ep))
+    };
+
     let mut cursor = 0usize;
     let section_end_rel = loop {
       let end_rel = payload[cursor..].find(end_tag).map(|p| cursor + p);
@@ -1118,23 +1357,36 @@ impl ToolParser for KimiK2 {
       let after_open = open_rel + call_begin.len();
       let arg_open_rel = match payload[after_open..].find(arg_begin) {
         Some(a) => after_open + a,
-        None => return Ok(None),
+        // L9 R13: opener found but no `<|tool_call_argument_begin|>` —
+        // the function-name region between them is plain text (no quote
+        // structure), so a plain-substring section-end search is sound.
+        None => return Ok(r13_plain()),
       };
       let args_at = arg_open_rel + arg_begin.len();
       let args_region = &payload[args_at..];
       let after_args_rel = match classify_json_payload_start(args_region) {
         JsonPayloadStart::Object => {
           let Some((_, obj_end)) = balanced_json_object_prefix(args_region) else {
-            return Ok(None);
+            // L9 R13: args JSON malformed. Use JSON-string-aware section-end
+            // search so an in-args-string `<|tool_calls_section_end|>`
+            // literal cannot falsely close a streaming-mid-string inner
+            // block, but a truly-bounded malformed body still surfaces
+            // the same-chunk suffix.
+            return Ok(r13_json());
           };
           let Some(end_rel) = args_region[obj_end..].find(call_end) else {
-            return Ok(None);
+            // L9 R13: balanced JSON args but no inner `<|tool_call_end|>`
+            // — past the args object the bytes are plain (no string
+            // structure), so plain section-end search is sound.
+            return Ok(r13_plain());
           };
           obj_end + end_rel + call_end.len()
         }
         _ => {
           let Some(end_rel) = args_region.find(call_end) else {
-            return Ok(None);
+            // L9 R13: non-JSON args body (no `{` opener); the args region
+            // is plain text, so plain section-end search is sound.
+            return Ok(r13_plain());
           };
           end_rel + call_end.len()
         }
@@ -1225,7 +1477,15 @@ impl ToolParser for Longcat {
       JsonPayloadStart::Object
     ) {
       let Some((_, obj_end)) = balanced_json_object_prefix(payload) else {
-        return Ok(None);
+        // L9 R13: malformed object body. JSON-string-aware helper so an
+        // in-string `</longcat_tool_call>` literal cannot falsely close a
+        // streaming-mid-string section, but a truly-bounded malformed body
+        // (`<longcat_tool_call>{</longcat_tool_call>visible`) still
+        // surfaces the same-chunk suffix.
+        return Ok(
+          closed_but_malformed_end_pos_quote_aware(buffer, payload_at, end_tag, b"\"")
+            .map(|ep| (Vec::new(), ep)),
+        );
       };
       let Some(rel) = payload[obj_end..].find(end_tag) else {
         return Ok(None);
@@ -1239,6 +1499,10 @@ impl ToolParser for Longcat {
         end_tag,
       ) {
         Some(rel) => rel,
+        // L9 R13 note: xml scan returned None — either no end-tag in buffer
+        // (truly incomplete) or end-tag inside an open `<longcat_arg_value>`
+        // region (in-VALUE text). `Ok(None)` is correct; a plain-substring
+        // R13 fallback would falsely close a streaming-mid-value section.
         None => return Ok(None),
       }
     };
@@ -1442,7 +1706,19 @@ impl ToolParser for MinimaxM2 {
       };
       let close_search_from = open_rel + open.len();
       let Some(close_rel) = payload[close_search_from..].find(close) else {
-        return Ok(None);
+        // L9 R13: `<invoke name=` opened but no matching `</invoke>` found.
+        // Use the parameter-value-aware scan (`<parameter name=...
+        // </parameter>` regions can legitimately carry the section end-tag
+        // literal — see `streaming_minimax_m2_parameter_value_with_end_tag_
+        // literal_extracts_intact`-style tests). An end-tag OUTSIDE every
+        // `<parameter name=...></parameter>` region surfaces as a closed-
+        // but-malformed section so the same-chunk suffix is preserved; an
+        // in-value end-tag stays `Ok(None)` so more chunks can complete
+        // the parameter close.
+        return Ok(
+          xml_value_aware_end_tag_scan(payload, "<parameter name=", "</parameter>", end_tag)
+            .map(|rel| (Vec::new(), payload_at + rel + end_tag.len())),
+        );
       };
       cursor = close_search_from + close_rel + close.len();
     };
@@ -1530,7 +1806,12 @@ impl ToolParser for FunctionGemma {
     };
     let call_marker = "call:";
     let Some(call_rel) = payload.find(call_marker) else {
-      return Ok(None);
+      // L9 R13: body has no `call:` marker — structurally not a
+      // function_gemma call. No `<escape>` region can be in flight without
+      // a preceding `{`, so a plain substring section-end search is sound.
+      return Ok(
+        closed_but_malformed_end_pos(buffer, payload_at, end_tag).map(|ep| (Vec::new(), ep)),
+      );
     };
     let after_marker = call_rel + call_marker.len();
     let bytes = payload.as_bytes();
@@ -1541,7 +1822,12 @@ impl ToolParser for FunctionGemma {
       j += 1;
     }
     if j >= bytes.len() || bytes[j] != b'{' {
-      return Ok(None);
+      // L9 R13: `call:NAME` found but no `{` body opener. Bytes between the
+      // name and any in-buffer end-tag are plain text (no `<escape>` region
+      // can be in flight without a `{`), so plain substring is sound.
+      return Ok(
+        closed_but_malformed_end_pos(buffer, payload_at, end_tag).map(|ep| (Vec::new(), ep)),
+      );
     }
     // Scan past the first `}` that is not inside `<escape>...<escape>`.
     let escape = "<escape>";
@@ -1549,7 +1835,18 @@ impl ToolParser for FunctionGemma {
     let mut in_escape = false;
     let body_close_after = loop {
       if idx >= bytes.len() {
-        return Ok(None);
+        // L9 R13: body `{` opened but no matching `}` found. Use the
+        // value-aware helper so an end-tag OUTSIDE every `<escape>...
+        // <escape>` region surfaces as a closed-but-malformed section
+        // (`<start_function_call>call:f{garbage<end_function_call>visible`
+        // → display `visible`), but an end-tag inside an open
+        // `<escape>STR<escape>` (which can legitimately carry the
+        // `<end_function_call>` literal verbatim) stays `Ok(None)` so the
+        // next chunk can complete the STR.
+        return Ok(
+          closed_but_malformed_end_pos_value_aware(buffer, payload_at, end_tag, escape, escape)
+            .map(|ep| (Vec::new(), ep)),
+        );
       }
       if !in_escape && payload[idx..].starts_with(escape) {
         in_escape = true;
@@ -1666,7 +1963,18 @@ impl ToolParser for Gemma4 {
       }
       let body = &payload[j..];
       let Some(close_rel) = balanced_brace_end(body) else {
-        return Ok(None);
+        // L9 R13: `{` opened but no matching `}` found (either truly
+        // incomplete OR an `<|"|>STR<|"|>` region is unterminated). Use
+        // the value-aware helper so an end-tag OUTSIDE every `<|"|>...
+        // <|"|>` region surfaces as a closed-but-malformed section
+        // (`<|tool_call>call:f{BAD<tool_call|>visible` → display
+        // `visible`), but an end-tag INSIDE an open `<|"|>` STR (which
+        // can legitimately carry the `<tool_call|>` literal verbatim)
+        // stays `Ok(None)` so more chunks can complete the STR.
+        return Ok(
+          closed_but_malformed_end_pos_value_aware(buffer, payload_at, end_tag, "<|\"|>", "<|\"|>")
+            .map(|ep| (Vec::new(), ep)),
+        );
       };
       cursor = j + close_rel + 1;
     };
@@ -5554,6 +5862,386 @@ mod tests {
         display, expect_display,
         "{}: same-chunk suffix must reach display",
         label,
+      );
+    }
+  }
+
+  // --- L9 R13 finding regression coverage ---------------------------------
+  // The R12 audit assumed every parser routed confirmed-but-rejected sections
+  // through the `_` arm of the final `match self.parse(...)` block. That
+  // claim missed the EARLY-RETURN paths: a malformed body (e.g. `bad` for
+  // json_tools) makes `balanced_json_object_prefix` fail BEFORE reaching the
+  // final match, returning `Ok(None)` even when the wrapper end-tag is
+  // already in the buffer. The processor treats `Ok(None)` as "incomplete"
+  // and keeps the whole buffer, so the same-chunk suffix after the malformed
+  // section is suppressed until cap/EOS (`<tool_call>bad</tool_call>visible`
+  // never surfaces `visible`). R13 tightens the per-parser early-return
+  // contract: when the end-tag IS locatable in the buffer, return
+  // `Ok(Some((Vec::new(), end_pos)))` so the processor preserves the suffix.
+
+  #[test]
+  fn streaming_json_tools_malformed_body_in_closed_section_preserves_same_chunk_suffix() {
+    // The R13 motivating case. The body `bad` is unparseable as JSON; in the
+    // pre-R13 implementation `balanced_json_object_prefix` failed and
+    // returned `Ok(None)` even though `</tool_call>` was already in the
+    // buffer, so the suffix `visible` never surfaced.
+    let (display, calls) =
+      run_with_parser(Box::new(JsonTools), &["<tool_call>bad</tool_call>visible"]);
+    assert_eq!(calls.len(), 0, "malformed body emits no calls");
+    assert_eq!(
+      display, "visible",
+      "trailing suffix from the SAME chunk must survive the malformed-but-closed section"
+    );
+  }
+
+  #[test]
+  fn streaming_json_tools_malformed_body_in_closed_section_preserves_suffix_split_chunk() {
+    // R13 companion across a chunk boundary: start-tag and start of body in
+    // chunk 1, end-tag and trailing suffix in chunk 2.
+    let (display, calls) = run_with_parser(
+      Box::new(JsonTools),
+      &["<tool_call>bad", "</tool_call>visible"],
+    );
+    assert_eq!(calls.len(), 0);
+    assert_eq!(
+      display, "visible",
+      "split-chunk: end-tag + suffix in chunk 2 still surface `visible`"
+    );
+  }
+
+  #[test]
+  fn streaming_json_tools_malformed_body_returns_state_to_normal() {
+    // R13: after consuming the malformed-but-closed section + suffix the
+    // processor must be back in `State::Normal` with empty buffers so a
+    // subsequent plain chunk passes through untouched.
+    let mut p = ToolCallProcessor::new(Box::new(JsonTools), None);
+    let out1 = p.process_chunk("<tool_call>bad</tool_call>visible");
+    assert_eq!(out1.as_deref(), Some("visible"));
+    assert!(p.tool_call_buffer.is_empty(), "buffer drained");
+    assert!(p.pending_display.is_empty(), "pending_display drained");
+    assert_eq!(p.state, State::Normal, "state reset to Normal");
+    let out2 = p.process_chunk("hello world");
+    assert_eq!(out2.as_deref(), Some("hello world"));
+  }
+
+  #[test]
+  fn streaming_json_tools_object_body_unbalanced_with_outside_end_tag_closes() {
+    // R13 unit case for the JSON-string-aware quote helper: body opens with
+    // `{` but never closes the object. The `</tool_call>` is OUTSIDE any
+    // JSON string so the section is closed-but-malformed, the suffix
+    // surfaces. This is the case the simple plain-substring R13 would have
+    // got right, but a naive "stay Ok(None) when body opens with `{`"
+    // workaround would have suppressed.
+    let (display, calls) =
+      run_with_parser(Box::new(JsonTools), &["<tool_call>{</tool_call>visible"]);
+    assert_eq!(calls.len(), 0);
+    assert_eq!(display, "visible");
+  }
+
+  #[test]
+  fn streaming_json_tools_in_string_end_tag_with_incomplete_object_stays_buffered() {
+    // R13 contract guard: `<tool_call>{"s":"</tool_call>` is INCOMPLETE
+    // (JSON string open, in-string `</tool_call>` literal). The R13 fix
+    // MUST NOT falsely close this section — a follow-up chunk must complete
+    // the call legitimately. (Locked at the unit level by
+    // `per_parser_try_parse_one_call_routing` for json_tools / glm47 /
+    // pythonic; this is the end-to-end streaming counterpart.)
+    let mut p = ToolCallProcessor::new(Box::new(JsonTools), None);
+    let out1 = p.process_chunk(r#"<tool_call>{"name":"echo","arguments":{"s":"</tool_call>"#);
+    assert_eq!(
+      out1, None,
+      "in-string `</tool_call>` MUST NOT close section"
+    );
+    assert_eq!(p.tool_calls.len(), 0);
+    let out2 = p.process_chunk(r#""}}</tool_call> done"#);
+    assert_eq!(out2.as_deref(), Some(" done"));
+    assert_eq!(p.tool_calls.len(), 1);
+    assert_eq!(p.tool_calls[0].name, "echo");
+    assert_eq!(
+      p.tool_calls[0].arguments,
+      serde_json::json!({"s": "</tool_call>"}),
+      "in-string `</tool_call>` literal preserved verbatim"
+    );
+  }
+
+  // --- L9 R13 per-parser audit-locking ------------------------------------
+  // For EVERY parser, construct a payload of shape `<start>BAD<end>visible`
+  // where BAD is unparseable for the parser's body grammar AND would
+  // trigger an early `Ok(None)` in the pre-R13 implementation. Assert the
+  // trailing `visible` reaches display byte-for-byte.
+
+  #[test]
+  fn try_parse_one_call_malformed_body_in_closed_section_per_parser_audit() {
+    // Each row: (label, parser, buffer with `<start>BAD<end>visible`,
+    // expected display).
+    //
+    // Mistral is excluded — its `tool_call_end` is empty and the streaming
+    // processor short-circuits via the `end_tag.is_empty()` branch in
+    // `process_tagged_chunk` (no `try_parse_one_call` invocation), so the
+    // R13 contract does not bite there.
+    let rows: Vec<(&'static str, Box<dyn ToolParser>, String, &'static str)> = vec![
+      // json_tools: body `bad` makes `balanced_json_object_prefix` fail (no
+      // `{` opener at all → `JsonPayloadStart::None` branch).
+      (
+        "json_tools (no-{ malformed body)",
+        Box::new(JsonTools),
+        "<tool_call>bad</tool_call>visible".to_owned(),
+        "visible",
+      ),
+      // json_tools: body `{` makes `balanced_json_object_prefix` fail (opens
+      // but never closes); the JSON-aware helper finds end-tag OUTSIDE the
+      // (still-open) object structure since no string is in flight.
+      (
+        "json_tools ({-open malformed body)",
+        Box::new(JsonTools),
+        "<tool_call>{</tool_call>visible".to_owned(),
+        "visible",
+      ),
+      // pythonic: body `bad` (no `[` opener) makes `pythonic_call_close`
+      // return None.
+      (
+        "pythonic (no-[ malformed body)",
+        Box::new(Pythonic),
+        "<|tool_call_start|>bad<|tool_call_end|>visible".to_owned(),
+        "visible",
+      ),
+      // pythonic: body `[bad` (call opens but never closes) — quote-aware
+      // helper finds end-tag outside any quote.
+      (
+        "pythonic ([-open malformed body)",
+        Box::new(Pythonic),
+        "<|tool_call_start|>[bad<|tool_call_end|>visible".to_owned(),
+        "visible",
+      ),
+      // qwen3_coder: body `bad` (no `<function=`) hits the top-level
+      // `<function=` not-found early return.
+      (
+        "qwen3_coder (no-<function= malformed body)",
+        Box::new(Qwen3Coder),
+        "<tool_call>bad</tool_call>visible".to_owned(),
+        "visible",
+      ),
+      // qwen3_coder: `<function=f` opened but no `</function>` close (and
+      // no `<parameter=` in flight) — value-aware helper finds end-tag
+      // outside every `<parameter=…></parameter>` region.
+      (
+        "qwen3_coder (<function= without close)",
+        Box::new(Qwen3Coder),
+        "<tool_call><function=f</tool_call>visible".to_owned(),
+        "visible",
+      ),
+      // glm47: body `{` (object opens but never closes) — JSON-aware helper
+      // finds end-tag OUTSIDE any JSON string.
+      (
+        "glm47 ({-open malformed body)",
+        Box::new(Glm47),
+        "<tool_call>{</tool_call>visible".to_owned(),
+        "visible",
+      ),
+      // glm47: body `[` (array opens but never closes) — JSON-aware helper
+      // finds end-tag OUTSIDE any JSON string.
+      (
+        "glm47 ([-open malformed body)",
+        Box::new(Glm47),
+        "<tool_call>[</tool_call>visible".to_owned(),
+        "visible",
+      ),
+      // longcat: body `{` (object opens but never closes) — JSON-aware
+      // helper finds end-tag OUTSIDE any JSON string.
+      (
+        "longcat ({-open malformed body)",
+        Box::new(Longcat),
+        "<longcat_tool_call>{</longcat_tool_call>visible".to_owned(),
+        "visible",
+      ),
+      // kimi_k2: `<|tool_call_begin|>` opener found but no
+      // `<|tool_call_argument_begin|>` after — plain helper finds the
+      // section end-tag.
+      (
+        "kimi_k2 (call_begin without argument_begin)",
+        Box::new(KimiK2),
+        concat!(
+          "<|tool_calls_section_begin|>",
+          "<|tool_call_begin|>functions.f:0BAD",
+          "<|tool_calls_section_end|>visible",
+        )
+        .to_owned(),
+        "visible",
+      ),
+      // kimi_k2: args region opens with `{` but never balances — JSON-aware
+      // helper finds the section end-tag outside any JSON string.
+      (
+        "kimi_k2 (args { without close)",
+        Box::new(KimiK2),
+        concat!(
+          "<|tool_calls_section_begin|>",
+          "<|tool_call_begin|>functions.f:0<|tool_call_argument_begin|>{",
+          "<|tool_calls_section_end|>visible",
+        )
+        .to_owned(),
+        "visible",
+      ),
+      // minimax_m2: `<invoke name="f"` opened but no `</invoke>` close,
+      // and no `<parameter name=` in flight — xml-value-aware helper finds
+      // section end-tag outside every `<parameter name=…></parameter>`
+      // region.
+      (
+        "minimax_m2 (<invoke without close)",
+        Box::new(MinimaxM2),
+        r#"<minimax:tool_call><invoke name="f"</minimax:tool_call>visible"#.to_owned(),
+        "visible",
+      ),
+      // function_gemma: body has no `call:` marker — plain helper finds the
+      // wrapper end-tag.
+      (
+        "function_gemma (no call: marker)",
+        Box::new(FunctionGemma),
+        "<start_function_call>bad<end_function_call>visible".to_owned(),
+        "visible",
+      ),
+      // function_gemma: `call:f` found but no `{` body opener — plain
+      // helper finds the wrapper end-tag.
+      (
+        "function_gemma (call:NAME without {)",
+        Box::new(FunctionGemma),
+        "<start_function_call>call:f<end_function_call>visible".to_owned(),
+        "visible",
+      ),
+      // function_gemma: `call:f{garbage` opens body but never closes; no
+      // `<escape>` region in flight — value-aware helper finds wrapper
+      // end-tag outside every `<escape>...</escape>` region.
+      (
+        "function_gemma (call:f{ without close)",
+        Box::new(FunctionGemma),
+        "<start_function_call>call:f{garbage<end_function_call>visible".to_owned(),
+        "visible",
+      ),
+      // gemma4: body has no `call:` (terminates via `(Some(e), None)` arm).
+      (
+        "gemma4 (no call: marker)",
+        Box::new(Gemma4),
+        "<|tool_call>bad<tool_call|>visible".to_owned(),
+        "visible",
+      ),
+      // gemma4: `call:f{garbage` opens body but never closes; no `<|"|>`
+      // region in flight — value-aware helper finds wrapper end-tag outside
+      // every `<|"|>...<|"|>` region.
+      (
+        "gemma4 (call:f{ without close)",
+        Box::new(Gemma4),
+        "<|tool_call>call:f{garbage<tool_call|>visible".to_owned(),
+        "visible",
+      ),
+    ];
+    for (label, parser, buffer, expect_display) in rows {
+      let (display, calls) = run_with_parser(parser, &[buffer.as_str()]);
+      assert_eq!(
+        calls.len(),
+        0,
+        "{}: malformed body must produce zero calls",
+        label,
+      );
+      assert_eq!(
+        display, expect_display,
+        "{}: same-chunk suffix must reach display verbatim",
+        label,
+      );
+    }
+  }
+
+  // --- L9 R13 contract-guard regression tests -----------------------------
+  // Each row of the audit above is the positive case: a body that triggers
+  // an early return path, AND the end-tag IS in the buffer outside any
+  // legitimate in-value structure → closed-but-malformed. These tests lock
+  // the negative cases: bodies whose end-tag candidate is INSIDE an open
+  // in-value region (or no end-tag at all) MUST keep returning `Ok(None)`
+  // so the next chunk can complete the legitimate call.
+
+  #[test]
+  fn try_parse_one_call_in_value_end_tag_stays_buffered_per_parser_audit() {
+    // For each parser: a payload where the end-tag literal is inside an
+    // open in-VALUE region. The processor must NOT extract or close —
+    // returns None (no display yet), then we feed a closing chunk and
+    // expect the full call to materialize.
+    //
+    // We exercise this via single-chunk `try_parse_one_call` so the
+    // Ok(None) discipline is locked at the unit level (the processor's
+    // end-to-end behaviour is already exercised by R3 split-chunk tests).
+    let rows: Vec<(&'static str, Box<dyn ToolParser>, &'static str)> = vec![
+      // json_tools: JSON string open, in-string end-tag literal.
+      (
+        "json_tools (in-JSON-string end-tag)",
+        Box::new(JsonTools),
+        r#"<tool_call>{"s":"</tool_call>"#,
+      ),
+      // pythonic: single-quoted Python string open, in-string end-tag.
+      (
+        "pythonic (in-single-quote end-tag)",
+        Box::new(Pythonic),
+        "<|tool_call_start|>[echo(s='<|tool_call_end|>",
+      ),
+      // glm47 Object: in-JSON-string end-tag.
+      (
+        "glm47 (in-JSON-string end-tag, object body)",
+        Box::new(Glm47),
+        r#"<tool_call>{"s":"</tool_call>"#,
+      ),
+      // glm47 Array: in-JSON-string end-tag.
+      (
+        "glm47 (in-JSON-string end-tag, array body)",
+        Box::new(Glm47),
+        r#"<tool_call>[{"s":"</tool_call>"#,
+      ),
+      // longcat: in-JSON-string end-tag.
+      (
+        "longcat (in-JSON-string end-tag)",
+        Box::new(Longcat),
+        r#"<longcat_tool_call>{"s":"</longcat_tool_call>"#,
+      ),
+      // kimi_k2: args JSON string open, in-string section-end literal.
+      (
+        "kimi_k2 (in-args-JSON-string section-end)",
+        Box::new(KimiK2),
+        concat!(
+          "<|tool_calls_section_begin|>",
+          "<|tool_call_begin|>functions.f:0<|tool_call_argument_begin|>",
+          r#"{"s":"<|tool_calls_section_end|>"#,
+        ),
+      ),
+      // qwen3_coder: `<parameter=p>` open with in-value end-tag literal.
+      (
+        "qwen3_coder (in-parameter-value end-tag)",
+        Box::new(Qwen3Coder),
+        "<tool_call><function=f><parameter=p></tool_call>",
+      ),
+      // minimax_m2: `<parameter name="p">` open with in-value end-tag.
+      (
+        "minimax_m2 (in-parameter-value end-tag)",
+        Box::new(MinimaxM2),
+        r#"<minimax:tool_call><invoke name="f"><parameter name="p"></minimax:tool_call>"#,
+      ),
+      // function_gemma: `<escape>` open with in-escape end-tag.
+      (
+        "function_gemma (in-escape end-tag)",
+        Box::new(FunctionGemma),
+        "<start_function_call>call:f{k:<escape><end_function_call>",
+      ),
+      // gemma4: `<|"|>` open with in-STR end-tag.
+      (
+        "gemma4 (in-STR end-tag)",
+        Box::new(Gemma4),
+        r#"<|tool_call>call:f{k: <|"|><tool_call|>"#,
+      ),
+    ];
+    for (label, parser, buffer) in rows {
+      let result = parser
+        .try_parse_one_call(buffer, None)
+        .unwrap_or_else(|e| panic!("{}: try_parse_one_call errored: {e}", label));
+      assert!(
+        result.is_none(),
+        "{}: in-value end-tag literal MUST NOT close the section (got {:?})",
+        label,
+        result,
       );
     }
   }
