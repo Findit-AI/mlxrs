@@ -253,9 +253,13 @@ pub fn load_config(dir: &Path) -> Result<String> {
 /// to mlx-audio's Python ([utils.py:221-226][audio-utils-quant]):
 ///
 /// 1. **Key fallback** ([utils.py:221-223][audio-utils-quant]): try
-///    top-level `"quantization"` first, and if that key is absent fall
-///    back to `"quantization_config"` (the longer key HF post-quantize
-///    artifacts use — `mlx_audio.utils.apply_quantization` reads both).
+///    top-level `"quantization"` first, and if that key is absent **or
+///    explicitly `null`** fall back to `"quantization_config"` (the
+///    longer key HF post-quantize artifacts use —
+///    `mlx_audio.utils.apply_quantization` reads both). Python's
+///    `config.get("quantization", None)` treats a missing key and a
+///    `null` value identically, so an explicit `null` triggers the
+///    fallback just like an absent key.
 /// 2. **`group_size` default** ([utils.py:226][audio-utils-quant]): if
 ///    the chosen block has no `"group_size"`, default it to `64` (audio
 ///    convention — Python's `quantization.get("group_size", 64)`). The
@@ -278,7 +282,8 @@ pub fn load_config(dir: &Path) -> Result<String> {
 ///
 /// `Ok(None)` ⇒ the checkpoint is dense (mlx-audio's no-op early-return
 /// at [utils.py:222-225][audio-utils-quant] — neither
-/// `"quantization"` nor `"quantization_config"` is present).
+/// `"quantization"` nor `"quantization_config"` is present, or both are
+/// explicitly `null`).
 /// `Ok(Some(plq))` ⇒ the checkpoint is quantized; `plq` carries the
 /// global default (`group_size` / `bits` / `mode`) plus any per-layer
 /// overrides. A malformed quantization block (e.g. `bits` missing or
@@ -294,16 +299,20 @@ pub fn apply_quantization(config_json: &str) -> Result<Option<PerLayerQuantizati
     message: format!("audio apply_quantization: invalid config JSON: {e}"),
   })?;
 
-  // (1) mlx-audio utils.py:221-223 — prefer top-level "quantization",
-  // fall back to "quantization_config" (the HF post-quantize artifact
-  // key).
+  // (1) mlx-audio utils.py:221-223 — prefer top-level "quantization" if
+  // NON-NULL, else fall back to "quantization_config" (the HF
+  // post-quantize artifact key) if NON-NULL, else dense model (no-op).
+  // Python's `config.get("quantization", None)` treats a missing key and
+  // an explicit `null` value identically, so the fallback must trigger
+  // in both cases — and `{"quantization_config": null}` is itself the
+  // dense-model no-op early return at utils.py:222-225.
   let block = match value.get("quantization") {
-    Some(b) => b,
-    None => match value.get("quantization_config") {
-      Some(b) => b,
-      // Neither key present → dense model, the no-op early return at
-      // mlx-audio utils.py:222-225.
-      None => return Ok(None),
+    Some(b) if !b.is_null() => b,
+    _ => match value.get("quantization_config") {
+      Some(b) if !b.is_null() => b,
+      // Neither key present (or both null) → dense model, the no-op
+      // early return at mlx-audio utils.py:222-225.
+      _ => return Ok(None),
     },
   };
 
@@ -552,6 +561,73 @@ mod tests {
     let global = plq.quantization.expect("global default present");
     assert_eq!(global.bits, 8, "top-level `quantization` wins");
     assert_eq!(global.group_size, 32, "top-level `quantization` wins");
+  }
+
+  /// Python's `config.get("quantization", None)` ([utils.py:221]) treats
+  /// a missing key and an explicit `null` value identically — both fall
+  /// through to the `quantization_config` retry. A `{"quantization":
+  /// null, "quantization_config": {...}}` config must therefore select
+  /// the non-null `quantization_config` block, not error on the null.
+  #[test]
+  fn apply_quantization_null_primary_falls_back_to_quantization_config() {
+    let body = r#"{
+      "model_type": "voxtral",
+      "quantization": null,
+      "quantization_config": { "bits": 4, "group_size": 64 }
+    }"#;
+    let q = apply_quantization(body).expect("null-primary config falls back");
+    let plq = q.expect("Some(PerLayerQuantization) from quantization_config fallback");
+    let global = plq.quantization.expect("global default present");
+    assert_eq!(global.bits, 4, "fallback block's `bits` selected");
+    assert_eq!(
+      global.group_size, 64,
+      "fallback block's `group_size` selected"
+    );
+  }
+
+  /// `{"quantization_config": null}` is the dense-model no-op (Python's
+  /// `config.get("quantization_config", None)` is `None`, the early
+  /// return at [utils.py:222-225] fires), not an error on the null
+  /// value.
+  #[test]
+  fn apply_quantization_only_null_quantization_config_returns_none() {
+    let body = r#"{ "model_type": "voxtral", "quantization_config": null }"#;
+    let q = apply_quantization(body).expect("null-only quantization_config parses as dense");
+    assert!(
+      q.is_none(),
+      "null quantization_config → Ok(None), matches upstream's no-op early return"
+    );
+  }
+
+  /// `{"quantization": null}` — same rationale as the
+  /// `quantization_config: null` case: Python's `dict.get(_, None)` on a
+  /// null value yields `None`, falling through to the no-op early
+  /// return, not erroring on the null.
+  #[test]
+  fn apply_quantization_only_null_quantization_returns_none() {
+    let body = r#"{ "model_type": "voxtral", "quantization": null }"#;
+    let q = apply_quantization(body).expect("null-only quantization parses as dense");
+    assert!(
+      q.is_none(),
+      "null quantization → Ok(None), matches upstream's no-op early return"
+    );
+  }
+
+  /// Both keys explicitly `null` is the conjunction of the two
+  /// preceding cases — the null-aware fallback must still reach the
+  /// dense no-op early return, not error on either null block.
+  #[test]
+  fn apply_quantization_both_null_returns_none() {
+    let body = r#"{
+      "model_type": "voxtral",
+      "quantization": null,
+      "quantization_config": null
+    }"#;
+    let q = apply_quantization(body).expect("both-null config parses as dense");
+    assert!(
+      q.is_none(),
+      "both keys null → Ok(None), matches upstream's no-op early return"
+    );
   }
 
   /// `hf://org/model` repo-id-shaped input: the rejection message's
