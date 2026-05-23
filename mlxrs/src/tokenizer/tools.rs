@@ -583,11 +583,16 @@ impl ToolParser for Glm47 {
     //      `<arg_value>` regions before matching the wrapper end tag.
     //   2. `glm_parse_json` fallback — top-level JSON object OR array. Use the
     //      balanced scanner whose shape matches the payload's leading byte.
-    //   3. `glm_parse_plain` fallback — plain text.
+    //   3. `glm_parse_plain` fallback — plain text whose bytes are opaque and
+    //      may carry a raw `<arg_value>` literal (no matching close). It must
+    //      NOT be routed through the value-aware scanner (would block on the
+    //      missing `</arg_value>` and drop the call at buffer cap — L9 R8).
     //
     // Classify the payload's leading non-whitespace byte: `{` → balanced
     // object then plain substring; `[` → balanced array then plain substring;
-    // else value-tag-aware XML scan (shape 1).
+    // else distinguish shape 1 (XML-style) from shape 3 (plain) by the
+    // presence of `<arg_key>` (`parse()`'s XML branch gate; the plain branch
+    // never emits it).
     let payload_at = match buffer.find(start_tag) {
       Some(idx) => idx + start_tag.len(),
       None => return buffer.find(end_tag),
@@ -605,9 +610,36 @@ impl ToolParser for Glm47 {
         Some(payload_at + arr_end + rel)
       }
       JsonPayloadStart::None => {
-        // Shape 1 (XML-style) OR shape 3 (plain). The value-aware scanner is
-        // safe for both: if the payload has no `<arg_value>` regions it
-        // degenerates to a plain substring search for `end_tag`.
+        // Shape 1 (XML-style) OR shape 3 (plain). The discriminator is the
+        // presence of `<arg_key>`: `parse()`'s XML branch is gated on
+        // `text.find("<arg_key>")` and `find_kv_pairs` always consumes the key
+        // BEFORE the value, so every structurally-valid XML-style payload
+        // contains `<arg_key>` at or before any `<arg_value>`. The plain
+        // fallback (`glm_parse_plain`) NEVER emits `<arg_key>` tags — its
+        // bytes are arbitrary command text that may legitimately contain a
+        // raw `<arg_value>` literal (L9 R8 finding: a payload like
+        // `<tool_call>echo <arg_value></tool_call>` was over-eagerly routed
+        // through the value-aware scanner which then blocked waiting for a
+        // matching `</arg_value>` that never arrives → soft-DoS, call
+        // dropped at buffer cap).
+        //
+        // Streaming corner-case audit: each call re-evaluates the full
+        // buffer, so there is no lock-in. If `<arg_key>` arrives in a later
+        // chunk (i.e. an XML-style payload whose key tag straddles the
+        // chunk boundary), the next invocation routes to the XML scanner.
+        // The simple "no `<arg_key>` ⇒ plain" rule is sound because a valid
+        // XML-style payload cannot have `<arg_value>` before `<arg_key>`
+        // (`find_kv_pairs` requires key-then-value), so a buffer with
+        // `<arg_value>` literals but no `<arg_key>` is unambiguously the
+        // plain fallback. If both branches still defer (no `<arg_key>` AND
+        // no `end_tag` yet), the scanner returns `None` and the processor
+        // keeps collecting.
+        if !payload.contains("<arg_key>") {
+          // Plain fallback: a plain substring search for `end_tag` suffices.
+          // Any `<arg_value>` literal inside the payload is opaque text, not
+          // a structural region.
+          return payload.find(end_tag).map(|rel| payload_at + rel);
+        }
         xml_value_aware_end_tag_scan(payload, "<arg_value>", "</arg_value>", end_tag)
           .map(|rel| payload_at + rel)
       }
@@ -4395,6 +4427,84 @@ mod tests {
     assert_eq!(
       c[0].arguments,
       serde_json::json!({"s": "blah</longcat_tool_call> more blah"}),
+    );
+  }
+
+  // L9 R8: glm47's non-JSON branch in `find_end_tag_in_buffer` must route
+  // shape 1 (XML-style with `<arg_key>`/`<arg_value>` pairs) and shape 3
+  // (`glm_parse_plain` fallback — opaque text that may carry a raw
+  // `<arg_value>` literal) DIFFERENTLY. The previous unconditional value-aware
+  // scan blocked on a plain-fallback payload containing an unmatched
+  // `<arg_value>` literal (no `</arg_value>` ever arrives) and dropped the
+  // call at buffer cap. The discriminator is `<arg_key>` presence, mirroring
+  // `parse()`'s XML branch gate.
+
+  #[test]
+  fn streaming_glm47_plain_fallback_with_unmatched_arg_value_literal_does_not_block() {
+    // Plain-fallback payload (no `<arg_key>`) whose opaque arg text contains a
+    // raw `<arg_value>` literal with no matching `</arg_value>`. The end-tag
+    // scanner must NOT lock on the missing `</arg_value>` — it must accept
+    // `</tool_call>` directly via plain substring search and surface a plain
+    // tool call.
+    let (d, c) = run_with_parser(
+      Box::new(Glm47),
+      &["<tool_call>echo <arg_value></tool_call> after"],
+    );
+    assert_eq!(d, " after", "trailing display reaches caller");
+    assert_eq!(
+      c.len(),
+      1,
+      "plain-fallback call must extract (not be dropped)"
+    );
+    assert_eq!(c[0].name, "echo");
+    assert_eq!(
+      c[0].arguments,
+      serde_json::json!({"raw": "<arg_value>"}),
+      "raw `<arg_value>` literal preserved verbatim as plain arg text"
+    );
+  }
+
+  #[test]
+  fn streaming_glm47_plain_fallback_with_unmatched_arg_value_literal_split_across_chunks() {
+    // Same as the single-chunk variant but with the chunk boundary inside
+    // the wrapper end tag. The plain-substring routing must still locate the
+    // `</tool_call>` once both halves arrive.
+    let (d, c) = run_with_parser(
+      Box::new(Glm47),
+      &["<tool_call>echo <arg_value></tool_", "call> after"],
+    );
+    assert_eq!(d, " after");
+    assert_eq!(c.len(), 1, "plain-fallback call must extract across chunks");
+    assert_eq!(c[0].name, "echo");
+    assert_eq!(c[0].arguments, serde_json::json!({"raw": "<arg_value>"}));
+  }
+
+  #[test]
+  fn streaming_glm47_xml_arg_key_arrives_in_later_chunk() {
+    // Streaming corner case: the chunk boundary lands inside the `<arg_key>`
+    // OPEN tag itself (`<arg_ke|y>`), so chunk 1's buffer contains NO
+    // `<arg_key>` literal. The non-JSON arm must NOT latch into "plain" mode
+    // on the basis of chunk 1 alone — each call re-evaluates the full buffer,
+    // so once chunk 2 reveals `<arg_key>`, routing flips to the value-aware
+    // XML scanner and the call extracts intact.
+    let (d, c) = run_with_parser(
+      Box::new(Glm47),
+      &[
+        "<tool_call>echo<arg_ke",
+        "y>s</arg_key><arg_value>v</arg_value></tool_call> after",
+      ],
+    );
+    assert_eq!(d, " after");
+    assert_eq!(
+      c.len(),
+      1,
+      "XML-style call must extract once `<arg_key>` arrives"
+    );
+    assert_eq!(c[0].name, "echo");
+    assert_eq!(
+      c[0].arguments,
+      serde_json::json!({"s": "v"}),
+      "XML-aware routing recovers the key/value pair"
     );
   }
 }
