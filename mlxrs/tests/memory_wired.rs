@@ -18,11 +18,16 @@
 //! without serialization. Tests that mutate the wired limit acquire
 //! [`WIRED_LIMIT_LOCK`] first so they run strictly serially within this
 //! binary. Per-policy math tests do NOT acquire the lock (they are pure
-//! functions of their inputs). The two tests that intentionally exercise
-//! concurrent installs (`concurrent_install_t1_drops_first_t2_retains_
-//! recommended_limit` and `concurrent_install_drop_restores_correct_old_
-//! limit_per_owner`) hold the lock for their full duration to keep their
-//! observation of the live process-global limit consistent.
+//! functions of their inputs). The test that intentionally exercises
+//! concurrent installs across threads
+//! (`concurrent_install_drop_restores_correct_old_limit_per_owner`) holds
+//! the lock for its full duration to keep its observation of the live
+//! process-global limit consistent. The deterministic in-scope-protection
+//! contract is exercised single-threaded by
+//! `sequential_install_then_install_then_drop_first_still_protects_second_guard`
+//! — the refcount-semantic contract does not require threading and the
+//! single-threaded version is immune to scheduler-dependent test-infra
+//! defects.
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
@@ -292,8 +297,8 @@ fn wired_limit_guard_drop_restores_old_limit() {
 /// wired-memory limit at its original pre-install value, not at the
 /// recommended budget. Coarse stress test that asserts the final
 /// restored-state invariant; the deterministic in-scope-protection
-/// invariant is asserted by
-/// [`concurrent_install_t1_drops_first_t2_retains_recommended_limit`].
+/// invariant is asserted single-threaded by
+/// [`sequential_install_then_install_then_drop_first_still_protects_second_guard`].
 ///
 /// Pre-F2 failure mode (no synchronization):
 /// ```text
@@ -384,48 +389,51 @@ fn concurrent_install_drop_restores_correct_old_limit_per_owner() {
 }
 
 /// CODEX R2 [HIGH] regression guard — the deterministic
-/// in-scope-protection invariant. T1 installs, T2 installs (T2 receives
-/// a real guard, NOT `Ok(None)`), T1 drops FIRST — T2's continued scope
-/// MUST still observe the limit at the recommended budget, not at the
-/// originally-captured prior value.
+/// in-scope-protection invariant, exercised single-threaded via the
+/// refcount-semantic contract (NOT via thread concurrency).
+///
+/// **Why single-threaded.** The R2 in-scope-protection invariant is a
+/// refcount-semantic contract — install bumps the refcount, drop decrements
+/// it, and the captured prior limit is restored only when the refcount
+/// reaches zero. That contract is fully exercised by a single thread
+/// performing `install, install, drop, observe, drop, observe` — no
+/// scheduler dependence is required. The previous threaded versions
+/// (`Barrier` in R2, `mpsc` channel handshake in R3, timeout-bounded `recv`
+/// in R3-fix) accumulated subtle test-infra defects across four review
+/// rounds (Codex R2/R3/R3-fix/R4: barrier-deadlock, ordering, channel
+/// disconnect ambiguity, timeout escape, worker-cleanup race). Per
+/// `[[feedback_escalate_dont_spiral]]`, the entire defect class was killed
+/// structurally by replacing the threaded test with this sequential one.
+/// The coarser cross-thread invariant (post-stress restored-state) is still
+/// covered by [`concurrent_install_drop_restores_correct_old_limit_per_owner`].
 ///
 /// Pre-R2 (single-active-guard) failure mode flagged by Codex:
 /// ```text
-///   T1 install      → captures L0, sets recommended, returns Some(guard)
-///   T2 install      → flag set, returns Ok(None) (NO GUARD)
-///   T2 work assumes protection; in reality is unprotected from the start
-///   T1 drops        → restores L0 (the original, lower limit)
-///   T2 still active → now at L0 for the rest of its scope (no protection)
+///   g1 install → captures L0, sets recommended, returns Some(guard)
+///   g2 install → flag set, returns Ok(None) (NO GUARD)
+///   caller assumes g2 protected; in reality unprotected from the start
+///   g1 drops   → restores L0 (the original, lower limit)
+///   g2 still active → now at L0 for the rest of its scope (no protection)
 /// ```
 ///
 /// Post-R2 (refcounted-guard):
 /// ```text
-///   T1 install      → state=Some(L0, 1), limit=recommended
-///   T2 install      → state=Some(L0, 2), limit STAYS recommended, Some(guard)
-///   T1 drop         → state=Some(L0, 1), limit STAYS recommended  ← THE FIX
-///   T2 still active → observes limit==recommended (verified by this test)
-///   T2 drop         → state=None, limit=L0 (final restore)
+///   g1 install → state=Some(L0, 1), limit=recommended
+///   g2 install → state=Some(L0, 2), limit STAYS recommended, Some(guard)
+///   g1 drop    → state=Some(L0, 1), limit STAYS recommended  ← THE FIX
+///   g2 still active → observes limit==recommended (verified by this test)
+///   g2 drop    → state=None, limit=L0 (final restore)
 /// ```
 ///
-/// Uses explicit `mpsc` handshake channels to deterministically order T1's
-/// install BEFORE T2's, T2's observation BEFORE T1's drop, and T1's drop
-/// BEFORE T2's post-drop assertion — no `Barrier` (the prior design had no
-/// T1-before-T2 ordering, allowing R1 single-active behavior to pass with the
-/// roles swapped, and a panicked worker would deadlock the 3-party barrier).
-/// All `recv` calls are bounded by [`RECV_TIMEOUT`] so a panicking worker
-/// fails the test promptly instead of hanging CI.
-///
-/// CODEX R3 [MEDIUM] hardening (replaces the R2-era `Barrier` design):
-/// - Explicit T1-before-T2 ordering (channel handshake) instead of barriers
-///   whose 3-party `wait()` deadlocks if any participant panics.
-/// - Deliberate `test_baseline` (different from `recommended`) so the
-///   discriminator holds regardless of the ambient pre-test wired-limit.
-/// - `Drop`-guarded baseline restore so a panicked assertion still cleans up.
+/// Under R1 single-active semantics, `WiredLimitGuard::install(...)` while
+/// `g1` is alive returns `Ok(None)` and the `expect(...)` on the second
+/// install fires immediately — exact-same failure mode as the threaded test
+/// it replaces, without any threading overhead.
 #[test]
-fn concurrent_install_t1_drops_first_t2_retains_recommended_limit() {
+fn sequential_install_then_install_then_drop_first_still_protects_second_guard() {
   // Acquire the per-binary serializer for any test that mutates the
   // process-global wired-limit.
-  let _serialized = lock_wired_limit();
+  let _serialize = lock_wired_limit();
 
   let Ok(Some(recommended)) = recommended_working_set_bytes() else {
     eprintln!("skipping: recommended_working_set_bytes unavailable on this host");
@@ -441,157 +449,67 @@ fn concurrent_install_t1_drops_first_t2_retains_recommended_limit() {
   } else {
     recommended.saturating_sub(1024)
   };
-  let original = set_wired_limit(test_baseline).expect("set deliberate baseline");
+  let original = set_wired_limit(test_baseline).expect("set baseline");
 
-  // Drop-guarded restore of the pre-test limit. Fires even on test panic, so
-  // a failed assertion never leaves the process-global limit at a foreign
-  // value for sibling tests.
-  struct RestoreOnDrop(u64);
-  impl Drop for RestoreOnDrop {
+  // RAII cleanup — single owner on this thread, no detached worker, no
+  // overlapping Drop with any other guard.
+  struct RestoreOriginal(u64);
+  impl Drop for RestoreOriginal {
     fn drop(&mut self) {
       let _ = set_wired_limit(self.0);
     }
   }
-  let _restore = RestoreOnDrop(original);
+  let _restore = RestoreOriginal(original);
 
-  // Timeout guarding every cross-thread `recv` so a panicked worker fails
-  // the test promptly (within seconds) rather than wedging the runner.
-  const RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+  // g1 install — first install in this epoch.
+  let g1 = WiredLimitGuard::install(0, &[])
+    .expect("g1 install: FFI error")
+    .expect("g1 install: returned None on first install with Metal available");
 
-  // Channels for ordered handshake + failure propagation.
-  // t1_installed:    T1 → main      "T1's guard is live (or here is why not)"
-  // t2_observed:     T2 → T1        "T2 has installed + observed (or here is why not)"
-  // t1_dropped:      T1 → T2        "T1's guard has dropped — T2 can now do its post-drop assert"
-  let (t1_installed_tx, t1_installed_rx) = std::sync::mpsc::channel::<Result<(), String>>();
-  let (t2_observed_tx, t2_observed_rx) = std::sync::mpsc::channel::<Result<u64, String>>();
-  let (t1_dropped_tx, t1_dropped_rx) = std::sync::mpsc::channel::<()>();
-
-  let t1 = std::thread::spawn(move || {
-    let install_result = match WiredLimitGuard::install(0, &[]) {
-      Ok(Some(g)) => Ok(g),
-      Ok(None) => Err(
-        "T1 install returned Ok(None) on a Metal-available host (recommended_working_set_bytes \
-         was Some(_) at test start)"
-          .to_string(),
-      ),
-      Err(e) => Err(format!("T1 install returned Err: {e:?}")),
-    };
-    let guard = match install_result {
-      Ok(g) => {
-        t1_installed_tx
-          .send(Ok(()))
-          .expect("main must be alive to receive t1_installed");
-        g
-      }
-      Err(e) => {
-        // Tell main + T2 so neither blocks on recv_timeout for the full
-        // RECV_TIMEOUT just because T1 bailed early.
-        let _ = t1_installed_tx.send(Err(e));
-        return;
-      }
-    };
-    // Wait for T2 to install + observe BEFORE we drop. Bounded by
-    // RECV_TIMEOUT so a panicked T2 doesn't wedge us.
-    let _ = t2_observed_rx.recv_timeout(RECV_TIMEOUT);
-    // Drop T1's guard explicitly: this triggers the (potentially racy under
-    // R1) restore. Under R2 the limit MUST stay at `recommended` because T2
-    // still holds a refcount.
-    drop(guard);
-    // Signal T2 that the drop has happened so it can perform the critical
-    // post-drop observation.
-    let _ = t1_dropped_tx.send(());
-  });
-
-  // Wait for T1 to install before launching T2. This gives us deterministic
-  // T1-before-T2 ordering at the install site — the broken R1 single-active
-  // semantics can no longer pass by accident with the roles swapped.
-  match t1_installed_rx.recv_timeout(RECV_TIMEOUT) {
-    Ok(Ok(())) => {}
-    Ok(Err(e)) => panic!("T1 install reported failure: {e}"),
-    Err(e) => panic!("T1 install timed out after {RECV_TIMEOUT:?}: {e:?}"),
-  }
-
-  let t2 = std::thread::spawn(move || {
-    // CRITICAL: any failure here must PANIC (not silently return) so the
-    // main thread's `t2.join().expect(...)` catches it. Sending the error
-    // over the channel is supplementary diagnostics for the T1 side; it is
-    // NOT the failure surface.
-    let guard = match WiredLimitGuard::install(0, &[]) {
-      Ok(Some(g)) => g,
-      Ok(None) => {
-        let msg = "T2 install returned Ok(None) while T1 was active — exact R1 single-active \
-                   regression (the bug Codex R2 caught: second concurrent install loses its \
-                   in-scope protection)";
-        let _ = t2_observed_tx.send(Err(msg.into()));
-        panic!("{msg}");
-      }
-      Err(e) => {
-        let msg = format!("T2 install returned Err: {e:?}");
-        let _ = t2_observed_tx.send(Err(msg.clone()));
-        panic!("{msg}");
-      }
-    };
-    // Critical first observation: BEFORE T1 drops, the limit must already
-    // be at `recommended` (T1's install set it; T2's install must NOT
-    // disturb it). Round-trip via `set_wired_limit(recommended)` so we read
-    // the live value without permanently changing it.
-    let observed_before_t1_drop = match set_wired_limit(recommended) {
-      Ok(v) => v,
-      Err(e) => {
-        let msg = format!("T2 round-trip read failed: {e:?}");
-        let _ = t2_observed_tx.send(Err(msg.clone()));
-        panic!("{msg}");
-      }
-    };
-    assert_eq!(
-      observed_before_t1_drop, recommended,
-      "BEFORE T1 drop: live limit was {observed_before_t1_drop}, expected recommended \
-       {recommended}"
+  // g2 install while g1 is active — MUST return Some(guard) under
+  // refcounted semantics. Under R1 single-active regression this returns
+  // Ok(None) and the assertion fires with the exact diagnostic message.
+  let g2 = WiredLimitGuard::install(0, &[])
+    .expect("g2 install: FFI error")
+    .expect(
+      "g2 install: returned Ok(None) while g1 was active — \
+       exact R1 single-active regression (R2-fix should return Ok(Some) via refcount bump)",
     );
-    // Tell T1 it may now drop.
-    let _ = t2_observed_tx.send(Ok(observed_before_t1_drop));
-    // Wait for T1's drop to complete (bounded so a panicked T1 doesn't
-    // wedge us).
-    let _ = t1_dropped_rx.recv_timeout(RECV_TIMEOUT);
-    // CRITICAL R2 invariant: after T1's drop, T2 is still alive. The
-    // process-global limit MUST still be `recommended`. Under R1
-    // (single-active) T1's drop would restore the captured original here
-    // and T2's scope would be silently unprotected — the exact Codex R2
-    // finding.
-    let observed_after_t1_drop = set_wired_limit(recommended).expect("T2 post-drop round-trip");
-    assert_eq!(
-      observed_after_t1_drop, recommended,
-      "R2 in-scope protection: after T1 drops first while T2 still holds a guard, the \
-       live wired-memory limit must STILL be recommended (observed={observed_after_t1_drop}, \
-       recommended={recommended}). A mismatch (typically observed == the pre-epoch baseline) \
-       is the exact Codex R2 finding: the R1 single-active design restored the limit on T1's \
-       drop, leaving T2's remaining scope unprotected."
-    );
-    // T2's guard drops at scope exit, triggering the LAST-drop restore.
-    drop(guard);
-  });
 
-  // Join T1 first (it depends on hearing from T2 via t2_observed_rx; if T2
-  // panicked, the channel will be disconnected and T1's recv_timeout will
-  // return Err quickly so T1 still exits). Then join T2 and surface any
-  // panic — that is where the R2 in-scope-protection contract lives.
-  t1.join().expect("T1 worker panicked");
-  if let Err(panic_payload) = t2.join() {
-    // Re-panic with T2's payload so the failure mode is the exact assertion
-    // message from T2 (not a generic "T2 worker panicked").
-    std::panic::resume_unwind(panic_payload);
-  }
-
-  // After BOTH guards drop, the limit must be restored to `test_baseline`
-  // (R2 last-drop-restores discipline). Use a round-trip via
-  // `set_wired_limit(test_baseline)` so we both read the live value AND set
-  // it for the Drop-guarded `_restore` to find a sane state.
-  let observed_final = set_wired_limit(test_baseline).expect("final round-trip read");
+  // Refcount=2, both protected. Verify the live limit is `recommended`
+  // (round-trip via set_wired_limit, which returns the prior value as its
+  // out-param without permanently changing the live value when we pass the
+  // value already in place).
+  let observed_before_drop = set_wired_limit(recommended).expect("readback 1");
   assert_eq!(
-    observed_final, test_baseline,
-    "R2 last-drop-restores: after both guards drop, the live limit must equal the deliberate \
-     test_baseline (observed_final={observed_final}, test_baseline={test_baseline}). A mismatch \
-     means the refcounted last-drop-restores discipline broke."
+    observed_before_drop, recommended,
+    "before any drop, limit was {observed_before_drop} not recommended {recommended} — \
+     refcount bookkeeping broken"
+  );
+
+  drop(g1); // refcount=1, g2 still alive.
+
+  // CRITICAL ASSERT: limit STAYS at `recommended` after g1 drops, because
+  // g2 still holds a refcount. This is the R2 contract: in-scope protection
+  // preserved across overlapping guard lifetimes. Under R1 this would
+  // restore to `test_baseline` and g2's remaining scope would be
+  // silently unprotected.
+  let observed_after_g1_drop = set_wired_limit(recommended).expect("readback 2");
+  assert_eq!(
+    observed_after_g1_drop, recommended,
+    "after dropping g1 while g2 alive, limit was {observed_after_g1_drop} not recommended \
+     {recommended} — in-scope protection lost (R2 finding regression)"
+  );
+
+  drop(g2); // refcount=0, restore to `test_baseline`.
+
+  // Final assert: limit restored to the baseline we set, proving the
+  // last-drop-restores discipline fired correctly.
+  let final_observed = set_wired_limit(test_baseline).expect("readback 3");
+  assert_eq!(
+    final_observed, test_baseline,
+    "after all drops, limit was {final_observed} not test_baseline {test_baseline} — \
+     restore broken"
   );
 }
 
@@ -674,7 +592,7 @@ fn refcounted_guard_drop_does_not_restore_until_last_drop() {
   let _ = set_wired_limit(snapshot_before).expect("restore baseline");
 
   // Sanity: discriminating power requires snapshot_before != recommended
-  // (same reason as `concurrent_install_t1_drops_first_t2_retains_recommended_limit`).
+  // (same reason as `sequential_install_then_install_then_drop_first_still_protects_second_guard`).
   if snapshot_before == recommended {
     eprintln!(
       "skipping: snapshot_before ({snapshot_before}) == recommended ({recommended}); \
