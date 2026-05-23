@@ -34,7 +34,9 @@ use crate::{
 };
 
 /// One row of a parsed CMUDict file, BEFORE ARPAbet→IPA conversion.
-/// Mirrors swift's `CMUDictRawEntry`.
+/// Mirrors swift's `CMUDictRawEntry` (with one mlxrs extension:
+/// `line_number` is carried through so the lexicon converter can surface
+/// per-row errors with their source-line position).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RawEntry {
   /// The lowercase word (the variant suffix `(N)` is stripped).
@@ -45,6 +47,87 @@ pub struct RawEntry {
   /// `Some(n)` for variant pronunciations (`word(n)` syntax); `None` for
   /// the primary entry.
   pub variant: Option<u32>,
+  /// The 1-indexed source-line number this row came from. Carried so the
+  /// downstream ARPAbet → IPA converter can surface a malformed-token
+  /// error with the offending line position.
+  pub line_number: usize,
+}
+
+/// Construct a `malformed-word` [`Error::Backend`] tagged with the
+/// 1-indexed `line_number`, the offending `word_token`, and a short
+/// `reason` describing why the parse failed.
+fn malformed_word(word_token: &str, line_number: usize, reason: &str) -> Error {
+  Error::Backend {
+    message: format!(
+      "CMUDict line {line_number}: malformed word '{word_token}' (expected WORD or WORD(N)) — \
+       {reason}"
+    ),
+  }
+}
+
+/// Strict parse of a CMUDict word token into its base spelling and
+/// (optional) variant index.
+///
+/// Accepts exactly two shapes:
+/// - `WORD` — no parens, returns `(WORD, None)`.
+/// - `WORD(N)` — a non-empty base, an open paren, ≥1 ASCII digits, and a
+///   close paren that is the LAST character of the token. Returns
+///   `(WORD, Some(N))`.
+///
+/// Rejects every other shape (`the(x)`, `the()`, `the(2)junk`, `(2)`,
+/// `WORD(`) with a backend error tagged by `line_number` so the bulk
+/// parse can point the caller at the offending row.
+fn parse_word_and_variant(word_token: &str, line_number: usize) -> Result<(&str, Option<u32>)> {
+  let Some(open_idx) = word_token.find('(') else {
+    // No paren → bare WORD. (`word_part.is_empty()` is already rejected by
+    // the caller, so we don't re-check here.)
+    return Ok((word_token, None));
+  };
+
+  // Close paren MUST be the last char of the token (no trailing garbage
+  // after `WORD(N)`).
+  if !word_token.ends_with(')') {
+    return Err(malformed_word(
+      word_token,
+      line_number,
+      "trailing characters after closing paren (or missing closing paren)",
+    ));
+  }
+  // `find('(')` returns a byte index in an ASCII-only path, and `(` / `)`
+  // are single-byte; safe to slice byte-wise.
+  let base = &word_token[..open_idx];
+  if base.is_empty() {
+    return Err(malformed_word(
+      word_token,
+      line_number,
+      "empty base word before opening paren",
+    ));
+  }
+  // The token is at least `<base>(<...>)` with `base` non-empty and
+  // ending in `)`, so `open_idx + 1 <= word_token.len() - 1`.
+  let variant_str = &word_token[open_idx + 1..word_token.len() - 1];
+  if variant_str.is_empty() {
+    return Err(malformed_word(
+      word_token,
+      line_number,
+      "empty variant index between parens",
+    ));
+  }
+  if !variant_str.bytes().all(|b| b.is_ascii_digit()) {
+    return Err(malformed_word(
+      word_token,
+      line_number,
+      "variant index must be 1+ ASCII digits",
+    ));
+  }
+  let variant = variant_str.parse::<u32>().map_err(|_| {
+    malformed_word(
+      word_token,
+      line_number,
+      "variant index overflows u32 (>4_294_967_295)",
+    )
+  })?;
+  Ok((base, Some(variant)))
 }
 
 /// Parse a single CMUDict source line into a [`RawEntry`].
@@ -81,21 +164,9 @@ pub fn parse_line(line: &str, line_number: usize) -> Result<Option<RawEntry>> {
     });
   }
 
-  // Split `WORD(n)` into (word, variant).
-  let (word, variant) = if let Some(paren_start) = word_part.find('(') {
-    if let Some(paren_end) = word_part[paren_start + 1..]
-      .find(')')
-      .map(|i| paren_start + 1 + i)
-    {
-      let var_str = &word_part[paren_start + 1..paren_end];
-      let var = var_str.parse::<u32>().ok();
-      (word_part[..paren_start].to_lowercase(), var)
-    } else {
-      (word_part.to_lowercase(), None)
-    }
-  } else {
-    (word_part.to_lowercase(), None)
-  };
+  // Strict split of `WORD` / `WORD(N)`: any other shape errors.
+  let (word_str, variant) = parse_word_and_variant(word_part, line_number)?;
+  let word = word_str.to_lowercase();
 
   let arpabet: Vec<String> = pron_part
     .split(' ')
@@ -112,6 +183,7 @@ pub fn parse_line(line: &str, line_number: usize) -> Result<Option<RawEntry>> {
     word,
     arpabet,
     variant,
+    line_number,
   }))
 }
 
@@ -161,14 +233,41 @@ impl CMUDict {
   }
 
   /// Build a [`CMUDict`] from the parsed raw entries. Each row's ARPAbet
-  /// sequence is mapped to IPA via [`crate::audio::tts::g2p::arpabet`].
-  #[must_use]
-  pub fn from_raw_entries(raw: impl IntoIterator<Item = RawEntry>) -> Self {
-    let entries = raw.into_iter().map(|r| {
-      let phonemes = arpabet::convert_sequence(&r.arpabet);
-      LexiconEntry::new(r.word, phonemes)
-    });
-    Self::from_entries(entries)
+  /// sequence is mapped to IPA via
+  /// [`arpabet::try_convert_sequence_strict`] — the STRICT path: the first
+  /// unknown ARPAbet token in any row fails the whole build with
+  /// [`Error::Backend`] tagged by the source-line position.
+  ///
+  /// Empty post-conversion pronunciations (the row's `arpabet` was
+  /// non-empty pre-conversion but every token was rejected — currently
+  /// unreachable because
+  /// [`arpabet::try_convert_sequence_strict`] errors on the first
+  /// unknown, but a future refactor could relax that) are likewise
+  /// surfaced as a backend error: an empty pronunciation in a lexicon is
+  /// invalid by definition (it would block the lexicon-first /
+  /// neural-fallback pattern: a `Some` with an empty `phonemes` masks the
+  /// fallback case).
+  pub fn from_raw_entries(raw: impl IntoIterator<Item = RawEntry>) -> Result<Self> {
+    let mut entries = Vec::new();
+    for r in raw {
+      let phonemes =
+        arpabet::try_convert_sequence_strict(&r.arpabet).map_err(|bad| Error::Backend {
+          message: format!(
+            "CMUDict line {}: word '{}' has unknown ARPAbet token '{}'",
+            r.line_number, r.word, bad.token,
+          ),
+        })?;
+      if phonemes.is_empty() {
+        return Err(Error::Backend {
+          message: format!(
+            "CMUDict line {}: word '{}' has empty pronunciation after ARPAbet → IPA conversion",
+            r.line_number, r.word,
+          ),
+        });
+      }
+      entries.push(LexiconEntry::new(r.word, phonemes));
+    }
+    Ok(Self::from_entries(entries))
   }
 
   /// Number of unique graphemes in the lexicon.
@@ -227,7 +326,7 @@ impl CMUDictLoader {
     };
 
     let raw = parse(&text, true)?;
-    Ok(CMUDict::from_raw_entries(raw))
+    CMUDict::from_raw_entries(raw)
   }
 }
 
@@ -339,7 +438,7 @@ mod tests {
       true,
     )
     .unwrap();
-    CMUDict::from_raw_entries(raw)
+    CMUDict::from_raw_entries(raw).unwrap()
   }
 
   #[test]
@@ -375,16 +474,26 @@ mod tests {
     assert!(!dict.is_empty());
   }
 
+  /// `from_raw_entries` now uses the STRICT ARPAbet conversion path: an
+  /// unknown token mid-sequence fails the build with a backend error
+  /// carrying the word + offending token + 1-indexed line number.
+  ///
+  /// Inverts the previous (silent-skip) behaviour deliberately — a dropped
+  /// token silently corrupted lexicon entries (empty / wrong-length
+  /// pronunciation, blocking the lexicon-first / neural-fallback pattern).
   #[test]
-  fn from_raw_entries_silently_skips_unknown_arpabet() {
+  fn from_raw_entries_strict_rejects_unknown_arpabet() {
     let raw = vec![RawEntry {
       word: "weird".into(),
       arpabet: vec!["HH".into(), "XX".into(), "L".into()],
       variant: None,
+      line_number: 7,
     }];
-    let dict = CMUDict::from_raw_entries(raw);
-    let entry = dict.lookup("weird").unwrap();
-    assert_eq!(entry.phonemes, vec!["h", "l"]);
+    let err = CMUDict::from_raw_entries(raw).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("weird"), "expected word in {msg:?}");
+    assert!(msg.contains("XX"), "expected offending token in {msg:?}");
+    assert!(msg.contains("line 7"), "expected line number in {msg:?}");
   }
 
   // === Loader (file-system) ===
@@ -463,5 +572,109 @@ mod tests {
       dict.lookup("café").is_some(),
       "café should be present after Latin-1 fallback"
     );
+  }
+
+  // ============================================================
+  // F1 strict variant-parser tests — every malformed `WORD(...)` shape
+  // surfaces as `Err(Backend)` carrying the 1-indexed line number + the
+  // offending token. Previously these slipped through and (often) wrote
+  // a malformed `variant: None` entry as if it were the canonical
+  // pronunciation, silently corrupting the lexicon.
+  // ============================================================
+
+  #[test]
+  fn cmudict_parse_line_rejects_non_digit_variant_paren() {
+    let err = parse_line("the(x)  DH IY0", 13).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+      msg.contains("the(x)"),
+      "expected offending token in {msg:?}"
+    );
+    assert!(msg.contains("line 13"), "expected line number in {msg:?}");
+  }
+
+  #[test]
+  fn cmudict_parse_line_rejects_empty_paren() {
+    let err = parse_line("the()  DH IY0", 21).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("the()"), "expected offending token in {msg:?}");
+    assert!(msg.contains("line 21"), "expected line number in {msg:?}");
+  }
+
+  #[test]
+  fn cmudict_parse_line_rejects_trailing_garbage_after_paren() {
+    let err = parse_line("the(2)junk  DH IY0", 34).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+      msg.contains("the(2)junk"),
+      "expected offending token in {msg:?}"
+    );
+    assert!(msg.contains("line 34"), "expected line number in {msg:?}");
+  }
+
+  #[test]
+  fn cmudict_parse_line_rejects_empty_word_before_paren() {
+    let err = parse_line("(2)  DH IY0", 55).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("(2)"), "expected offending token in {msg:?}");
+    assert!(msg.contains("line 55"), "expected line number in {msg:?}");
+  }
+
+  // ============================================================
+  // F2 strict ARPAbet-conversion tests — driven through the loader so we
+  // exercise the same path real callers hit (parse → from_raw_entries),
+  // and so the surfaced error carries the 1-indexed line number.
+  // ============================================================
+
+  #[test]
+  fn cmudict_loader_rejects_unknown_arpabet_token() {
+    let dir = temp_dir("loader_unknown_arpabet");
+    // Two real lines so the offending row is on line 2 (1-indexed):
+    fs::write(
+      dir.join("cmudict.dict"),
+      "hello  HH AH0 L OW1\n\
+       word  XX YY\n",
+    )
+    .unwrap();
+    let err = CMUDictLoader::load(&dir).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("word"), "expected word in {msg:?}");
+    assert!(msg.contains("XX"), "expected offending token in {msg:?}");
+    assert!(msg.contains("line 2"), "expected line number in {msg:?}");
+  }
+
+  /// A row whose `arpabet` is non-empty pre-conversion but reduces to
+  /// nothing post-conversion must error (an empty pronunciation in a
+  /// lexicon is invalid by definition). This is a belt-and-suspenders
+  /// guard — currently unreachable because `try_convert_sequence_strict`
+  /// errors on the first unknown — but it locks the contract in case a
+  /// future refactor relaxes the strict path.
+  #[test]
+  fn cmudict_loader_rejects_empty_phonemes_after_conversion() {
+    let raw = vec![RawEntry {
+      word: "ghostword".into(),
+      arpabet: Vec::new(),
+      variant: None,
+      line_number: 17,
+    }];
+    let err = CMUDict::from_raw_entries(raw).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("ghostword"), "expected word in {msg:?}");
+    assert!(
+      msg.contains("empty"),
+      "expected 'empty' diagnostic in {msg:?}"
+    );
+    assert!(msg.contains("line 17"), "expected line number in {msg:?}");
+  }
+
+  /// Sanity-check: the strict fix doesn't break the happy path. A
+  /// well-formed `WORD  PHONEMES` row still loads + maps correctly.
+  #[test]
+  fn cmudict_loader_accepts_well_known_word_after_fix() {
+    let dir = temp_dir("loader_well_known_after_fix");
+    fs::write(dir.join("cmudict.dict"), "hello  HH AH0 L OW1\n").unwrap();
+    let dict = CMUDictLoader::load(&dir).unwrap();
+    let entry = dict.lookup("hello").expect("hello in dict");
+    assert_eq!(entry.phonemes, vec!["h", "ə", "l", "oʊ"]);
   }
 }
