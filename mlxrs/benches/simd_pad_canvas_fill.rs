@@ -17,7 +17,7 @@
 //! `codegen-units = 1`, `lto = 'thin'` in the workspace root
 //! `Cargo.toml` — no per-bench tuning needed.
 
-use std::hint::black_box;
+use std::{hint::black_box, mem::MaybeUninit};
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use mlxrs::simd::vlm::pad_canvas_fill::{pad_canvas_fill, pad_canvas_fill_scalar};
@@ -42,28 +42,42 @@ fn old_extend_loop(bytes: usize) -> Vec<u8> {
   buf
 }
 
-/// NEW scalar reference — `chunks_exact_mut(3) + copy_from_slice` on
-/// a pre-sized `vec![0u8; bytes]`. Matches the dispatcher's scalar
-/// arm bit-for-bit. The allocation is `vec![0u8; bytes]` rather than
-/// the call-site's `try_reserve_exact + spare_capacity_mut + set_len`
-/// dance so the bench measures the fill kernel — not the alloc
-/// pattern. The `vec![0u8; n]` zero-fill is identical across all three
-/// benches and effectively a `memset`, so any timing difference between
-/// the three benches isolates the fill loop.
+/// NEW scalar reference — `chunks_exact_mut(3)` per-slot `write` on
+/// `Vec<u8>::spare_capacity_mut()`. Matches the dispatcher's scalar
+/// arm bit-for-bit. The allocation is `Vec::with_capacity(bytes)` +
+/// kernel-write + `set_len` — the **exact** shape of the real
+/// `pad_to_square` call site (matches the type-encoded uninit-safe
+/// API). The `Vec::with_capacity(n)` call does one allocation with no
+/// zero-fill, so timing differences across the three benches isolate
+/// the fill loop.
 #[inline(never)]
 fn new_scalar(bytes: usize) -> Vec<u8> {
-  let mut buf = vec![0u8; bytes];
-  pad_canvas_fill_scalar(&mut buf, RGB);
+  let mut buf: Vec<u8> = Vec::with_capacity(bytes);
+  let spare: &mut [MaybeUninit<u8>] = buf.spare_capacity_mut();
+  pad_canvas_fill_scalar(&mut spare[..bytes], RGB);
+  // SAFETY: `pad_canvas_fill_scalar` wrote every byte of the first
+  // `bytes` `MaybeUninit<u8>` slots (function-level contract).
+  // `bytes <= buf.capacity()` because `Vec::with_capacity(bytes)`
+  // reserved exactly `bytes` slots, so `Vec::set_len`'s preconditions
+  // hold.
+  unsafe { buf.set_len(bytes) };
   buf
 }
 
 /// NEW dispatcher — on `aarch64` routes to the NEON 48-byte LCM(3,
 /// 16) tile, elsewhere to `pad_canvas_fill_scalar`. Same allocation
-/// shape as `new_scalar` so the timing diff isolates the NEON body.
+/// shape as `new_scalar` (and the real call site) so the timing diff
+/// isolates the NEON body.
 #[inline(never)]
 fn new_dispatch(bytes: usize) -> Vec<u8> {
-  let mut buf = vec![0u8; bytes];
-  pad_canvas_fill(&mut buf, RGB);
+  let mut buf: Vec<u8> = Vec::with_capacity(bytes);
+  let spare: &mut [MaybeUninit<u8>] = buf.spare_capacity_mut();
+  pad_canvas_fill(&mut spare[..bytes], RGB);
+  // SAFETY: `pad_canvas_fill` wrote every byte of the first `bytes`
+  // `MaybeUninit<u8>` slots (function-level contract). `bytes <=
+  // buf.capacity()` because `Vec::with_capacity(bytes)` reserved
+  // exactly `bytes` slots, so `Vec::set_len`'s preconditions hold.
+  unsafe { buf.set_len(bytes) };
   buf
 }
 

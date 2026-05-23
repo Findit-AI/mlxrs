@@ -1,5 +1,5 @@
-//! C6 — `pad_to_square` canvas fill: tile a `&mut [u8]` with a
-//! repeating 3-byte RGB pattern.
+//! C6 — `pad_to_square` canvas fill: tile a `&mut [MaybeUninit<u8>]`
+//! with a repeating 3-byte RGB pattern.
 //!
 //! Tracking: [#151](https://github.com/Findit-AI/mlxrs/issues/151).
 //! Plan: `docs/core-arch-simd-candidates.md` §2 row C6, §5.5 execution
@@ -70,11 +70,27 @@
 //! The differential test in this module asserts byte equality via
 //! [`crate::simd::diff::assert_eq_over_lane_sweep`] (the `Exact` class).
 //!
+//! # `MaybeUninit<u8>` API — type-encoded uninit safety
+//!
+//! The kernel API takes `&mut [MaybeUninit<u8>]` (not `&mut [u8]`) so
+//! the call site in [`crate::vlm::image::pad_to_square`] can pass
+//! `Vec::spare_capacity_mut()` **directly** — no `from_raw_parts_mut`
+//! cast over uninit backing memory (which would be UB regardless of
+//! the subsequent writes, per the `from_raw_parts_mut` safety contract
+//! requiring "properly initialized" elements). The kernels write every
+//! byte of `out` via `MaybeUninit::write` (scalar) or raw pointer store
+//! `vst1q_u8` (NEON) — both sound on `MaybeUninit`. The function-level
+//! contract on [`pad_canvas_fill`] is "every byte of `out` is written
+//! before this returns", so the caller may safely `set_len` over the
+//! covered region.
+//!
 //! # No new dependencies
 //!
-//! Pure `core::slice` + `core::arch::aarch64` (the latter is a `core`
-//! re-export, no crate dep). The dispatcher routes through
+//! Pure `core::slice` + `core::arch::aarch64` + `core::mem::MaybeUninit`
+//! (all `core`, no crate dep). The dispatcher routes through
 //! [`crate::simd::is_neon_available`].
+
+use core::mem::MaybeUninit;
 
 #[cfg(target_arch = "aarch64")]
 use core::arch::aarch64::{uint8x16_t, vld1q_u8, vst1q_u8};
@@ -83,29 +99,36 @@ use core::arch::aarch64::{uint8x16_t, vld1q_u8, vst1q_u8};
 /// reference — the bit-exact oracle for the NEON dispatcher.
 ///
 /// **Always compiled** — independent of `target_arch`. Anchors the
-/// math contract (a `(out.len() / 3)`-iteration `copy_from_slice` of
+/// math contract (a `(out.len() / 3)`-iteration `MaybeUninit::write` of
 /// the same 3-byte triple), is the differential-test oracle, and is
 /// the fallback path on every non-`aarch64` target.
 ///
+/// # Initialization contract
+///
+/// Every byte of `out` is written via `MaybeUninit::write` before this
+/// returns. On return the entire slice is fully initialized; the caller
+/// may treat the backing memory as `[u8]` (via `Vec::set_len`,
+/// `MaybeUninit::slice_assume_init_ref`, etc.).
+///
 /// # Implementation choice
 ///
-/// `chunks_mut(3).for_each(|c| c.copy_from_slice(&rgb))` over the
-/// **already-sized** `&mut [u8]` (caller has pre-reserved). The
+/// `chunks_exact_mut(3)` over the **already-sized**
+/// `&mut [MaybeUninit<u8>]` (caller has pre-reserved). Each chunk
+/// writes 3 `MaybeUninit::write` calls (one per RGB byte). The
 /// alternative — build a ~48-byte pre-broadcast LCM(3, 16) pattern on
 /// the stack and bulk-copy by 48-byte tiles — is what the NEON kernel
-/// does; we keep the scalar path simple (one `chunks_mut(3)` line) so
-/// it stays the trivially-auditable reference. LLVM emits a tight
-/// `stp`-pair loop on aarch64 for this shape — the bench shows it
-/// already runs at memory bandwidth on M-series silicon.
+/// does; we keep the scalar path simple (one `chunks_exact_mut(3)`
+/// line) so it stays the trivially-auditable reference. LLVM emits a
+/// tight `stp`-pair loop on aarch64 for this shape — the bench shows
+/// it already runs at memory bandwidth on M-series silicon.
 ///
 /// # Tail handling
 ///
 /// If `out.len() % 3 != 0` (a partial RGB triple at the end), the
 /// trailing 1 or 2 bytes are filled with the leading 1 or 2 bytes of
-/// `rgb`. This matches the `out.chunks_mut(3)` semantics: the final
-/// chunk has `len() < 3` and `copy_from_slice` would panic on a
-/// mismatched length, so the partial-triple tail is handled
-/// explicitly via a trailing `copy_from_slice(&rgb[..tail])`.
+/// `rgb`. This matches the `out.chunks_exact_mut(3)` semantics: the
+/// final remainder has `len() < 3` and we write each remaining slot
+/// individually with the corresponding `rgb` byte.
 ///
 /// **In the [`crate::vlm::image::pad_to_square`] call site `out.len()`
 /// is always a multiple of 3** (the byte count is `size * size * 3` by
@@ -116,19 +139,23 @@ use core::arch::aarch64::{uint8x16_t, vld1q_u8, vst1q_u8};
 /// covered by the differential test.
 #[inline]
 #[doc(hidden)]
-pub fn pad_canvas_fill_scalar(out: &mut [u8], rgb: [u8; 3]) {
+pub fn pad_canvas_fill_scalar(out: &mut [MaybeUninit<u8>], rgb: [u8; 3]) {
   let mut chunks = out.chunks_exact_mut(3);
   for c in chunks.by_ref() {
-    c.copy_from_slice(&rgb);
+    c[0].write(rgb[0]);
+    c[1].write(rgb[1]);
+    c[2].write(rgb[2]);
   }
   let tail = chunks.into_remainder();
-  if !tail.is_empty() {
-    // Partial-triple tail (1 or 2 bytes). Unreachable in the
-    // `pad_to_square` call site (canvas is always `size * size * 3`
-    // bytes — a multiple of 3) but tested via the
-    // `lane_sweep_lengths(16)` sweep, which includes lengths like
-    // 1 and 17 that are not multiples of 3.
-    tail.copy_from_slice(&rgb[..tail.len()]);
+  // Partial-triple tail (1 or 2 bytes). Unreachable in the
+  // `pad_to_square` call site (canvas is always `size * size * 3`
+  // bytes — a multiple of 3) but tested via the
+  // `lane_sweep_lengths(16)` sweep, which includes lengths like
+  // 1 and 17 that are not multiples of 3. Writing one slot at a
+  // time matches the `&rgb[..tail.len()]` semantics of the old
+  // `copy_from_slice(&rgb[..tail.len()])` form on `&mut [u8]`.
+  for (i, slot) in tail.iter_mut().enumerate() {
+    slot.write(rgb[i]);
   }
 }
 
@@ -152,15 +179,27 @@ pub fn pad_canvas_fill_scalar(out: &mut [u8], rgb: [u8; 3]) {
 ///    bounded above by 47 bytes — negligible compared to the body
 ///    even at the smallest tested 256² (≈196k B) canvas.
 ///
+/// # Initialization contract
+///
+/// Every byte of `out` is written before this returns — the body loop
+/// covers `out[0..body_len]` via raw `vst1q_u8` stores, and the
+/// scalar arm covers the trailing `out[body_len..]` via
+/// `MaybeUninit::write`. On return the entire slice is fully
+/// initialized.
+///
 /// # Safety
 ///
 /// 1. NEON must be available on the executing CPU. This is the
 ///    caller's obligation — the public dispatcher
 ///    [`pad_canvas_fill`] discharges it via
 ///    [`crate::simd::is_neon_available`].
-/// 2. `out` must be a valid `&mut [u8]` slice (the standard
-///    `&mut [T]` aliasing contract — Rust's borrow checker enforces
-///    this at every safe call site).
+/// 2. `out` must be a valid `&mut [MaybeUninit<u8>]` slice (the
+///    standard `&mut [T]` aliasing contract — Rust's borrow checker
+///    enforces this at every safe call site). Writing to
+///    `MaybeUninit<u8>` via a raw pointer store is always sound
+///    (`MaybeUninit<u8>` has no validity invariants beyond size +
+///    alignment; the standard library's `MaybeUninit` doc explicitly
+///    permits this idiom).
 ///
 /// There is no input alignment requirement: `vst1q_u8` accepts
 /// unaligned stores at full throughput on aarch64 (no faulting on
@@ -169,7 +208,7 @@ pub fn pad_canvas_fill_scalar(out: &mut [u8], rgb: [u8; 3]) {
 #[cfg(target_arch = "aarch64")]
 #[inline]
 #[target_feature(enable = "neon")]
-pub(crate) unsafe fn pad_canvas_fill_neon(out: &mut [u8], rgb: [u8; 3]) {
+pub(crate) unsafe fn pad_canvas_fill_neon(out: &mut [MaybeUninit<u8>], rgb: [u8; 3]) {
   // Build the 48-byte LCM(3, 16) pre-broadcast pattern on the stack.
   // Three RGB triples pack into 9 bytes; 48 / 3 = 16 triples = 48
   // bytes — exactly three `uint8x16_t` registers.
@@ -189,17 +228,24 @@ pub(crate) unsafe fn pad_canvas_fill_neon(out: &mut [u8], rgb: [u8; 3]) {
   // reads at offsets 0, 16, 32 are within bounds (each reads 16 bytes,
   // and 32 + 16 = 48 = pattern.len()). The body loop writes at offsets
   // [tile, tile+16, tile+32) with `tile + 48 <= body_len <= n =
-  // out.len()`, all within `out`. NEON availability is the caller's
-  // obligation (precondition #1 — discharged by the dispatcher's
-  // `is_neon_available()` check).
+  // out.len()`, all within `out`. Stores target `MaybeUninit<u8>`
+  // backing memory, which has no validity invariants and accepts any
+  // bit pattern — raw-pointer writes to it are sound. NEON
+  // availability is the caller's obligation (precondition #1 —
+  // discharged by the dispatcher's `is_neon_available()` check).
   unsafe {
     let v0: uint8x16_t = vld1q_u8(pattern.as_ptr());
     let v1: uint8x16_t = vld1q_u8(pattern.as_ptr().add(16));
     let v2: uint8x16_t = vld1q_u8(pattern.as_ptr().add(32));
 
+    // `out.as_mut_ptr()` returns `*mut MaybeUninit<u8>`; cast to
+    // `*mut u8` (same size + alignment, validity-permissive target)
+    // for the `vst1q_u8` stores.
+    let dst_base = out.as_mut_ptr().cast::<u8>();
+
     let mut tile = 0usize;
     while tile + 48 <= body_len {
-      let dst = out.as_mut_ptr().add(tile);
+      let dst = dst_base.add(tile);
       vst1q_u8(dst, v0);
       vst1q_u8(dst.add(16), v1);
       vst1q_u8(dst.add(32), v2);
@@ -211,7 +257,7 @@ pub(crate) unsafe fn pad_canvas_fill_neon(out: &mut [u8], rgb: [u8; 3]) {
   // The scalar arm respects the 3-byte period, so a tail length that
   // is not a multiple of 3 still writes the correct leading-RGB
   // prefix (matches the scalar reference's `chunks_exact_mut(3) +
-  // remainder copy_from_slice`).
+  // remainder per-slot `write`).
   if body_len < n {
     pad_canvas_fill_scalar(&mut out[body_len..], rgb);
   }
@@ -220,6 +266,14 @@ pub(crate) unsafe fn pad_canvas_fill_neon(out: &mut [u8], rgb: [u8; 3]) {
 /// Fill `out` with the repeating 3-byte RGB triple `rgb`. Routes to
 /// NEON on `aarch64` (when the CPU reports NEON), else to
 /// [`pad_canvas_fill_scalar`].
+///
+/// # Initialization contract
+///
+/// **Every byte of `out` is written before this returns.** On return
+/// the entire `&mut [MaybeUninit<u8>]` slice is fully initialized; the
+/// caller may treat the backing memory as `[u8]` (e.g. via
+/// `Vec::set_len` over the covered region after passing
+/// `spare_capacity_mut()`).
 ///
 /// Tracking: [#151](https://github.com/Findit-AI/mlxrs/issues/151).
 /// See `docs/core-arch-simd-candidates.md` §2 row C6 + §5.5 execution
@@ -244,16 +298,17 @@ pub(crate) unsafe fn pad_canvas_fill_neon(out: &mut [u8], rgb: [u8; 3]) {
 ///
 /// [`crate::vlm::image::pad_to_square`] — fills the pre-reserved
 /// `size * size * 3`-byte canvas with a uniform RGB triple before the
-/// source overlay step.
+/// source overlay step. Passes `canvas_buf.spare_capacity_mut()`
+/// directly (no `from_raw_parts_mut` cast).
 #[inline]
 #[doc(hidden)]
-pub fn pad_canvas_fill(out: &mut [u8], rgb: [u8; 3]) {
+pub fn pad_canvas_fill(out: &mut [MaybeUninit<u8>], rgb: [u8; 3]) {
   #[cfg(target_arch = "aarch64")]
   {
     if crate::simd::is_neon_available() {
       // SAFETY: `is_neon_available()` confirmed NEON is on this CPU
-      // (precondition #1). `&mut [u8]` borrow checker discharges
-      // precondition #2.
+      // (precondition #1). `&mut [MaybeUninit<u8>]` borrow checker
+      // discharges precondition #2.
       unsafe { pad_canvas_fill_neon(out, rgb) };
       return;
     }
@@ -265,9 +320,59 @@ pub fn pad_canvas_fill(out: &mut [u8], rgb: [u8; 3]) {
 mod tests {
   //! Scalar vs dispatcher differential tests + edge / behavioural
   //! coverage for C6.
+  //!
+  //! # Test adapter pattern
+  //!
+  //! The kernels take `&mut [MaybeUninit<u8>]` (type-encoded uninit-
+  //! safety contract — see the module-level doc). Tests assert on
+  //! initialized output, so each kernel is wrapped in a tiny
+  //! `*_init(n, rgb) -> Vec<u8>` adapter that:
+  //!   (1) allocates a `Vec<u8>` of capacity `n`,
+  //!   (2) calls the kernel on the first `n` slots of
+  //!       `spare_capacity_mut()`,
+  //!   (3) sets the length to `n` after the kernel returns (every byte
+  //!       written per the function-level contract).
+  //!
+  //! The adapters preserve the byte-equality assertions; the kernels
+  //! themselves write into uninitialized backing memory exactly as the
+  //! real `pad_to_square` call site does.
+
+  use core::mem::MaybeUninit;
 
   use super::{pad_canvas_fill, pad_canvas_fill_scalar};
   use crate::simd::diff::{assert_eq_over_lane_sweep, lane_sweep_lengths};
+
+  /// Test adapter — call [`pad_canvas_fill_scalar`] on `n` slots of
+  /// uninit `Vec<u8>` spare capacity, return the initialized
+  /// `Vec<u8>`.
+  fn pad_canvas_fill_scalar_init(n: usize, rgb: [u8; 3]) -> Vec<u8> {
+    let mut v: Vec<u8> = Vec::with_capacity(n);
+    let spare: &mut [MaybeUninit<u8>] = v.spare_capacity_mut();
+    pad_canvas_fill_scalar(&mut spare[..n], rgb);
+    // SAFETY: `pad_canvas_fill_scalar` wrote every byte of the first
+    // `n` `MaybeUninit<u8>` slots (function-level contract: "every
+    // byte of `out` is written before this returns"). `n <=
+    // v.capacity()` because `Vec::with_capacity(n)` reserved exactly
+    // `n` slots, so `Vec::set_len`'s preconditions hold.
+    unsafe { v.set_len(n) };
+    v
+  }
+
+  /// Test adapter — call [`pad_canvas_fill`] (dispatcher) on `n`
+  /// slots of uninit `Vec<u8>` spare capacity, return the initialized
+  /// `Vec<u8>`.
+  fn pad_canvas_fill_dispatch_init(n: usize, rgb: [u8; 3]) -> Vec<u8> {
+    let mut v: Vec<u8> = Vec::with_capacity(n);
+    let spare: &mut [MaybeUninit<u8>] = v.spare_capacity_mut();
+    pad_canvas_fill(&mut spare[..n], rgb);
+    // SAFETY: `pad_canvas_fill` wrote every byte of the first `n`
+    // `MaybeUninit<u8>` slots (function-level contract: "every byte
+    // of `out` is written before this returns"). `n <= v.capacity()`
+    // because `Vec::with_capacity(n)` reserved exactly `n` slots, so
+    // `Vec::set_len`'s preconditions hold.
+    unsafe { v.set_len(n) };
+    v
+  }
 
   /// `Exact` differential test (data-movement / lossless kernel).
   ///
@@ -286,14 +391,10 @@ mod tests {
   #[test]
   fn pad_canvas_fill_scalar_matches_dispatcher_exact() {
     fn fill_scalar(out: &[u8]) -> Vec<u8> {
-      let mut buf = vec![0u8; out.len()];
-      pad_canvas_fill_scalar(&mut buf, [1, 128, 254]);
-      buf
+      pad_canvas_fill_scalar_init(out.len(), [1, 128, 254])
     }
     fn fill_dispatch(out: &[u8]) -> Vec<u8> {
-      let mut buf = vec![0u8; out.len()];
-      pad_canvas_fill(&mut buf, [1, 128, 254]);
-      buf
+      pad_canvas_fill_dispatch_init(out.len(), [1, 128, 254])
     }
     // The generator's `n` is the lane sweep length; we multiply by 3
     // so the canvas size is always a multiple of 3 (matching the
@@ -318,14 +419,10 @@ mod tests {
   #[test]
   fn pad_canvas_fill_scalar_matches_dispatcher_partial_triple_tails() {
     fn fill_scalar(out: &[u8]) -> Vec<u8> {
-      let mut buf = vec![0u8; out.len()];
-      pad_canvas_fill_scalar(&mut buf, [42, 100, 200]);
-      buf
+      pad_canvas_fill_scalar_init(out.len(), [42, 100, 200])
     }
     fn fill_dispatch(out: &[u8]) -> Vec<u8> {
-      let mut buf = vec![0u8; out.len()];
-      pad_canvas_fill(&mut buf, [42, 100, 200]);
-      buf
+      pad_canvas_fill_dispatch_init(out.len(), [42, 100, 200])
     }
     assert_eq_over_lane_sweep(
       16,
@@ -349,16 +446,15 @@ mod tests {
   }
 
   /// Edge: empty canvas — both paths must be a no-op (no writes, no
-  /// panics). A length-0 `&mut [u8]` is a valid slice; the scalar
-  /// `chunks_exact_mut(3)` yields nothing, the remainder is empty,
-  /// and the NEON path's `body_len = 0 - 0 = 0` skips the loop and
-  /// the tail (both zero-length).
+  /// panics). A length-0 `&mut [MaybeUninit<u8>]` is a valid slice;
+  /// the scalar `chunks_exact_mut(3)` yields nothing, the remainder
+  /// is empty, and the NEON path's `body_len = 0 - 0 = 0` skips the
+  /// loop and the tail (both zero-length).
   #[test]
   fn pad_canvas_fill_empty_canvas_is_noop() {
-    let mut buf: Vec<u8> = Vec::new();
-    pad_canvas_fill(&mut buf, [1, 2, 3]);
+    let buf = pad_canvas_fill_dispatch_init(0, [1, 2, 3]);
     assert!(buf.is_empty());
-    pad_canvas_fill_scalar(&mut buf, [1, 2, 3]);
+    let buf = pad_canvas_fill_scalar_init(0, [1, 2, 3]);
     assert!(buf.is_empty());
   }
 
@@ -368,8 +464,7 @@ mod tests {
   /// by the scalar arm).
   #[test]
   fn pad_canvas_fill_one_pixel_canvas_writes_one_triple() {
-    let mut buf = vec![0u8; 3];
-    pad_canvas_fill(&mut buf, [10, 20, 30]);
+    let buf = pad_canvas_fill_dispatch_init(3, [10, 20, 30]);
     assert_eq!(buf, vec![10, 20, 30]);
   }
 
@@ -379,8 +474,7 @@ mod tests {
   /// tail is the full 15 bytes — scalar arm via the dispatcher.
   #[test]
   fn pad_canvas_fill_fifteen_bytes_five_pixels() {
-    let mut buf = vec![0u8; 15];
-    pad_canvas_fill(&mut buf, [7, 8, 9]);
+    let buf = pad_canvas_fill_dispatch_init(15, [7, 8, 9]);
     let expected: Vec<u8> = std::iter::repeat_n([7u8, 8, 9], 5).flatten().collect();
     assert_eq!(buf, expected);
   }
@@ -391,8 +485,7 @@ mod tests {
   /// NEON tile boundary (scalar via the dispatcher).
   #[test]
   fn pad_canvas_fill_eighteen_bytes_six_pixels() {
-    let mut buf = vec![0u8; 18];
-    pad_canvas_fill(&mut buf, [11, 22, 33]);
+    let buf = pad_canvas_fill_dispatch_init(18, [11, 22, 33]);
     let expected: Vec<u8> = std::iter::repeat_n([11u8, 22, 33], 6).flatten().collect();
     assert_eq!(buf, expected);
   }
@@ -402,11 +495,13 @@ mod tests {
   /// the NEON body loop with zero tail**. Body is 48 bytes (one tile),
   /// tail is 0 bytes (skipped). A bug in the body loop's exit
   /// condition (e.g. `tile + 48 < body_len` instead of `<=`) would
-  /// silently miss this tile, leaving zeros — caught here.
+  /// silently miss this tile, leaving the spare capacity uninit —
+  /// caught here (the adapter `set_len` would expose uninit reads in
+  /// the assert if Miri were run, and the byte-eq assert vs the
+  /// expected pattern catches it on stable).
   #[test]
   fn pad_canvas_fill_forty_eight_bytes_one_full_tile() {
-    let mut buf = vec![0u8; 48];
-    pad_canvas_fill(&mut buf, [100, 150, 200]);
+    let buf = pad_canvas_fill_dispatch_init(48, [100, 150, 200]);
     let expected: Vec<u8> = std::iter::repeat_n([100u8, 150, 200], 16)
       .flatten()
       .collect();
@@ -434,10 +529,9 @@ mod tests {
         "OLD loop length mismatch (fill={fill:?})"
       );
 
-      // NEW path — the dispatcher, called on a pre-sized buffer
-      // (matching the `pad_to_square` call site shape).
-      let mut new = vec![0u8; canvas_bytes];
-      pad_canvas_fill(&mut new, fill);
+      // NEW path — the dispatcher, called on uninit spare capacity
+      // (matching the real `pad_to_square` call site shape).
+      let new = pad_canvas_fill_dispatch_init(canvas_bytes, fill);
 
       assert_eq!(
         new, old,
@@ -459,8 +553,7 @@ mod tests {
       for _ in 0..(canvas_bytes / 3) {
         old.extend_from_slice(&fill);
       }
-      let mut new = vec![0u8; canvas_bytes];
-      pad_canvas_fill_scalar(&mut new, fill);
+      let new = pad_canvas_fill_scalar_init(canvas_bytes, fill);
       assert_eq!(
         new, old,
         "C6 scalar must produce byte-identical output to the OLD \
