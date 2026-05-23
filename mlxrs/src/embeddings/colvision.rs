@@ -89,9 +89,10 @@ use crate::{
   error::{Error, Result},
   ops::{
     linalg_basic::matmul,
+    logical::select,
     misc::astype,
     reduction::{max_axes, sum_axes},
-    shape::{concatenate, expand_dims_axes, stack, transpose_axes},
+    shape::{broadcast_to, concatenate, expand_dims_axes, stack, transpose_axes},
   },
 };
 
@@ -255,6 +256,43 @@ pub fn score_single_vector(qs: &[Array], ps: &[Array]) -> Result<Array> {
 /// is exactly `(b,c,n,s)` (the einsum semantic). No `mlx_einsum` FFI
 /// wrapper is needed.
 ///
+/// ## Deliberate divergence from the python reference: padded-passage masking
+///
+/// The python reference at
+/// [`mlx_embeddings/colvision_processor.py`](https://github.com/Blaizzy/mlx-embeddings/blob/main/mlx_embeddings/colvision_processor.py)
+/// lines 80-102 zero-pads ragged passages with **zero vectors** and
+/// then includes those padded columns in `mx.max(sim, axis=3)`. For
+/// signed embeddings (e.g. anything with negative similarity components
+/// — common with non-normalized or non-ReLU'd encoders) this is a
+/// **correctness bug**: a real similarity of `-1.0` between query and
+/// a passage token loses to the padded `0.0` dot product, so MaxSim
+/// reports `0` instead of `-1` whenever the passage was tile-padded.
+/// Worst-case, a passage's score depends on its `batch_size` tile
+/// neighbours: passage `p0 = [[-1, 0]]` returns `-1.0` alone but `0.0`
+/// when tiled with a length-2 passage. This violates the contract
+/// (MaxSim should be batch-size-agnostic) and corrupts ranking.
+///
+/// The mlxrs port fixes this by masking the padded positions to
+/// `f32::NEG_INFINITY` (cast via [`astype`] to the input dtype to
+/// preserve f16/bf16) **before** the [`max_axes`] reduction. Padded
+/// positions can never win the max, so the per-tile result equals the
+/// untiled result for every passage, restoring batch-size invariance.
+///
+/// Dtype choice: `f32::NEG_INFINITY` (via the existing `scalar_like`
+/// pattern shared with [`crate::embeddings::pooling::max_pooling`])
+/// rather than `T::MIN` finite — mlx's [`max_axes`] handles `-inf`
+/// cleanly (no NaN propagation: the input similarities are finite, so
+/// `max(finite, -inf) = finite` always). The all-padded edge case
+/// cannot arise here because the internal `pad_to_max` helper only ever
+/// pads *up to* the tile max length, so every column at index
+/// `< max_len` exists for at least one passage in the tile. (A `-inf`
+/// result would only escape
+/// the max if a real similarity happened to be `-inf`, which finite
+/// f32/f16/bf16 dot products of finite embeddings cannot produce.)
+///
+/// An upstream issue should be filed against
+/// <https://github.com/Blaizzy/mlx-embeddings> referencing this PR.
+///
 /// ## Errors
 /// - `qs.is_empty()` → [`Error::ShapeMismatch`] with the python message
 ///   `"No queries provided"` (line 76).
@@ -294,12 +332,21 @@ pub fn score_multi_vector(qs: &[Array], ps: &[Array], batch_size: usize) -> Resu
   let mut i = 0usize;
   while i < qs.len() {
     let j_end_q = i.saturating_add(batch_size).min(qs.len());
-    let qs_batch = pad_to_max(&qs[i..j_end_q])?;
+    // Query padding is benign: a zero query token has 0 dot product with
+    // every passage token (real or padded), so its post-max(axis=3) is
+    // 0 and contributes 0 to the sum(axis=2) — the per-passage score is
+    // unaffected. We therefore discard the query-side lengths.
+    let (qs_batch, _q_lens) = pad_to_max(&qs[i..j_end_q])?;
     let mut scores_batch_parts: Vec<Array> = Vec::with_capacity(ps.len().div_ceil(batch_size));
     let mut j = 0usize;
     while j < ps.len() {
       let j_end_p = j.saturating_add(batch_size).min(ps.len());
-      let ps_batch = pad_to_max(&ps[j..j_end_p])?;
+      // Passage padding is NOT benign — see the divergence note on the
+      // `score_multi_vector` doc: a zero passage column dot-producted
+      // with a real query token yields 0, and `max(real_negative, 0) = 0`
+      // → padded positions win the max for signed embeddings. Retain
+      // the original passage lengths so we can mask them out below.
+      let (ps_batch, p_lens) = pad_to_max(&ps[j..j_end_p])?;
       // python line 100: `mx.einsum("bnd,csd->bcns", qs_batch,
       // ps_batch)`. Expand qs_batch (b,n,d) → (b,1,n,d) and
       // ps_batch (c,s,d) → transpose to (c,d,s) → (1,c,d,s); a rank-4
@@ -309,8 +356,37 @@ pub fn score_multi_vector(qs: &[Array], ps: &[Array], batch_size: usize) -> Resu
       let ps_t = transpose_axes(&ps_batch, &[0, 2, 1])?; // (c,d,s)
       let ps_b = expand_dims_axes(&ps_t, &[0])?; // (1,c,d,s)
       let sim = matmul(&qs_b, &ps_b)?; // (b,c,n,s)
-      // python line 101: `mx.max(sim, axis=3)` → (b,c,n).
-      let maxsim = max_axes(&sim, &[3], false)?;
+      // DIVERGENCE FROM PYTHON REFERENCE: mask padded passage columns to
+      // -inf so they cannot win `max(axis=3)`. See the module-level
+      // divergence note. The mask is shape `(c, s)` (one row per
+      // passage in the tile, one column per token position). It is
+      // explicitly expanded to `(1, c, 1, s)` and broadcast to
+      // `(b, c, n, s)` before [`select`] so the masking is independent
+      // of every `(b, n)` query position.
+      let s_shape = sim.shape(); // (b, c, n, s)
+      let (b, c, n, s_max) = (s_shape[0], s_shape[1], s_shape[2], s_shape[3]);
+      // Build a flat (c * s_max) bool mask: true = real, false = padded.
+      // p_lens[k] is the *original* length of passage k in this tile.
+      let mut flat_mask: Vec<bool> = Vec::with_capacity(c * s_max);
+      for &len in &p_lens {
+        for t in 0..s_max {
+          flat_mask.push(t < len);
+        }
+      }
+      let mask_cs = Array::from_slice::<bool>(&flat_mask, &(c, s_max))?; // (c, s)
+      // Reshape to (1, c, 1, s_max), broadcast to (b, c, n, s_max).
+      let mask_4d = expand_dims_axes(&mask_cs, &[0, 2])?; // (1, c, 1, s_max)
+      let mask_full = broadcast_to(&mask_4d, &(b, c, n, s_max))?;
+      // -inf scalar in `sim`'s dtype so the mask preserves f16/bf16 (no
+      // silent f32 promotion). Mirrors the `scalar_like` pattern used in
+      // `embeddings::pooling::max_pooling`.
+      let neg_inf_scalar = Array::full::<f32>(&(1,), f32::NEG_INFINITY)?;
+      let neg_inf = astype(&neg_inf_scalar, sim.dtype()?)?;
+      let neg_inf_bcast = broadcast_to(&neg_inf, &(b, c, n, s_max))?;
+      let sim_masked = select(&mask_full, &sim, &neg_inf_bcast)?;
+      // python line 101: `mx.max(sim, axis=3)` → (b,c,n). Padded
+      // positions are now -inf so they can't win the max.
+      let maxsim = max_axes(&sim_masked, &[3], false)?;
       // python line 102: `mx.sum(maxsim, axis=2)` → (b,c).
       let summed = sum_axes(&maxsim, &[2], false)?;
       scores_batch_parts.push(summed);
@@ -373,7 +449,17 @@ pub fn score_multi_vector(qs: &[Array], ps: &[Array], batch_size: usize) -> Resu
 /// `!arrays.is_empty()` as a precondition; calling with an empty slice
 /// returns [`Error::ShapeMismatch`] (defensive — would otherwise panic
 /// on `arrays[0].shape()`).
-fn pad_to_max(arrays: &[Array]) -> Result<Array> {
+///
+/// ## Return shape (diverges from python)
+///
+/// Returns `(padded, original_lengths)`:
+/// - `padded` — the stacked `(len, max_n, d)` batch (the python return).
+/// - `original_lengths` — a `Vec<usize>` of length `arrays.len()` where
+///   `original_lengths[i] == arrays[i].shape()[0]` (before padding).
+///   Required by [`score_multi_vector`] to mask the zero-padded
+///   passage columns to `-inf` before the MaxSim `max(axis=3)`. See
+///   the divergence note on [`score_multi_vector`].
+pub(crate) fn pad_to_max(arrays: &[Array]) -> Result<(Array, Vec<usize>)> {
   if arrays.is_empty() {
     return Err(Error::ShapeMismatch {
       message: "pad_to_max: arrays slice is empty".into(),
@@ -394,6 +480,7 @@ fn pad_to_max(arrays: &[Array]) -> Result<Array> {
   }
   let emb_dim = first_shape[1]; // python line 82
   let mut max_len: usize = 0;
+  let mut original_lengths: Vec<usize> = Vec::with_capacity(arrays.len());
   for a in arrays {
     let sh = a.shape();
     if sh.len() != 2 {
@@ -416,6 +503,7 @@ fn pad_to_max(arrays: &[Array]) -> Result<Array> {
     if sh[0] > max_len {
       max_len = sh[0];
     }
+    original_lengths.push(sh[0]);
   }
   // python lines 83-90: zero-pad each array to (max_len, emb_dim) in
   // its own dtype; arrays already at max_len pass through.
@@ -447,7 +535,8 @@ fn pad_to_max(arrays: &[Array]) -> Result<Array> {
   }
   // python line 91: `mx.stack(padded)`.
   let refs: Vec<&Array> = padded.iter().collect();
-  stack(&refs)
+  let stacked = stack(&refs)?;
+  Ok((stacked, original_lengths))
 }
 
 #[cfg(test)]
@@ -637,7 +726,7 @@ mod tests {
   fn pad_to_max_pads_ragged_then_stacks() {
     let a = Array::from_slice::<f32>(&[1.0, 2.0], &(1, 2)).unwrap(); // n=1
     let b = Array::from_slice::<f32>(&[3.0, 4.0, 5.0, 6.0], &(2, 2)).unwrap(); // n=2
-    let mut padded = pad_to_max(&[a, b]).unwrap();
+    let (mut padded, _lens) = pad_to_max(&[a, b]).unwrap();
     // (len=2, max_n=2, d=2). a is padded with one zero row; b is unchanged.
     assert_eq!(padded.shape(), vec![2, 2, 2]);
     let v = padded.to_vec::<f32>().unwrap();
@@ -687,12 +776,89 @@ mod tests {
       .unwrap()
       .astype(Dtype::F16)
       .unwrap();
-    let padded = pad_to_max(&[a, b]).unwrap();
+    let (padded, _lens) = pad_to_max(&[a, b]).unwrap();
     assert_eq!(padded.shape(), vec![2, 2, 2]);
     assert_eq!(
       padded.dtype().unwrap(),
       Dtype::F16,
       "padding must preserve input dtype (python L87 `dtype=a.dtype`)"
+    );
+  }
+
+  /// Sanity check on the divergence-from-python tuple return shape:
+  /// `pad_to_max` reports the **original** lengths of each input array
+  /// (before zero-padding), in input order. The mask in
+  /// [`score_multi_vector`] depends on this contract.
+  #[test]
+  fn pad_to_max_returns_original_lengths() {
+    let a = Array::from_slice::<f32>(&[1.0, 2.0], &(1, 2)).unwrap(); // n=1
+    let b = Array::from_slice::<f32>(&[3.0, 4.0, 5.0, 6.0], &(2, 2)).unwrap(); // n=2
+    let c = Array::from_slice::<f32>(&[7.0, 8.0, 9.0, 10.0, 11.0, 12.0], &(3, 2)).unwrap(); // n=3
+    let (padded, lens) = pad_to_max(&[a, b, c]).unwrap();
+    assert_eq!(padded.shape(), vec![3, 3, 2], "stacked to (3, max_n=3, 2)");
+    assert_eq!(
+      lens,
+      vec![1, 2, 3],
+      "original_lengths must mirror input order"
+    );
+  }
+
+  /// REGRESSION (Codex finding, round 1): zero-padded passages must not
+  /// win `max(axis=3)` for signed embeddings. With
+  /// `q = [[1, 0]]`, `p0 = [[-1, 0]]`, `p1 = [[2, 0], [0, 1]]`:
+  /// - Scoring `p0` alone (`batch_size = 1`, no padding): MaxSim is
+  ///   `max(<q, p0_0>) = max(-1) = -1` → sum = -1.
+  /// - Scoring `[p0, p1]` together with `batch_size = 2` (p0 gets a
+  ///   zero-pad row to match p1's length 2): python ref returns
+  ///   `max(-1, 0) = 0` (wrong; padded zero won). mlxrs must return
+  ///   `-1.0` (the unpadded answer) in BOTH cases — ranking is
+  ///   batch-size-agnostic.
+  ///
+  /// Codex finding rationale: the upstream
+  /// `mlx_embeddings/colvision_processor.py` includes the zero-padded
+  /// columns in `mx.max(sim, axis=3)`. mlxrs masks them to
+  /// `f32::NEG_INFINITY` (cast to the input dtype) before the max.
+  #[test]
+  fn score_multi_vector_ragged_negative_similarity_batch_size_agnostic() {
+    let q = Array::from_slice::<f32>(&[1.0, 0.0], &(1, 2)).unwrap();
+    let p0 = Array::from_slice::<f32>(&[-1.0, 0.0], &(1, 2)).unwrap();
+    let p1 = Array::from_slice::<f32>(&[2.0, 0.0, 0.0, 1.0], &(2, 2)).unwrap();
+
+    // Branch A: batch_size=1, p0 is processed alone (no padding).
+    let mut scores_b1 = score_multi_vector(
+      std::slice::from_ref(&q),
+      &[p0.try_clone().unwrap(), p1.try_clone().unwrap()],
+      1,
+    )
+    .unwrap();
+    assert_eq!(scores_b1.shape(), vec![1, 2]);
+    let v_b1 = scores_b1.to_vec::<f32>().unwrap();
+
+    // Branch B: batch_size=2, p0 is tile-padded with a zero row.
+    let mut scores_tiled = score_multi_vector(std::slice::from_ref(&q), &[p0, p1], 2).unwrap();
+    assert_eq!(scores_tiled.shape(), vec![1, 2]);
+    let v_tiled = scores_tiled.to_vec::<f32>().unwrap();
+
+    // p0 score (index 0) must be -1.0 in BOTH branches.
+    assert_eq!(
+      v_b1[0], -1.0,
+      "p0 alone: <q,p0_0> = -1.0; sum over the single query token = -1.0"
+    );
+    assert_eq!(
+      v_tiled[0], -1.0,
+      "p0 tiled with p1: padded zero column must be masked → -1.0, not 0.0"
+    );
+
+    // p1's score should be the same in both branches too (sanity).
+    assert_eq!(
+      v_b1[1], v_tiled[1],
+      "p1 score must be tile-invariant in both branches"
+    );
+
+    // The whole vector must be batch-size-agnostic.
+    assert_eq!(
+      v_b1, v_tiled,
+      "score_multi_vector ranking must not depend on batch_size"
     );
   }
 
