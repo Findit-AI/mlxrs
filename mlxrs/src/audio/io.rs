@@ -68,13 +68,17 @@ use symphonia::core::{
 
 use crate::error::{Error, Result};
 
-/// PCM-16 full-scale; matches `mlx-audio`'s `int16 → float32` divisor on
-/// `read` and `float32 → int16` multiplier on `write` (the reference uses
-/// `32768.0` on read and `32767` on write — both conventions are common and
-/// mlx-audio inherits scipy's split; we follow `read=32768.0` /
-/// `write=32767` to match `mlx_audio.audio_io.read` and `.write` exactly).
+/// PCM-16 full-scale on `read`; matches `mlx-audio`'s `int16 → float32`
+/// divisor on `read` (the reference uses `32768.0` on read and `32767`
+/// on write — both conventions are common and mlx-audio inherits scipy's
+/// split; we follow `read=32768.0` / `write=32767` to match
+/// `mlx_audio.audio_io.read` and `.write` exactly).
+///
+/// On `write`, the C7 SIMD quantizer in
+/// [`crate::simd::audio::quantize`] carries the matching `32767`
+/// multiplier; that constant lives in the SIMD module so the NEON
+/// kernel and scalar reference share one source of truth.
 const I16_DIV: f32 = 32768.0;
-const I16_MUL: f32 = 32767.0;
 
 /// Public-input-driven Vec allocation cap. Hard ceiling on the number of
 /// f32 samples [`load_audio`] / [`resample_linear`] will materialize from
@@ -821,16 +825,86 @@ pub fn save_wav(path: &Path, samples: &[f32], sample_rate: u32) -> Result<()> {
       message: format!("save_wav: header write failed: {e}"),
     })?;
 
-    // Stream the samples. Quantization: clip to `[-1, 1]`, multiply by
-    // `I16_MUL = 32767`, round to nearest, cast to i16, write LE.
-    for &s in samples {
-      let clipped = s.clamp(-1.0, 1.0);
-      let q = (clipped * I16_MUL).round() as i16;
-      writer
-        .write_all(&q.to_le_bytes())
-        .map_err(|e| Error::Backend {
-          message: format!("save_wav: sample write failed: {e}"),
-        })?;
+    // Quantize all samples first via the C7 SIMD dispatcher
+    // (`simd::audio::quantize::f32_to_i16_quantize`) — clip to `[-1, 1]`,
+    // multiply by `I16_MUL = 32767`, round-half-away-from-zero, cast to
+    // i16. On `aarch64` this routes to an 8-lane NEON tile (vminq/vmaxq
+    // clamp → vmulq_n scale → vcvtaq_s32 round (FCVTAS, ties away from
+    // zero — bit-exact match for `f32::round`) → vqmovn+vcombine narrow
+    // → vst1q_s16 store); elsewhere it falls back to the scalar
+    // `clamp + round + cast` loop. See `docs/core-arch-simd-candidates.md`
+    // §2 row C7 + §3.5 + tracking [#152].
+    //
+    // The dispatcher takes `&mut [MaybeUninit<i16>]` (type-encoded
+    // uninit safety), so we pre-reserve via `try_reserve_exact` (so a
+    // multi-GB sample buffer cannot trigger an infallible abort here),
+    // pass the spare capacity directly, and `set_len` after every i16
+    // has been written. Then a SINGLE `write_all` writes the entire
+    // i16 byte view in one syscall — replacing the per-sample
+    // BufWriter pushes.
+    let mut quantized: Vec<i16> = Vec::new();
+    quantized
+      .try_reserve_exact(samples.len())
+      .map_err(|_| Error::OutOfMemory)?;
+    {
+      let spare: &mut [core::mem::MaybeUninit<i16>] = quantized.spare_capacity_mut();
+      // `samples.len() <= spare.len()` because `try_reserve_exact(samples.len())`
+      // above reserved exactly that much capacity.
+      debug_assert!(spare.len() >= samples.len());
+      crate::simd::audio::quantize::f32_to_i16_quantize(&mut spare[..samples.len()], samples);
+    }
+    // SAFETY: `f32_to_i16_quantize` wrote every i16 in `0..samples.len()`
+    // of the spare capacity (function-level contract). `Vec::set_len`'s
+    // preconditions: (1) `samples.len() <= quantized.capacity()` — the
+    // `try_reserve_exact` succeeded; (2) elements at `[0..samples.len()]`
+    // are initialized — kernel contract guarantees this.
+    unsafe { quantized.set_len(samples.len()) };
+
+    // Single bulk write of the entire i16 buffer as little-endian bytes.
+    // `to_le` on i16 is a no-op on LE hosts (the common case) and a
+    // bswap on BE hosts; per-element. After the conversion, the
+    // `&[i16]` is reinterpreted as `&[u8]` of `2 * samples.len()` bytes
+    // and written in one shot. The wav format stores i16 samples in
+    // little-endian order regardless of host endianness.
+    if cfg!(target_endian = "little") {
+      // SAFETY: `quantized` is `Vec<i16>` (len = samples.len(),
+      // cap = samples.len()), all initialized above. On a
+      // little-endian host the i16 in-memory representation IS the
+      // LE byte order required by the WAV format — reinterpret the
+      // contiguous slice as `&[u8]` of double the length for a
+      // single zero-copy `write_all`. `i16` and `u8` have well-
+      // defined layouts (no padding, no validity invariants), so a
+      // borrow of one as the other via `from_raw_parts` is sound.
+      // The borrow lives only for the `write_all` call below.
+      let byte_view: &[u8] = unsafe {
+        core::slice::from_raw_parts(
+          quantized.as_ptr().cast::<u8>(),
+          quantized.len().checked_mul(2).expect(
+            "save_wav: byte-view length overflow (cap was MAX_MONO_I16_SAMPLES, * 2 ≤ u32::MAX - 36)",
+          ),
+        )
+      };
+      writer.write_all(byte_view).map_err(|e| Error::Backend {
+        message: format!("save_wav: bulk sample write failed: {e}"),
+      })?;
+    } else {
+      // Big-endian host: byteswap each i16 into a small stack buffer
+      // and write in chunks. Not benchmarked; rare path.
+      const CHUNK: usize = 1024;
+      let mut buf = [0u8; CHUNK * 2];
+      let mut idx = 0;
+      while idx < quantized.len() {
+        let n = (quantized.len() - idx).min(CHUNK);
+        for (i, &q) in quantized[idx..idx + n].iter().enumerate() {
+          buf[i * 2..i * 2 + 2].copy_from_slice(&q.to_le_bytes());
+        }
+        writer
+          .write_all(&buf[..n * 2])
+          .map_err(|e| Error::Backend {
+            message: format!("save_wav: bulk sample write failed: {e}"),
+          })?;
+        idx += n;
+      }
     }
 
     // BufWriter does NOT auto-flush on drop into a Result, and a missed
