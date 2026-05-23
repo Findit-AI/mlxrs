@@ -98,21 +98,49 @@ pub trait ToolParser: Send + Sync {
   }
 
   /// Attempt to parse ONE complete tagged tool-call section starting in
-  /// `buffer`. Returns `Ok(Some((calls, end_pos)))` when `buffer` contains a
-  /// complete section — `calls` are the [`ToolCall`]s extracted from that
-  /// section (one for singleton parsers; many for multi-block parsers like
-  /// `minimax_m2`, `kimi_k2`, `gemma4`) and `end_pos` is the byte position
-  /// one past the last byte the section consumed. Returns `Ok(None)` if
-  /// `buffer` is incomplete (the streaming caller appends the next chunk
-  /// and retries). Returns `Err` for an unrecoverable malformation.
+  /// `buffer`.
   ///
-  /// **Critical contract:** this method UNIFIES extraction and end-detection
-  /// — it must use EXACTLY the same find/rfind/iteration order as
-  /// [`parse`](Self::parse) over the same payload, so streaming and batch
-  /// results are identical for every input. The L9 R10 structural pivot:
-  /// each parser owns ONE method that performs both jobs in lock-step,
-  /// instead of a separate end-tag-scanner that drifts from `parse`
-  /// round-after-round (R7..R10 chased exactly that drift).
+  /// # Return contract (L9 R12 tightened)
+  ///
+  /// - **`Ok(Some((calls, end_pos)))`** — `buffer[..end_pos]` IS a complete,
+  ///   known-bounded section. `end_pos` is the byte position one past the
+  ///   last byte the section consumed. `calls` are the [`ToolCall`]s
+  ///   extracted from that section (one for singleton parsers; many for
+  ///   multi-block parsers like `minimax_m2`, `kimi_k2`, `gemma4`).
+  ///
+  ///   `calls` MAY be empty when the section is structurally a tagged-call
+  ///   shape but its body is rejected on inspection (e.g. `json_tools`
+  ///   served a top-level array that fails the `name` lookup). The streaming
+  ///   processor TREATS THE EMPTY CASE IDENTICALLY to the non-empty case:
+  ///   the section's bytes are dropped, the suffix `buffer[end_pos..]` from
+  ///   the SAME chunk is preserved as display / re-examined for back-to-back
+  ///   sections. This is what makes `process_chunk("[tc]bad[/tc]visible")`
+  ///   surface `visible` even when the parser rejected the body (L9 R12).
+  ///
+  /// - **`Ok(None)`** — the buffer is incomplete (no recognisable end of
+  ///   section yet). The streaming caller appends the next chunk and
+  ///   retries; the buffered bytes are preserved.
+  ///
+  /// - **`Err(_)`** — RESERVED for *truly indeterminate* failures with NO
+  ///   recoverable `end_pos` (e.g. an internal error from the parser itself
+  ///   or an input shape that defies even section-boundary detection). The
+  ///   streaming processor treats this as if the whole buffer is bad: it
+  ///   drains its tool-call buffer and resets to the normal (pre-detection)
+  ///   state. A confirmed-but-rejected section that knows where it ends
+  ///   MUST NOT use this arm — same-chunk suffix bytes would be permanently
+  ///   lost (L9 R12 motivating case).
+  ///
+  /// # Lock-step with [`parse`](Self::parse)
+  ///
+  /// This method UNIFIES extraction and end-detection — it must use EXACTLY
+  /// the same find/rfind/iteration order as [`parse`](Self::parse) over the
+  /// same payload, so streaming and batch results are identical for every
+  /// input. The L9 R10 structural pivot: each parser owns ONE method that
+  /// performs both jobs in lock-step, instead of a separate end-tag-scanner
+  /// that drifts from `parse` round-after-round (R7..R10 chased exactly
+  /// that drift).
+  ///
+  /// # Multi-call parsers
   ///
   /// For multi-call parsers the streaming caller does NOT loop on per-inner-
   /// block extraction here: `try_parse_one_call` peels off ONE TAGGED
@@ -2127,6 +2155,14 @@ impl ToolCallProcessor {
   /// structurally malformed for THIS parser, so holding onto it until the cap
   /// fires would suppress every subsequent output token until cap or EOS.
   /// Resetting eagerly lets the next chunk start fresh in [`State::Normal`].
+  ///
+  /// **L9 R12 contract:** dropping the whole buffer here also drops any
+  /// suffix bytes that arrived in the SAME chunk after a malformed-section
+  /// close. The tightened [`ToolParser::try_parse_one_call`] return contract
+  /// reserves `Err` for *truly indeterminate* failures where no `end_pos`
+  /// is known — confirmed-but-rejected sections (the common case for
+  /// production parsers) MUST return `Ok(Some((Vec::new(), end_pos)))`
+  /// instead, so the processor preserves the same-chunk suffix.
   fn reset_on_malformed(&mut self, display: &mut Option<String>) {
     if let Some(flushed) = self.recover_at_cap() {
       push_display(display, &flushed);
@@ -2347,12 +2383,16 @@ impl ToolCallProcessor {
       // sole `try_parse_one_call` method. Lock-step with `parse()` removes
       // the round-after-round drift between a separate end-tag scanner and
       // each parser's own extraction logic (R7..R10 chased exactly that
-      // drift). Match outcomes:
-      //   Ok(Some((calls, end_pos))) → emit the calls, truncate the buffer
-      //     to `[end_pos..]`, loop on any remaining suffix that contains the
-      //     start char (back-to-back sections);
+      // drift). Match outcomes (L9 R12 tightened contract — see the trait
+      // doc on `ToolParser::try_parse_one_call`):
+      //   Ok(Some((calls, end_pos))) → confirmed-bounded section. Emit any
+      //     calls (may be EMPTY for a structurally-tagged but body-rejected
+      //     section — L9 R12: the bytes are dropped but the same-chunk
+      //     suffix `[end_pos..]` is preserved as display / re-examined for
+      //     back-to-back sections);
       //   Ok(None) → buffer is incomplete, keep collecting (apply cap);
-      //   Err → malformed section, recover via cap path.
+      //   Err → truly indeterminate (no end_pos available), recover via
+      //     unconditional reset.
       let outcome = self
         .parser
         .try_parse_one_call(&self.tool_call_buffer, self.tools.as_ref());
@@ -2364,6 +2404,9 @@ impl ToolCallProcessor {
             self.cap_recover_into(&mut display);
             return display;
           }
+          // L9 R12: `extend(empty)` is a no-op for body-rejected sections;
+          // the section bytes are dropped, but the trailing suffix from the
+          // SAME chunk is preserved verbatim (display or re-examination).
           self.tool_calls.extend(calls);
           let trailing_token = self.tool_call_buffer[end_pos..].to_owned();
           self.tool_call_buffer.clear();
@@ -2384,11 +2427,16 @@ impl ToolCallProcessor {
           return display;
         }
         Err(_) => {
-          // Malformed section (L9 R11 finding-2): reset state UNCONDITIONALLY
-          // — `cap_recover_into` is a no-op below `MAX_TOOL_CALL_BUFFER_BYTES`,
-          // which would suppress every later output token until the cap fires
-          // or EOS. `reset_on_malformed` drains immediately so the next chunk
-          // starts fresh in `State::Normal`.
+          // Truly indeterminate (L9 R11 finding-2, L9 R12 tightened): the
+          // parser knows the section is bad but cannot identify its end
+          // boundary. Reset state UNCONDITIONALLY — `cap_recover_into` is a
+          // no-op below `MAX_TOOL_CALL_BUFFER_BYTES`, which would suppress
+          // every later output token until the cap fires or EOS.
+          // `reset_on_malformed` drains immediately so the next chunk starts
+          // fresh in `State::Normal`. Note: parsers that DO know the section
+          // end MUST use `Ok(Some((Vec::new(), end_pos)))` instead — this
+          // arm necessarily drops any same-chunk suffix because no end_pos
+          // is available to slice it off.
           self.reset_on_malformed(&mut display);
           return display;
         }
@@ -5286,5 +5334,227 @@ mod tests {
     // Plain text passes through normally.
     let out = p.process_chunk("plain");
     assert_eq!(out.as_deref(), Some("plain"));
+  }
+
+  // --- L9 R12 finding regression coverage ---------------------------------
+  // The R11 Err arm of `process_tagged_chunk` calls `reset_on_malformed`
+  // which drops the ENTIRE `tool_call_buffer`. When the buffer also holds
+  // suffix bytes AFTER a malformed section's end-tag from the SAME chunk
+  // those bytes are permanently lost. R12 tightens the trait contract:
+  // confirmed-but-rejected sections MUST return `Ok(Some((Vec::new(),
+  // end_pos)))` so the processor can preserve the suffix as display. The
+  // Err arm is reserved for truly indeterminate failures where no end_pos
+  // is known (the existing R11 tests above still cover that case verbatim).
+
+  /// Tagged-format test parser that exemplifies the R12 tightened contract:
+  /// once a complete `<tc>...</tc>` section is present it returns
+  /// `Ok(Some((Vec::new(), end_pos)))` (empty calls + the end_pos one past
+  /// the `</tc>` close) so the processor preserves the same-chunk suffix.
+  struct RejectedSectionParser;
+
+  impl ToolParser for RejectedSectionParser {
+    fn parse(&self, _text: &str, _tools: Option<&Value>) -> Result<Vec<ToolCall>, Error> {
+      // `parse` rejects every payload — matching the streaming behaviour.
+      Err(err("rejected_section_test_parser: rejected"))
+    }
+    fn name(&self) -> &'static str {
+      "rejected_section_test_parser"
+    }
+    fn tool_call_start(&self) -> &'static str {
+      "<tc>"
+    }
+    fn tool_call_end(&self) -> &'static str {
+      "</tc>"
+    }
+    fn try_parse_one_call(
+      &self,
+      buffer: &str,
+      _tools: Option<&Value>,
+    ) -> Result<Option<(Vec<ToolCall>, usize)>, Error> {
+      // Detect a complete `<tc>...</tc>` section and return zero calls plus
+      // the byte position one past the section close. This is the R12
+      // contract for confirmed-but-rejected sections: identifying the end
+      // boundary lets the processor preserve any same-chunk suffix.
+      let start = "<tc>";
+      let end = "</tc>";
+      let Some(s) = buffer.find(start) else {
+        return Ok(None);
+      };
+      let after_start = s + start.len();
+      let Some(e_rel) = buffer[after_start..].find(end) else {
+        return Ok(None);
+      };
+      let end_pos = after_start + e_rel + end.len();
+      Ok(Some((Vec::new(), end_pos)))
+    }
+  }
+
+  #[test]
+  fn processor_rejected_section_preserves_same_chunk_suffix() {
+    // R12 finding: the malformed section closes mid-chunk and the trailing
+    // bytes (`visible`) arrive in the SAME process_chunk call. Under the
+    // pre-R12 Err contract the trailing bytes were lost to
+    // `reset_on_malformed`'s buffer drop. Under the R12 Ok-empty contract
+    // the processor truncates to `[end_pos..]` and surfaces the suffix as
+    // display text, byte-for-byte.
+    let (display, calls) =
+      run_with_parser(Box::new(RejectedSectionParser), &["<tc>bad</tc>visible"]);
+    assert_eq!(calls.len(), 0, "rejected section emits no tool calls");
+    assert_eq!(
+      display, "visible",
+      "trailing suffix from the SAME chunk must survive the rejected section"
+    );
+  }
+
+  #[test]
+  fn processor_rejected_section_preserves_same_chunk_suffix_split_chunk() {
+    // R12 companion: the same rejected section + trailing suffix split
+    // across chunk boundaries (start tag in chunk 1; close + suffix in
+    // chunk 2). The suffix still reaches display because the section is
+    // closed in chunk 2 and its [end_pos..] is processed there.
+    let (display, calls) = run_with_parser(
+      Box::new(RejectedSectionParser),
+      &["<tc>bad", "</tc>visible"],
+    );
+    assert_eq!(calls.len(), 0, "rejected section emits no tool calls");
+    assert_eq!(
+      display, "visible",
+      "trailing suffix split across chunks must still reach display"
+    );
+  }
+
+  #[test]
+  fn processor_rejected_section_returns_to_normal_state() {
+    // R12: after the processor consumes a rejected section + suffix it must
+    // return to `State::Normal` with empty buffers — a follow-up chunk of
+    // plain text must pass through verbatim (the contract that R11 exercised
+    // for Err is also exercised here for the Ok-empty path).
+    let mut p = ToolCallProcessor::new(Box::new(RejectedSectionParser), None);
+    let out1 = p.process_chunk("<tc>bad</tc>visible");
+    assert_eq!(out1.as_deref(), Some("visible"));
+    assert!(p.tool_call_buffer.is_empty(), "buffer drained");
+    assert!(p.pending_display.is_empty(), "pending_display drained");
+    assert_eq!(p.state, State::Normal, "state reset");
+    let out2 = p.process_chunk("hello world");
+    assert_eq!(out2.as_deref(), Some("hello world"));
+  }
+
+  #[test]
+  fn processor_rejected_section_back_to_back_with_suffix() {
+    // R12: two rejected sections back-to-back in the same chunk, with a
+    // suffix after the second close. The processor's trailing-token re-feed
+    // loop must consume both sections AND surface the suffix.
+    let (display, calls) = run_with_parser(
+      Box::new(RejectedSectionParser),
+      &["<tc>a</tc><tc>b</tc>tail"],
+    );
+    assert_eq!(calls.len(), 0);
+    assert_eq!(
+      display, "tail",
+      "back-to-back rejected sections + trailing suffix"
+    );
+  }
+
+  #[test]
+  fn processor_rejected_section_preserves_leading_display() {
+    // R12 + R3 interaction: pre-tag prose is parked in `pending_display` and
+    // must surface in stream order BEFORE the rejected section's suffix is
+    // emitted. The L9 R10 trailing-token logic already runs through the
+    // shared Ok(Some) arm, so emptiness of `calls` cannot suppress the
+    // leading display flush.
+    let (display, calls) = run_with_parser(
+      Box::new(RejectedSectionParser),
+      &["before <tc>bad</tc>after"],
+    );
+    assert_eq!(calls.len(), 0);
+    assert_eq!(
+      display, "before after",
+      "leading prose (`before `) + trailing suffix (`after`) survive in stream order"
+    );
+  }
+
+  #[test]
+  fn processor_err_for_truly_indeterminate_buffer_still_resets() {
+    // R12 explicit preservation of the R11 Err arm for the case it was
+    // designed for: a parser that legitimately cannot identify the section
+    // end (no `end_pos` available). Returning Err is still the correct
+    // contract for that — the processor drops the buffer and resets.
+    // Mirrors `processor_err_from_try_parse_one_call_clears_buffer_immediately`
+    // above but locked here so a regression that re-routes Err through the
+    // R12 Ok-empty path (and silently drops the documented Err contract)
+    // fails an explicit test.
+    let mut p = ToolCallProcessor::new(Box::new(AlwaysErrParser), None);
+    let out1 = p.process_chunk("<tc>indeterminate</tc>");
+    assert_eq!(out1, None, "Err recovery drops the whole buffer");
+    assert!(p.tool_call_buffer.is_empty());
+    assert!(p.pending_display.is_empty());
+    assert_eq!(p.state, State::Normal);
+    // Subsequent plain chunk passes through normally.
+    let out2 = p.process_chunk("next");
+    assert_eq!(out2.as_deref(), Some("next"));
+  }
+
+  // --- L9 R12 per-parser audit lock ---------------------------------------
+  // Every production parser's `try_parse_one_call` already converts a
+  // confirmed-but-rejected section to `Ok(Some((Vec::new(), end_pos)))` (see
+  // each parser's `match self.parse(...)` block: the catch-all `_` arm
+  // returns the empty-calls + end_pos pair). The R12 contract tightening
+  // does not change that production code path — it documents and locks the
+  // contract. These tests verify each parser-internal Err-or-empty path
+  // surfaces a same-chunk suffix through the streaming processor, so an
+  // accidental future swap to `?`-propagated `Err` trips an explicit test.
+  //
+  // Each row constructs a buffer whose section is structurally a tagged-call
+  // shape but whose body is rejected by the parser, with a trailing display
+  // suffix in the SAME chunk. Assertion: zero calls extracted AND the
+  // trailing suffix reaches display verbatim.
+
+  #[test]
+  fn try_parse_one_call_rejected_section_with_same_chunk_suffix_per_parser_audit() {
+    // Each tuple: (label, parser, buffer-with-trailing-suffix, expected
+    // display). The parser is freshly boxed per row so the trait-object
+    // (`!Copy`) can be moved into `run_with_parser`. Vec (not array) so
+    // heterogeneous-but-same-type boxes coexist.
+    let rows: Vec<(
+      &'static str,
+      Box<dyn ToolParser>,
+      &'static str,
+      &'static str,
+    )> = vec![
+      // json_tools: a top-level array fails `v.get("name")` so `parse`
+      // rejects, the streaming impl returns Ok-empty + end_pos (cited:
+      // tools.rs json_tools `try_parse_one_call`, `_` arm).
+      (
+        "json_tools (array body — no `name`)",
+        Box::new(JsonTools),
+        r#"<tool_call>[{"x":1}]</tool_call>tail"#,
+        "tail",
+      ),
+      // gemma4: an args body that fails `gemma4_args_to_json` → JSON parse —
+      // `parse` returns Err, but `balanced_brace_end` closes the body so
+      // `try_parse_one_call` has an end_pos. The catch-all `_` arm returns
+      // Ok-empty + end_pos (cited: tools.rs gemma4 `try_parse_one_call`,
+      // `_` arm).
+      (
+        "gemma4 (unparseable args body)",
+        Box::new(Gemma4),
+        r#"<|tool_call>call:f{!bad!}<tool_call|>tail"#,
+        "tail",
+      ),
+    ];
+    for (label, parser, buffer, expect_display) in rows {
+      let (display, calls) = run_with_parser(parser, &[buffer]);
+      assert_eq!(
+        calls.len(),
+        0,
+        "{}: parser rejected the body so zero calls",
+        label,
+      );
+      assert_eq!(
+        display, expect_display,
+        "{}: same-chunk suffix must reach display",
+        label,
+      );
+    }
   }
 }
