@@ -86,6 +86,27 @@
 //!   induces a save-side failure (read-only `save_path`) and asserts
 //!   no `<save_path>/.staging-fuse-*` directory survives. The staging
 //!   guard's `Drop` is the single mechanism that holds this invariant.
+//! - `fuse_fails_when_stale_destination_tokenizer_config_is_directory`
+//!   (R4 Finding 1 HIGH) — pre-existing `save_dir/tokenizer_config.json/`
+//!   as a DIRECTORY (source lacks the file). Pre-R4 the stale sweep
+//!   gated removal on `is_file()` and silently SKIPPED the directory,
+//!   then `lm::load::load(save_dir)` failed (or hung on a FIFO) reading
+//!   a dir as JSON. The R4 fix uses `symlink_metadata()` and fails
+//!   promotion with [`Error::Backend`] naming the path + "non-regular".
+//! - `fuse_fails_when_stale_destination_python_extra_is_directory`
+//!   (R4 Finding 1 HIGH) — same `*.py` sweep variant for an
+//!   attacker- or operator-planted `save_dir/custom_arch.py/`.
+//! - `fuse_fails_when_stale_destination_tokenizer_json_is_symlink_to_directory`
+//!   (R4 Finding 1 HIGH) — `tokenizer.json` as a symlink to a dir.
+//!   `is_file()` follows symlinks, so it returns `false` (target is dir)
+//!   and the pre-R4 code SKIPPED. The R4 fix's `symlink_metadata()`
+//!   never follows symlinks and surfaces the symlink as a fail.
+//! - `fuse_cleans_up_staging_dir_on_stale_removal_failure`
+//!   (R4 Finding 2 MEDIUM) — pre-create
+//!   `save_dir/tokenizer_config.json/{nested}` so the R4 F1 fix
+//!   returns `Err(Backend)` from the stale-sweep. The R4 F2 fix keeps
+//!   the staging guard ARMED until promotion success, so this
+//!   mid-promote Err must NOT leak a `.staging-fuse-*` dir.
 //!
 //! No `peak_memory()` magnitude asserts (per project memory).
 #![cfg(feature = "lm")]
@@ -1537,4 +1558,272 @@ fn fuse_cleans_up_staging_dir_on_save_failure() {
   // Best-effort GC cleanup of the sentinel structure (so the test
   // runner's tempdir cleanup recurses cleanly).
   let _ = fs::remove_dir_all(save_dir.join("config.json"));
+}
+
+// ────────── R4 Finding 1 [HIGH] — stale-sweep symlink_metadata + non-regular reject ──────────
+
+/// Helper for the R4 F1 tests: extract the inner promotion error's
+/// message from the [`Error::ConvertPostSavePartial`] wrapper that
+/// `fuse()` returns for any hard promotion failure (per the
+/// `promote_outcome -> Err(...)` arm in `fuse.rs::fuse`). Asserts on
+/// the WRAPPED `copy_error` (which carries the original
+/// `Error::Backend` message via `io::Error::other`), so the diagnostic
+/// stays end-to-end machine-checkable.
+fn extract_promote_error_message(err: &Error) -> String {
+  match err {
+    Error::ConvertPostSavePartial { copy_error, .. } => copy_error.to_string(),
+    other => {
+      panic!("expected Error::ConvertPostSavePartial wrapping the promote err, got: {other:?}")
+    }
+  }
+}
+
+#[test]
+fn fuse_fails_when_stale_destination_tokenizer_config_is_directory() {
+  // R4 Finding 1 [HIGH] — pre-R4 the stale-sweep gated removal on
+  // `path.is_file()` and silently SKIPPED non-regular entries (dir,
+  // FIFO, symlink-to-dir). When the source LACKED `tokenizer_config.json`
+  // and the destination held a stale `tokenizer_config.json/` DIRECTORY,
+  // the dir survived into save_path, then `lm::load::load(save_path)`
+  // failed (or hung) reading a dir as a JSON file.
+  //
+  // The R4 fix uses `symlink_metadata()` and returns
+  // `Err(Error::Backend)` for any non-regular reserved basename. We
+  // assert (a) fuse fails (b) the error wraps the path + the
+  // "non-regular" hint so the operator can act.
+  let weights = toy_base_weights(1);
+  let model_dir = write_base_dir("stale_tokcfg_dir_model", &weights, &plain_config_json(1));
+  assert!(
+    !model_dir.join("tokenizer_config.json").exists(),
+    "fixture precondition: source has NO tokenizer_config.json"
+  );
+
+  let adapter_dir = write_mlxlm_adapter("stale_tokcfg_dir_adapter", &[0], 2.0);
+  let save_dir = temp_dir("stale_tokcfg_dir_save");
+  // Pre-create the reserved basename as an EMPTY directory. The R4
+  // policy treats this as "non-regular reserved path; remove manually".
+  fs::create_dir(save_dir.join("tokenizer_config.json")).unwrap();
+
+  let result = fuse::fuse(&model_dir, &adapter_dir, &save_dir, false);
+  let err = result.expect_err("fuse must fail when stale tokenizer_config.json is a directory");
+  let msg = extract_promote_error_message(&err);
+  assert!(
+    msg.contains("tokenizer_config.json"),
+    "error message must name the offending basename; got: {msg}"
+  );
+  assert!(
+    msg.contains("non-regular"),
+    "error message must mark the path as non-regular reserved; got: {msg}"
+  );
+  assert!(
+    msg.contains("directory"),
+    "error message must name the kind (directory); got: {msg}"
+  );
+
+  // R4 F2 contract: no `.staging-fuse-*` survived a mid-promote Err.
+  let leftover = staging_dir_count(&save_dir);
+  assert_eq!(
+    leftover, 0,
+    "the F2 fix must keep the staging guard armed until success; \
+     found {leftover} leftover .staging-fuse-* dirs after a stale-sweep failure"
+  );
+
+  // Best-effort GC.
+  let _ = fs::remove_dir_all(save_dir.join("tokenizer_config.json"));
+}
+
+#[test]
+fn fuse_fails_when_stale_destination_python_extra_is_directory() {
+  // R4 Finding 1 [HIGH] — same shape for the `*.py` stale-sweep. Any
+  // `save_dir/<name>.py/` directory in the destination at promotion
+  // time must fail with the named non-regular error; pre-R4 it was
+  // silently skipped by `is_file() == false`.
+  let weights = toy_base_weights(1);
+  // Source has no *.py — `write_base_dir` only writes tokenizer.json
+  // + config.json + model.safetensors.
+  let model_dir = write_base_dir("stale_py_dir_model", &weights, &plain_config_json(1));
+
+  let adapter_dir = write_mlxlm_adapter("stale_py_dir_adapter", &[0], 2.0);
+  let save_dir = temp_dir("stale_py_dir_save");
+  // Pre-create custom_arch.py AS A DIRECTORY (with one entry so it is
+  // not unlink-replaceable as an empty dir; mirrors the R3
+  // save-failure test's non-empty config.json/sentinel shape).
+  fs::create_dir_all(save_dir.join("custom_arch.py").join("nested")).unwrap();
+
+  let result = fuse::fuse(&model_dir, &adapter_dir, &save_dir, false);
+  let err = result.expect_err("fuse must fail when stale custom_arch.py is a directory");
+  let msg = extract_promote_error_message(&err);
+  assert!(
+    msg.contains("custom_arch.py"),
+    "error message must name the offending *.py basename; got: {msg}"
+  );
+  assert!(
+    msg.contains("non-regular"),
+    "error message must mark the path as non-regular reserved; got: {msg}"
+  );
+  assert!(
+    msg.contains("directory"),
+    "error message must name the kind (directory); got: {msg}"
+  );
+
+  // R4 F2 contract: no `.staging-fuse-*` survived the stale-sweep fail.
+  let leftover = staging_dir_count(&save_dir);
+  assert_eq!(
+    leftover, 0,
+    "the F2 fix must keep the staging guard armed until success; \
+     found {leftover} leftover .staging-fuse-* dirs after a *.py-sweep failure"
+  );
+
+  let _ = fs::remove_dir_all(save_dir.join("custom_arch.py"));
+}
+
+#[cfg(unix)]
+#[test]
+fn fuse_fails_when_stale_destination_tokenizer_json_is_symlink_to_directory() {
+  // R4 Finding 1 [HIGH] — `is_file()` FOLLOWS symlinks, so a
+  // `save_dir/tokenizer.json` symlink whose target is a directory
+  // returns `false` (target is dir) and was SILENTLY SKIPPED by the
+  // pre-R4 sweep. Worse: a symlink at a reserved basename pointing at
+  // an arbitrary path is an unbounded redirection vector (cross-FS
+  // escape via `/etc/passwd`). The R4 sweep uses
+  // `symlink_metadata()` (NEVER follows symlinks) and rejects ANY
+  // symlink at a reserved basename via the same named-error path.
+  //
+  // Note: the source `write_base_dir` writes tokenizer.json, so
+  // `staged_names` will contain `tokenizer.json`. The stale sweep
+  // skips entries in `staged_names`, so to actually exercise the
+  // symlink-rejection path the source must LACK tokenizer.json.
+  let weights = toy_base_weights(1);
+  let model_dir =
+    write_base_dir_no_tokenizer("stale_toksym_model", &weights, &plain_config_json(1));
+  assert!(
+    !model_dir.join("tokenizer.json").exists(),
+    "fixture precondition: source has NO tokenizer.json"
+  );
+  // R2 validate would normally fail with a missing tokenizer; we want
+  // the test to exercise the STALE-SWEEP path (not the
+  // validate-before-save path). So we substitute spiece.model — a
+  // RESERVED basename that's NOT validated by `load_tokenizer` but IS
+  // a member of TOKENIZER_EXTRA_FILES, so the stale sweep walks it.
+  // But the validate step itself requires tokenizer.json to be loadable.
+  //
+  // Cleaner approach: add a tokenizer.json so validate passes, but
+  // pre-create the SYMLINK at a DIFFERENT reserved basename the
+  // source lacks (`special_tokens_map.json` or `vocab.json`). The R4
+  // policy is basename-agnostic — any reserved basename that's a
+  // symlink fails.
+  fs::write(model_dir.join("tokenizer.json"), minimal_tokenizer_json()).unwrap();
+  assert!(
+    !model_dir.join("special_tokens_map.json").exists(),
+    "fixture precondition: source has NO special_tokens_map.json"
+  );
+
+  let adapter_dir = write_mlxlm_adapter("stale_toksym_adapter", &[0], 2.0);
+  let save_dir = temp_dir("stale_toksym_save");
+  // Create the symlink target: a directory under save_dir. We use a
+  // subdir of save_dir (not /tmp) so the test cleanup is local and
+  // the symlink resolves to an EXISTING dir (the `symlink_metadata`
+  // check would still classify the symlink itself as `is_symlink ==
+  // true` regardless of target existence, but using an existing dir
+  // makes the test fixture maximally realistic).
+  let target_dir = save_dir.join("sym_target_dir");
+  fs::create_dir_all(&target_dir).unwrap();
+  std::os::unix::fs::symlink(&target_dir, save_dir.join("special_tokens_map.json")).unwrap();
+  // Sanity: the path EXISTS as a symlink and `is_file()` follows the
+  // link (returns false because target is dir) — exactly the trap the
+  // R4 fix closes.
+  assert!(
+    save_dir
+      .join("special_tokens_map.json")
+      .symlink_metadata()
+      .is_ok(),
+    "fixture: symlink IS at the reserved basename"
+  );
+  assert!(
+    !save_dir.join("special_tokens_map.json").is_file(),
+    "fixture: pre-R4 `is_file()` follows the link and returns false (symlink-to-dir target)"
+  );
+
+  let result = fuse::fuse(&model_dir, &adapter_dir, &save_dir, false);
+  let err =
+    result.expect_err("fuse must fail when stale special_tokens_map.json is a symlink-to-dir");
+  let msg = extract_promote_error_message(&err);
+  assert!(
+    msg.contains("special_tokens_map.json"),
+    "error message must name the offending basename; got: {msg}"
+  );
+  assert!(
+    msg.contains("non-regular"),
+    "error message must mark the path as non-regular reserved; got: {msg}"
+  );
+  assert!(
+    msg.contains("symlink"),
+    "error message must name the kind (symlink); got: {msg}"
+  );
+
+  // R4 F2 contract.
+  let leftover = staging_dir_count(&save_dir);
+  assert_eq!(
+    leftover, 0,
+    "the F2 fix must keep the staging guard armed until success; \
+     found {leftover} leftover .staging-fuse-* dirs after a symlink-rejection failure"
+  );
+
+  let _ = fs::remove_file(save_dir.join("special_tokens_map.json"));
+  let _ = fs::remove_dir_all(&target_dir);
+}
+
+// ────────── R4 Finding 2 [MEDIUM] — staging guard armed until promote success ──────────
+
+#[test]
+fn fuse_cleans_up_staging_dir_on_stale_removal_failure() {
+  // R4 Finding 2 [MEDIUM] — pre-R4, `promote_staging_into_save_path`
+  // called `staging.consume()` as its FIRST step, disarming the RAII
+  // guard. Any later Err (rename failure, stale-sweep removal failure,
+  // the new R4 F1 non-regular rejection) returned WITHOUT cleanup and
+  // a `.staging-fuse-*` dir LEAKED into `save_path` permanently.
+  //
+  // The R4 F2 fix keeps `staging` ARMED across the entire borrow-only
+  // inner pass; only the success path consumes the guard and removes
+  // the (now-empty) staging dir explicitly. Every Err path drops the
+  // guard, firing `StagingDir::Drop`'s `remove_dir_all`.
+  //
+  // Failure-injection strategy: pre-create a NON-EMPTY directory at a
+  // reserved basename the source lacks. The R4 F1 fix's stale-sweep
+  // hits this entry, classifies it as `directory`, and returns
+  // `Err(Error::Backend { "non-regular reserved path" })`. This is a
+  // mid-promote Err — exactly the path the F2 fix is required to
+  // clean up (pre-R4 it leaked because `consume()` had already
+  // disarmed the guard).
+  let weights = toy_base_weights(1);
+  let model_dir = write_base_dir("f2_cleanup_model", &weights, &plain_config_json(1));
+  assert!(
+    !model_dir.join("tokenizer_config.json").exists(),
+    "fixture precondition: source lacks tokenizer_config.json (so stale-sweep visits it)"
+  );
+
+  let adapter_dir = write_mlxlm_adapter("f2_cleanup_adapter", &[0], 2.0);
+  let save_dir = temp_dir("f2_cleanup_save");
+  // Non-empty dir at the reserved basename — F1 rejects, F2 must
+  // still clean up the staging dir.
+  fs::create_dir_all(save_dir.join("tokenizer_config.json").join("nested_file")).unwrap();
+
+  let result = fuse::fuse(&model_dir, &adapter_dir, &save_dir, false);
+  assert!(
+    result.is_err(),
+    "fuse must fail when stale tokenizer_config.json is a non-empty directory: got {result:?}"
+  );
+
+  // R4 F2 contract: no `.staging-fuse-*` leaked. This is the WHOLE
+  // POINT of keeping the guard armed — the pre-R4 consume()-first
+  // shape would leak here because the Err returned AFTER consume()
+  // disarmed the guard.
+  let leftover = staging_dir_count(&save_dir);
+  assert_eq!(
+    leftover, 0,
+    "the F2 fix MUST clean up the staging dir on a stale-sweep failure; \
+     found {leftover} leftover .staging-fuse-* dirs (pre-R4 regression signature)"
+  );
+
+  let _ = fs::remove_dir_all(save_dir.join("tokenizer_config.json"));
 }

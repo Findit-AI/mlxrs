@@ -737,33 +737,90 @@ struct PostPromoteWarnings {
 /// **Returns** the post-promotion fsync warnings (see
 /// [`PostPromoteWarnings`]). A hard IO failure — a rename failure, an
 /// unlink failure on a stale extra, a `read_dir(save_path)` failure
-/// during the stale-sweep — short-circuits with `Err(Error::Backend)`
-/// the caller routes through [`Error::ConvertPostSavePartial`]. The
-/// stale-sweep's `read_dir(staging)` failure also short-circuits the
-/// same way.
+/// during the stale-sweep, a non-regular reserved basename (F1 R4) —
+/// short-circuits with `Err(Error::Backend)` the caller routes through
+/// [`Error::ConvertPostSavePartial`]. The stale-sweep's
+/// `read_dir(staging)` failure also short-circuits the same way.
+///
+/// **F2 staging-guard contract** (Codex R4 MEDIUM). The `staging`
+/// guard stays ARMED through the entire borrow-only inner pass; only
+/// the success path consumes it and explicitly `remove_dir`s the
+/// now-empty staging directory. Every `Err` path drops the guard
+/// in-frame, and [`StagingDir::Drop`] `remove_dir_all`s the staging
+/// dir — so a promotion that fails halfway through (rename failure,
+/// stale-sweep failure, F1 R4 non-regular reserved basename) never
+/// leaks a `.staging-fuse-*` dir under `save_path`.
 fn promote_staging_into_save_path(
   staging: StagingDir,
   save_path: &Path,
 ) -> Result<PostPromoteWarnings> {
+  // **F2 fix (Codex R4 MEDIUM).** `staging` stays ARMED for the entire
+  // borrow-only run of [`promote_staging_inner`]. Any `?` early-return
+  // from the inner helper (a `read_dir`/`rename` failure, a stale-sweep
+  // unlink failure, the F1 non-regular reserved-path rejection)
+  // propagates out of THIS function with `staging` still owned by this
+  // frame, so the `StagingDir::Drop` impl fires and `remove_dir_all`s
+  // the staging directory. Pre-R4, `staging.consume()` was the FIRST
+  // call inside the function: any later error returned WITHOUT cleanup
+  // and a `.staging-fuse-*` dir leaked under `save_path`.
+  let post_promote_file = promote_staging_inner(staging.path(), save_path)?;
+
+  // Success path: disarm the guard, then explicitly `remove_dir` the
+  // (now empty) staging directory. We use `remove_dir` (not
+  // `remove_dir_all`) on the success branch so an unexpected stray file
+  // in the staging dir surfaces as an `ENOTEMPTY` warning rather than
+  // being silently nuked. (The error branch above still uses
+  // `remove_dir_all` via `Drop` — that's correct because an in-flight
+  // failure may have left partial-write artifacts and we must not
+  // refuse cleanup of our own scratch space on the error path.)
+  let staging_path = staging.consume();
+  if let Err(e) = std::fs::remove_dir(&staging_path) {
+    eprintln!(
+      "fuse: warning — could not remove empty staging dir {}: {e}",
+      staging_path.display()
+    );
+  }
+
+  // Post-promotion directory fsync — makes the new directory entries
+  // (the renamed-in staged files + any unlinked stale extras) durable.
+  // Same shape as the post-rename `fsync_dir` `crate::lm::load::save`
+  // uses. A failure is a durability-only warning (the entries ARE
+  // observable on a running kernel; only a power loss could revert).
+  let post_promote_dir = crate::lm::load::fsync_dir(save_path).err();
+
+  Ok(PostPromoteWarnings {
+    post_promote_file,
+    post_promote_dir,
+  })
+}
+
+/// Borrow-only worker for [`promote_staging_into_save_path`].
+///
+/// **F2 contract** (Codex R4 MEDIUM): this helper takes `staging` as a
+/// borrowed `&Path` so the parent's [`StagingDir`] RAII guard stays
+/// ARMED across every operation here. Any `Err` returned from this
+/// function propagates up to the parent, drops the guard, and the
+/// `StagingDir::Drop` impl `remove_dir_all`s the staging directory. No
+/// cleanup is needed on this side of the call.
+///
+/// Returns the first post-rename `fsync_path_io` warning (or `None`).
+/// The post-promotion `fsync_dir(save_path)` warning is taken in the
+/// parent after this returns.
+fn promote_staging_inner(staging: &Path, save_path: &Path) -> Result<Option<std::io::Error>> {
   use std::collections::HashSet;
 
   // Snapshot the staged file names BEFORE we move them — we need the
   // set for the stale-sweep below.
-  let staging_path = staging.consume();
-
   let mut staged_names: HashSet<String> = HashSet::new();
-  let entries = std::fs::read_dir(&staging_path).map_err(|e| Error::Backend {
-    message: format!(
-      "fuse: cannot read staging dir {}: {e}",
-      staging_path.display()
-    ),
+  let entries = std::fs::read_dir(staging).map_err(|e| Error::Backend {
+    message: format!("fuse: cannot read staging dir {}: {e}", staging.display()),
   })?;
   let mut staged_paths: Vec<PathBuf> = Vec::new();
   for entry in entries {
     let entry = entry.map_err(|e| Error::Backend {
       message: format!(
         "fuse: cannot read entry in staging dir {}: {e}",
-        staging_path.display()
+        staging.display()
       ),
     })?;
     let path = entry.path();
@@ -828,19 +885,33 @@ fn promote_staging_into_save_path(
   // (`load_config` consumes `generation_config.json` as EOS override;
   // tokenizer surface consumes `tokenizer_config.json` + chat
   // metadata).
+  //
+  // **F1 R4 fix (Codex R4 HIGH).** Pre-R4, both stale-sweep loops gated
+  // removal on `is_file()` which (a) follows symlinks (a symlink whose
+  // TARGET is a directory returns `false`) and (b) silently skipped
+  // every non-regular entry (directory, FIFO, socket, symlink-to-dir).
+  // The skipped entries SURVIVED into `save_path`, then downstream
+  // `lm::load::load(save_path)` either failed when it tried to read a
+  // dir as a JSON file (Err — opaque error from the loader, not the
+  // fuse driver), hung when it tried to read a FIFO, or — worse — read
+  // an attacker-planted symlink's target (cross-FS escape via
+  // `save_path/tokenizer_config.json` pointing at `/etc/passwd`).
+  //
+  // The R4 fix uses `symlink_metadata` (NEVER follows symlinks) and:
+  // - regular file → `remove_file` (the ordinary stale-extras case)
+  // - any other kind (dir, symlink-of-any-target, FIFO, socket, …) →
+  //   fail promotion with [`Error::Backend`] naming the offending path
+  //   and the kind, instructing the operator to "remove manually or
+  //   use a fresh save destination". We deliberately do NOT
+  //   `remove_dir_all` a non-regular reserved path — too destructive
+  //   for a stale-sweep gated on a basename match; an operator-visible
+  //   error is the correct boundary.
   for name in TOKENIZER_EXTRA_FILES {
     if staged_names.contains(*name) {
       continue;
     }
     let candidate = save_path.join(name);
-    if candidate.is_file() {
-      std::fs::remove_file(&candidate).map_err(|e| Error::Backend {
-        message: format!(
-          "fuse: cannot remove stale destination file {}: {e}",
-          candidate.display()
-        ),
-      })?;
-    }
+    remove_stale_reserved_path(&candidate, name)?;
   }
 
   // `*.py` sweep. We walk save_path; for each `*.py`, if NOT in
@@ -861,9 +932,6 @@ fn promote_staging_into_save_path(
       ),
     })?;
     let path = entry.path();
-    if !path.is_file() {
-      continue;
-    }
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
       continue;
     };
@@ -873,34 +941,85 @@ fn promote_staging_into_save_path(
     if staged_names.contains(name) {
       continue;
     }
-    std::fs::remove_file(&path).map_err(|e| Error::Backend {
+    // F1 R4: route every `*.py` reserved basename through the same
+    // symlink_metadata-gated remover as the TOKENIZER_EXTRA_FILES loop
+    // above. A `save_path/foo.py/` DIRECTORY (or symlink, or FIFO)
+    // that the snapshot did not carry must fail promotion, not be
+    // silently skipped by `path.is_file() == false`.
+    remove_stale_reserved_path(&path, name)?;
+  }
+
+  Ok(post_promote_file)
+}
+
+/// Remove a single stale reserved-basename entry at `path`, where
+/// `name` is the basename used for diagnostics.
+///
+/// **F1 R4 contract** (Codex R4 HIGH). The pre-R4 stale-sweep used
+/// `path.is_file()` which (1) follows symlinks (a symlink whose target
+/// is a directory returns `false`) and (2) silently skipped every
+/// non-regular entry. Both behaviors let stale non-regular reserved
+/// paths survive into `save_path`, where downstream
+/// `lm::load::load(save_path)` failed (read-dir-as-json) or hung (FIFO)
+/// or escaped (attacker-planted symlink to `/etc/passwd`).
+///
+/// The R4 sweep uses [`std::fs::symlink_metadata`] (NEVER follows
+/// symlinks) and routes by `file_type`:
+/// - **regular file** → [`std::fs::remove_file`] (ordinary stale extra).
+/// - **directory** → `Err(Error::Backend)` naming the path + kind. We
+///   deliberately do NOT `remove_dir_all` — too destructive for a
+///   sweep keyed on a fixed basename family; the operator should
+///   resolve the conflict manually (or pick a fresh `save_path`).
+/// - **symlink** (regardless of target) → `Err(Error::Backend)`. A
+///   symlink at a reserved basename is a security smell (cross-fs
+///   escape); same operator-visible boundary as the directory case.
+/// - **other** (FIFO, socket, block/char device, …) →
+///   `Err(Error::Backend)` with the kind named so the operator can
+///   diagnose without re-stat'ing.
+/// - **`NotFound`** → no-op (the basename simply isn't there; the
+///   normal absent case).
+fn remove_stale_reserved_path(path: &Path, name: &str) -> Result<()> {
+  let meta = match std::fs::symlink_metadata(path) {
+    Ok(m) => m,
+    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+    Err(e) => {
+      return Err(Error::Backend {
+        message: format!(
+          "fuse: cannot stat stale destination path {}: {e}",
+          path.display()
+        ),
+      });
+    }
+  };
+  let ft = meta.file_type();
+  if ft.is_file() {
+    std::fs::remove_file(path).map_err(|e| Error::Backend {
       message: format!(
         "fuse: cannot remove stale destination file {}: {e}",
         path.display()
       ),
     })?;
+    return Ok(());
   }
-
-  // Remove the (now-empty) staging directory. A failure here is a
-  // best-effort warning — the destination dir is correct; only a stray
-  // `<save_path>/.staging-fuse-*` survived.
-  if let Err(e) = std::fs::remove_dir(&staging_path) {
-    eprintln!(
-      "fuse: warning — could not remove empty staging dir {}: {e}",
-      staging_path.display()
-    );
-  }
-
-  // Post-promotion directory fsync — makes the new directory entries
-  // (the renamed-in staged files + any unlinked stale extras) durable.
-  // Same shape as the post-rename `fsync_dir` `crate::lm::load::save`
-  // uses. A failure is a durability-only warning (the entries ARE
-  // observable on a running kernel; only a power loss could revert).
-  let post_promote_dir = crate::lm::load::fsync_dir(save_path).err();
-
-  Ok(PostPromoteWarnings {
-    post_promote_file,
-    post_promote_dir,
+  // Diagnose the offending kind so the operator can act without a
+  // re-stat. is_symlink is checked BEFORE is_dir because symlink_metadata
+  // never follows symlinks; a symlink-to-dir has is_symlink() == true
+  // and is_dir() == false here.
+  let kind = if ft.is_symlink() {
+    "symlink"
+  } else if ft.is_dir() {
+    "directory"
+  } else {
+    "non-regular file (FIFO, socket, or device)"
+  };
+  Err(Error::Backend {
+    message: format!(
+      "fuse: stale destination path {} (basename {}) is a {}; non-regular reserved path; \
+       remove manually or use a fresh save destination",
+      path.display(),
+      name,
+      kind
+    ),
   })
 }
 
