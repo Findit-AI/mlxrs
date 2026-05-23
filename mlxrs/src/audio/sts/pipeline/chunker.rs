@@ -305,7 +305,10 @@ mod tests {
     preroll.append(&[4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]);
     // After append: total written = 10, capped at 8 → drops [1, 2].
     assert_eq!(preroll.len(), 8);
-    assert_eq!(preroll.snapshot(), vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]);
+    assert_eq!(
+      preroll.snapshot(),
+      vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+    );
   }
 
   /// `clear()` empties the buffer.

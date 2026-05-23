@@ -120,11 +120,12 @@ pub trait AudioOutputStream: Send {
 /// Blanket impl forwarding [`AudioOutputStream`] through a mutable
 /// reference — lets callers pass `&mut sink` to APIs that accept a
 /// `S: AudioOutputStream` by value, retaining ownership for
-/// post-call inspection (the
-/// [`crate::audio::sts::pipeline::VoiceSession::run`] call site this
+/// post-call inspection (the [`VoicePipeline::run`] call site this
 /// blanket enables).
 ///
 /// The forwarding is a flat delegation; no buffering is added.
+///
+/// [`VoicePipeline::run`]: crate::audio::sts::pipeline::VoicePipeline::run
 impl<T: AudioOutputStream + ?Sized> AudioOutputStream for &mut T {
   fn write_samples(&mut self, samples: &[f32]) -> Result<usize> {
     (**self).write_samples(samples)

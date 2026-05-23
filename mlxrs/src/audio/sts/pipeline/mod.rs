@@ -23,12 +23,11 @@
 //!   [`VoicePipeline`] implementor that composes every trait
 //!   surface together into one synchronous mic-iterator-driven
 //!   loop) plus the four per-step adapter traits
-//!   [`VadFrameAdapter`][orchestrator::VadFrameAdapter] /
-//!   [`SttTurnAdapter`][orchestrator::SttTurnAdapter] /
-//!   [`LlmResponderAdapter`][orchestrator::LlmResponderAdapter] /
-//!   [`TtsStreamAdapter`][orchestrator::TtsStreamAdapter] the
-//!   orchestrator needs (a streaming view over the
-//!   whole-utterance shapes the existing
+//!   [`orchestrator::VadFrameAdapter`] /
+//!   [`orchestrator::SttTurnAdapter`] /
+//!   [`orchestrator::LlmResponderAdapter`] /
+//!   [`orchestrator::TtsStreamAdapter`] the orchestrator needs (a
+//!   streaming view over the whole-utterance shapes the existing
 //!   [`crate::audio::vad::VadModel`] /
 //!   [`crate::audio::stt::model::Model`] /
 //!   [`crate::lm::model::Model`] /

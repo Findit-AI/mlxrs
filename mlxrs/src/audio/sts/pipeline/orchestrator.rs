@@ -285,6 +285,27 @@ where
     self.total_chunks_consumed
   }
 
+  /// Read-only access to the wrapped VAD adapter — useful for
+  /// downstream tests / inspection without exposing `&mut`.
+  pub fn vad(&self) -> &V {
+    &self.vad
+  }
+
+  /// Read-only access to the wrapped STT adapter.
+  pub fn stt(&self) -> &S {
+    &self.stt
+  }
+
+  /// Read-only access to the wrapped LLM adapter.
+  pub fn llm(&self) -> &L {
+    &self.llm
+  }
+
+  /// Read-only access to the wrapped TTS adapter.
+  pub fn tts(&self) -> &T {
+    &self.tts
+  }
+
   /// Process one mic-frame iterator step: push through the chunker,
   /// run VAD per chunk, update the turn state, and — on a
   /// turn-finalize event — drive STT + LLM + TTS into `output`.

@@ -24,8 +24,9 @@
 //! code uses an `AudioPlayer`), and (b) the per-frame hot path
 //! (chunker push + barge-in detect + turn-policy poll) inlines
 //! away the trait dispatch — the same shape
-//! [`crate::lm::generate`] uses for its [`Sampler`] +
-//! [`LogitsProcessor`] trait surfaces.
+//! [`crate::lm::generate`] uses for its sampler / logits-processor
+//! boxed-closure surfaces ([`crate::lm::generate::Sampler`] +
+//! [`crate::lm::generate::LogitsProcessor`]).
 //!
 //! The default implementor lives in [`super::orchestrator`]
 //! ([`super::orchestrator::VoiceSession`]); a caller who needs a

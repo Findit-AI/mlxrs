@@ -17,9 +17,12 @@
 //! `response_model` / `tts_model`) are intentionally **non-resolved**:
 //! mlxrs's [no per-model arch porting][noarch] rule means the per-model
 //! loader is the caller's responsibility — this config carries the
-//! repo / path string for the caller to feed into
-//! [`crate::audio::stt::load`] / [`crate::audio::tts::load`] /
-//! [`crate::audio::vad::load`] / [`crate::lm::load`].
+//! repo / path string for the caller to feed into the per-domain
+//! `load` entry points
+//! ([`crate::audio::stt::load::load()`] /
+//! [`crate::audio::tts::load::load()`] /
+//! [`crate::audio::vad::load::load()`] /
+//! [`crate::lm::load::load()`]).
 //!
 //! [vp-cfg]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/sts/voice_pipeline.py#L25-L89
 //! [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
@@ -93,10 +96,14 @@ impl LatencyProfile {
 /// Per [no per-model arch porting][noarch] the per-model name strings
 /// (`stt_model` / `vad_model` / `turn_model` / `response_model` /
 /// `tts_model`) carry the upstream repo / path string verbatim; the
-/// caller resolves them into concrete trait objects via
-/// [`crate::audio::stt::load`] / [`crate::audio::tts::load`] /
-/// [`crate::audio::vad::load`] / [`crate::lm::load`] before handing
-/// them to [`super::orchestrator::VoiceSession`].
+/// caller resolves them into concrete trait objects via the per-domain
+/// `load` entry points ([`crate::audio::stt::load::load()`] /
+/// [`crate::audio::tts::load::load()`] /
+/// [`crate::audio::vad::load::load()`] /
+/// [`crate::lm::load::load()`]) before handing them to
+/// [`VoiceSession`][session].
+///
+/// [session]: crate::audio::sts::pipeline::orchestrator::VoiceSession
 ///
 /// [vp-cfg]: https://github.com/Blaizzy/mlx-audio/blob/main/mlx_audio/sts/voice_pipeline.py#L25-L89
 /// [noarch]: https://github.com/uqio/mlxrs/blob/mlx/docs/superpowers/conventions/no-per-model-arch-porting.md
@@ -209,9 +216,11 @@ pub struct VoicePipelineConfig {
 
   // === Output / runtime ===
   /// Whether to play TTS output through an audio device. mlx-audio
-  /// default `true`. mlxrs respects this via
-  /// [`super::orchestrator::VoiceSession::run`] — when `false`, the
-  /// sink is not driven (mlx-audio's `play_audio=False`).
+  /// default `true`. mlxrs respects this via [`VoicePipeline::run`] —
+  /// when `false`, the sink is not driven (mlx-audio's
+  /// `play_audio=False`).
+  ///
+  /// [`VoicePipeline::run`]: super::voice_pipeline::VoicePipeline::run
   pub play_audio: bool,
   /// Audio-queue capacity (slots). mlx-audio default `128`.
   pub queue_size: usize,
@@ -239,8 +248,7 @@ impl VoicePipelineConfig {
   #[must_use]
   pub fn resolved(mut self) -> Self {
     if self.stt_transcription_delay_ms.is_none() {
-      self.stt_transcription_delay_ms =
-        Some(self.latency_profile.default_transcription_delay_ms());
+      self.stt_transcription_delay_ms = Some(self.latency_profile.default_transcription_delay_ms());
     }
     if self.tts_streaming_interval.is_none() {
       self.tts_streaming_interval = Some(self.latency_profile.default_tts_streaming_interval());
@@ -340,7 +348,10 @@ mod tests {
     assert_eq!(cfg.frame_duration_ms, 32);
     assert_eq!(cfg.latency_profile, LatencyProfile::Balanced);
 
-    assert_eq!(cfg.stt_model, "mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit");
+    assert_eq!(
+      cfg.stt_model,
+      "mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit"
+    );
     assert_eq!(cfg.stt_transcription_delay_ms, None);
     assert_eq!(cfg.stt_max_decode_tokens_per_step, 6);
     assert_eq!(cfg.stt_max_turn_tokens, 256);
@@ -439,8 +450,7 @@ mod tests {
       folded.stt_transcription_delay_ms.unwrap()
     );
     assert!(
-      (raw.resolved_tts_streaming_interval() - folded.tts_streaming_interval.unwrap()).abs()
-        < 1e-6
+      (raw.resolved_tts_streaming_interval() - folded.tts_streaming_interval.unwrap()).abs() < 1e-6
     );
   }
 }
