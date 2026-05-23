@@ -1273,14 +1273,57 @@ pub fn pad_to_square(img: ::image::DynamicImage, fill: [u8; 3]) -> Result<::imag
   canvas_buf
     .try_reserve_exact(bytes_usize)
     .map_err(|_| Error::OutOfMemory)?;
-  // Uniform RGB fill — equivalent to `RgbImage::from_pixel(size, size,
-  // Rgb(fill))` but without the panic-on-OOM backing alloc. Each pixel
-  // is the same 3-byte triple, so a single `extend_from_slice` per row
-  // would also work; the per-pixel loop here is straight-line code that
-  // LLVM auto-vectorizes (and the byte budget is already capped above).
-  for _ in 0..(bytes_usize / 3) {
-    canvas_buf.extend_from_slice(&fill);
-  }
+  // Uniform RGB fill via the C6 `pad_canvas_fill` dispatcher
+  // (`crate::simd::vlm::pad_canvas_fill`). On `aarch64` this routes to
+  // a 48-byte LCM(3, 16) NEON pre-broadcast tile (~2-4× faster than
+  // the new scalar at 4096²; ~10-50× faster than the pre-C6 per-3-byte
+  // `extend_from_slice` idiom this replaces — verify-before-claim
+  // bench in `mlxrs/benches/simd_pad_canvas_fill.rs`); elsewhere it
+  // falls back to the scalar `chunks_exact_mut(3) + copy_from_slice`
+  // path. See `docs/core-arch-simd-candidates.md` §2 row C6 + §5.5
+  // for the rationale + tracking ([#151]).
+  //
+  // The dispatcher takes a sized `&mut [u8]`, so we write into the
+  // pre-reserved spare capacity and then `set_len` after every byte
+  // has been written. `spare_capacity_mut()` gives `&mut [MaybeUninit<u8>]`;
+  // we cast through `MaybeUninit::as_mut_ptr()` to a `*mut u8` that
+  // the fill kernel can write into. Since the fill writes every byte
+  // before `set_len` is called, there is no uninitialized-byte read.
+  let bytes_written = {
+    let spare = canvas_buf.spare_capacity_mut();
+    // `bytes_usize <= spare.len()` because `try_reserve_exact` reserved
+    // exactly `bytes_usize` extra capacity. Take the first `bytes_usize`
+    // bytes of spare (the canvas region).
+    debug_assert!(
+      spare.len() >= bytes_usize,
+      "try_reserve_exact must have reserved at least bytes_usize"
+    );
+    // SAFETY: `spare` is a `&mut [MaybeUninit<u8>]` with `spare.len()
+    // >= bytes_usize`; we take a raw pointer to the first byte and
+    // build a `&mut [u8]` view of `bytes_usize` bytes. `u8` is plain-
+    // old-data (no drop, no padding, no validity invariants beyond
+    // "any bit pattern"), so a `&mut [u8]` to uninitialized backing
+    // memory is well-defined as long as no read happens before a
+    // write. `pad_canvas_fill` writes every byte (it's a tile fill
+    // that covers the full slice), so no uninit-read can occur. The
+    // `&mut` is exclusive (we hold a unique borrow of `canvas_buf`'s
+    // spare capacity), satisfying Rust's aliasing rule. After the
+    // fill returns the buffer is fully initialized and `set_len`
+    // below extends the logical length.
+    let dst: &mut [u8] =
+      unsafe { core::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<u8>(), bytes_usize) };
+    crate::simd::vlm::pad_canvas_fill(dst, fill);
+    bytes_usize
+  };
+  // SAFETY: `pad_canvas_fill` wrote every byte in `0..bytes_usize` of
+  // the spare capacity (it is a `memset`-like tile fill covering the
+  // full slice — see `pad_canvas_fill_scalar` and the NEON kernel
+  // doc-comments). `bytes_usize <= canvas_buf.capacity()` because
+  // `try_reserve_exact(bytes_usize)` above reserved exactly that much
+  // capacity (and a `try_reserve_exact` failure would have early-
+  // returned `Error::OutOfMemory`). Both `Vec::set_len`
+  // preconditions hold.
+  unsafe { canvas_buf.set_len(bytes_written) };
   debug_assert_eq!(
     canvas_buf.len(),
     bytes_usize,
