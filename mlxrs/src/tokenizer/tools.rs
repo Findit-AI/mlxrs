@@ -385,6 +385,61 @@ fn closed_but_malformed_end_pos_quote_aware(
   None
 }
 
+/// **L9 R15 race outcome** for `bound_section`. Race the parser opener against
+/// the wrapper end-tag BEFORE running a syntax-aware end-tag scanner. Orphan
+/// scanner-bait markers in malformed bodies (a stray `"` for JSON; a
+/// `<parameter=` before any `<function=` for qwen3_coder; an `<escape>` before
+/// any `call:` for function_gemma) can fool a quote/value-aware scanner into
+/// either waiting forever for a missing close or skipping over the real
+/// wrapper end-tag — silently dropping the same-chunk suffix until cap/EOS.
+/// Racing the parser opener first proves parser context: only THEN is the
+/// syntax-aware scanner safe to run.
+///
+/// `OpenerProven` means the parser opener appears strictly before the first
+/// `end_tag` candidate in `payload` — the syntax-aware scanner is now sound
+/// because the parser context is established (a stray `"`/`<parameter=`/
+/// `<escape>` past the opener is real grammar, not orphan noise).
+///
+/// `PlainEnd` means the parser opener is missing in `payload[..first_end_rel]`
+/// — either no opener at all, or it appears AFTER the first end_tag (so the
+/// opener belongs to a LATER section, not the current malformed body). The
+/// `body_end_rel` is the relative position one past the plain end_tag — the
+/// caller maps this to an absolute `end_pos`.
+enum BoundRaceOutcome {
+  PlainEnd { end_rel: usize },
+  OpenerProven,
+}
+
+/// Race the parser `opener` against `end_tag` in `payload`, returning:
+/// * `None` if `end_tag` is not yet in `payload` (the streaming caller waits
+///   for more bytes).
+/// * `Some(PlainEnd { end_rel })` if `opener` is missing in `payload` OR
+///   `opener` appears AFTER the first end_tag candidate — the malformed body
+///   has no parser context, so a plain-substring end_tag scan is the safe
+///   close (the syntax-aware scanner would be fooled by orphan markers).
+///   `end_rel` is the position just past the plain end_tag, relative to
+///   `payload`.
+/// * `Some(OpenerProven)` if `opener` appears strictly before the first
+///   end_tag — parser context is established, the caller may now safely run
+///   its syntax-aware end_tag scanner over `payload`.
+fn race_opener_vs_end_tag(payload: &str, opener: &str, end_tag: &str) -> Option<BoundRaceOutcome> {
+  if end_tag.is_empty() {
+    return None;
+  }
+  let first_end = payload.find(end_tag)?;
+  let first_opener = if opener.is_empty() {
+    None
+  } else {
+    payload[..first_end].find(opener)
+  };
+  match first_opener {
+    Some(o) if o < first_end => Some(BoundRaceOutcome::OpenerProven),
+    _ => Some(BoundRaceOutcome::PlainEnd {
+      end_rel: first_end + end_tag.len(),
+    }),
+  }
+}
+
 /// Approximates Python `ast.literal_eval` enough for tool-arg coercion:
 /// JSON first, then `True`/`False`/`None`, single-quoted strings, and bare
 /// ints/floats. Falls back to returning the input as a JSON string.
@@ -502,13 +557,27 @@ impl JsonTools {
   /// scan in its `else` branch when `balanced_json_object_prefix` failed;
   /// R14 hoists it to the FIRST step so the opener search itself runs on
   /// the bounded prefix.)
+  ///
+  /// **L9 R15 race:** [`race_opener_vs_end_tag`] proves JSON context first
+  /// (parser opener `{`). When the body does NOT start with a JSON object
+  /// (`<tool_call>bad"</tool_call>{...}` — an orphan `"` BEFORE any `{`),
+  /// the quote-aware scanner would treat the orphan `"` as a string-open,
+  /// wait for the matching `"` that never lands inside the body, and
+  /// return None — the same-chunk suffix `{...}` then drops silently.
+  /// The race detects this (no `{` before first end_tag) and returns the
+  /// plain end_tag position so the suffix is preserved.
   fn bound_section<'a>(
     &self,
     payload: &'a str,
     payload_at: usize,
     end_tag: &str,
   ) -> Option<(&'a str, usize)> {
-    let end_pos = closed_but_malformed_end_pos_quote_aware(payload, 0, end_tag, b"\"")?;
+    let end_pos = match race_opener_vs_end_tag(payload, "{", end_tag)? {
+      BoundRaceOutcome::PlainEnd { end_rel } => end_rel,
+      BoundRaceOutcome::OpenerProven => {
+        closed_but_malformed_end_pos_quote_aware(payload, 0, end_tag, b"\"")?
+      }
+    };
     // `end_pos` is relative to payload (we passed payload_at=0). Body is
     // payload[..end_pos - end_tag.len()].
     let body_end = end_pos - end_tag.len();
@@ -595,13 +664,27 @@ impl Pythonic {
   /// where `args` can hold both single- and double-quoted strings. An
   /// in-string end-tag literal is legitimate value text; only an end-tag
   /// OUTSIDE every quoted region is the real wrapper close.
+  ///
+  /// **L9 R15 race:** [`race_opener_vs_end_tag`] proves pythonic context
+  /// first (parser opener `[`). When the body does NOT contain a `[`
+  /// before the first end_tag (`<|tool_call_start|>bad'<|tool_call_end|>
+  /// [echo(x=1)]` — an orphan `'` BEFORE any `[`), the quote-aware
+  /// scanner would treat the orphan `'` as a string-open and wait for a
+  /// matching `'` that never lands inside the body — same-chunk suffix
+  /// drops silently. The race detects this (no `[` before first end_tag)
+  /// and returns the plain end_tag position so the suffix is preserved.
   fn bound_section<'a>(
     &self,
     payload: &'a str,
     payload_at: usize,
     end_tag: &str,
   ) -> Option<(&'a str, usize)> {
-    let end_pos = closed_but_malformed_end_pos_quote_aware(payload, 0, end_tag, b"\"'")?;
+    let end_pos = match race_opener_vs_end_tag(payload, "[", end_tag)? {
+      BoundRaceOutcome::PlainEnd { end_rel } => end_rel,
+      BoundRaceOutcome::OpenerProven => {
+        closed_but_malformed_end_pos_quote_aware(payload, 0, end_tag, b"\"'")?
+      }
+    };
     let body_end = end_pos - end_tag.len();
     Some((&payload[..body_end], payload_at + end_pos))
   }
@@ -835,13 +918,29 @@ impl Qwen3Coder {
   /// real wrapper close. An in-value end-tag literal (e.g.
   /// `<parameter=p></tool_call>` mid-stream, before `</parameter>`) returns
   /// `None` — the R13 in-value-end-tag negative tests stay green.
+  ///
+  /// **L9 R15 race:** [`race_opener_vs_end_tag`] proves qwen3_coder context
+  /// first (parser opener `<function=`). When the body does NOT contain a
+  /// `<function=` before the first end_tag (`<tool_call>bad<parameter=p>
+  /// </tool_call><function=f>...` — an orphan `<parameter=` BEFORE any
+  /// `<function=`), the parameter-value-aware scanner would treat the
+  /// orphan `<parameter=` as a real parameter region, look for the
+  /// matching `</parameter>` that never lands inside the body, and return
+  /// None — same-chunk suffix `<function=f>...` drops silently. The race
+  /// detects this (no `<function=` before first end_tag) and returns the
+  /// plain end_tag position so the suffix is preserved.
   fn bound_section<'a>(
     &self,
     payload: &'a str,
     payload_at: usize,
     end_tag: &str,
   ) -> Option<(&'a str, usize)> {
-    let rel = xml_value_aware_end_tag_scan(payload, "<parameter=", "</parameter>", end_tag)?;
+    let rel = match race_opener_vs_end_tag(payload, "<function=", end_tag)? {
+      BoundRaceOutcome::PlainEnd { end_rel } => end_rel - end_tag.len(),
+      BoundRaceOutcome::OpenerProven => {
+        xml_value_aware_end_tag_scan(payload, "<parameter=", "</parameter>", end_tag)?
+      }
+    };
     let end_pos = rel + end_tag.len();
     Some((&payload[..rel], payload_at + end_pos))
   }
@@ -1076,6 +1175,17 @@ impl Glm47 {
   /// Mirrors the existing per-arm scanner choices the parser body already
   /// uses; R14 hoists those choices to BEFORE the parser's body balancers
   /// so suffix bytes can never bias the body scan.
+  ///
+  /// **L9 R15 race per arm:** [`race_opener_vs_end_tag`] proves the
+  /// per-arm parser opener context BEFORE running the matching syntax-
+  /// aware scanner. For `{`-leading bodies the `{` is at the leading byte
+  /// so the race trivially passes; for `[`-leading bodies the `[` is at
+  /// the leading byte; the None arm preserves the R8/R9
+  /// `first_key < first_end` race (`<arg_key>` opener). In every arm,
+  /// when the opener is missing in `payload[..first_end_rel]` (so no
+  /// parser context is proven), the bounded close falls back to the
+  /// plain end_tag position — an orphan scanner-bait marker can never
+  /// hide the real wrapper close (L9 R15).
   fn bound_section<'a>(
     &self,
     payload: &'a str,
@@ -1083,10 +1193,20 @@ impl Glm47 {
     end_tag: &str,
   ) -> Option<(&'a str, usize)> {
     let end_rel = match classify_json_payload_start(payload) {
-      JsonPayloadStart::Object | JsonPayloadStart::Array => {
-        closed_but_malformed_end_pos_quote_aware(payload, 0, end_tag, b"\"")
-          .map(|ep| ep - end_tag.len())?
-      }
+      JsonPayloadStart::Object => match race_opener_vs_end_tag(payload, "{", end_tag)? {
+        BoundRaceOutcome::PlainEnd { end_rel } => end_rel - end_tag.len(),
+        BoundRaceOutcome::OpenerProven => {
+          closed_but_malformed_end_pos_quote_aware(payload, 0, end_tag, b"\"")
+            .map(|ep| ep - end_tag.len())?
+        }
+      },
+      JsonPayloadStart::Array => match race_opener_vs_end_tag(payload, "[", end_tag)? {
+        BoundRaceOutcome::PlainEnd { end_rel } => end_rel - end_tag.len(),
+        BoundRaceOutcome::OpenerProven => {
+          closed_but_malformed_end_pos_quote_aware(payload, 0, end_tag, b"\"")
+            .map(|ep| ep - end_tag.len())?
+        }
+      },
       JsonPayloadStart::None => {
         let first_end = payload.find(end_tag);
         let first_key = payload.find("<arg_key>");
@@ -1504,6 +1624,15 @@ impl Longcat {
   ///   </longcat_arg_value>` regions (those values can carry the wrapper
   ///   end-tag literal verbatim — only an end-tag OUTSIDE every value
   ///   region is the real wrapper close).
+  ///
+  /// **L9 R15 race per arm:** [`race_opener_vs_end_tag`] proves the
+  /// per-arm parser opener context BEFORE running the matching syntax-
+  /// aware scanner. For `{`-leading bodies the `{` is at the leading byte
+  /// so the race trivially passes; for the else arm the opener
+  /// `<longcat_arg_key>` is raced against `end_tag` so an orphan
+  /// `<longcat_arg_value>` in a malformed body (no `<longcat_arg_key>`
+  /// before any end_tag) falls back to the plain end_tag position
+  /// instead of scanning forward over the suffix.
   fn bound_section<'a>(
     &self,
     payload: &'a str,
@@ -1514,15 +1643,23 @@ impl Longcat {
       classify_json_payload_start(payload),
       JsonPayloadStart::Object
     ) {
-      closed_but_malformed_end_pos_quote_aware(payload, 0, end_tag, b"\"")
-        .map(|ep| ep - end_tag.len())?
+      match race_opener_vs_end_tag(payload, "{", end_tag)? {
+        BoundRaceOutcome::PlainEnd { end_rel } => end_rel - end_tag.len(),
+        BoundRaceOutcome::OpenerProven => {
+          closed_but_malformed_end_pos_quote_aware(payload, 0, end_tag, b"\"")
+            .map(|ep| ep - end_tag.len())?
+        }
+      }
     } else {
-      xml_value_aware_end_tag_scan(
-        payload,
-        "<longcat_arg_value>",
-        "</longcat_arg_value>",
-        end_tag,
-      )?
+      match race_opener_vs_end_tag(payload, "<longcat_arg_key>", end_tag)? {
+        BoundRaceOutcome::PlainEnd { end_rel } => end_rel - end_tag.len(),
+        BoundRaceOutcome::OpenerProven => xml_value_aware_end_tag_scan(
+          payload,
+          "<longcat_arg_value>",
+          "</longcat_arg_value>",
+          end_tag,
+        )?,
+      }
     };
     Some((&payload[..end_rel], payload_at + end_rel + end_tag.len()))
   }
@@ -1847,14 +1984,29 @@ impl FunctionGemma {
   /// verbatim; only an end-tag OUTSIDE every escape region is the real
   /// wrapper close. An in-escape end-tag literal mid-stream returns
   /// `None` — the R13 in-value-end-tag negative tests stay green.
+  ///
+  /// **L9 R15 race:** [`race_opener_vs_end_tag`] proves function_gemma
+  /// context first (parser opener `call:`). When the body does NOT
+  /// contain a `call:` before the first end_tag (`<start_function_call>
+  /// bad<escape><end_function_call>call:f{k:v}` — an orphan `<escape>`
+  /// BEFORE any `call:`), the escape-region-aware scanner would treat
+  /// the orphan `<escape>` as a real value region, look for the matching
+  /// `<escape>` close that never lands inside the body, and return None
+  /// — same-chunk suffix `call:f{k:v}` drops silently. The race detects
+  /// this (no `call:` before first end_tag) and returns the plain
+  /// end_tag position so the suffix is preserved.
   fn bound_section<'a>(
     &self,
     payload: &'a str,
     payload_at: usize,
     end_tag: &str,
   ) -> Option<(&'a str, usize)> {
-    let end_pos =
-      closed_but_malformed_end_pos_value_aware(payload, 0, end_tag, "<escape>", "<escape>")?;
+    let end_pos = match race_opener_vs_end_tag(payload, "call:", end_tag)? {
+      BoundRaceOutcome::PlainEnd { end_rel } => end_rel,
+      BoundRaceOutcome::OpenerProven => {
+        closed_but_malformed_end_pos_value_aware(payload, 0, end_tag, "<escape>", "<escape>")?
+      }
+    };
     let body_end = end_pos - end_tag.len();
     Some((&payload[..body_end], payload_at + end_pos))
   }
@@ -6761,6 +6913,333 @@ mod tests {
         "{}: per-parser call-acceptance baseline for malformed body inside bounded prefix (got {:?})",
         row.label,
         calls,
+      );
+    }
+  }
+
+  // --- L9 R15 STRUCTURAL: orphan value markers hide the real wrapper close --
+  //
+  // Pre-R15, each `bound_section`'s quote/value-aware scanner ran over the
+  // RAW payload BEFORE the parser opener context was proven. Orphan markers
+  // in MALFORMED bodies (a stray `"` in non-JSON garbage / a `<parameter=`
+  // before any `<function=` / an `<escape>` before any `call:name{`) fooled
+  // the syntax-aware scanners into either waiting forever for a missing
+  // close or skipping past the real wrapper end-tag — silently dropping the
+  // same-chunk suffix until cap/EOS.
+  //
+  // R15 STRUCTURAL fix: each `bound_section` now RACES the parser opener
+  // against the first end_tag candidate BEFORE running the syntax-aware
+  // scanner. When the opener is missing in `payload[..first_end_rel]` (no
+  // parser context proven), the bounded close falls back to the plain
+  // end_tag position — orphan scanner-bait markers can never hide the real
+  // wrapper close.
+  //
+  // These tests construct the orphan-marker prefix shape per parser and
+  // assert the safe end-to-end outcome: ZERO (or permissive) calls + FULL
+  // suffix bytes reach display verbatim.
+
+  #[test]
+  fn streaming_json_tools_orphan_quote_in_malformed_body_does_not_hide_close() {
+    // Pre-R15: payload `<tool_call>bad"</tool_call>{"name":"x"}` — the
+    // orphan `"` BEFORE the wrapper close fools the JSON-string-quote-
+    // aware scanner into entering string state at `"`, walking through
+    // `</tool_call>{`, finding the matching `"` deep in the suffix
+    // (`"name"`), continuing… no `</tool_call>` ever appears OUTSIDE
+    // strings in the body, scanner returns None, `bound_section` returns
+    // None, caller returns `Ok(None)` → suffix dropped silently until
+    // cap/EOS.
+    //
+    // R15: race(`{`, end_tag) → no `{` in `payload[..first_end_rel]`
+    // (only `bad"`) → PlainEnd → end_pos lands at the FIRST wrapper
+    // close; bounded body `bad"` is unbalanced JSON → empty calls;
+    // suffix `{"name":"x"}` reaches display.
+    let (display, calls) = run_with_parser(
+      Box::new(JsonTools),
+      &[r#"<tool_call>bad"</tool_call>{"name":"x"}"#],
+    );
+    assert_eq!(
+      calls.len(),
+      0,
+      "orphan `\"` BEFORE wrapper close must not hide the real end-tag (R15)",
+    );
+    assert_eq!(
+      display, r#"{"name":"x"}"#,
+      "FULL suffix bytes reach display — body scan must not lock onto the orphan `\"`",
+    );
+  }
+
+  #[test]
+  fn streaming_pythonic_orphan_quote_in_malformed_body_does_not_hide_close() {
+    // Pre-R15: payload `<|tool_call_start|>bad'<|tool_call_end|>[echo(x=1)] tail`
+    // — the orphan `'` BEFORE the wrapper close fools the Python-quote-
+    // aware scanner (which tracks both `'` and `"`) into entering string
+    // state at `'`, walking forward looking for matching `'`… never
+    // finding one outside strings in the body → bound returns None →
+    // Ok(None) → suffix dropped.
+    //
+    // R15: race(`[`, end_tag) → no `[` in `payload[..first_end_rel]`
+    // (only `bad'`) → PlainEnd → end_pos lands at FIRST wrapper close;
+    // bounded body `bad'` has no `[name(` → empty calls; suffix
+    // `[echo(x=1)] tail` reaches display.
+    let (display, calls) = run_with_parser(
+      Box::new(Pythonic),
+      &["<|tool_call_start|>bad'<|tool_call_end|>[echo(x=1)] tail"],
+    );
+    assert_eq!(
+      calls.len(),
+      0,
+      "orphan `'` BEFORE wrapper close must not hide the real end-tag (R15)",
+    );
+    assert_eq!(
+      display, "[echo(x=1)] tail",
+      "FULL suffix bytes reach display — body scan must not lock onto the orphan `'`",
+    );
+  }
+
+  #[test]
+  fn streaming_qwen3_coder_orphan_parameter_in_malformed_body_does_not_hide_close() {
+    // Pre-R15: payload
+    // `<tool_call>bad<parameter=p></tool_call><function=f><parameter=p>v</parameter></function> tail`
+    // — the orphan `<parameter=` BEFORE any `<function=` fools the
+    // parameter-value-aware scanner into entering a parameter region at
+    // the orphan, looking for matching `</parameter>` that never lands
+    // inside the body (the `</parameter>` is in the SUFFIX past the
+    // wrapper close) → scanner returns None → bound returns None →
+    // Ok(None) → suffix dropped silently until cap/EOS.
+    //
+    // R15: race(`<function=`, end_tag) → no `<function=` in
+    // `payload[..first_end_rel]` (only `bad<parameter=p>`) → PlainEnd
+    // → end_pos lands at FIRST wrapper close; bounded body
+    // `bad<parameter=p>` has no `<function=` → empty calls; suffix
+    // `<function=f>...` reaches display.
+    let (display, calls) = run_with_parser(
+      Box::new(Qwen3Coder),
+      &[
+        "<tool_call>bad<parameter=p></tool_call><function=f><parameter=p>v</parameter></function> tail",
+      ],
+    );
+    assert_eq!(
+      calls.len(),
+      0,
+      "orphan `<parameter=` BEFORE wrapper close must not hide the real end-tag (R15)",
+    );
+    assert_eq!(
+      display, "<function=f><parameter=p>v</parameter></function> tail",
+      "FULL suffix bytes reach display — body scan must not lock onto the orphan `<parameter=`",
+    );
+  }
+
+  #[test]
+  fn streaming_glm47_orphan_quote_in_malformed_body_does_not_hide_close() {
+    // glm47 Object arm: body starts with `{` so classify=Object. The
+    // R15 race for the Object arm is trivially `{` at byte 0 < any
+    // end_tag → OpenerProven → JSON-string-quote-aware scan runs.
+    //
+    // This test exercises the Object arm's R15-gated path for a CLEAN
+    // body: the quote-aware scan correctly finds the wrapper close and
+    // the same-chunk suffix is preserved. (The body-balancer step then
+    // rejects the bounded JSON as invalid because the body is
+    // intentionally malformed; the call surface is glm47's permissive
+    // plain-text fallback OR zero — both are pre-R14 baseline. The R15
+    // invariant verified here is *suffix preservation* — the close
+    // must land at the FIRST wrapper close, never advanced past it.)
+    let (display, calls) = run_with_parser(
+      Box::new(Glm47),
+      &[r#"<tool_call>{garbage}</tool_call>{"name":"y"} tail"#],
+    );
+    // glm47 is permissive: a body like `{garbage}` is treated as a
+    // plain-text name by glm_parse_plain (no `<arg_key>`, not valid
+    // JSON), so one call surfaces with name=`{garbage}`. The R15
+    // assertion is suffix preservation.
+    assert_eq!(calls.len(), 1, "glm47 permissive parse on `{{garbage}}`");
+    assert_eq!(calls[0].name, "{garbage}");
+    assert_eq!(
+      display, r#"{"name":"y"} tail"#,
+      "FULL suffix bytes reach display — Object arm race must close at the FIRST wrapper end-tag",
+    );
+  }
+
+  #[test]
+  fn streaming_glm47_orphan_bracket_in_malformed_body_does_not_hide_close() {
+    // glm47 Array arm: body starts with `[` so classify=Array. The R15
+    // race for the Array arm is trivially `[` at byte 0 < any end_tag
+    // → OpenerProven → JSON-string-quote-aware scan runs. Cleanly-
+    // closed `[garbage]` body in the Array arm: the scan finds the
+    // wrapper close, suffix preserved.
+    let (display, calls) = run_with_parser(
+      Box::new(Glm47),
+      &[r#"<tool_call>[garbage]</tool_call>{"name":"y"} tail"#],
+    );
+    // glm47 permissive: `[garbage]` body, glm_parse_plain treats as name.
+    assert_eq!(calls.len(), 1, "glm47 permissive parse on `[garbage]`");
+    assert_eq!(calls[0].name, "[garbage]");
+    assert_eq!(
+      display, r#"{"name":"y"} tail"#,
+      "FULL suffix bytes reach display — Array arm race must close at the FIRST wrapper end-tag",
+    );
+  }
+
+  #[test]
+  fn streaming_glm47_orphan_arg_key_in_malformed_body_does_not_hide_close() {
+    // glm47 None arm with R8/R9 race preserved: body has an `<arg_key>`
+    // opener BEFORE the wrapper end-tag, so `first_key < first_end`
+    // routes to the xml_value_aware scanner. An UNTERMINATED `<arg_key>`
+    // (no matching `</arg_key>`) stays a benign plain text segment for
+    // the scanner — the scanner only skips `<arg_value>...</arg_value>`
+    // regions. So the wrapper close is found and the suffix is
+    // preserved.
+    //
+    // R15 invariant for the None arm: the existing R8/R9 race plumbing
+    // continues to surface the FIRST wrapper close, not silently drop
+    // the same-chunk suffix.
+    let (display, calls) = run_with_parser(
+      Box::new(Glm47),
+      &[r#"<tool_call>bad<arg_key></tool_call>{"name":"y"} tail"#],
+    );
+    // glm47 permissive: body parsed via glm_parse_plain → name=`bad`.
+    assert_eq!(calls.len(), 1, "glm47 permissive parse extracts one call");
+    assert_eq!(calls[0].name, "bad");
+    assert_eq!(
+      display, r#"{"name":"y"} tail"#,
+      "FULL suffix bytes reach display — R8/R9 None-arm race stays correct under R15",
+    );
+  }
+
+  #[test]
+  fn streaming_longcat_orphan_quote_in_malformed_body_does_not_hide_close() {
+    // Longcat Object arm: body starts with `{` so the `{`-leading
+    // fast-path runs. R15 race: `{` at byte 0 < end_tag → OpenerProven
+    // → JSON-string-quote-aware scan runs. Cleanly-closed `{garbage}`
+    // body: the scan finds the wrapper close, suffix preserved.
+    let (display, calls) = run_with_parser(
+      Box::new(Longcat),
+      &[r#"<longcat_tool_call>{garbage}</longcat_tool_call>{"name":"y"} tail"#],
+    );
+    // Longcat's `{`-leading fast-path requires valid JSON; `{garbage}`
+    // is invalid JSON → falls through the `serde_json::from_str` check
+    // → drops into the `<longcat_arg_key>` path which errors (no
+    // function name) → try_parse_one_call's `_` arm returns
+    // `Ok(Some((Vec::new(), end_pos)))` (R12 contract). Zero calls.
+    assert_eq!(
+      calls.len(),
+      0,
+      "longcat strict on malformed `{{garbage}}` body"
+    );
+    assert_eq!(
+      display, r#"{"name":"y"} tail"#,
+      "FULL suffix bytes reach display — Object arm race must close at the FIRST wrapper end-tag",
+    );
+  }
+
+  #[test]
+  fn streaming_function_gemma_orphan_escape_in_malformed_body_does_not_hide_close() {
+    // Pre-R15: payload
+    // `<start_function_call>bad<escape><end_function_call>call:f{k:v} tail`
+    // — the orphan `<escape>` BEFORE any `call:` fools the escape-
+    // region-aware scanner into entering a value region at the orphan,
+    // looking for matching `<escape>` close that never lands inside the
+    // body (the body only has ONE `<escape>`) → scanner returns None →
+    // bound returns None → Ok(None) → suffix dropped silently.
+    //
+    // R15: race(`call:`, end_tag) → no `call:` in
+    // `payload[..first_end_rel]` (only `bad<escape>`) → PlainEnd →
+    // end_pos lands at FIRST wrapper close; bounded body `bad<escape>`
+    // has no `call:` → empty calls; suffix `call:f{k:v} tail` reaches
+    // display.
+    let (display, calls) = run_with_parser(
+      Box::new(FunctionGemma),
+      &["<start_function_call>bad<escape><end_function_call>call:f{k:v} tail"],
+    );
+    assert_eq!(
+      calls.len(),
+      0,
+      "orphan `<escape>` BEFORE wrapper close must not hide the real end-tag (R15)",
+    );
+    assert_eq!(
+      display, "call:f{k:v} tail",
+      "FULL suffix bytes reach display — body scan must not lock onto the orphan `<escape>`",
+    );
+  }
+
+  /// L9 R15 table audit: one row per patched parser, asserting that
+  /// orphan value-markers BEFORE the parser opener context do NOT hide
+  /// the real wrapper close. The body scan must close at the FIRST
+  /// wrapper end-tag and the same-chunk suffix must reach display
+  /// verbatim.
+  ///
+  /// Per-arm coverage:
+  /// * `json_tools` — orphan `"` (string-open bait).
+  /// * `pythonic` — orphan `'` (Python string-open bait).
+  /// * `qwen3_coder` — orphan `<parameter=` (value-region bait).
+  /// * `glm47` None arm — orphan `<arg_key>` text (R8/R9 race
+  ///   confirmed: `<arg_key>` opener seen but unterminated body stays
+  ///   benign under the xml_value_aware scanner).
+  /// * `longcat` Object arm — malformed `{`-leading body.
+  /// * `function_gemma` — orphan `<escape>` (value-region bait).
+  #[test]
+  fn try_parse_one_call_orphan_value_markers_per_parser_audit() {
+    struct Row {
+      label: &'static str,
+      parser: Box<dyn ToolParser>,
+      buffer: &'static str,
+      // Byte position one past the FIRST wrapper end-tag — the body
+      // scan MUST NOT advance past this even when an orphan value
+      // marker appears in `payload[..first_end_rel]`.
+      expect_end_pos: usize,
+    }
+    let rows = [
+      Row {
+        label: "json_tools (orphan `\"`)",
+        parser: Box::new(JsonTools),
+        buffer: r#"<tool_call>bad"</tool_call>{"name":"x"}"#,
+        expect_end_pos: r#"<tool_call>bad"</tool_call>"#.len(),
+      },
+      Row {
+        label: "pythonic (orphan `'`)",
+        parser: Box::new(Pythonic),
+        buffer: "<|tool_call_start|>bad'<|tool_call_end|>[echo(x=1)] tail",
+        expect_end_pos: "<|tool_call_start|>bad'<|tool_call_end|>".len(),
+      },
+      Row {
+        label: "qwen3_coder (orphan `<parameter=`)",
+        parser: Box::new(Qwen3Coder),
+        buffer: "<tool_call>bad<parameter=p></tool_call><function=f><parameter=p>v</parameter></function> tail",
+        expect_end_pos: "<tool_call>bad<parameter=p></tool_call>".len(),
+      },
+      Row {
+        label: "glm47 None arm (orphan `<arg_key>`)",
+        parser: Box::new(Glm47),
+        buffer: r#"<tool_call>bad<arg_key></tool_call>{"name":"y"} tail"#,
+        expect_end_pos: r#"<tool_call>bad<arg_key></tool_call>"#.len(),
+      },
+      Row {
+        label: "longcat Object arm (malformed `{`-leading)",
+        parser: Box::new(Longcat),
+        buffer: r#"<longcat_tool_call>{garbage}</longcat_tool_call>{"name":"y"} tail"#,
+        expect_end_pos: r#"<longcat_tool_call>{garbage}</longcat_tool_call>"#.len(),
+      },
+      Row {
+        label: "function_gemma (orphan `<escape>`)",
+        parser: Box::new(FunctionGemma),
+        buffer: "<start_function_call>bad<escape><end_function_call>call:f{k:v} tail",
+        expect_end_pos: "<start_function_call>bad<escape><end_function_call>".len(),
+      },
+    ];
+    for row in &rows {
+      let result = row
+        .parser
+        .try_parse_one_call(row.buffer, None)
+        .unwrap_or_else(|e| panic!("{}: try_parse_one_call errored: {e}", row.label));
+      let (_, end_pos) = result.unwrap_or_else(|| {
+        panic!(
+          "{}: confirmed-bounded section expected (the wrapper end-tag is in the buffer), got Ok(None) — R15 regression: orphan value marker hid the real wrapper close",
+          row.label,
+        )
+      });
+      assert_eq!(
+        end_pos, row.expect_end_pos,
+        "{}: end_pos must land at the FIRST wrapper close — orphan value marker must not bias the body scan",
+        row.label,
       );
     }
   }
