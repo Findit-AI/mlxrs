@@ -263,21 +263,41 @@ impl Drop for WiredLimitGuard<'_> {
     // dropped per the crate's `Drop` convention (must not panic, must not
     // call check() through the TLS), the same as `Stream::drop`.
     //
+    // CODEX R1 [HIGH] F3 fix — Drop MUST be infallible.
+    // Previously, `Stream::default_gpu()` and `Stream::synchronize()` both
+    // invoke `assert_streams_not_cleared()` which `panic!`s when the
+    // thread's streams have been bulk-cleared via
+    // `Stream::clear_current_thread_streams()`. A safe sequence —
+    // install guard → `clear_current_thread_streams` → scope-exit drop —
+    // would have panicked here, leaking the process-global wired-memory
+    // limit; and if the scope-exit was *already* from an in-flight panic,
+    // a panic-while-panicking double-panics → process abort.
+    //
+    // Use the crate-internal non-panicking variants
+    // ([`Stream::try_default_gpu`] / [`Stream::try_synchronize`]) which
+    // silently skip the sync step on a poisoned thread. The
+    // `set_wired_limit` restore still runs unconditionally — the wired
+    // limit is process-global, not per-stream, so restoring it is correct
+    // (and required) even when the per-thread streams have been cleared.
+    //
     // SAFETY (no `unsafe` block, but the contract): the streams slice is
     // borrowed for `'a`, so all stream handles are still live; the
     // wired-limit restore uses the safe `set_wired_limit` wrapper which
     // drains its own rc on failure (rc is discarded here).
     if self.streams.is_empty() {
       // Default stream synchronize. Mirrors Python's `mx.synchronize()`
-      // (no-arg). The crate's default stream is a per-thread cache; if it
-      // was never initialized on this thread, `default_gpu` succeeds the
-      // first time (initializes Metal) but cannot panic.
-      if let Ok(s) = Stream::default_gpu() {
-        let _ = s.synchronize();
+      // (no-arg). `try_default_gpu` returns `None` on a poisoned thread
+      // (or any FFI failure) instead of panicking — skip the sync step.
+      if let Some(s) = Stream::try_default_gpu() {
+        let _ = s.try_synchronize();
       }
     } else {
       for s in self.streams {
-        let _ = s.synchronize();
+        // `try_synchronize` no-ops on a poisoned thread instead of
+        // panicking — the original sync intent cannot complete (the
+        // stream's encoders are gone) but the limit restore below still
+        // runs.
+        let _ = s.try_synchronize();
       }
     }
     let _ = set_wired_limit(self.old_limit);

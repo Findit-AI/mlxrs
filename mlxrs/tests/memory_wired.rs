@@ -19,9 +19,12 @@
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use mlxrs::memory::{
-  WiredBudgetPolicy, WiredFixedPolicy, WiredLimitGuard, WiredMaxPolicy, WiredMemoryMeasurement,
-  WiredMemoryPolicy, WiredSumPolicy, recommended_working_set_bytes, set_wired_limit,
+use mlxrs::{
+  Stream,
+  memory::{
+    WiredBudgetPolicy, WiredFixedPolicy, WiredLimitGuard, WiredMaxPolicy, WiredMemoryMeasurement,
+    WiredMemoryPolicy, WiredSumPolicy, recommended_working_set_bytes, set_wired_limit,
+  },
 };
 
 /// Process-global serialization for any test that mutates the wired-memory
@@ -274,6 +277,138 @@ fn wired_limit_guard_drop_restores_old_limit() {
     observed_after_drop, captured_old,
     "guard's Drop must restore the captured old_limit (recommended={recommended}, \
      captured_old={captured_old}, observed_after_drop={observed_after_drop})"
+  );
+}
+
+/// CODEX R1 [HIGH] F3 regression guard — the guard's `Drop` MUST NOT
+/// panic when `clear_current_thread_streams()` was called before scope
+/// exit, AND MUST still restore the prior wired-memory limit.
+///
+/// The prior `Drop` impl called `Stream::default_gpu()` /
+/// `Stream::synchronize()`, both of which panic via
+/// `assert_streams_not_cleared()` once the thread has been
+/// stream-cleared. That would leak the process-global wired-memory limit
+/// (the restore line was unreachable).
+///
+/// Run inside a dedicated worker thread because
+/// `clear_current_thread_streams()` permanently poisons the calling
+/// thread for any future mlx work — we don't want to poison the cargo
+/// test runner.
+#[test]
+fn wired_limit_guard_drop_after_stream_cleanup_does_not_panic_and_still_restores() {
+  let _serialized = lock_wired_limit();
+
+  let Ok(Some(_recommended)) = recommended_working_set_bytes() else {
+    eprintln!("skipping: recommended_working_set_bytes unavailable on this host");
+    return;
+  };
+
+  // Snapshot the current process-global limit BEFORE the worker thread
+  // installs a guard. After the worker joins, this value must be the
+  // observed limit — proving the worker's guard `Drop` successfully ran
+  // the `set_wired_limit(old)` restore step despite its thread being
+  // stream-cleared mid-scope.
+  let snapshot_before = set_wired_limit(0).expect("snapshot via round-trip");
+  let _ = set_wired_limit(snapshot_before).expect("restore snapshot baseline");
+
+  let join = std::thread::spawn(move || {
+    // Touch the GPU stream FIRST so the install path / Drop path have a
+    // real per-thread default to interact with — this matches a realistic
+    // generation scope where the body did mlx work.
+    let _ = Stream::default_gpu();
+
+    let guard = WiredLimitGuard::install(0, &[])
+      .expect("install rc")
+      .expect("guard installed");
+    let captured = guard.old_limit();
+
+    // POISON: clear this thread's streams. Subsequent
+    // `Stream::default_gpu` / `Stream::synchronize` would panic via
+    // `assert_streams_not_cleared`. The guard's `Drop` (about to run on
+    // scope exit) MUST detour around those panicking paths.
+    Stream::clear_current_thread_streams().expect("clear_streams shim rc");
+
+    // Guard drops here — must not panic, must still restore `captured`.
+    drop(guard);
+
+    captured
+  });
+
+  let captured = join.join().expect(
+    "worker thread MUST NOT panic — the F3 regression makes \
+     WiredLimitGuard::drop call Stream::default_gpu()/synchronize() which \
+     panic on a stream-cleared thread, and a panic-on-Drop would leak \
+     the process-global wired-memory limit (worst case: double-panic abort).",
+  );
+
+  // Verify the restore actually happened: the limit must equal the value
+  // captured at install-time (which was `snapshot_before` since nothing
+  // else mutated it under the serialization lock).
+  let observed = set_wired_limit(captured).expect("read-back via set");
+  assert_eq!(
+    observed, captured,
+    "Drop must restore captured old_limit (captured={captured}, \
+     observed={observed}, snapshot_before={snapshot_before}) — \
+     the F3 fix uses Stream::try_synchronize/try_default_gpu to skip the \
+     sync step on a cleared thread while still running the limit restore."
+  );
+}
+
+/// CODEX R1 [HIGH] F3 regression guard — the guard's `Drop` running
+/// during an already-in-flight panic MUST NOT double-panic (which would
+/// abort the process). Uses `std::panic::catch_unwind` on a closure
+/// that creates a live `WiredLimitGuard` and then panics; the catch
+/// MUST return `Err(_)` (the original panic propagates) and the limit
+/// MUST be restored.
+///
+/// Pre-F3 failure mode: the closure panics → unwind starts → guard's
+/// `Drop` runs → `Stream::default_gpu()` succeeds (thread not cleared) →
+/// `Stream::synchronize()` is called, also fine → restore runs. So the
+/// double-panic risk specifically materializes when sync ALSO panics —
+/// covered by the stream-cleanup test above. This test additionally
+/// confirms the simpler "Drop during normal panic completes cleanly"
+/// invariant.
+#[test]
+fn wired_limit_guard_drop_during_panic_does_not_double_panic() {
+  let _serialized = lock_wired_limit();
+
+  let Ok(Some(_recommended)) = recommended_working_set_bytes() else {
+    eprintln!("skipping: recommended_working_set_bytes unavailable on this host");
+    return;
+  };
+
+  let snapshot_before = set_wired_limit(0).expect("snapshot via round-trip");
+  let _ = set_wired_limit(snapshot_before).expect("restore snapshot baseline");
+
+  // catch_unwind needs an UnwindSafe closure; the guard is RAII-only and
+  // does not implement UnwindSafe (it borrows `&[]`), so use
+  // AssertUnwindSafe — we manually verify the post-state below.
+  let captured_cell = std::sync::Mutex::new(None::<u64>);
+  let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let guard = WiredLimitGuard::install(0, &[])
+      .expect("install rc")
+      .expect("guard installed");
+    *captured_cell.lock().unwrap() = Some(guard.old_limit());
+    panic!("F3 test: deliberate panic with live WiredLimitGuard");
+  }));
+
+  // The closure SHOULD have panicked; catch_unwind returns Err on panic.
+  assert!(
+    result.is_err(),
+    "deliberate panic inside the closure must propagate as Err from catch_unwind"
+  );
+
+  let captured = captured_cell.lock().unwrap().expect(
+    "guard install ran before the panic, so old_limit was recorded; if this is \
+     None, the install path or panic ordering changed",
+  );
+
+  // Verify the restore happened despite the panic-on-Drop path.
+  let observed = set_wired_limit(captured).expect("read-back via set");
+  assert_eq!(
+    observed, captured,
+    "Drop-during-panic must restore captured old_limit (captured={captured}, \
+     observed={observed}, snapshot_before={snapshot_before})"
   );
 }
 
