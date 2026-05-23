@@ -197,6 +197,7 @@ fn build_session() -> VoiceSession<
     EnergyBargeInDetector::default(),
     SilenceTurnTakingPolicy::new(200),
   )
+  .expect("build_session: non-zero sample rate")
 }
 
 /// End-to-end shape check: 5 speech chunks + 12 silence chunks →
@@ -362,7 +363,8 @@ fn voice_session_play_audio_false_skips_tts_writes() {
     FixedSizeAudioChunker::new(CHUNK_SIZE),
     EnergyBargeInDetector::default(),
     SilenceTurnTakingPolicy::new(200),
-  );
+  )
+  .expect("build_session: non-zero sample rate");
   let mut sink = RecordingSink::new();
 
   let speech = speech_chunk(CHUNK_SIZE);

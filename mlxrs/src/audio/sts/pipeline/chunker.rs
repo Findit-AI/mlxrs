@@ -50,6 +50,18 @@ pub trait AudioChunker {
   /// or format conversion may.
   fn push_samples(&mut self, samples: &[f32]) -> Result<Vec<Vec<f32>>>;
 
+  /// Drain any residual buffered samples (shorter than one full
+  /// chunk) and return them, leaving the chunker empty. Used by
+  /// [`super::orchestrator::VoiceSession::flush_in_progress_turn`]
+  /// at mic-EOF so the trailing partial-chunk audio still reaches
+  /// the STT.
+  ///
+  /// Implementors that never buffer (e.g. a pass-through chunker
+  /// that immediately re-emits whatever it received) may return an
+  /// empty `Vec`. The default [`FixedSizeAudioChunker`] returns the
+  /// tail and clears its internal buffer.
+  fn drain_residual(&mut self) -> Vec<f32>;
+
   /// Reset internal state (drop any buffered residual). Used when
   /// the pipeline tears a turn down and starts fresh (mirror of the
   /// `chunker = FixedSizeAudioChunker(...)` reset in mlx-audio's
@@ -137,6 +149,10 @@ impl AudioChunker for FixedSizeAudioChunker {
       }
     }
     Ok(chunks)
+  }
+
+  fn drain_residual(&mut self) -> Vec<f32> {
+    std::mem::take(&mut self.buffer)
   }
 
   fn reset(&mut self) {
@@ -288,6 +304,36 @@ mod tests {
     assert_eq!(chunker.buffered_len(), 200);
     chunker.reset();
     assert_eq!(chunker.buffered_len(), 0);
+  }
+
+  /// `drain_residual()` returns the buffered tail and empties the
+  /// chunker — the EOF-finalize hook the orchestrator needs to avoid
+  /// dropping the partial chunk before STT.
+  #[test]
+  fn fixed_size_chunker_drain_residual_returns_and_clears_tail() {
+    let mut chunker = FixedSizeAudioChunker::new(512);
+    let _ = chunker.push_samples(&[1.0_f32; 200]).unwrap();
+    assert_eq!(chunker.buffered_len(), 200);
+
+    let drained = chunker.drain_residual();
+    assert_eq!(drained.len(), 200);
+    assert!(drained.iter().all(|&s| s == 1.0));
+    assert_eq!(chunker.buffered_len(), 0);
+
+    // Second drain on an empty buffer is a no-op (empty Vec).
+    let drained2 = chunker.drain_residual();
+    assert!(drained2.is_empty());
+  }
+
+  /// `drain_residual()` on a chunker that has emitted all its samples
+  /// returns an empty `Vec` (no tail buffered).
+  #[test]
+  fn fixed_size_chunker_drain_residual_empty_when_aligned() {
+    let mut chunker = FixedSizeAudioChunker::new(100);
+    let _ = chunker.push_samples(&[0.0_f32; 200]).unwrap();
+    assert_eq!(chunker.buffered_len(), 0);
+    let drained = chunker.drain_residual();
+    assert!(drained.is_empty());
   }
 
   /// `chunk_size == 0` panics at construction.

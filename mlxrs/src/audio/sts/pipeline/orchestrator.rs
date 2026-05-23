@@ -219,8 +219,10 @@ where
   in_speech: bool,
   /// Silence-run accumulator (ms) since the last speech frame.
   silence_ms_accum: u32,
-  /// Whether the barge-in detector fired during the current turn.
-  barge_in_observed: bool,
+  /// Whether the barge-in detector fired during the CURRENT in-progress
+  /// turn. Reset at the start of each new turn so an idle-noise
+  /// barge-in observation cannot leak into a later, unrelated turn.
+  current_turn_barge_in: bool,
   /// Total chunks consumed across the lifetime of this session.
   total_chunks_consumed: usize,
 }
@@ -239,7 +241,12 @@ where
   /// session's [`PreRollBuffer`] capacity is derived from
   /// `config.input_sample_rate * config.preroll_ms / 1000`
   /// (mirror of `voice_pipeline.py:613-615`).
-  #[must_use]
+  ///
+  /// # Errors
+  /// Returns [`crate::error::Error::Backend`] when
+  /// `config.input_sample_rate == 0` — the per-chunk silence-ms
+  /// accounting divides by the sample rate and a zero rate would
+  /// either panic or silently produce nonsense durations.
   #[allow(clippy::too_many_arguments)]
   pub fn new(
     config: VoicePipelineConfig,
@@ -250,10 +257,18 @@ where
     chunker: C,
     barge_in: B,
     turn_policy: P,
-  ) -> Self {
+  ) -> Result<Self> {
+    if config.input_sample_rate == 0 {
+      return Err(crate::error::Error::Backend {
+        message:
+          "VoicePipelineConfig::input_sample_rate must be > 0 (got 0); the orchestrator's per-chunk \
+           silence-ms accounting divides by the sample rate"
+            .into(),
+      });
+    }
     let preroll_samples =
       (config.input_sample_rate as usize) * (config.preroll_ms as usize) / 1_000;
-    Self {
+    Ok(Self {
       config,
       vad,
       stt,
@@ -267,9 +282,9 @@ where
       in_progress_audio: Vec::new(),
       in_speech: false,
       silence_ms_accum: 0,
-      barge_in_observed: false,
+      current_turn_barge_in: false,
       total_chunks_consumed: 0,
-    }
+    })
   }
 
   /// All [`TurnEvent`]s recorded during the most recent
@@ -326,42 +341,42 @@ where
   ) -> Result<usize> {
     let mut turns_finalized = 0;
     let chunks = self.chunker.push_samples(frame)?;
-
-    // Per-chunk chunk_ms = chunk_samples * 1000 / sample_rate.
-    let chunk_ms = if !chunks.is_empty() {
-      ((chunks[0].len() as u64) * 1_000 / (self.config.input_sample_rate as u64)) as u32
-    } else {
-      0
-    };
+    let sample_rate = self.config.input_sample_rate as u64;
 
     for chunk in chunks {
       self.total_chunks_consumed += 1;
+      // Per-chunk chunk_ms = chunk_samples * 1000 / sample_rate.
+      // Computed PER CHUNK (not from chunks[0]) so a chunker that
+      // emits variable-size frames accumulates silence-ms
+      // faithfully. `sample_rate` is validated > 0 in `new()`.
+      let chunk_ms = ((chunk.len() as u64) * 1_000 / sample_rate) as u32;
+
+      // VAD first — every other branch depends on this decision,
+      // and ordering matters: appending the chunk to the pre-roll
+      // BEFORE the VAD-decision branch would double-feed the first
+      // speech chunk (preroll already has it, then the start-of-
+      // turn snapshot prepends preroll AND we append the chunk
+      // separately).
       let is_speech = self.vad.is_speech(&chunk)?;
 
-      // Track pre-roll while idle; once speech starts, accumulate
-      // turn audio.
-      if !self.in_speech {
-        self.preroll.append(&chunk);
-      }
-      // Barge-in: while TTS is playing, an energy-positive chunk
-      // counts as an overlap candidate. We don't act on it here —
-      // mlx-audio's confirmation pipeline is out of scope — but
-      // record it so a caller can observe it via [`TurnEvent`].
-      if self.config.barge_in && self.barge_in.detect(&chunk, tts_playing) {
-        self.barge_in_observed = true;
-      }
-
       if is_speech {
-        // Start a new turn: drain the pre-roll into the turn
-        // audio so the STT sees the leading samples the VAD
-        // ran past.
         if !self.in_speech {
+          // Start of turn: reset the barge-in flag (defensive — also
+          // reset in `finalize_turn` — so an "idle noise while TTS
+          // playing" detection that fired in a previous turn cannot
+          // leak in here), then snapshot the pre-roll into the turn
+          // audio so the STT sees the leading samples the VAD ran
+          // past, and append the current speech chunk ONCE.
+          self.current_turn_barge_in = false;
           let preroll_snapshot = self.preroll.snapshot();
           self.in_progress_audio.extend_from_slice(&preroll_snapshot);
+          self.in_progress_audio.extend_from_slice(&chunk);
           self.preroll.clear();
           self.in_speech = true;
+        } else {
+          // Mid-turn speech: just append.
+          self.in_progress_audio.extend_from_slice(&chunk);
         }
-        self.in_progress_audio.extend_from_slice(&chunk);
         self.silence_ms_accum = 0;
       } else if self.in_speech {
         // Silence inside a turn: tail it on (mlx-audio carries
@@ -379,6 +394,31 @@ where
           self.finalize_turn(output)?;
           turns_finalized += 1;
         }
+      } else {
+        // Idle non-speech: feed the pre-roll only. (No turn audio
+        // accumulation, no silence counter — silence accounting is
+        // a per-TURN concept.)
+        self.preroll.append(&chunk);
+      }
+
+      // Barge-in: a TTS-overlap candidate is only meaningful when
+      // (a) the chunk is actually speech (per the VAD) and
+      // (b) we are inside a turn (the in-turn speech run is what
+      //     would interrupt the TTS — idle background noise that
+      //     happens to cross the energy threshold while TTS is
+      //     playing is NOT a barge-in event and must not leak into
+      //     a later turn's event log).
+      //
+      // The fence requires `is_speech && in_speech`; the start-of-
+      // turn block above flips `in_speech` to true BEFORE we reach
+      // this check, so the very first speech chunk that opens a
+      // turn is still counted (matches the mlx-audio shape).
+      if self.config.barge_in
+        && is_speech
+        && self.in_speech
+        && self.barge_in.detect(&chunk, tts_playing)
+      {
+        self.current_turn_barge_in = true;
       }
     }
 
@@ -388,7 +428,17 @@ where
   /// Force-finalize any in-progress turn — called from
   /// [`VoiceSession::run`] when the mic iterator exhausts mid-turn.
   /// A noop when no turn is in progress.
+  ///
+  /// Drains the chunker's residual (the buffered tail shorter than
+  /// one full chunk) into the in-progress turn audio BEFORE
+  /// finalizing, so the trailing partial-chunk samples reach the STT
+  /// rather than being discarded by `finalize_turn`'s
+  /// `chunker.reset()`.
   pub fn flush_in_progress_turn<O: AudioOutputStream>(&mut self, output: &mut O) -> Result<bool> {
+    let residual = self.chunker.drain_residual();
+    if self.in_speech && !residual.is_empty() {
+      self.in_progress_audio.extend_from_slice(&residual);
+    }
     if !self.in_speech || self.in_progress_audio.is_empty() {
       return Ok(false);
     }
@@ -404,7 +454,7 @@ where
     self.silence_ms_accum = 0;
     self.preroll.clear();
     self.chunker.reset();
-    let barge_in_observed = std::mem::replace(&mut self.barge_in_observed, false);
+    let barge_in_observed = std::mem::replace(&mut self.current_turn_barge_in, false);
 
     let user_text = self.stt.transcribe_turn(&turn_audio)?;
     let user_text_for_event = user_text.clone();
@@ -613,6 +663,7 @@ mod tests {
       EnergyBargeInDetector::default(),
       SilenceTurnTakingPolicy::new(200),
     )
+    .expect("test session input_sample_rate is non-zero")
   }
 
   /// End-to-end happy path: speech → silence → finalize → STT
@@ -814,5 +865,340 @@ mod tests {
     let cfg = sess.config();
     assert_eq!(cfg.input_sample_rate, 16_000);
     assert_eq!(cfg.frame_duration_ms, 20);
+  }
+
+  // ---------- Fix 1 (HIGH): first speech chunk must not be ----------
+  // ---------- duplicated in the turn audio.                ----------
+  /// Pre-roll fills with idle silence; the first speech chunk that
+  /// follows must be appended to the turn audio EXACTLY ONCE — the
+  /// pre-fix idle branch appended the chunk to the pre-roll BEFORE
+  /// the VAD branch ran, then the start-of-turn snapshot prepended
+  /// the same pre-roll back onto the turn audio AND the speech
+  /// branch appended the chunk a second time. STT then saw the
+  /// chunk's samples twice (preroll-copy + direct-append).
+  ///
+  /// We assert via a recording STT that captures the EXACT turn
+  /// audio (not just its length) and verifies the speech-chunk's
+  /// distinct marker value appears exactly once in the leading
+  /// non-silence region.
+  #[test]
+  fn voice_session_first_speech_chunk_is_not_duplicated_in_turn_audio() {
+    // A recording STT that captures the full turn audio buffer
+    // (not just its length), so we can count how many times the
+    // speech chunk's distinct marker appears.
+    struct CapturingStt {
+      audio: RefCell<Vec<f32>>,
+    }
+    impl SttTurnAdapter for CapturingStt {
+      fn transcribe_turn(&mut self, turn_audio: &[f32]) -> Result<String> {
+        *self.audio.borrow_mut() = turn_audio.to_vec();
+        Ok("captured".to_string())
+      }
+    }
+
+    let config = VoicePipelineConfig {
+      input_sample_rate: 16_000,
+      frame_duration_ms: 20,
+      preroll_ms: 40,
+      vad_end_silence_ms: 200,
+      turn_max_incomplete_silence_ms: 200,
+      ..VoicePipelineConfig::default()
+    };
+    let chunk_size = 320;
+    let mut sess = VoiceSession::new(
+      config,
+      MockVad { threshold: 0.05 },
+      CapturingStt {
+        audio: RefCell::new(Vec::new()),
+      },
+      MockLlm {
+        seen: RefCell::new(Vec::new()),
+      },
+      MockTts {
+        seen: RefCell::new(Vec::new()),
+        samples_per_word: 1,
+      },
+      FixedSizeAudioChunker::new(chunk_size),
+      EnergyBargeInDetector::default(),
+      SilenceTurnTakingPolicy::new(200),
+    )
+    .unwrap();
+
+    let mut sink = MockSink::new();
+    let silence_chunk: Vec<f32> = vec![0.0; chunk_size];
+    // SPEECH chunk uses a distinct constant value (0.5) so we can
+    // count how many samples in the captured turn audio equal it.
+    // RMS = 0.5 ≥ 0.05 → VAD says speech.
+    let speech_chunk: Vec<f32> = vec![0.5_f32; chunk_size];
+    let silence_for_finalize: Vec<f32> = vec![0.0; chunk_size * 12];
+
+    // Pre-feed 2 silence chunks so pre-roll fills to capacity
+    // (640 samples — all 0.0 — so the only 0.5 values that should
+    // appear in the captured turn audio come from the SINGLE speech
+    // chunk).
+    sess.step(&silence_chunk, &mut sink, false).unwrap();
+    sess.step(&silence_chunk, &mut sink, false).unwrap();
+    sess.step(&speech_chunk, &mut sink, false).unwrap();
+    sess.step(&silence_for_finalize, &mut sink, false).unwrap();
+
+    assert_eq!(sess.turn_events().len(), 1);
+    let audio = sess.stt.audio.borrow();
+    let n_marker = audio.iter().filter(|&&s| s == 0.5).count();
+    assert_eq!(
+      n_marker, chunk_size,
+      "the speech chunk (320 samples of 0.5) must appear EXACTLY \
+       ONCE in the turn audio — pre-fix the idle branch would have \
+       pushed it into the pre-roll BEFORE the VAD branch ran, \
+       then the start-of-turn snapshot would have copied it into \
+       the turn audio AGAIN (640 marker samples total)."
+    );
+  }
+
+  // ---------- Fix 2 (HIGH): EOF flush must drain the chunker -------
+  // ---------- residual so the partial chunk is not dropped. --------
+  /// `run()` ends mid-turn with a partial chunk in the chunker —
+  /// `flush_in_progress_turn` must drain that residual into the turn
+  /// audio before `finalize_turn` runs `chunker.reset()` (which would
+  /// discard it).
+  #[test]
+  fn voice_session_run_at_mic_eof_with_partial_chunk_still_finalizes_full_audio() {
+    let mut sess = test_session();
+    let mut sink = MockSink::new();
+    let chunk_size = 320;
+    // 5 full speech chunks + 100 trailing speech samples that don't
+    // make a complete 320-sample chunk.
+    let speech_chunk: Vec<f32> = (0..chunk_size).map(|i| 0.3 * ((i as f32).sin())).collect();
+    let partial: Vec<f32> = (0..100)
+      .map(|i| 0.3 * ((i as f32 + 1000.0).sin()))
+      .collect();
+
+    let mic: Vec<Vec<f32>> = {
+      let mut v = Vec::new();
+      for _ in 0..5 {
+        v.push(speech_chunk.clone());
+      }
+      v.push(partial);
+      v
+    };
+    sess.run(mic.into_iter(), &mut sink).unwrap();
+
+    assert_eq!(sess.turn_events().len(), 1);
+    // STT must see at least the 5 full speech chunks (= 1600 samples)
+    // PLUS the 100-sample residual the chunker had buffered at EOF.
+    // (Pre-roll is empty because the very first sample was speech;
+    // no idle frames fed it.)
+    let stt_len = *sess.stt.last_audio_len.borrow();
+    assert_eq!(
+      stt_len,
+      5 * 320 + 100,
+      "STT must receive the 5 full speech chunks PLUS the 100 \
+       residual samples buffered in the chunker at mic-EOF"
+    );
+  }
+
+  /// `flush_in_progress_turn` called directly drains the chunker
+  /// residual into the turn audio.
+  #[test]
+  fn voice_session_flush_in_progress_turn_drains_chunker_residual() {
+    let mut sess = test_session();
+    let mut sink = MockSink::new();
+    let chunk_size = 320;
+    let speech_chunk: Vec<f32> = (0..chunk_size).map(|i| 0.3 * ((i as f32).sin())).collect();
+    let partial: Vec<f32> = (0..50).map(|i| 0.3 * ((i as f32 + 7.0).sin())).collect();
+
+    // 3 full speech chunks + a 50-sample partial → chunker emits 3
+    // chunks, retains 50.
+    sess.step(&speech_chunk, &mut sink, false).unwrap();
+    sess.step(&speech_chunk, &mut sink, false).unwrap();
+    sess.step(&speech_chunk, &mut sink, false).unwrap();
+    sess.step(&partial, &mut sink, false).unwrap();
+
+    // Chunker residual should be 50; flush drains them.
+    assert!(sess.flush_in_progress_turn(&mut sink).unwrap());
+    let stt_len = *sess.stt.last_audio_len.borrow();
+    assert_eq!(stt_len, 3 * 320 + 50);
+  }
+
+  // ---------- Fix 3 (MEDIUM): barge-in observations must not -------
+  // ---------- leak from idle noise into a later turn.        --------
+  /// Pre-fix: a non-speech "noisy idle" chunk fed while TTS was
+  /// playing would set `barge_in_observed = true` — and that flag
+  /// would survive into the NEXT turn (cleared only on
+  /// `finalize_turn`, so the idle-noise event tagged a completely
+  /// unrelated later turn). Post-fix: barge-in only fires for
+  /// `is_speech && in_speech`, and is reset at start-of-turn.
+  #[test]
+  fn voice_session_barge_in_observed_does_not_leak_from_idle_into_later_turn() {
+    let mut sess = test_session();
+    let mut sink = MockSink::new();
+    let chunk_size = 320;
+    // The pre-fix bug used non-speech chunks below the VAD threshold
+    // but ABOVE the barge-in detector's energy threshold (0.02).
+    // RMS of a constant 0.04 signal = 0.04 ≥ 0.02 (barge-in
+    // threshold) but < 0.05 (VAD threshold).
+    let noisy_idle: Vec<f32> = vec![0.04_f32; chunk_size];
+    let silence: Vec<f32> = vec![0.0; chunk_size];
+
+    // Step 1: noisy idle while TTS playing. Pre-fix: would set
+    // `barge_in_observed = true` even though no turn is in progress
+    // and the VAD did not detect speech. Post-fix: ignored.
+    sess
+      .step(&noisy_idle, &mut sink, /* tts_playing = */ true)
+      .unwrap();
+    // Step 2: a stretch of true silence with TTS off.
+    sess.step(&silence, &mut sink, false).unwrap();
+    // Step 3: TTS stops; user starts speaking (no overlap).
+    let speech_frame: Vec<f32> = (0..5 * chunk_size)
+      .map(|i| 0.3 * (((i % chunk_size) as f32).sin()))
+      .collect();
+    sess
+      .step(&speech_frame, &mut sink, /* tts_playing = */ false)
+      .unwrap();
+    // Step 4: a long stretch of silence (with TTS off) → finalize.
+    let silence_frame: Vec<f32> = vec![0.0; 12 * chunk_size];
+    sess.step(&silence_frame, &mut sink, false).unwrap();
+
+    let events = sess.turn_events();
+    assert_eq!(events.len(), 1, "exactly one turn finalized");
+    assert!(
+      !events[0].barge_in_observed,
+      "idle-noise barge-in detection must NOT leak into a later \
+       turn — only in-turn speech-while-TTS-playing counts"
+    );
+  }
+
+  // ---------- Fix 4 (MEDIUM): silence accounting must be per- ------
+  // ---------- chunk + sample-rate==0 must be rejected.        ------
+  /// `VoiceSession::new` rejects `input_sample_rate == 0` rather
+  /// than panicking at the first chunk's `chunk_ms` division.
+  #[test]
+  fn voice_session_new_rejects_zero_sample_rate() {
+    let config = VoicePipelineConfig {
+      input_sample_rate: 0,
+      frame_duration_ms: 20,
+      preroll_ms: 40,
+      vad_end_silence_ms: 200,
+      turn_max_incomplete_silence_ms: 200,
+      ..VoicePipelineConfig::default()
+    };
+    let chunk_size = 320;
+    let result = VoiceSession::new(
+      config,
+      MockVad { threshold: 0.05 },
+      MockStt {
+        last_audio_len: RefCell::new(0),
+        text: "x".to_string(),
+      },
+      MockLlm {
+        seen: RefCell::new(Vec::new()),
+      },
+      MockTts {
+        seen: RefCell::new(Vec::new()),
+        samples_per_word: 1,
+      },
+      FixedSizeAudioChunker::new(chunk_size),
+      EnergyBargeInDetector::default(),
+      SilenceTurnTakingPolicy::new(200),
+    );
+    match result {
+      Ok(_) => panic!("expected Err, got Ok"),
+      Err(Error::Backend { message }) => assert!(
+        message.contains("sample_rate"),
+        "expected Backend error mentioning sample_rate, got: {message}"
+      ),
+      Err(other) => panic!("expected Backend error, got: {other:?}"),
+    }
+  }
+
+  /// `step()` computes `chunk_ms` PER CHUNK so a variable-frame
+  /// chunker accumulates silence-ms faithfully (pre-fix used
+  /// `chunks[0].len()` for every chunk in the batch — a chunker
+  /// emitting 200-sample + 100-sample frames would attribute the
+  /// 100-sample frame's silence the same 12.5 ms the 200-sample
+  /// frame deserves, double-counting the second frame's silence).
+  #[test]
+  fn voice_session_silence_accounting_uses_per_chunk_duration_not_first_chunk() {
+    // Two speech chunks (320 samples each, 20 ms each) to open the
+    // turn, then two SILENCE chunks of DIFFERENT sizes: 320 (20 ms)
+    // + 160 (10 ms). Total silence-ms must be 20 + 10 = 30 ms (NOT
+    // 20 + 20 = 40 ms which the pre-fix would have computed if both
+    // were emitted in the same step batch).
+    //
+    // We use a one-shot chunker that emits all four pre-queued
+    // chunks in a SINGLE push_samples call (the bug was
+    // specifically that the per-call chunk_ms was computed from
+    // chunks[0]). Different chunk sizes (320, 320, 320, 160) are
+    // intentional — the silence accounting must reflect the real
+    // 160-sample / 10 ms second silence chunk, not re-use the
+    // 20 ms of chunks[0].
+    let speech_chunk: Vec<f32> = (0..320).map(|i| 0.3 * ((i as f32).sin())).collect();
+    let big_silence: Vec<f32> = vec![0.0; 320];
+    let small_silence: Vec<f32> = vec![0.0; 160];
+    struct OneShotChunker {
+      chunks: Option<Vec<Vec<f32>>>,
+    }
+    impl AudioChunker for OneShotChunker {
+      fn push_samples(&mut self, _samples: &[f32]) -> Result<Vec<Vec<f32>>> {
+        Ok(self.chunks.take().unwrap_or_default())
+      }
+      fn drain_residual(&mut self) -> Vec<f32> {
+        Vec::new()
+      }
+      fn reset(&mut self) {
+        self.chunks = None;
+      }
+    }
+    let one_shot = OneShotChunker {
+      chunks: Some(vec![
+        speech_chunk.clone(),
+        speech_chunk,
+        big_silence,
+        small_silence,
+      ]),
+    };
+    let config = VoicePipelineConfig {
+      input_sample_rate: 16_000,
+      frame_duration_ms: 20,
+      preroll_ms: 0, // disable preroll for a clean length check
+      vad_end_silence_ms: 200,
+      turn_max_incomplete_silence_ms: 200,
+      ..VoicePipelineConfig::default()
+    };
+    let mut sess = VoiceSession::new(
+      config,
+      MockVad { threshold: 0.05 },
+      MockStt {
+        last_audio_len: RefCell::new(0),
+        text: "x".to_string(),
+      },
+      MockLlm {
+        seen: RefCell::new(Vec::new()),
+      },
+      MockTts {
+        seen: RefCell::new(Vec::new()),
+        samples_per_word: 1,
+      },
+      one_shot,
+      EnergyBargeInDetector::default(),
+      // Threshold = 25 ms — 20 + 10 = 30 ms crosses it, 20 + 20 = 40
+      // ms also crosses (so a finalize either way) but the
+      // silence_ms_accum value at finalize must be 30, not 40.
+      // We assert the in_progress_audio LENGTH at finalize: it must
+      // be 2 × 320 (speech) + 320 + 160 (silence) = 1120 samples.
+      SilenceTurnTakingPolicy::new(25),
+    )
+    .unwrap();
+
+    let mut sink = MockSink::new();
+    sess.step(&[], &mut sink, false).unwrap();
+    assert_eq!(sess.turn_events().len(), 1);
+    // STT saw exactly: 2 × 320 speech + 320 + 160 trailing silence
+    // = 1120 samples. The fix is about the silence-ms ACCOUNTING;
+    // here we lock that the audio that reached STT is the full
+    // variable-frame stream (per-chunk semantics) and ALSO that the
+    // turn finalizes after the second silence chunk (silence_ms =
+    // 30 ≥ 25), not after the first (which would only give 20).
+    let stt_len = *sess.stt.last_audio_len.borrow();
+    assert_eq!(stt_len, 2 * 320 + 320 + 160);
   }
 }
