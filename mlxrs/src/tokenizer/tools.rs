@@ -1060,18 +1060,25 @@ impl Qwen3Coder {
 impl ToolParser for Qwen3Coder {
   fn parse(&self, text: &str, tools: Option<&Value>) -> Result<Vec<ToolCall>, Error> {
     // _function_regex = <function=(.*?)</function>$ (DOTALL, findall->[0])
-    // Use the SHARED recognizer ([`qwen_function_open_at`]) to find the
-    // first `<function=NAME>` opener — so the parser body and the
-    // streaming context predicate ([`qwen_function_context_proven`])
-    // cannot drift. The recognizer accepts any non-empty `<function=NAME>`
-    // opener whose NAME contains neither `>` nor `<` — dotted (`foo.bar`),
-    // spaced (`foo bar`), and other punctuation are valid here, matching
-    // every byte the upstream Python parser's `body.find('>')` step
-    // accepts (R18 finding: dotted/spaced names parser-accepted but
-    // R17-predicate-rejected).
-    let bytes = text.as_bytes();
-    let (name_start, after_close_bracket) = (0..bytes.len())
-      .find_map(|i| qwen_function_open_at(text, i))
+    // Use the SHARED recognizer ([`find_first_qwen_function_open`] +
+    // [`qwen_function_open_at`]) to find the first `<function=NAME>`
+    // opener — so the parser body and the streaming context predicate
+    // ([`qwen_function_context_proven`]) cannot drift. The recognizer
+    // accepts any non-empty `<function=NAME>` opener whose NAME contains
+    // neither `>` nor `<` — dotted (`foo.bar`), spaced (`foo bar`), and
+    // other punctuation are valid here, matching every byte the upstream
+    // Python parser's `body.find('>')` step accepts (R18 finding:
+    // dotted/spaced names parser-accepted but R17-predicate-rejected).
+    //
+    // L9 R19 terminal-on-first-marker: `find_first_qwen_function_open`
+    // anchors on the FIRST `<function=` literal — if that anchor is
+    // malformed, the section is malformed and we reject the whole input.
+    // We must NOT scan past to find a later valid opener inside a
+    // malformed anchor (e.g. `<function=a<function=real>` would otherwise
+    // emit a "real" call from structurally-invalid bytes).
+    let marker_at = find_first_qwen_function_open(text)
+      .ok_or_else(|| err("qwen3_coder: No function provided."))?;
+    let (name_start, after_close_bracket) = qwen_function_open_at(text, marker_at)
       .ok_or_else(|| err("qwen3_coder: No function provided."))?;
     let after = &text[after_close_bracket..];
     let end = after
@@ -1154,16 +1161,33 @@ impl ToolParser for Qwen3Coder {
     //     prefix using the SHARED recognizer ([`qwen_function_open_at`] via
     //     [`find_first_qwen_function_open`]) so this gate cannot drift from
     //     the predicate ([`qwen_function_context_proven`]) or the parser
-    //     body ([`Qwen3Coder::parse`]). The recognizer returns
+    //     body ([`Qwen3Coder::parse`]).
+    //
+    //     L9 R19 terminal-on-first-marker: `find_first_qwen_function_open`
+    //     returns `Some(marker_at)` ONLY if the FIRST `<function=` literal
+    //     parses as a valid opener. A malformed first marker (e.g.
+    //     `<function=a<function=real>...`) returns None — we MUST NOT
+    //     skip past it to a nested-but-valid marker (R19 finding: doing
+    //     so emits "real" as a tool call from structurally-malformed
+    //     bytes, defeating R18's section-level structural rejection).
+    //
+    //     `qwen_function_open_at` at that marker recovers
     //     `after_close_bracket` — one past the `>` that closes the opener
     //     — which is the correct starting cursor for the `</function>`
     //     forward-scan below (an in-name `<` or `>` would never get past
     //     the recognizer).
-    let Some(after_open_rel) = find_first_qwen_function_open(bounded) else {
-      // No `<function=NAME>` opener in the bounded body → bounded-but-
-      // malformed section (the body is structurally invalid for
-      // qwen3_coder). Surface zero calls with the known end_pos so the
-      // streaming processor preserves the same-chunk suffix.
+    let Some(marker_at) = find_first_qwen_function_open(bounded) else {
+      // No structurally-valid `<function=NAME>` opener anchors the
+      // bounded body → malformed section. Surface zero calls with the
+      // known end_pos so the streaming processor preserves the same-chunk
+      // suffix.
+      return Ok(Some((Vec::new(), end_pos)));
+    };
+    let Some((_, after_open_rel)) = qwen_function_open_at(bounded, marker_at) else {
+      // Unreachable: `find_first_qwen_function_open` returned `Some` only
+      // because `qwen_function_open_at` accepted the marker. Surface zero
+      // calls for defense-in-depth (the recognizer is the SOLE source of
+      // truth — any drift here is a structural bug).
       return Ok(Some((Vec::new(), end_pos)));
     };
 
@@ -1261,18 +1285,41 @@ fn qwen_function_open_at(payload: &str, at: usize) -> Option<(usize, usize)> {
   Some((name_start, j + 1))
 }
 
-/// Scan `payload` for the FIRST byte position where
-/// [`qwen_function_open_at`] returns Some. Returns the
-/// `after_close_bracket` index of that first function open-tag, or `None`
-/// if no valid `<function=NAME>` open-tag appears anywhere in `payload`.
+/// Find the FIRST `<function=` literal in `payload`. Returns `Some(idx)`
+/// of that literal **only** if the marker at that first occurrence is a
+/// structurally-valid open (parses via [`qwen_function_open_at`]). If the
+/// first `<function=` literal is malformed (e.g. name contains `<` or `>`,
+/// or empty name), returns `None` — does NOT scan past to find a later
+/// valid opener, because the first `<function=` IS the section's
+/// structural anchor.
+///
+/// **L9 R19 terminal-on-first-marker fix:** R18's prior implementation
+/// scanned every byte position for a valid open, so a malformed outer
+/// opener (`<function=a<function=real>...`) would correctly fail
+/// `qwen_function_open_at` at the outer marker but then succeed at the
+/// nested marker — causing the parser to emit `"real"` as a tool call
+/// from a structurally-malformed section. Terminating on the first
+/// `<function=` literal rejects the section as a whole when that anchor
+/// is malformed, instead of letting a nested-but-valid opener pretend to
+/// be a new section.
+///
+/// Examples:
+/// * `<function=foo.bar>...` → first marker at 0, parses → `Some(0)`.
+/// * `<function=a<function=real>...` → first marker at 0, malformed
+///   (name contains `<`) → `None`. Nested marker IGNORED.
+/// * `bad<function=foo>` → first marker at 3, parses → `Some(3)`. Stray
+///   prefix bytes are harmless because the marker itself is structural.
+/// * `<function=>...` → first marker at 0, malformed (empty name) →
+///   `None`.
+///
+/// Call sites that need the parsed `(name_start, after_close_bracket)`
+/// span call [`qwen_function_open_at`] directly at the returned marker
+/// index — both [`Qwen3Coder::parse`] and
+/// [`Qwen3Coder::try_parse_one_call`] do this so the recognizer remains
+/// the SOLE source of truth.
 fn find_first_qwen_function_open(payload: &str) -> Option<usize> {
-  let bytes = payload.as_bytes();
-  for i in 0..bytes.len() {
-    if let Some((_, after_close_bracket)) = qwen_function_open_at(payload, i) {
-      return Some(after_close_bracket);
-    }
-  }
-  None
+  let marker_at = payload.find("<function=")?;
+  qwen_function_open_at(payload, marker_at).map(|_| marker_at)
 }
 
 fn convert_param_value(
@@ -7993,6 +8040,104 @@ mod tests {
     );
   }
 
+  // ===========================================================
+  // L9 R19 — terminal-on-first-marker for qwen3_coder
+  // -----------------------------------------------------------
+  // R18 extracted `find_first_qwen_function_open` as the shared
+  // recognizer between predicate and parser body, but its
+  // implementation scanned EVERY byte position for a valid
+  // `<function=NAME>` open. A malformed outer opener
+  // (`<function=a<function=real>...`) correctly failed
+  // `qwen_function_open_at` at the outer marker, but the scan
+  // CONTINUED past it and found the nested `<function=real>` as
+  // a valid opener — so the parser body extracted `"real"` as a
+  // tool call from structurally-malformed bytes, defeating R18's
+  // section-level structural rejection.
+  //
+  // R19 makes `find_first_qwen_function_open` TERMINAL on the
+  // first `<function=` literal: that literal IS the section's
+  // structural anchor; if it is malformed, the section as a
+  // whole is malformed (return None) — we don't pretend a later
+  // nested opener is a new valid section. The two tests below
+  // pin the two malformed-anchor shapes (name contains `<`,
+  // empty name) and assert that the nested-but-valid marker is
+  // NOT extracted as a call.
+
+  #[test]
+  fn streaming_qwen3_coder_malformed_outer_opener_with_nested_valid_does_not_extract_nested_as_call()
+   {
+    // R19 motivating case (name contains `<`). The body
+    // `<function=a<function=real><parameter=p>v</parameter></function>`
+    // has an outer `<function=a<...>` opener whose name `a` is
+    // followed by `<` — `qwen_function_open_at` correctly rejects
+    // the outer marker (NAME must contain neither `>` nor `<`).
+    //
+    // Pre-R19: `find_first_qwen_function_open` continued scanning
+    // past the rejected outer marker, hit the nested
+    // `<function=real>` at byte 12, and accepted it as a valid
+    // opener. The predicate then proved context true, the
+    // parameter-value-aware scan skipped `<parameter=p>...</parameter>`,
+    // the wrapper close landed at the real `</tool_call>`, the
+    // parser body's separate `(0..bytes.len()).find_map(...)`
+    // scan ALSO found the nested opener — and emitted `"real"`
+    // as a tool call from structurally-invalid bytes.
+    //
+    // R19: terminal-on-first-marker. First `<function=` at byte
+    // 0 is malformed → recognizer returns None → predicate false
+    // → PlainEnd → bounded body is everything before
+    // `</tool_call>`; the bounded prefix's first marker is also
+    // malformed → empty calls. Same-chunk suffix ` tail` reaches
+    // display.
+    let (display, calls) = run_with_parser(
+      Box::new(Qwen3Coder),
+      &[
+        "<tool_call><function=a<function=real><parameter=p>v</parameter></function></tool_call> tail",
+      ],
+    );
+    assert_eq!(
+      calls.len(),
+      0,
+      "malformed outer `<function=a<...>` opener MUST NOT be bypassed by scanning past to a nested `<function=real>` opener (R19 finding: the first `<function=` literal IS the section's structural anchor — if it is malformed the section as a whole is malformed)",
+    );
+    assert_eq!(
+      display, " tail",
+      "FULL same-chunk suffix bytes reach display — terminal-on-first-marker MUST reject the section without emitting a nested-marker call",
+    );
+  }
+
+  #[test]
+  fn streaming_qwen3_coder_empty_name_opener_with_nested_valid_does_not_extract_nested() {
+    // R19 motivating case (empty name). The body
+    // `<function=><function=real><parameter=p>v</parameter></function>`
+    // has an outer `<function=>` opener whose name is empty —
+    // `qwen_function_open_at` correctly rejects (NAME must be
+    // non-empty).
+    //
+    // Pre-R19: scan continued past the rejected outer marker,
+    // hit `<function=real>` at byte 11, accepted it → predicate
+    // true → parser body extracted `"real"` as a tool call.
+    //
+    // R19: terminal-on-first-marker. First `<function=` at byte
+    // 0 is malformed (empty name) → recognizer returns None →
+    // predicate false → PlainEnd → empty calls. Same-chunk
+    // suffix ` tail` reaches display.
+    let (display, calls) = run_with_parser(
+      Box::new(Qwen3Coder),
+      &[
+        "<tool_call><function=><function=real><parameter=p>v</parameter></function></tool_call> tail",
+      ],
+    );
+    assert_eq!(
+      calls.len(),
+      0,
+      "malformed outer `<function=>` (empty name) opener MUST NOT be bypassed by scanning past to a nested `<function=real>` opener (R19 finding)",
+    );
+    assert_eq!(
+      display, " tail",
+      "FULL same-chunk suffix bytes reach display — terminal-on-first-marker MUST reject the section without emitting a nested-marker call",
+    );
+  }
+
   /// L9 R17 audit-locking test: for each parser whose `bound_section`
   /// uses a STRUCTURAL context predicate (not just the dispatcher's
   /// own leading-byte classifier), the predicate's acceptance grammar
@@ -8189,6 +8334,31 @@ mod tests {
         label: "qwen3_coder reject (R18): name with `<` `<function=a<b></function>`",
         parser: Box::new(Qwen3Coder),
         buffer: "<tool_call><function=a<b></function></tool_call>",
+        should_extract: false,
+      },
+      // R19 reject: malformed outer opener `<function=a<...>` with a
+      // nested valid opener `<function=real>`. The first `<function=`
+      // literal IS the section's structural anchor; if its NAME contains
+      // `<` it is malformed and the section as a whole is malformed —
+      // the parser MUST NOT scan past the rejected outer marker and
+      // emit `"real"` as a tool call from the nested marker. R19's
+      // `find_first_qwen_function_open` is terminal on the first
+      // `<function=` literal.
+      Row {
+        label: "qwen3_coder reject (R19): malformed outer + nested valid `<function=a<function=real></parameter></function>`",
+        parser: Box::new(Qwen3Coder),
+        buffer: "<tool_call><function=a<function=real><parameter=p>v</parameter></function></tool_call>",
+        should_extract: false,
+      },
+      // R19 reject: malformed outer opener `<function=>` (empty name)
+      // with a nested valid opener `<function=real>`. Same structural
+      // logic: empty-name first marker is malformed → section malformed
+      // → terminal-on-first-marker rejects → no call from the nested
+      // `<function=real>`.
+      Row {
+        label: "qwen3_coder reject (R19): empty-name outer + nested valid `<function=><function=real></parameter></function>`",
+        parser: Box::new(Qwen3Coder),
+        buffer: "<tool_call><function=><function=real><parameter=p>v</parameter></function></tool_call>",
         should_extract: false,
       },
       // --- function_gemma R16 baseline regressions ---------------------
