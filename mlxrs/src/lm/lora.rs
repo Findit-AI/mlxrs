@@ -1862,8 +1862,21 @@ impl BaseLinear {
 /// against any shape, so a single `from_slice(&[scale], (1,))` × `multiply`
 /// reproduces python's `scale * z` without an operator overload (mlxrs exposes
 /// no `impl Mul`). Lazy — does not evaluate.
+///
+/// Mirrors mlx-lm's `to_array(v, a.dtype())` scalar-coercion behavior: the
+/// `scale` operand is cast to `arr`'s dtype BEFORE the multiply, so a
+/// uniform-half input (e.g. an f16 `lora_a` × the Python scalar `self.scale`)
+/// stays at the input's narrow precision — mlx's promotion-on-mix would
+/// otherwise quietly upcast the result to f32, silently diverging from mlx-lm
+/// for uniform-half adapters (mlx-lm `tuner/lora.py:97`, `tuner/dora.py:200`).
+/// For mixed-precision (e.g. f16 base + f32 adapter), `arr` is the f32 adapter
+/// side so the scalar stays f32 and the surrounding promotion is unchanged.
 fn scaled(arr: &Array, scale: f32) -> Result<Array> {
   let s = Array::from_slice::<f32>(&[scale], &(1usize,))?;
+  let s = match arr.dtype() {
+    Ok(dt) => s.astype(dt)?,
+    Err(_) => s,
+  };
   arr.multiply(&s)
 }
 
@@ -7657,51 +7670,290 @@ mod tests {
 
   /// `dora_embedding_forward_preserves_base_dtype_for_uniform_precision` —
   /// sanity sibling of the mixed-precision dtype test: when base AND adapter
-  /// are both **f32**, `forward` returns f32 because no operand triggers
+  /// share a dtype, `forward` returns THAT dtype because no operand triggers
   /// mlx's promotion-on-mix rule. Direct guard against a defensive "just to
   /// be safe" re-introduction of the final astype — a forward that always
   /// did `.astype(y.dtype)` would also pass this test (it's the no-op case),
   /// but combined with `*_returns_promoted_dtype_for_mixed_precision`'s
-  /// "must be f32 for f16/bf16 base" assertion, the pair triangulates: a
-  /// re-introduced final astype would pass THIS test and fail THAT one,
-  /// pinpointing the regression.
+  /// "must be f32 for f16/bf16 base × f32 adapter" assertion, the pair
+  /// triangulates: a re-introduced final astype would pass THIS test and
+  /// fail THAT one, pinpointing the regression.
   ///
-  /// Note: an "f16 base + f16 adapter" case is intentionally NOT covered —
-  /// the `scale` parameter is a Rust f32 and the helper [`scaled`] creates
-  /// an f32 mlx scalar, so `z = scale · (lora_a[x] @ lora_b)` is promoted
-  /// to f32 even when both factor arrays are f16 (mirroring mlx-lm where
-  /// the Python float `self.scale` promotes the multiply). So with an f16
-  /// base, `forward`'s return is f32 regardless of the adapter's stored
-  /// dtype — which the `_returns_promoted_dtype_for_mixed_precision` test
-  /// covers explicitly.
+  /// Covers `(f32, f32)`, `(f16, f16)`, and `(bf16, bf16)`. The half-precision
+  /// cases exercise the round-3 fix to [`scaled`]: the scalar `self.scale` is
+  /// coerced to `arr.dtype()` (mirroring mlx-lm `to_array(v, a.dtype())`) so
+  /// `z = scale · (lora_a[x] @ lora_b)` stays in the adapter's narrow dtype
+  /// instead of promoting to f32. Before the round-3 fix, the helper created
+  /// an f32 mlx scalar that silently upcast uniform-half adapters to f32 —
+  /// this triple-test pins the helper's behavior across all three uniform
+  /// precisions.
   #[test]
   fn dora_embedding_forward_preserves_base_dtype_for_uniform_precision() {
-    let (weight_f32, lora_a_f32, lora_b_f32, m_f32, scale) = mp_fixture();
-    let num_embeddings = weight_f32.len();
-    let dims = weight_f32[0].len();
-    let r = lora_a_f32[0].len();
-    let flat_w: Vec<f32> = weight_f32.iter().flatten().copied().collect();
-    let flat_a: Vec<f32> = lora_a_f32.iter().flatten().copied().collect();
-    let flat_b: Vec<f32> = lora_b_f32.iter().flatten().copied().collect();
-    // All operands at f32 — no promotion at any step; `forward` returns f32.
-    let weight = Array::from_slice::<f32>(&flat_w, &(num_embeddings, dims)).unwrap();
+    for (uniform, label) in [
+      (Dtype::F32, "f32"),
+      (Dtype::F16, "f16"),
+      (Dtype::BF16, "bf16"),
+    ] {
+      let (weight_f32, lora_a_f32, lora_b_f32, m_f32, scale) = mp_fixture();
+      let num_embeddings = weight_f32.len();
+      let dims = weight_f32[0].len();
+      let r = lora_a_f32[0].len();
+      let flat_w: Vec<f32> = weight_f32.iter().flatten().copied().collect();
+      let flat_a: Vec<f32> = lora_a_f32.iter().flatten().copied().collect();
+      let flat_b: Vec<f32> = lora_b_f32.iter().flatten().copied().collect();
+      // All operands at the same dtype — no promotion at any step; `forward`
+      // returns `uniform`.
+      let weight = Array::from_slice::<f32>(&flat_w, &(num_embeddings, dims))
+        .unwrap()
+        .astype(uniform)
+        .unwrap();
+      let base = BaseEmbedding::dense(weight).unwrap();
+      let lora_a = Array::from_slice::<f32>(&flat_a, &(num_embeddings, r))
+        .unwrap()
+        .astype(uniform)
+        .unwrap();
+      let lora_b = Array::from_slice::<f32>(&flat_b, &(r, dims))
+        .unwrap()
+        .astype(uniform)
+        .unwrap();
+      let m = Array::from_slice::<f32>(&m_f32, &(num_embeddings,))
+        .unwrap()
+        .astype(uniform)
+        .unwrap();
+      let params = AdapterParams {
+        lora_a,
+        lora_b,
+        magnitude: Some(m),
+      };
+      let layer = DoRAEmbedding::new(base, params, scale).unwrap();
+      let ids_vec: Vec<i32> = (0..num_embeddings as i32).collect();
+      let ids = Array::from_slice::<i32>(&ids_vec, &(num_embeddings,)).unwrap();
+      let out = layer.forward(&ids).unwrap();
+      assert_eq!(
+        out.dtype().unwrap(),
+        uniform,
+        "forward must return {label} when base AND adapter are uniform {label} (no promotion)",
+      );
+    }
+  }
+
+  // ───────────────────── round-3 scaled() coercion fix ─────────────────────
+
+  /// `scaled_helper_coerces_scalar_to_array_dtype` — unit test on the
+  /// [`scaled`] helper: the scalar `scale` operand is cast to `arr`'s dtype
+  /// BEFORE the multiply, mirroring mlx-lm's `to_array(v, a.dtype())`
+  /// scalar-coercion (mlx-lm `lora.py:97`, `dora.py:200`).
+  ///
+  /// Pre-fix: the helper created an f32 mlx scalar, so `scaled(f16_arr, …)`
+  /// would silently return an f32 array (mlx promotes f16 × f32 → f32) —
+  /// silently diverging from mlx-lm for uniform-half adapters. This test
+  /// triangulates the fix across all three float dtypes the helper is
+  /// expected to round-trip preserving precision.
+  #[test]
+  fn scaled_helper_coerces_scalar_to_array_dtype() {
+    for (dt, label) in [
+      (Dtype::F16, "f16"),
+      (Dtype::BF16, "bf16"),
+      (Dtype::F32, "f32"),
+    ] {
+      let arr = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &(3usize,))
+        .unwrap()
+        .astype(dt)
+        .unwrap();
+      let out = scaled(&arr, 0.5).unwrap();
+      assert_eq!(
+        out.dtype().unwrap(),
+        dt,
+        "scaled must coerce the scalar to the array's dtype and keep the {label} result in {label}",
+      );
+    }
+  }
+
+  /// `dora_embedding_forward_uniform_f16_adapter_returns_f16` — round-3
+  /// finding: with a uniform-f16 base + adapter, `DoRAEmbedding::forward`
+  /// must return f16 (mlx-lm `to_array(scale, a.dtype())` keeps the scalar
+  /// at f16, so `z = scale · lora_a[x] @ lora_b` stays at f16 and no
+  /// downstream op promotes). Pre-fix `scaled` minted an f32 scalar, so the
+  /// final `out` was silently f32 — divergent from mlx-lm.
+  ///
+  /// Hand-constructed deterministic fixture (all values exact in f16/bf16):
+  /// num_embeddings=2, dims=2, r=1; weight=[[1,0],[0,1]], lora_a=[[1],[0]],
+  /// lora_b=[[1,0]], m=[1,1], scale=1.0. Per-token math:
+  /// - x=0: y=[1,0], z=1·[1,0]=[1,0], adapted=[2,0], ‖·‖=2, m/denom=0.5,
+  ///   out_pre=[2,0], out=0.5·[2,0]=[1,0].
+  /// - x=1: y=[0,1], z=1·[0,0]=[0,0], adapted=[0,1], ‖·‖=1, m/denom=1,
+  ///   out_pre=[0,1], out=1·[0,1]=[0,1].
+  ///
+  /// Expected for ids=[0,1] is [[1,0],[0,1]] — exact in f16/bf16.
+  #[test]
+  fn dora_embedding_forward_uniform_f16_adapter_returns_f16() {
+    dora_embedding_forward_uniform_dtype_case(Dtype::F16, "f16");
+  }
+
+  /// `dora_embedding_forward_uniform_bf16_adapter_returns_bf16` — bf16
+  /// sibling of the f16 uniform-dtype contract test. Same fixture (all
+  /// values exact in bf16); asserts dtype = bf16 and value parity.
+  #[test]
+  fn dora_embedding_forward_uniform_bf16_adapter_returns_bf16() {
+    dora_embedding_forward_uniform_dtype_case(Dtype::BF16, "bf16");
+  }
+
+  /// Shared driver for the uniform-dtype `forward` dtype + value contract.
+  /// See [`dora_embedding_forward_uniform_f16_adapter_returns_f16`]'s docstring
+  /// for the hand-traced fixture math.
+  fn dora_embedding_forward_uniform_dtype_case(uniform: Dtype, label: &str) {
+    let num_embeddings = 2usize;
+    let dims = 2usize;
+    let r = 1usize;
+    let weight = Array::from_slice::<f32>(&[1.0, 0.0, 0.0, 1.0], &(num_embeddings, dims))
+      .unwrap()
+      .astype(uniform)
+      .unwrap();
     let base = BaseEmbedding::dense(weight).unwrap();
-    let lora_a = Array::from_slice::<f32>(&flat_a, &(num_embeddings, r)).unwrap();
-    let lora_b = Array::from_slice::<f32>(&flat_b, &(r, dims)).unwrap();
-    let m = Array::from_slice::<f32>(&m_f32, &(num_embeddings,)).unwrap();
+    let lora_a = Array::from_slice::<f32>(&[1.0, 0.0], &(num_embeddings, r))
+      .unwrap()
+      .astype(uniform)
+      .unwrap();
+    let lora_b = Array::from_slice::<f32>(&[1.0, 0.0], &(r, dims))
+      .unwrap()
+      .astype(uniform)
+      .unwrap();
+    let m = Array::from_slice::<f32>(&[1.0, 1.0], &(num_embeddings,))
+      .unwrap()
+      .astype(uniform)
+      .unwrap();
     let params = AdapterParams {
       lora_a,
       lora_b,
       magnitude: Some(m),
     };
-    let layer = DoRAEmbedding::new(base, params, scale).unwrap();
-    let ids_vec: Vec<i32> = (0..num_embeddings as i32).collect();
-    let ids = Array::from_slice::<i32>(&ids_vec, &(num_embeddings,)).unwrap();
+    let layer = DoRAEmbedding::new(base, params, 1.0f32).unwrap();
+    let ids = Array::from_slice::<i32>(&[0, 1], &(2usize,)).unwrap();
     let out = layer.forward(&ids).unwrap();
     assert_eq!(
       out.dtype().unwrap(),
-      Dtype::F32,
-      "forward must return f32 when base AND adapter are uniform f32 (no promotion)",
+      uniform,
+      "forward must return {label} for uniform-{label} base + adapter (scaled() coerces scalar to arr.dtype)",
     );
+    let mut out_f32 = out.astype(Dtype::F32).unwrap();
+    let got = out_f32.to_vec::<f32>().unwrap();
+    // [[1, 0], [0, 1]] — exact in f16/bf16; zero tolerance would also pass,
+    // but a tight 1e-3 leaves headroom against any future kernel-order shift.
+    approx_eq(&got, &[1.0, 0.0, 0.0, 1.0], 1e-3);
+  }
+
+  /// `dora_embedding_as_linear_uniform_f16_adapter_returns_f16` — round-3
+  /// finding for `as_linear`: with uniform-f16 base + adapter, the tied-weight
+  /// LM-head forward must also return f16. The same `scaled` helper is on the
+  /// hot path (the scale·lora_a delta), so the fix applies symmetrically.
+  ///
+  /// Hand-constructed fixture (all values exact in f16/bf16) with x=[[1, 1]]:
+  /// - y = x @ weightᵀ = [1, 1]
+  /// - z = (x @ lora_bᵀ) @ lora_aᵀ = [1, 0]
+  /// - adapted = weight + scale · lora_a @ lora_b = [[2,0],[0,1]]
+  /// - denom (axis=1) = [2, 1], norm_scale = [0.5, 1]
+  /// - out_pre = y + scale·z = [2, 1], out = norm_scale · out_pre = [1, 1].
+  ///
+  /// Expected = [[1, 1]] — exact in f16/bf16.
+  #[test]
+  fn dora_embedding_as_linear_uniform_f16_adapter_returns_f16() {
+    dora_embedding_as_linear_uniform_dtype_case(Dtype::F16, "f16");
+  }
+
+  /// `dora_embedding_as_linear_uniform_bf16_adapter_returns_bf16` — bf16
+  /// sibling of the `as_linear` uniform-dtype contract test.
+  #[test]
+  fn dora_embedding_as_linear_uniform_bf16_adapter_returns_bf16() {
+    dora_embedding_as_linear_uniform_dtype_case(Dtype::BF16, "bf16");
+  }
+
+  /// Shared driver for the uniform-dtype `as_linear` dtype + value contract.
+  /// See [`dora_embedding_as_linear_uniform_f16_adapter_returns_f16`]'s
+  /// docstring for the hand-traced fixture math.
+  fn dora_embedding_as_linear_uniform_dtype_case(uniform: Dtype, label: &str) {
+    let num_embeddings = 2usize;
+    let dims = 2usize;
+    let r = 1usize;
+    let weight = Array::from_slice::<f32>(&[1.0, 0.0, 0.0, 1.0], &(num_embeddings, dims))
+      .unwrap()
+      .astype(uniform)
+      .unwrap();
+    let base = BaseEmbedding::dense(weight).unwrap();
+    let lora_a = Array::from_slice::<f32>(&[1.0, 0.0], &(num_embeddings, r))
+      .unwrap()
+      .astype(uniform)
+      .unwrap();
+    let lora_b = Array::from_slice::<f32>(&[1.0, 0.0], &(r, dims))
+      .unwrap()
+      .astype(uniform)
+      .unwrap();
+    let m = Array::from_slice::<f32>(&[1.0, 1.0], &(num_embeddings,))
+      .unwrap()
+      .astype(uniform)
+      .unwrap();
+    let params = AdapterParams {
+      lora_a,
+      lora_b,
+      magnitude: Some(m),
+    };
+    let layer = DoRAEmbedding::new(base, params, 1.0f32).unwrap();
+    let x = Array::from_slice::<f32>(&[1.0, 1.0], &(1usize, dims))
+      .unwrap()
+      .astype(uniform)
+      .unwrap();
+    let out = layer.as_linear(&x).unwrap();
+    assert_eq!(
+      out.dtype().unwrap(),
+      uniform,
+      "as_linear must return {label} for uniform-{label} base + adapter (scaled() coerces scalar to arr.dtype)",
+    );
+    let mut out_f32 = out.astype(Dtype::F32).unwrap();
+    let got = out_f32.to_vec::<f32>().unwrap();
+    approx_eq(&got, &[1.0, 1.0], 1e-3);
+  }
+
+  /// `dora_linear_forward_uniform_f16_adapter_returns_f16` — round-3 sibling
+  /// for [`DoRALinear`]: the same [`scaled`] helper is on its hot path, so
+  /// the fix propagates. DoRALinear's `forward` has an explicit trailing
+  /// `astype(x.dtype)` on the low-rank term (mlx-lm `tuner/lora.py:97` casts
+  /// `(scale * z).astype(x.dtype)`), so the dtype contract here is "out
+  /// matches x.dtype" — the scaled() fix doesn't change THAT contract for
+  /// DoRALinear (the trailing astype already enforces it), but the test
+  /// pins the contract as a regression oracle against a future refactor
+  /// that elides the trailing astype.
+  ///
+  /// Hand-traced fixture (all values exact in f16): input_dims=3,
+  /// output_dims=2, r=2; reuses [`base_weight`], [`lora_a`], [`lora_b`]
+  /// (the LoRA `[3, 6]` hand-trace) with m chosen so renorm = identity
+  /// (m = ‖adapted‖₂ row-wise = [3, 3], same as
+  /// [`dora_linear_forward_hand_traced`]) — expected out = [3, 6].
+  #[test]
+  fn dora_linear_forward_uniform_f16_adapter_returns_f16() {
+    let weight = base_weight().astype(Dtype::F16).unwrap();
+    let la = lora_a().astype(Dtype::F16).unwrap();
+    let lb = lora_b().astype(Dtype::F16).unwrap();
+    let m = Array::from_slice::<f32>(&[3.0, 3.0], &(2usize,))
+      .unwrap()
+      .astype(Dtype::F16)
+      .unwrap();
+    let params = AdapterParams {
+      lora_a: la,
+      lora_b: lb,
+      magnitude: Some(m),
+    };
+    let base = BaseLinear::dense(weight, None).unwrap();
+    let layer = DoRALinear::new(base, params, 2.0).unwrap();
+    let x = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &(1, 3))
+      .unwrap()
+      .astype(Dtype::F16)
+      .unwrap();
+    let out = layer.forward(&x).unwrap();
+    assert_eq!(
+      out.dtype().unwrap(),
+      Dtype::F16,
+      "DoRALinear::forward must return f16 for uniform-f16 base + adapter (trailing astype + scaled() coercion both contribute)",
+    );
+    let mut out_f32 = out.astype(Dtype::F32).unwrap();
+    approx_eq(&out_f32.to_vec::<f32>().unwrap(), &[3.0, 6.0], 1e-3);
   }
 }
