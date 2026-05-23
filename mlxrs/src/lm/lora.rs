@@ -3376,6 +3376,25 @@ pub fn load_adapters(
   linear_to_lora_layers(base_weights, &config, &adapter_params, quant, num_blocks)
 }
 
+/// Read + parse an adapter directory's `adapter_config.json` and return the
+/// typed [`LoraConfig`] — the same bounded read + serde parse
+/// [`load_adapters`] uses internally, exposed so callers that need only the
+/// config metadata (e.g. [`crate::lm::fuse::fuse`] needs the PEFT
+/// `fan_in_fan_out` flag to carry the persisted-orientation contract through
+/// fusion) don't have to load the full weight map + build the layer table
+/// first.
+///
+/// Same untrusted-dir safety discipline as [`load_adapters`]'s internal read:
+/// non-blocking open with `O_CLOEXEC`, regular-file check before any read,
+/// body capped at the crate-internal `MAX_CONFIG_BYTES` (1 MiB) via
+/// `Read::take`. A missing directory / file / non-regular target / oversized
+/// body / malformed JSON is a recoverable [`Error::Backend`] whose message
+/// names the offending path (twin of [`load_adapters`]'s error shape).
+pub fn read_adapter_config(dir: &Path) -> Result<LoraConfig> {
+  let config_text = read_bounded_adapter_config(dir)?;
+  LoraConfig::from_json(&config_text)
+}
+
 /// mlx-lm's adapter weights filename (`tuner/utils.py:137`
 /// `adapter_path / "adapters.safetensors"`).
 const MLX_LM_ADAPTER_FILE: &str = "adapters.safetensors";

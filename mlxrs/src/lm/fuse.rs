@@ -25,11 +25,16 @@
 //!      │   weights                       =  load::load_weights(model_path)
 //!      │   quant                         =  parse_quantization(config_json_text)
 //!      ▼
+//!   read adapter config (for fan_in_fan_out)     (fuse.py:65 → load_adapters reads this)
+//!      │   lora_cfg = lora::read_adapter_config(adapter_path)
+//!      │   fifo     = lora_cfg.fan_in_fan_out()  // PEFT-only, false on mlx-lm-native
+//!      ▼
 //!   load adapters → LoraLayers map               (fuse.py:64-66 → load(adapter_path=...))
 //!      │   lora::load_adapters(&weights, adapter_path, quant.as_ref(), num_blocks)
 //!      ▼
 //!   for (path, layer) in layers:                 (fuse.py:68-75 → fused_linears + update_modules)
 //!      │   fused = layer.fuse(dequantize)?
+//!      │   if fifo: fused.weight = transpose(fused.weight)  // [out, in] → [in, out]
 //!      │   replace `<path>.weight` / `.scales` / `.biases` / `.bias` in `weights`
 //!      ▼
 //!   if dequantize:                                (fuse.py:77-81)
@@ -188,7 +193,18 @@ pub fn fuse(
   // params correctly.
   let parsed_quant = quant::parse_quantization(&config_json_text)?;
 
-  // (4) Build the LoraLayers map (path → wrapped layer) by reading
+  // (4) Read the adapter's typed config separately so the PEFT
+  // `fan_in_fan_out` flag is available BEFORE we walk the fused layers
+  // — we need it to know whether the SAVED weight should be re-transposed
+  // back to the persisted `[in, out]` layout (see step 5). `load_adapters`
+  // already parses the same file internally; the duplicate parse is
+  // intentional and cheap (`adapter_config.json` is bounded by
+  // [`crate::lm::load::MAX_CONFIG_BYTES`] and small in practice — single-
+  // -digit-KB JSON).
+  let lora_cfg = lora::read_adapter_config(adapter_path)?;
+  let fan_in_fan_out = lora_cfg.fan_in_fan_out();
+
+  // (5) Build the LoraLayers map (path → wrapped layer) by reading
   // `adapter_config.json` + the adapter weights, then matching factor
   // groups to base layers. `load_adapters` does the explicit-target
   // completeness check (an `Error::Backend` when an `adapter_config.json`
@@ -202,15 +218,29 @@ pub fn fuse(
     cfg_typed.num_hidden_layers,
   )?;
 
-  // (5) Walk the layer map, fuse each, and rewrite the weight map. Take
+  // (6) Walk the layer map, fuse each, and rewrite the weight map. Take
   // ownership of `weights` so each replaced Array is dropped (not
   // cloned) before the fused replacement lands.
+  //
+  // PEFT `fan_in_fan_out: true` (`lora.rs:3185-3243` documents the load
+  // side): on disk the base weight is persisted `[in, out]` (Conv1D-style);
+  // `build_base_linear` transposes it back to canonical `[out, in]` for the
+  // forward + the fuse math. `LoraLayer::fuse` therefore returns a fused
+  // [`BaseLinear`] in the canonical `[out, in]` orientation — but the
+  // persisted-orientation contract on disk for any downstream PEFT-aware
+  // reader is `[in, out]`. So when `fan_in_fan_out` is set we transpose the
+  // fused weight back to `[in, out]` BEFORE insertion (the loader's
+  // transpose-on-read inverts it). Quantized + `fan_in_fan_out` is rejected
+  // at load time (`build_base_linear` `lora.rs:3212-3221`) — a packed
+  // quantized weight cannot be transposed without corrupting bit-packing —
+  // so the fused output we see when `fan_in_fan_out` is set is always
+  // [`BaseLinear::Dense`].
   let mut weights = weights;
   for (path, layer) in &layers {
-    apply_fuse_to_weights(&mut weights, path, layer, dequantize)?;
+    apply_fuse_to_weights(&mut weights, path, layer, dequantize, fan_in_fan_out)?;
   }
 
-  // (6) Per-layer quantization for the SAVED checkpoint:
+  // (7) Per-layer quantization for the SAVED checkpoint:
   //
   // - `dequantize=true`: the fused output is fully dense — drop the
   //   block AND walk any remaining quantized triples through
@@ -233,7 +263,7 @@ pub fn fuse(
     (weights, config_json_text, save_quant)
   };
 
-  // (7) Save — atomic, fsync-disciplined (F6). `save` does the
+  // (8) Save — atomic, fsync-disciplined (F6). `save` does the
   // config-stage / weights-shard / index-commit sequence; a post-commit
   // `fsync_dir` warning surfaces as `Error::DurabilityWarning {
   // committed: true, .. }` so the caller can distinguish "saved but
@@ -248,11 +278,27 @@ pub fn fuse(
 /// is now dense); for a Quantized fused output we write the full triple.
 /// For a `DoraEmbedding` we use [`LoraLayer::fuse_embedding`] which returns
 /// a [`BaseEmbedding`] (no bias / no quantized variant).
+///
+/// `fan_in_fan_out` (PEFT `LoraConfig.fan_in_fan_out`): when `true` the base
+/// weights on disk are persisted `[in_features, out_features]` (Conv1D-style)
+/// rather than canonical `[out_features, in_features]`. The fuse math runs
+/// on the canonical layout (`LoraLayer::fuse` returns canonical `[out, in]`),
+/// but the SAVED weight must round-trip through any PEFT-aware reader: the
+/// persisted-orientation contract is `[in, out]`. So before insertion we
+/// transpose the fused dense weight back to `[in, out]` — `transpose` on a
+/// 2-D Array swaps the two axes (equivalent to `transpose_axes(&[1, 0])`).
+///
+/// `fan_in_fan_out` over a quantized base is rejected at the LOAD side
+/// (`lora.rs::build_base_linear`, lines 3212-3221 — transposing a packed
+/// quantized weight would corrupt the bit-packing), so a fused Quantized
+/// variant cannot reach the `fan_in_fan_out: true` branch. A debug-only
+/// assertion in [`insert_base_linear`] guards that invariant.
 fn apply_fuse_to_weights(
   weights: &mut Weights,
   path: &str,
   layer: &LoraLayer,
   dequantize: bool,
+  fan_in_fan_out: bool,
 ) -> Result<()> {
   // Drop the source layer's weight-map entries up front so the per-variant
   // insert below is the only writer (no stale `.scales` / `.biases` left
@@ -269,9 +315,13 @@ fn apply_fuse_to_weights(
   match layer {
     LoraLayer::Lora(_) | LoraLayer::Dora(_) => {
       let fused = layer.fuse(dequantize)?;
-      insert_base_linear(weights, path, fused);
+      insert_base_linear(weights, path, fused, fan_in_fan_out)?;
     }
     LoraLayer::DoraEmbedding(_) => {
+      // PEFT `fan_in_fan_out` is a *Linear* concept (the Conv1D-style
+      // transposed weight only appears on linear layers — embeddings have
+      // their own `[num_embeddings, dims]` layout and PEFT does not
+      // transpose them). The flag is ignored for the embedding fuse path.
       let fused = layer.fuse_embedding()?;
       insert_base_embedding(weights, path, fused);
     }
@@ -283,10 +333,29 @@ fn apply_fuse_to_weights(
 /// the dense `[output_dims, input_dims]` weight at `<path>.weight`, the
 /// optional output bias at `<path>.bias`, and (for a re-quantized base)
 /// the `<path>.scales` + (`affine`-only) `<path>.biases` triple.
-fn insert_base_linear(weights: &mut Weights, path: &str, fused: BaseLinear) {
+///
+/// When `fan_in_fan_out` is `true` the dense `weight` is transposed back to
+/// the persisted `[in_features, out_features]` orientation before insertion
+/// — see [`apply_fuse_to_weights`] for the round-trip rationale. The
+/// Quantized branch is unreachable on the `fan_in_fan_out: true` path
+/// (rejected at load time, `lora.rs::build_base_linear` 3212-3221); a
+/// debug-only assertion confirms the invariant so a future refactor that
+/// loosens the load-side rejection without revisiting the fuse side fails
+/// loudly in debug builds rather than silently corrupting on disk.
+fn insert_base_linear(
+  weights: &mut Weights,
+  path: &str,
+  fused: BaseLinear,
+  fan_in_fan_out: bool,
+) -> Result<()> {
   match fused {
     BaseLinear::Dense { weight, bias } => {
-      weights.insert(format!("{path}.weight"), weight);
+      let persisted = if fan_in_fan_out {
+        weight.transpose()?
+      } else {
+        weight
+      };
+      weights.insert(format!("{path}.weight"), persisted);
       if let Some(b) = bias {
         weights.insert(format!("{path}.bias"), b);
       }
@@ -298,6 +367,13 @@ fn insert_base_linear(weights: &mut Weights, path: &str, fused: BaseLinear) {
       bias,
       ..
     } => {
+      debug_assert!(
+        !fan_in_fan_out,
+        "insert_base_linear: fan_in_fan_out=true reached a Quantized fused output for \
+         {path:?}; the load side rejects this combination (lora.rs::build_base_linear \
+         3212-3221) — a packed quantized weight cannot be transposed without corrupting \
+         the bit-packing"
+      );
       weights.insert(format!("{path}.weight"), weight);
       weights.insert(format!("{path}.scales"), scales);
       if let Some(qb) = quant_biases {
@@ -308,6 +384,7 @@ fn insert_base_linear(weights: &mut Weights, path: &str, fused: BaseLinear) {
       }
     }
   }
+  Ok(())
 }
 
 /// Insert a fused [`BaseEmbedding`] back into the weight map under `path`.

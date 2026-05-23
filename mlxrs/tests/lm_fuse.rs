@@ -20,6 +20,15 @@
 //!   adapter selection is an error, not a silent no-op save — same
 //!   contract A3 inherits from F5's adapter loader).
 //! - `fuse_save_path_is_created_when_absent`
+//! - `fuse_preserves_fan_in_fan_out_layout_for_non_square_peft_target` —
+//!   PEFT `fan_in_fan_out: true` on a non-square base ([in=4, out=3]); the
+//!   fused weight must be re-transposed back to the persisted `[in, out]`
+//!   layout before save so a load through the same loader round-trips.
+//! - `fuse_preserves_fan_in_fan_out_layout_for_square_target` — a square
+//!   PEFT `fan_in_fan_out: true` base with a NON-symmetric LoRA delta
+//!   (asymmetric upper-triangular); a silent transpose would produce a
+//!   different matrix, so this catches the corruption a square-base
+//!   numerical check would miss.
 //!
 //! No `peak_memory()` magnitude asserts (per project memory).
 #![cfg(feature = "lm")]
@@ -481,4 +490,266 @@ fn fuse_save_path_is_created_when_absent() {
     save_dir.join("model.safetensors.index.json").is_file(),
     "index.json written"
   );
+}
+
+// ─────────────────────────── PEFT fan_in_fan_out ───────────────────────────
+
+/// Write a PEFT `adapter_config.json` + `adapter_model.safetensors` for the
+/// given block list with `fan_in_fan_out: true`, rank `r` / `lora_alpha` /
+/// `target_modules`. The factor tensors are supplied in PEFT's on-disk
+/// orientation (`lora_A.weight`: `[r, in_features]`, `lora_B.weight`:
+/// `[out_features, r]`) — `translate_peft_keys` transposes them to the
+/// mlxrs scheme on load.
+fn write_peft_fifo_adapter(
+  name: &str,
+  blocks: &[i32],
+  r: i32,
+  lora_alpha: f32,
+  lora_a_disk: &Array,
+  lora_b_disk: &Array,
+) -> PathBuf {
+  let dir = temp_dir(name);
+  let config = format!(
+    r#"{{
+      "peft_type": "LORA",
+      "r": {r},
+      "lora_alpha": {lora_alpha},
+      "target_modules": ["q_proj"],
+      "fan_in_fan_out": true
+    }}"#
+  );
+  fs::write(dir.join("adapter_config.json"), config).unwrap();
+  let mut arrays: HashMap<String, Array> = HashMap::new();
+  for &b in blocks {
+    let path = format!("model.layers.{b}.self_attn.q_proj");
+    arrays.insert(
+      format!("base_model.model.{path}.lora_A.weight"),
+      lora_a_disk.try_clone().unwrap(),
+    );
+    arrays.insert(
+      format!("base_model.model.{path}.lora_B.weight"),
+      lora_b_disk.try_clone().unwrap(),
+    );
+  }
+  io::save_safetensors(&dir.join("adapter_model.safetensors"), &arrays).unwrap();
+  dir
+}
+
+#[test]
+fn fuse_preserves_fan_in_fan_out_layout_for_non_square_peft_target() {
+  // PEFT `fan_in_fan_out: true` on a NON-square base — `[in=4, out=3]`
+  // persisted in Conv1D layout. The fused weight must be saved in the
+  // SAME persisted `[in, out]` orientation so a `load::load_weights`
+  // reload yields a tensor the same loader transposes back to canonical
+  // `[out, in]` — i.e. the round-trip is consistent. Without the fix the
+  // fused weight is saved canonical `[out, in]` and a downstream reader
+  // either errors (non-square: shape mismatch) or silently transposes
+  // (square: semantic corruption — the next test covers that).
+  //
+  // We assert two contracts:
+  //  (1) The save succeeds and the reloaded `<path>.weight` has the
+  //      persisted shape `[in=4, out=3]` (NOT `[out=3, in=4]`).
+  //  (2) The reloaded weight equals `base_persisted + transpose(canonical
+  //      delta)` where `canonical delta = scale * lora_b @ lora_a` in
+  //      `[out, in]`.
+  //
+  // Fixture:
+  //   base canonical `W` ([out=3, in=4]) — picks elements 0,1,2 of x:
+  //     W = [[1,0,0,0],
+  //          [0,1,0,0],
+  //          [0,0,1,0]]
+  //   base persisted `W_p = W^T` ([in=4, out=3])
+  //   lora_A (PEFT disk) ([r=2, in=4]):
+  //     A_disk = [[1,0,0,0],
+  //               [0,1,0,0]]
+  //   lora_B (PEFT disk) ([out=3, r=2]):
+  //     B_disk = [[1,0],
+  //               [0,1],
+  //               [0,0]]
+  //   scale = lora_alpha / r = 4.0 / 2 = 2.0
+  //   canonical delta = scale * B_disk @ A_disk ([out, in])
+  //                   = 2 * [[1,0,0,0],
+  //                          [0,1,0,0],
+  //                          [0,0,0,0]]
+  //                   = [[2,0,0,0],
+  //                      [0,2,0,0],
+  //                      [0,0,0,0]]
+  //   canonical fused = W + delta
+  //                   = [[3,0,0,0],
+  //                      [0,3,0,0],
+  //                      [0,0,1,0]]
+  //   persisted fused = canonical fused^T ([in=4, out=3])
+  //                   = [[3,0,0],
+  //                      [0,3,0],
+  //                      [0,0,1],
+  //                      [0,0,0]]
+  let canonical_w = Array::from_slice::<f32>(
+    &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+    &(3, 4),
+  )
+  .unwrap();
+  let persisted_w = canonical_w.transpose().unwrap(); // [4, 3]
+  // The persisted shape is what the loader stores on disk for `fan_in_fan_out`.
+  assert_eq!(persisted_w.shape(), &[4, 3]);
+
+  let mut weights = HashMap::new();
+  weights.insert(
+    "model.layers.0.self_attn.q_proj.weight".to_string(),
+    persisted_w,
+  );
+  let model_dir = write_base_dir("fifo_nonsq_model", &weights, &plain_config_json(1));
+
+  // PEFT-disk lora_A: [r=2, in=4]; lora_B: [out=3, r=2].
+  let lora_a_disk = Array::from_slice::<f32>(
+    &[
+      1.0, 0.0, 0.0, 0.0, // r=0
+      0.0, 1.0, 0.0, 0.0, // r=1
+    ],
+    &(2, 4),
+  )
+  .unwrap();
+  let lora_b_disk = Array::from_slice::<f32>(
+    &[
+      1.0, 0.0, // out=0
+      0.0, 1.0, // out=1
+      0.0, 0.0, // out=2
+    ],
+    &(3, 2),
+  )
+  .unwrap();
+  let adapter_dir = write_peft_fifo_adapter(
+    "fifo_nonsq_adapter",
+    &[0],
+    /* r */ 2,
+    /* lora_alpha */ 4.0,
+    &lora_a_disk,
+    &lora_b_disk,
+  );
+  let save_dir = temp_dir("fifo_nonsq_save");
+  fs::remove_dir_all(&save_dir).unwrap();
+
+  // The fuse must succeed end-to-end (shape would mismatch without the
+  // transpose-back fix because the loader's [in, out] expectation could not
+  // match a [out, in]-saved fused weight on a re-load).
+  fuse::fuse(&model_dir, &adapter_dir, &save_dir, false).unwrap();
+
+  let mut reloaded = load::load_weights(&save_dir).unwrap();
+  let mut got = reloaded
+    .remove("model.layers.0.self_attn.q_proj.weight")
+    .expect("fused q_proj weight present");
+  // (1) Persisted shape: [in=4, out=3].
+  assert_eq!(
+    got.shape(),
+    &[4, 3],
+    "saved fused weight stays in the persisted [in, out] layout"
+  );
+  // (2) Hand-traced expected persisted fused weight (see fixture above).
+  let expected_persisted: Vec<f32> = vec![
+    3.0, 0.0, 0.0, // in=0
+    0.0, 3.0, 0.0, // in=1
+    0.0, 0.0, 1.0, // in=2
+    0.0, 0.0, 0.0, // in=3
+  ];
+  let vals = got.to_vec::<f32>().unwrap();
+  for (i, (g, e)) in vals.iter().zip(expected_persisted.iter()).enumerate() {
+    assert!(
+      (g - e).abs() <= 1e-5,
+      "persisted fused weight elt {i}: got {g}, expected {e} \
+       (full: {vals:?} vs {expected_persisted:?})"
+    );
+  }
+}
+
+#[test]
+fn fuse_preserves_fan_in_fan_out_layout_for_square_target() {
+  // Square PEFT `fan_in_fan_out: true` base — the silent-transpose
+  // corruption mode that a shape check cannot catch. We use a
+  // NON-symmetric LoRA delta (a rank-1 lower-triangular update on the
+  // bottom output row) so a transposed save produces a different matrix
+  // (an updated right COLUMN instead).
+  //
+  // Fixture:
+  //   base canonical `W` ([out=3, in=3]) — identity:
+  //     W = [[1,0,0],
+  //          [0,1,0],
+  //          [0,0,1]]
+  //   base persisted W_p = W^T = W (identity is symmetric — keeps the
+  //                                  base in BOTH orientations equal so
+  //                                  the asymmetry lives in the DELTA).
+  //   lora_A (PEFT disk) ([r=1, in=3]):
+  //     A_disk = [[1,1,1]]
+  //   lora_B (PEFT disk) ([out=3, r=1]):
+  //     B_disk = [[0],[0],[1]]   // only the last output row is updated
+  //   scale = lora_alpha / r = 2.0 / 1 = 2.0
+  //   canonical delta = scale * B_disk @ A_disk ([out=3, in=3])
+  //                   = 2 * [[0,0,0],
+  //                          [0,0,0],
+  //                          [1,1,1]]
+  //                   = [[0,0,0],
+  //                      [0,0,0],
+  //                      [2,2,2]]
+  //   canonical fused = W + delta
+  //                   = [[1,0,0],
+  //                      [0,1,0],
+  //                      [2,2,3]]                     ← bottom row updated
+  //   persisted fused = canonical fused^T
+  //                   = [[1,0,2],
+  //                      [0,1,2],
+  //                      [0,0,3]]                     ← right column updated
+  //                   (clearly NOT equal to the canonical layout — the
+  //                    silent-transpose bug would save the canonical
+  //                    layout and the loader would re-transpose it back,
+  //                    giving a model whose UPDATED ROW became an
+  //                    UPDATED COLUMN — wrong output.)
+  let canonical_w =
+    Array::from_slice::<f32>(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], &(3, 3)).unwrap();
+  let persisted_w = canonical_w.transpose().unwrap(); // [3, 3] but stored as W^T
+
+  let mut weights = HashMap::new();
+  weights.insert(
+    "model.layers.0.self_attn.q_proj.weight".to_string(),
+    persisted_w,
+  );
+  let model_dir = write_base_dir("fifo_sq_model", &weights, &plain_config_json(1));
+
+  let lora_a_disk = Array::from_slice::<f32>(&[1.0, 1.0, 1.0], &(1, 3)).unwrap();
+  let lora_b_disk = Array::from_slice::<f32>(&[0.0, 0.0, 1.0], &(3, 1)).unwrap();
+  let adapter_dir = write_peft_fifo_adapter(
+    "fifo_sq_adapter",
+    &[0],
+    /* r */ 1,
+    /* lora_alpha */ 2.0,
+    &lora_a_disk,
+    &lora_b_disk,
+  );
+  let save_dir = temp_dir("fifo_sq_save");
+  fs::remove_dir_all(&save_dir).unwrap();
+
+  fuse::fuse(&model_dir, &adapter_dir, &save_dir, false).unwrap();
+
+  let mut reloaded = load::load_weights(&save_dir).unwrap();
+  let mut got = reloaded
+    .remove("model.layers.0.self_attn.q_proj.weight")
+    .expect("fused square q_proj weight present");
+  assert_eq!(
+    got.shape(),
+    &[3, 3],
+    "shape preserved (square; the only signal is values)"
+  );
+  // Expected PERSISTED `[in, out]` (= canonical W_fused^T per the trace above).
+  let expected_persisted: Vec<f32> = vec![
+    1.0, 0.0, 2.0, // in=0
+    0.0, 1.0, 2.0, // in=1
+    0.0, 0.0, 3.0, // in=2
+  ];
+  let vals = got.to_vec::<f32>().unwrap();
+  for (i, (g, e)) in vals.iter().zip(expected_persisted.iter()).enumerate() {
+    assert!(
+      (g - e).abs() <= 1e-5,
+      "square persisted fused elt {i}: got {g}, expected {e} \
+       (full: {vals:?} vs {expected_persisted:?}); a silent transpose \
+       would produce the canonical layout `[[1,0,0],[0,1,0],[2,2,3]]` \
+       which differs at multiple cells"
+    );
+  }
 }
