@@ -25,8 +25,9 @@
 //!   the worked `dot` differential test in [`crate::simd`] for the
 //!   bit-exact reduction-tree contract.
 //!
-//! - **[`assert_close_over_lane_sweep`]** — the `Tolerance` class.
-//!   Used for fp-reduction / FMA-rounding kernels where SIMD changes
+//! - **[`assert_close_over_lane_sweep`]** — the `Tolerance` class,
+//!   *scalar* output. Used for fp-reduction / FMA-rounding kernels
+//!   that fold the input to a single `f64` and where SIMD changes
 //!   summation order or rounding (in general — note the in-tree
 //!   `dot`/`sum_of_squares` are deliberately bit-identical because the
 //!   scalar tree mirrors NEON's, but the generic `Tolerance` shape is
@@ -38,23 +39,49 @@
 //!   The helper asserts
 //!   `(scalar - simd).abs() <= abs.max(rel * scalar.abs())`.
 //!
+//! - **[`assert_close_slice_over_lane_sweep`]** — the `Tolerance`
+//!   class, *vector* output. The elementwise twin of
+//!   [`assert_close_over_lane_sweep`] for fp kernels that return a
+//!   `Vec<f64>`:
+//!     - **C5**  ([#150](https://github.com/Findit-AI/mlxrs/issues/150)) `rotate_buf` permutation (vector output),
+//!     - **C10** ([#155](https://github.com/Findit-AI/mlxrs/issues/155)) `mel_filter_bank` triangle construction,
+//!     - **C12** ([#157](https://github.com/Findit-AI/mlxrs/issues/157)) window generation (Hann / Hamming),
+//!     - any future fp kernel that emits a vector rather than a scalar.
+//!
+//!   The helper asserts the dispatcher and scalar outputs have the
+//!   same length, and that every element pair satisfies the same
+//!   `(s - d).abs() <= abs.max(rel * s.abs())` shape as the scalar
+//!   twin.
+//!
 //! # Length sweep
 //!
-//! Both helpers call the input generator at lengths
-//! `{0, 1, lanes-1, lanes, lanes+1, 3*lanes+1}` so the kernel's
-//! head / body / tail paths are *all* exercised (§5.3 — "Cover the
-//! tail / remainder"). `lanes` is parameterized at the call site (e.g.
-//! `lanes = 2` for `float64x2_t`-based kernels, `lanes = 4` for
-//! `float32x4_t`, `lanes = 16` for `uint8x16_t`).
+//! All three helpers call the input generator at lengths
+//! `{0, 1, lanes-1, lanes, lanes+1, 2*lanes, 3*lanes, 3*lanes+1}` so
+//! the kernel's head / body / tail paths are *all* exercised (§5.3 —
+//! "Cover the tail / remainder"). The two clean-multi-block lengths
+//! (`2*lanes`, `3*lanes`) specifically catch off-by-one bugs on the
+//! chunk-loop bound that a sweep without them would miss (a kernel
+//! that mis-handles `len == k * lanes && tail == 0` can pass a sweep
+//! that only carries multi-block-plus-tail). `lanes` is parameterized
+//! at the call site (e.g. `lanes = 2` for `float64x2_t`-based
+//! kernels, `lanes = 4` for `float32x4_t`, `lanes = 16` for
+//! `uint8x16_t`).
 //!
 //! # Signature shape
 //!
-//! Both helpers take:
+//! All three helpers take:
 //! 1. the scalar reference function pointer (`fn(&[T]) -> R`),
 //! 2. the public dispatcher function pointer (`fn(&[T]) -> R`) —
 //!    internally selects NEON or scalar,
 //! 3. an input generator (`fn(usize) -> Vec<T>` — receives the length
 //!    and returns a deterministic input of that length).
+//!
+//! The output type `R` is `R: PartialEq + core::fmt::Debug` for
+//! [`assert_eq_over_lane_sweep`], `f64` for
+//! [`assert_close_over_lane_sweep`], and `Vec<f64>` for
+//! [`assert_close_slice_over_lane_sweep`]. The two tolerance helpers
+//! share `f64` as the comparison type for symmetry — call sites with
+//! `f32` outputs widen via `as f64` (lossless).
 //!
 //! The generator returning a fresh `Vec` for each length is
 //! deliberate: it keeps the helper trivially `Send` / `Sync`-free
@@ -62,22 +89,51 @@
 //! the data distribution (random-seeded, alternating-sign, edge values
 //! like `i16::MIN`/`MAX`, etc.).
 
-/// Lane-sweep length set. See the module doc for rationale.
+/// Returns the canonical SIMD lane-sweep coverage for `lanes`-wide
+/// kernels.
 ///
-/// Returns inputs at length `0`, `1`, `lanes - 1`, `lanes`,
-/// `lanes + 1`, and `3 * lanes + 1` — the 6 lengths the helpers
-/// [`assert_eq_over_lane_sweep`] and [`assert_close_over_lane_sweep`]
-/// drive their generator at. The `lanes - 1` case `saturating_sub`s
-/// to `0` when `lanes <= 1` (re-running an earlier length is harmless).
+/// Covers eight boundary classes the helpers
+/// [`assert_eq_over_lane_sweep`], [`assert_close_over_lane_sweep`],
+/// and [`assert_close_slice_over_lane_sweep`] drive their generator
+/// at:
+///
+/// 1. `0`               — empty input (no body, no tail).
+/// 2. `1`               — singleton (degenerate-tail-only).
+/// 3. `lanes - 1`       — single-block-just-below (pure-tail, no body).
+/// 4. `lanes`           — single-block-clean (one body, no tail).
+/// 5. `lanes + 1`       — single-block-plus-tail (body + tail).
+/// 6. `2 * lanes`       — multi-block-clean ×2 (two bodies, no tail).
+/// 7. `3 * lanes`       — multi-block-clean ×3 (three bodies, no tail).
+/// 8. `3 * lanes + 1`   — multi-block-plus-tail (three bodies + tail).
+///
+/// The two clean-multi-block lengths catch chunk-loop off-by-one bugs
+/// that a sweep carrying only `3 * lanes + 1` would miss — a kernel
+/// that mis-handles `len == k * lanes && tail == 0` (e.g. an
+/// inclusive vs exclusive chunk bound) can still pass the
+/// multi-block-plus-tail length.
+///
+/// `lanes` is internally clamped to `>= 1` so `lanes == 0` is
+/// well-defined: it collapses (1 → 1, 0 → 0, 1 → 1, 2 → 2, 3 → 3,
+/// 4 → 4) but still covers the empty + singleton + small body cases.
+/// Some entries collide for very small `lanes` (e.g. `lanes == 1`
+/// gives `[0, 1, 0, 1, 2, 2, 3, 4]`); that is fine — duplicates are
+/// harmless (re-running a length is cheap) and the helper loop has no
+/// dedup requirement.
+///
+/// Returning a fixed-size array (`[usize; 8]`) keeps the signature
+/// stack-only and avoids any heap allocation — the sweep is
+/// constant-shape, callers iterate by `for &n in &lane_sweep_lengths(l)`.
 ///
 /// Exposed as `pub` so a test that needs a non-standard shape (e.g. a
 /// kernel taking two slices `dot(a, b)`) can build its own loop using
 /// the same length set, instead of reimplementing the sweep.
 #[inline]
-pub fn lane_sweep_lengths(lanes: usize) -> [usize; 6] {
-  let l = lanes;
-  // `saturating_sub` keeps `lanes <= 1` from underflowing.
-  [0, 1, l.saturating_sub(1), l, l + 1, 3 * l + 1]
+pub fn lane_sweep_lengths(lanes: usize) -> [usize; 8] {
+  // Clamp to >= 1 so `lanes == 0` doesn't degenerate every multi-block
+  // length to 0 (which would silently strip coverage). `lanes - 1`
+  // still uses `saturating_sub` on the clamped value for clarity.
+  let l = lanes.max(1);
+  [0, 1, l.saturating_sub(1), l, l + 1, 2 * l, 3 * l, 3 * l + 1]
 }
 
 /// `Exact` differential-test class — asserts the SIMD dispatcher's
@@ -179,6 +235,89 @@ pub fn assert_close_over_lane_sweep<T, S, D, G>(
   }
 }
 
+/// `Tolerance` differential-test class for kernels that return a
+/// slice / `Vec` of fp values — the elementwise twin of
+/// [`assert_close_over_lane_sweep`].
+///
+/// Asserts at every length in [`lane_sweep_lengths`]:
+///
+/// - the dispatcher's output length equals the scalar reference's
+///   output length (length-contract regression guard);
+/// - each elementwise pair `(s, d)` satisfies
+///   `(s - d).abs() <= abs.max(rel * s.abs())` — the same combined
+///   abs/rel shape as [`assert_close_over_lane_sweep`].
+///
+/// Use for vector-producing fp kernels — the C5 `rotate_buf`
+/// permutation, C10 `mel_filter_bank` triangle construction, C12
+/// window-generation candidates documented under `simd::audio` /
+/// `simd::vlm` (the C-series catalog; both modules are `pub(crate)`
+/// so are not intra-doc-linked from this public helper). The
+/// existing scalar [`assert_close_over_lane_sweep`] only covers fp
+/// *scalar* reductions (C2 loudness sum-of-squares); this sibling
+/// covers their vector-output counterparts.
+///
+/// # Output type
+///
+/// Returns `Vec<f64>` deliberately, matching the scalar twin's `f64`
+/// return — keeping both `Tolerance` helpers a symmetric API pair
+/// rather than introducing a `ToF64` trait or a parallel `_f32`
+/// variant for marginal gain. Call sites with `Vec<f32>` kernels
+/// promote via `.iter().map(|&x| x as f64).collect()` (an exact
+/// widening) the same way the scalar twin's `f64` return already
+/// requires; the cost is one allocation per length-sweep step, in
+/// test code only.
+///
+/// # Parameters
+///
+/// - `lanes`, `scalar_fn`, `dispatcher_fn`, `gen_input`, `abs`,
+///   `rel` — semantics identical to [`assert_close_over_lane_sweep`],
+///   except `scalar_fn` and `dispatcher_fn` return `Vec<f64>`.
+///
+/// # Panics
+///
+/// - On the first length where the dispatcher and scalar outputs have
+///   different lengths — the message includes the failing length and
+///   both lengths.
+/// - On the first elementwise pair that exceeds the tolerance — the
+///   message includes the failing length, the element index, both
+///   scalar values, the diff, and the tolerance used.
+pub fn assert_close_slice_over_lane_sweep<T, S, D, G>(
+  lanes: usize,
+  scalar_fn: S,
+  dispatcher_fn: D,
+  gen_input: G,
+  abs: f64,
+  rel: f64,
+) where
+  S: Fn(&[T]) -> Vec<f64>,
+  D: Fn(&[T]) -> Vec<f64>,
+  G: Fn(usize) -> Vec<T>,
+{
+  for n in lane_sweep_lengths(lanes) {
+    let input = gen_input(n);
+    let scalar_out = scalar_fn(&input);
+    let simd_out = dispatcher_fn(&input);
+    assert_eq!(
+      scalar_out.len(),
+      simd_out.len(),
+      "Tolerance-slice length mismatch at n={n} (lanes={lanes}): \
+       scalar.len={s_len} dispatcher.len={d_len}",
+      s_len = scalar_out.len(),
+      d_len = simd_out.len(),
+    );
+    for (i, (&s, &d)) in scalar_out.iter().zip(simd_out.iter()).enumerate() {
+      let tol = abs.max(rel * s.abs());
+      assert!(
+        (s - d).abs() <= tol,
+        "Tolerance-slice differential check failed at n={n} i={i} \
+         (lanes={lanes}): scalar={s} dispatcher={d} |diff|={diff} \
+         tol={tol} (abs={abs}, rel={rel})",
+        diff = (s - d).abs(),
+      );
+    }
+  }
+}
+
 #[cfg(test)]
 mod tests {
   //! Self-tests of the differential helpers, using the in-tree `dot`
@@ -188,19 +327,32 @@ mod tests {
   //! responsibility of the per-kernel differential tests in
   //! [`crate::simd`]. They validate that the helper drives a passing
   //! test across the lane-sweep set for both correctness classes.
-  use super::{assert_close_over_lane_sweep, assert_eq_over_lane_sweep, lane_sweep_lengths};
+  use super::{
+    assert_close_over_lane_sweep, assert_close_slice_over_lane_sweep, assert_eq_over_lane_sweep,
+    lane_sweep_lengths,
+  };
 
-  /// `lane_sweep_lengths` produces the documented 6-length set for a
-  /// representative NEON lane width (`lanes = 4` for `float32x4_t`),
-  /// and handles the `lanes <= 1` underflow case via
-  /// `saturating_sub`.
+  /// `lane_sweep_lengths` produces the documented 8-length set across
+  /// the canonical NEON lane widths the in-tree kernels use
+  /// (`lanes ∈ {1, 2, 4, 8, 16, 32}`). Locking the exact array per
+  /// lane width pins the coverage contract — every boundary class
+  /// (empty / singleton / single-block-just-below /
+  /// single-block-clean / single-block-plus-tail / multi-block-clean
+  /// ×2 / multi-block-clean ×3 / multi-block-plus-tail) is present at
+  /// every lane width, and adding/removing/shuffling an entry
+  /// surfaces here loudly.
   #[test]
-  fn lane_sweep_lengths_shape() {
-    assert_eq!(lane_sweep_lengths(4), [0, 1, 3, 4, 5, 13]);
-    assert_eq!(lane_sweep_lengths(2), [0, 1, 1, 2, 3, 7]); // dot's `float64x2_t` lane width.
-    assert_eq!(lane_sweep_lengths(16), [0, 1, 15, 16, 17, 49]); // `uint8x16_t`.
-    assert_eq!(lane_sweep_lengths(1), [0, 1, 0, 1, 2, 4]); // edge: saturating_sub kicks in.
-    assert_eq!(lane_sweep_lengths(0), [0, 1, 0, 0, 1, 1]); // edge: lanes=0 still well-defined.
+  fn lane_sweep_lengths_full_coverage() {
+    assert_eq!(lane_sweep_lengths(1), [0, 1, 0, 1, 2, 2, 3, 4]);
+    assert_eq!(lane_sweep_lengths(2), [0, 1, 1, 2, 3, 4, 6, 7]); // `float64x2_t`.
+    assert_eq!(lane_sweep_lengths(4), [0, 1, 3, 4, 5, 8, 12, 13]); // `float32x4_t`.
+    assert_eq!(lane_sweep_lengths(8), [0, 1, 7, 8, 9, 16, 24, 25]); // `int16x8_t`.
+    assert_eq!(lane_sweep_lengths(16), [0, 1, 15, 16, 17, 32, 48, 49]); // `uint8x16_t`.
+    assert_eq!(lane_sweep_lengths(32), [0, 1, 31, 32, 33, 64, 96, 97]); // 32-wide composite.
+    // Edge: `lanes == 0` is well-defined — the helper clamps `l = lanes.max(1)`
+    // so the sweep collapses to the `lanes == 1` shape rather than degenerating
+    // every multi-block entry to 0.
+    assert_eq!(lane_sweep_lengths(0), [0, 1, 0, 1, 2, 2, 3, 4]);
   }
 
   /// `Exact` class self-test using a trivial pass-through (`sum-by-fold`)
@@ -264,6 +416,62 @@ mod tests {
       // other targets routes to scalar and is exact. Use a small but
       // non-zero abs so a future fp-reorder regression in `dot` would
       // surface here too.
+      1e-12,
+      1e-12,
+    );
+  }
+
+  /// `Tolerance`-slice self-test using a trivial pass-through kernel:
+  /// both the "scalar" and "dispatcher" produce
+  /// `(0..n).map(|i| i as f64).collect()`. Asserts the helper drives
+  /// the length sweep, the per-length length-equality check, and the
+  /// elementwise tolerance comparison without spurious panics — the
+  /// vector-output twin of [`exact_helper_passes_on_passthrough_kernel`]
+  /// + [`tolerance_helper_passes_on_dot_dispatcher`].
+  #[test]
+  fn slice_tolerance_helper_passes_on_passthrough_kernel() {
+    fn identity_vec_f64(xs: &[i32]) -> Vec<f64> {
+      xs.iter().map(|&x| x as f64).collect()
+    }
+    assert_close_slice_over_lane_sweep(
+      4, // pretend lanes=4 for a `float32x4_t`-shaped vector-producing kernel.
+      identity_vec_f64,
+      identity_vec_f64,
+      |n| (0..n as i32).collect::<Vec<i32>>(),
+      // Identical closures ⇒ pointwise diff is exactly 0.0; any
+      // positive tolerance passes. Use a small but non-zero abs/rel
+      // so the comparison shape is exercised, not short-circuited.
+      1e-12,
+      1e-12,
+    );
+  }
+
+  /// `Tolerance`-slice self-test that the helper panics with the
+  /// documented message shape when the dispatcher's output diverges
+  /// outside tolerance. The dispatcher adds `1.0` to every element
+  /// (well above the `1e-12` abs / rel tolerance), so the helper must
+  /// trip on the elementwise comparison at the first non-zero index.
+  /// `should_panic(expected = "Tolerance-slice differential check failed")`
+  /// pins the failure-message contract — a future helper rename or
+  /// reword would surface here.
+  #[test]
+  #[should_panic(expected = "Tolerance-slice differential check failed")]
+  fn slice_tolerance_helper_fails_on_divergent_pair() {
+    fn identity_vec_f64(xs: &[i32]) -> Vec<f64> {
+      xs.iter().map(|&x| x as f64).collect()
+    }
+    fn divergent_vec_f64(xs: &[i32]) -> Vec<f64> {
+      xs.iter().map(|&x| x as f64 + 1.0).collect()
+    }
+    assert_close_slice_over_lane_sweep(
+      4,
+      identity_vec_f64,
+      divergent_vec_f64,
+      // Non-empty length needed for the divergence to bite — the
+      // helper sweeps `n == 0` first (no elements to compare ⇒ no
+      // panic at the empty length), then `n == 1` where the
+      // single-element output differs by 1.0.
+      |n| (0..n.max(1) as i32).collect::<Vec<i32>>(),
       1e-12,
       1e-12,
     );

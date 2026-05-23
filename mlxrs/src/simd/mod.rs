@@ -107,11 +107,28 @@
 //!   (the in-tree `dot` is one — matched reduction tree), the
 //!   `differential_tests` module below compares on `f64::to_bits()`
 //!   instead.
-//! - **`Tolerance { abs, rel }`** — call
+//! - **`Tolerance { abs, rel }` — scalar output** — call
 //!   [`diff::assert_close_over_lane_sweep`](crate::simd::diff::assert_close_over_lane_sweep).
-//!   Use for fp-reduction / FMA-rounding kernels (C2 loudness
-//!   sum-of-squares; any future fp reduction without a matched scalar
-//!   reduction tree).
+//!   Use for fp-reduction / FMA-rounding kernels that fold the input
+//!   to a single `f64` (C2 loudness sum-of-squares; any future fp
+//!   reduction without a matched scalar reduction tree).
+//! - **`Tolerance { abs, rel }` — vector output** — call
+//!   [`diff::assert_close_slice_over_lane_sweep`](crate::simd::diff::assert_close_slice_over_lane_sweep).
+//!   Use for fp kernels that return a `Vec<f64>` (C5 `rotate_buf`
+//!   permutation, C10 `mel_filter_bank` triangle construction, C12
+//!   window generation — the vector-producing fp candidates
+//!   documented under `simd::audio` / `simd::vlm`). Asserts
+//!   dispatcher and scalar outputs have the same length **and** every
+//!   element pair satisfies the same `abs.max(rel * |s|)` tolerance
+//!   as the scalar twin.
+//!
+//! All three helpers share the same length sweep
+//! ([`diff::lane_sweep_lengths`](crate::simd::diff::lane_sweep_lengths)
+//! — 8 lengths covering every boundary class: empty / singleton /
+//! single-block-just-below / single-block-clean / single-block-plus-tail /
+//! multi-block-clean ×2 / multi-block-clean ×3 / multi-block-plus-tail),
+//! so coverage is uniform across `Exact` and both `Tolerance`
+//! flavours.
 //!
 //! See the [`diff`](crate::simd::diff) module doc for the full class
 //! catalog and the length-sweep rationale.
