@@ -24,8 +24,14 @@
 
 use std::collections::VecDeque;
 
-use super::encoder::{StreamingEncoder, StreamingEncoderBackend};
-use crate::{Array, error::Result};
+use super::{
+  encoder::{StreamingEncoder, StreamingEncoderBackend},
+  mel_spectrogram::IncrementalMelSpectrogram,
+};
+use crate::{
+  Array,
+  error::{Error, Result},
+};
 
 /// One window of encoded mel that owes a finalize decode.
 ///
@@ -144,6 +150,16 @@ impl SessionRetryState {
     self.resume_at.as_ref()
   }
 
+  /// True iff `resume_at == Some(StopMelFlush)`. The session uses this
+  /// to dispatch the unified `StopMelFlush` discharge — without it the
+  /// `StopMelFlush` obligation would be stranded forever because
+  /// `discharge_retry_obligation`'s dispatcher would have nothing to
+  /// gate on and `has_obligation()` would short-circuit `stop()` to an
+  /// early-return.
+  pub(super) fn has_pending_stop_mel_flush(&self) -> bool {
+    matches!(self.resume_at, Some(RetryStage::StopMelFlush))
+  }
+
   /// True iff `resume_at` names a stage whose source-of-truth lives
   /// inside `mel_processor` / `encoder` — i.e. some prior call's
   /// encoder.feed errored and the staged mel rows live in
@@ -249,6 +265,81 @@ impl SessionRetryState {
   pub(super) fn clear_stop_mel_flush(&mut self) {
     if matches!(self.resume_at, Some(RetryStage::StopMelFlush)) {
       self.resume_at = None;
+    }
+  }
+
+  /// Discharge the [`RetryStage::StopMelFlush`] obligation, if any,
+  /// against `mel_processor`. Re-attempts the `flush()` whose previous
+  /// invocation errored, and on success advances the resume point to
+  /// [`RetryStage::StopEncoderFeed`] when the flush produced mel rows
+  /// (so the next discharge step can drive the encoder feed).
+  ///
+  /// Returns the freshly-flushed `Option<Array>` so the caller can
+  /// inspect it (the in-tree dispatcher discards it and falls through
+  /// to [`discharge_stop_encoder_feed`](Self::discharge_stop_encoder_feed),
+  /// but callers writing custom orchestrations can use it directly).
+  ///
+  /// Returns `Ok(None)` when there is no `StopMelFlush` obligation.
+  ///
+  /// # Transactional rollback
+  /// - `mel_processor.flush()` Err → re-arms `StopMelFlush` so the next
+  ///   call retries the SAME flush. `IncrementalMelSpectrogram::flush`
+  ///   preserves `overlap_buffer` on Err (its own transactional
+  ///   contract), so the retry sees identical input.
+  /// - `Array::try_clone` on the flushed mel Err (rare — refcount-clone
+  ///   only allocates a fresh handle slot) → re-arms `StopMelFlush` so
+  ///   the next call retries the ENTIRE flush+stage. The freshly
+  ///   flushed mel cannot be carried forward because its only handle
+  ///   was needed both for the return value AND the `StopEncoderFeed`
+  ///   stage, so we redo the whole step.
+  ///
+  /// # Errors
+  /// Propagates from [`IncrementalMelSpectrogram::flush`] or from
+  /// [`Array::try_clone`].
+  pub(super) fn discharge_stop_mel_flush(
+    &mut self,
+    mel_processor: &mut IncrementalMelSpectrogram,
+  ) -> Result<Option<Array>> {
+    let Some(RetryStage::StopMelFlush) = self.resume_at else {
+      return Ok(None);
+    };
+
+    // Take the obligation so we can either commit or re-arm.
+    self.resume_at = None;
+
+    match mel_processor.flush() {
+      Ok(mel_opt) => {
+        // Success: advance — if flush produced mel, stage StopEncoderFeed next.
+        if let Some(mel) = mel_opt.as_ref() {
+          match mel.try_clone() {
+            Ok(cloned) => {
+              self.resume_at = Some(RetryStage::StopEncoderFeed { mel_frames: cloned });
+            }
+            Err(e) => {
+              // try_clone failed: re-arm StopMelFlush to retry the whole
+              // flush+stage. The original mel handle (in `mel_opt`) is
+              // dropped on the Err return — we cannot stage it because
+              // the next discharge cannot recompute it from the (now-
+              // cleared) overlap. The next StopMelFlush retry will
+              // observe an empty overlap and short-circuit `Ok(None)`
+              // unless new audio is fed first — which is exactly the
+              // honest surface: the caller sees the Err and decides.
+              self.resume_at = Some(RetryStage::StopMelFlush);
+              return Err(Error::Backend {
+                message: format!(
+                  "StopMelFlush: failed to clone flushed mel for next-stage retry: {e}"
+                ),
+              });
+            }
+          }
+        }
+        Ok(mel_opt)
+      }
+      Err(e) => {
+        // Rollback: re-arm StopMelFlush so next stop() retries.
+        self.resume_at = Some(RetryStage::StopMelFlush);
+        Err(e)
+      }
     }
   }
 
@@ -384,5 +475,84 @@ mod tests {
     let taken = s.take_stop_partial_decode_features().expect("set above");
     assert!(taken.is_some());
     assert!(!s.has_pending_stop_partial_decode());
+  }
+
+  // -------------------------------------------------------------------
+  // F1: discharge_stop_mel_flush wiring + transactional contract.
+  // -------------------------------------------------------------------
+
+  /// F1: `discharge_stop_mel_flush` returns `Ok(None)` and clears the
+  /// resume point when no obligation is set — the no-op short-circuit.
+  #[test]
+  fn discharge_stop_mel_flush_noop_when_not_staged() {
+    let mut s = SessionRetryState::new();
+    let mut mel = IncrementalMelSpectrogram::new(16_000, 32, 16, 8).unwrap();
+    let out = s
+      .discharge_stop_mel_flush(&mut mel)
+      .expect("noop must succeed");
+    assert!(out.is_none(), "no obligation ⇒ Ok(None)");
+    assert!(!s.has_obligation());
+  }
+
+  /// F1: with an empty overlap, `discharge_stop_mel_flush` clears the
+  /// obligation and returns `Ok(None)` (mel.flush short-circuits on
+  /// empty overlap). The resume point advances to `None`, NOT to
+  /// `StopEncoderFeed` (no mel rows to stage).
+  #[test]
+  fn discharge_stop_mel_flush_empty_overlap_clears_obligation() {
+    let mut s = SessionRetryState::new();
+    let mut mel = IncrementalMelSpectrogram::new(16_000, 32, 16, 8).unwrap();
+    s.stage_stop_mel_flush();
+    assert!(s.has_pending_stop_mel_flush());
+
+    let out = s
+      .discharge_stop_mel_flush(&mut mel)
+      .expect("empty-overlap flush must succeed");
+    assert!(
+      out.is_none(),
+      "empty overlap ⇒ flush yields None ⇒ no StopEncoderFeed stage"
+    );
+    assert!(!s.has_pending_stop_mel_flush());
+    assert!(
+      !s.has_pending_stop_encoder_feed(),
+      "F1: no mel rows ⇒ MUST NOT advance to StopEncoderFeed"
+    );
+    assert!(!s.has_obligation());
+  }
+
+  /// F1: with non-empty overlap, `discharge_stop_mel_flush` runs the
+  /// flush, advances `resume_at` to `StopEncoderFeed` carrying the
+  /// fresh mel, and returns the flushed `Some(mel)` to the caller.
+  /// The mel processor's overlap is cleared by the successful flush
+  /// (the transactional contract — not the discharge's
+  /// responsibility, but observable here).
+  #[test]
+  fn discharge_stop_mel_flush_with_overlap_advances_to_stop_encoder_feed() {
+    let mut s = SessionRetryState::new();
+    let mut mel = IncrementalMelSpectrogram::new(16_000, 32, 16, 8).unwrap();
+    // Feed a chunk that's smaller than n_fft so process() returns None
+    // and the samples accumulate in the overlap.
+    let _ = mel
+      .process(&[0.1_f32; 16])
+      .expect("process must succeed on small input");
+    assert!(
+      mel.overlap_buffer_len() > 0,
+      "test precondition: overlap populated"
+    );
+
+    s.stage_stop_mel_flush();
+    let out = s
+      .discharge_stop_mel_flush(&mut mel)
+      .expect("flush must succeed");
+    assert!(out.is_some(), "non-empty overlap ⇒ flush yields Some(mel)");
+    assert!(
+      s.has_pending_stop_encoder_feed(),
+      "F1: successful flush with mel rows MUST advance resume_at to \
+       StopEncoderFeed for the downstream discharge to drain"
+    );
+    assert!(
+      !s.has_pending_stop_mel_flush(),
+      "F1: successful flush MUST clear StopMelFlush"
+    );
   }
 }

@@ -58,6 +58,19 @@ pub struct IncrementalMelSpectrogram {
   running_log_max: f32,
   /// Total mel frames produced since construction / `reset`.
   total_frames: usize,
+
+  /// Test-only error-injection counter: while `> 0`, the next
+  /// [`flush`](Self::flush) returns [`Error::Backend`] and decrements
+  /// the counter. Used by retry-state regression tests to script a
+  /// recoverable `flush()` failure — there is no real-world Err the
+  /// pure-MLX compute pipeline reliably surfaces, so a deterministic
+  /// counter is the only way to exercise the cross-call retry path.
+  ///
+  /// Crucially, the injection fires BEFORE `overlap_buffer` is
+  /// touched, so the transactional contract (overlap preserved on Err)
+  /// holds for the injected error path too.
+  #[cfg(test)]
+  pub(crate) flush_err_inject_count: usize,
 }
 
 impl IncrementalMelSpectrogram {
@@ -112,6 +125,8 @@ impl IncrementalMelSpectrogram {
       is_first_chunk: true,
       running_log_max: f32::NEG_INFINITY,
       total_frames: 0,
+      #[cfg(test)]
+      flush_err_inject_count: 0,
     })
   }
 
@@ -197,6 +212,17 @@ impl IncrementalMelSpectrogram {
   /// # Errors
   /// Same propagation as [`process`](Self::process).
   pub fn flush(&mut self) -> Result<Option<Array>> {
+    // Test-only error injection — fires BEFORE we touch
+    // `overlap_buffer` so the transactional contract holds (overlap
+    // preserved on Err → retry sees identical input).
+    #[cfg(test)]
+    if self.flush_err_inject_count > 0 {
+      self.flush_err_inject_count -= 1;
+      return Err(Error::Backend {
+        message: "IncrementalMelSpectrogram::flush: scripted test injection".into(),
+      });
+    }
+
     if self.overlap_buffer.is_empty() {
       return Ok(None);
     }
