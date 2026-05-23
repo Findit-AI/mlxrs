@@ -1112,6 +1112,59 @@ mod tests {
 
   use super::*;
 
+  // ───────────────────────── instrumented reader ─────────────────────────
+
+  /// Test-only `BufRead` wrapper that records the cumulative byte count
+  /// the helper consumed from the inner reader. Used by
+  /// `load_dataset_cap_enforced_on_single_giant_line` to PROVE the
+  /// `take(remaining + 1)` allocation cap held — i.e. the helper read at
+  /// most `cap + 1` bytes before erroring, NOT the full input. The old
+  /// `BufRead::lines()` impl would have pulled the entire line into a
+  /// `String` before yielding, so this counter distinguishes the two
+  /// implementations.
+  ///
+  /// Both `Read::read` and `BufRead::consume` are instrumented so the
+  /// counter rises regardless of which path the helper exercises
+  /// (`read_until` goes through `fill_buf` + `consume`; the EOF-peek
+  /// path goes through raw `Read::read`). The two paths are mutually
+  /// exclusive per iteration so there is no double-counting risk:
+  /// `fill_buf` does NOT advance the cursor, only `consume(amt)` does,
+  /// and `Read::read` only fires on the raw peek (not while
+  /// `read_until` is draining the buffer through `Take`).
+  struct CountingReader<R: std::io::BufRead> {
+    inner: R,
+    consumed: usize,
+  }
+
+  impl<R: std::io::BufRead> CountingReader<R> {
+    fn new(inner: R) -> Self {
+      Self { inner, consumed: 0 }
+    }
+
+    fn consumed(&self) -> usize {
+      self.consumed
+    }
+  }
+
+  impl<R: std::io::BufRead> std::io::Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+      let n = self.inner.read(buf)?;
+      self.consumed += n;
+      Ok(n)
+    }
+  }
+
+  impl<R: std::io::BufRead> std::io::BufRead for CountingReader<R> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+      self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, amt: usize) {
+      self.consumed += amt;
+      self.inner.consume(amt);
+    }
+  }
+
   // ───────────────────────── fixtures ─────────────────────────
 
   fn fresh_dir(tag: &str) -> PathBuf {
@@ -1819,13 +1872,21 @@ mod tests {
   // under the truncation.
   #[test]
   fn load_dataset_cap_enforced_on_single_giant_line() {
-    use std::io::Cursor;
+    use std::io::{BufReader, Cursor};
     // 100 bytes of `a`, no newline anywhere — would force any
     // line-buffered reader to consume the full input before yielding.
     let body: Vec<u8> = vec![b'a'; 100];
     let cap: u64 = 40;
     let path = std::path::PathBuf::from("/synthetic/giant.jsonl");
-    let err = read_jsonl_with_cap(Cursor::new(body), &path, cap).unwrap_err();
+
+    // Wrap the fixture in `CountingReader` so we can OBSERVE how many
+    // bytes the helper pulled from the underlying reader. The helper
+    // takes `R: BufRead` by value; the `impl<R: BufRead + ?Sized>
+    // BufRead for &mut R` blanket lets us pass `&mut counting` and
+    // retain ownership of the wrapper to query `.consumed()` after
+    // the call returns.
+    let mut counting = CountingReader::new(BufReader::new(Cursor::new(body)));
+    let err = read_jsonl_with_cap(&mut counting, &path, cap).unwrap_err();
     let s = err.to_string();
     assert!(
       s.contains("exceeded the 40-byte cap"),
@@ -1839,6 +1900,23 @@ mod tests {
       s.contains("/synthetic/giant.jsonl"),
       "expected synthetic path in cap error, got: {s}",
     );
+
+    // PROVE the `take(remaining + 1)` allocation cap held — at most
+    // `cap + 1 = 41` bytes consumed from the underlying reader,
+    // regardless of how long the unterminated line is. The OLD
+    // `BufRead::lines()` impl would have consumed all 100 bytes
+    // before erroring (since `lines()` reads a full line into a
+    // `String` BEFORE yielding). This assertion distinguishes the
+    // safe-allocation `read_until` + `take` path from the OOM-prone
+    // `lines()` path, which is the actual subject of the R2 fix.
+    let consumed = counting.consumed();
+    assert!(
+      consumed <= (cap as usize) + 1,
+      "take(remaining + 1) allocation cap violated: consumed {consumed} bytes from a 100-byte \
+       fixture with cap={cap} (expected <= {}); the old lines() impl would have consumed 100",
+      cap as usize + 1,
+    );
+
     // Also exercise the "no newline anywhere, cap >= input" boundary
     // to confirm a short single line WITHOUT a trailing newline
     // doesn't trip the cap (it should parse as one record). 16 bytes
