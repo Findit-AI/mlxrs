@@ -59,6 +59,9 @@
 pub mod bgr_widen;
 #[doc(hidden)]
 pub mod pad_canvas_fill;
+#[doc(hidden)]
+pub mod rgb_widen;
 
 pub(crate) use bgr_widen::bgr_widen;
 pub(crate) use pad_canvas_fill::pad_canvas_fill;
+pub(crate) use rgb_widen::rgb_widen;

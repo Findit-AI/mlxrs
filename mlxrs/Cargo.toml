@@ -156,3 +156,9 @@ required-features = ["vlm"]
 name = "simd_quantize"
 harness = false
 required-features = ["audio"]
+
+# C3 RGB widen bench — gated on the `vlm` feature.
+[[bench]]
+name = "simd_rgb_widen"
+harness = false
+required-features = ["vlm"]

@@ -1501,9 +1501,41 @@ pub fn image_to_array(img: &::image::DynamicImage, color_order: ColorOrder) -> R
       })?;
     match color_order {
       ColorOrder::Rgb => {
-        // Contiguous u8 → f32 widening — LLVM auto-vectorizes this on
-        // both NEON (aarch64) and AVX2 (x86_64) backends.
-        buf.extend(raw.iter().map(|&b| f32::from(b)));
+        // C3 SIMD dispatcher (`crate::simd::vlm::rgb_widen`). On
+        // `aarch64` this routes to a `vld1q_u8` + four `vst1q_f32`
+        // 16-byte-per-tile NEON kernel (pure byte-for-byte widen, no
+        // de-interleave needed for RGB-in-RGB-out); elsewhere it
+        // falls back to the scalar `MaybeUninit::write` path. The
+        // pre-C3 `buf.extend(raw.iter().map(|&b| f32::from(b)))`
+        // shape LLVM auto-vectorized cleanly, but the hand-rolled
+        // NEON arm pins the contract against compiler-version drift
+        // (per the user directive 2026-05-23 / project memory rule
+        // **"SIMD ship NEON regardless"**). See
+        // `docs/core-arch-simd-candidates.md` §2 row C3 + §3.3 +
+        // tracking [#148].
+        //
+        // The dispatcher takes `&mut [MaybeUninit<f32>]` (type-
+        // encoded uninit safety, matching C4/C6); we pass the
+        // pre-reserved spare capacity directly and `set_len(total)`
+        // after every f32 has been written.
+        {
+          let spare = buf.spare_capacity_mut();
+          debug_assert!(
+            spare.len() >= total,
+            "try_reserve_exact must have reserved at least total f32s"
+          );
+          crate::simd::vlm::rgb_widen(&mut spare[..total], raw);
+        }
+        // SAFETY: `rgb_widen` wrote every f32 in `0..total` of the
+        // spare capacity (function-level contract: "every f32 of
+        // `out` is written before this returns" — both scalar and
+        // NEON arms cover the full slice). `Vec::set_len`'s
+        // preconditions:
+        //   (1) `total <= buf.capacity()` — `try_reserve_exact`
+        //       above reserved exactly that much;
+        //   (2) elements at `[0..total]` are initialized — by
+        //       kernel contract.
+        unsafe { buf.set_len(total) };
       }
       ColorOrder::Bgr => {
         // Per-pixel R↔B swap via the C4 `bgr_widen` dispatcher
