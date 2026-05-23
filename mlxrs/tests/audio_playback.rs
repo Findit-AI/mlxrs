@@ -542,6 +542,222 @@ fn audio_output_stream_rejects_writes_after_stop() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// F1 (HIGH) — one-way `terminated` latch independent of playback state
+// ---------------------------------------------------------------------------
+//
+// Pre-R2 fix, `write_samples`' STATE_STOPPED gate only rejected while
+// state was CURRENTLY STOPPED, but `start()` unconditionally stored
+// STATE_RUNNING. The sequence `start(); stop(); start();` would slip
+// past the gate and let `write_samples()` resume accepting post-stop
+// chunks — silently violating `AudioOutputStream::stop`'s one-way
+// terminal contract. R2 adds a dedicated `SharedState::terminated`
+// AtomicBool latch (set in `stop()`, checked FIRST in every producer
+// method); these tests pin the new contract on a real device.
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires real default audio output device"]
+fn audio_player_start_after_stop_returns_terminated_err() {
+  // F1: `start(); stop(); start()` — the second `start()` MUST
+  // reject with a "terminated" Backend error rather than re-arm the
+  // player. Pre-R2 this returned Ok(()) and silently rehydrated the
+  // producer surface.
+  use mlxrs::audio::playback::AudioPlayer;
+
+  let mut player = AudioPlayer::new(PlaybackConfig::mono(16_000)).unwrap();
+  player.start().unwrap();
+  player.stop().unwrap();
+
+  let err = player.start().unwrap_err();
+  match err {
+    mlxrs::error::Error::Backend { message } => {
+      assert!(
+        message.contains("terminated"),
+        "expected `terminated` in start()-after-stop() error, got: {message}"
+      );
+    }
+    other => panic!("expected Backend error, got {other:?}"),
+  }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires real default audio output device"]
+fn audio_player_write_samples_after_restart_attempt_still_rejected() {
+  // F1 hardening: even if a caller IGNORES the `start()`-after-stop
+  // Err and pushes samples anyway, `write_samples` MUST still reject
+  // (the terminated latch is checked FIRST, before the state
+  // tri-state). This is the regression test for the exact attack the
+  // R2 fix is closing: `start(); stop(); start(); write_samples()`
+  // pre-fix slipped past `state == STATE_STOPPED` because the second
+  // `start()` re-armed state to STATE_RUNNING.
+  use mlxrs::audio::playback::AudioPlayer;
+
+  let mut player = AudioPlayer::new(PlaybackConfig::mono(16_000)).unwrap();
+  player.start().unwrap();
+  player.stop().unwrap();
+  // Ignore the Err from the restart attempt — the contract is that
+  // EVEN IF the producer ignores `start()`'s Err, `write_samples`
+  // still rejects.
+  let _ = player.start();
+
+  let err = player.write_samples(&[0.5_f32; 64]).unwrap_err();
+  match err {
+    mlxrs::error::Error::Backend { message } => {
+      assert!(
+        message.contains("terminated"),
+        "expected `terminated` in write_samples()-after-restart-attempt error, got: {message}"
+      );
+    }
+    other => panic!("expected Backend error, got {other:?}"),
+  }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires real default audio output device"]
+fn audio_player_pause_after_stop_returns_terminated_err() {
+  // F1: `pause()` after `stop()` MUST reject — same terminated-latch
+  // rule as `start()`. Without this, a caller could `start();
+  // stop(); pause()` and surprise the state machine.
+  use mlxrs::audio::playback::AudioPlayer;
+
+  let mut player = AudioPlayer::new(PlaybackConfig::mono(16_000)).unwrap();
+  player.start().unwrap();
+  player.stop().unwrap();
+
+  let err = player.pause().unwrap_err();
+  match err {
+    mlxrs::error::Error::Backend { message } => {
+      assert!(
+        message.contains("terminated"),
+        "expected `terminated` in pause()-after-stop() error, got: {message}"
+      );
+    }
+    other => panic!("expected Backend error, got {other:?}"),
+  }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires real default audio output device"]
+fn audio_player_resume_after_stop_returns_terminated_err() {
+  // F1: `resume()` after `stop()` MUST reject. Resume delegates to
+  // `start()` internally but the dedicated `resume`-named error
+  // message keeps the call-site signal clear.
+  use mlxrs::audio::playback::AudioPlayer;
+
+  let mut player = AudioPlayer::new(PlaybackConfig::mono(16_000)).unwrap();
+  player.start().unwrap();
+  player.stop().unwrap();
+
+  let err = player.resume().unwrap_err();
+  match err {
+    mlxrs::error::Error::Backend { message } => {
+      assert!(
+        message.contains("terminated"),
+        "expected `terminated` in resume()-after-stop() error, got: {message}"
+      );
+    }
+    other => panic!("expected Backend error, got {other:?}"),
+  }
+}
+
+// ---------------------------------------------------------------------------
+// F2 (MEDIUM) — queue pre-allocation at construction, NO per-chunk realloc
+// ---------------------------------------------------------------------------
+//
+// Pre-R2, `write_samples`' producer loop called `q.reserve_exact(chunk.len())`
+// under the queue lock on every chunk — if the underlying VecDeque needed to
+// grow past its initial capacity, the allocator path ran inside the lock and
+// the cpal callback's `try_lock` would see WouldBlock for allocator time too
+// (not just `extend`). R2 pre-allocates the full bounded
+// `queue_capacity_samples` at construction (via `try_reserve_exact` so alloc
+// failure surfaces as `Error::Backend`) and removes the per-chunk
+// `reserve_exact`. These tests assert the capacity is sized to the bound at
+// construction and never grows during playback. The `_test_*` accessors are
+// `#[doc(hidden)]` test-only API on AudioPlayer.
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires real default audio output device"]
+fn audio_player_pre_allocates_queue_capacity_at_construction() {
+  // F2 invariant: `buffer_depth()` is 0 immediately after
+  // construction (no samples queued) but the underlying VecDeque is
+  // already sized to `queue_capacity_samples`. The `>= cap` form is
+  // the `try_reserve_exact` contract ("AT LEAST `additional` more").
+  use mlxrs::audio::playback::AudioPlayer;
+
+  let cfg = PlaybackConfig {
+    sample_rate: 16_000,
+    channels: ChannelLayout::Mono,
+    sample_format: SampleFormat::F32,
+    buffer_size_frames: None,
+    queue_capacity_frames: 4096,
+  };
+  let player = AudioPlayer::new(cfg).unwrap();
+
+  assert_eq!(player.buffer_depth(), 0);
+  let cap_samples = player._test_queue_capacity_samples();
+  assert_eq!(
+    cap_samples, 4096,
+    "queue cap = frames * channels = 4096 * 1"
+  );
+  let underlying = player._test_queue_underlying_capacity();
+  assert!(
+    underlying >= cap_samples,
+    "VecDeque underlying capacity ({underlying}) must be >= bounded cap ({cap_samples}) per \
+     try_reserve_exact contract"
+  );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires real default audio output device"]
+fn audio_player_write_samples_does_not_grow_queue_capacity_during_playback() {
+  // F2 invariant: producer-side `write_samples` does NOT call
+  // `reserve_exact` (or any other capacity-growing path) under the
+  // queue lock. We capture the underlying VecDeque capacity before
+  // + after a write well under the bound and assert it's unchanged
+  // — the producer-loop `extend` is a pure memcpy because the bound
+  // was pre-allocated at construction.
+  //
+  // We pause() (not stop()) so the cpal callback doesn't drain the
+  // samples we just pushed and trigger a buffer-depth race in the
+  // post-write capacity read; with the player paused, the queue
+  // holds the pushed samples and we can read capacity reliably.
+  use mlxrs::audio::playback::AudioPlayer;
+
+  let cfg = PlaybackConfig {
+    sample_rate: 16_000,
+    channels: ChannelLayout::Mono,
+    sample_format: SampleFormat::F32,
+    buffer_size_frames: None,
+    queue_capacity_frames: 4096,
+  };
+  let mut player = AudioPlayer::new(cfg).unwrap();
+  player.start().unwrap();
+  player.pause().unwrap();
+
+  let cap_before = player._test_queue_underlying_capacity();
+  let cap_samples = player._test_queue_capacity_samples();
+
+  // Push 1024 samples — well under the 4096-sample bound, so under
+  // the new contract `extend` is a pure memcpy with no realloc.
+  player.write_samples(&[0.25_f32; 1024]).unwrap();
+
+  let cap_after = player._test_queue_underlying_capacity();
+  assert_eq!(
+    cap_after, cap_before,
+    "queue capacity grew during write_samples (before={cap_before}, after={cap_after}) — \
+     producer-loop `extend` must not realloc because the queue is pre-allocated to \
+     queue_capacity_samples ({cap_samples}) at construction"
+  );
+
+  let _ = player.stop();
+}
+
 // F3 tests exercise the pure `sanitize_volume` helper directly so
 // they run in CI without a default audio output device. The
 // device-touching round-trip is exercised in

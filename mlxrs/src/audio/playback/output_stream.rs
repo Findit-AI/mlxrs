@@ -86,6 +86,19 @@ pub trait AudioOutputStream: Send {
   /// Mirrors Swift's
   /// `MLXAudioCore.AudioPlayer.stopStreaming()`.
   ///
+  /// **One-way transition.** `stop()` is a one-way latch on the
+  /// implementor: any restart-style call on the same
+  /// [`AudioOutputStream`] (e.g. a sink-specific `start()` /
+  /// `resume()` / a second `stop()`) MUST NOT re-arm the producer
+  /// surface. The caller MUST drop the implementor and construct a
+  /// fresh one to resume — this is the contract that lets the A8
+  /// pipeline treat `stop()` as a hard end-of-stream marker without
+  /// auditing the implementor's internal state-machine on every
+  /// transition. The [`super::player::AudioPlayer`] impl enforces
+  /// this with a dedicated `SharedState::terminated` atomic flag
+  /// checked BEFORE the playback-state tri-state on every producer
+  /// method (`start`, `pause`, `resume`, `write_samples`).
+  ///
   /// Distinct from a pause-style suspension: a pausable sink (e.g.
   /// [`super::player::AudioPlayer::pause`]) buffers writes for later
   /// resume; `stop()` does not. Implementors MUST NOT silently

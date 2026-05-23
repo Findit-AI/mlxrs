@@ -143,7 +143,7 @@ use std::{
   collections::VecDeque,
   sync::{
     Arc, Mutex,
-    atomic::{AtomicU8, AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering},
   },
   thread,
   time::{Duration, Instant},
@@ -249,6 +249,20 @@ struct SharedState {
   /// pop loop); written by the producer (`start`, `pause`, `resume`,
   /// `stop`).
   state: AtomicU8,
+  /// **One-way terminal latch**, set by [`AudioPlayer::stop`] and
+  /// never cleared. Independent of [`SharedState::state`] (which is a
+  /// tri-state playback flag the cpal callback gates on every
+  /// invocation) because the terminal contract is asymmetric: once
+  /// `stop()` returns, NO subsequent `start()` / `pause()` /
+  /// `resume()` / `write_samples()` may "rehydrate" the player to a
+  /// live state and accept further producer writes. Without this
+  /// separate latch, `start()` storing `STATE_RUNNING` after `stop()`
+  /// would mask the terminated condition from the producer-side
+  /// `STATE_STOPPED` gate in `write_samples()` and let post-stop
+  /// chunks accumulate + play on the re-started cpal stream — a
+  /// silent violation of [`super::output_stream::AudioOutputStream::stop`]'s
+  /// "MUST NOT silently accept post-stop writes" clause.
+  terminated: AtomicBool,
   /// Current volume scalar, stored as `f32::to_bits` in an
   /// `AtomicU32`. Read by the cpal callback every sample; written
   /// by [`AudioPlayer::set_volume`]. Default is 1.0 (unity gain) —
@@ -266,16 +280,36 @@ struct SharedState {
 }
 
 impl SharedState {
-  fn new(queue_capacity_samples: usize) -> Self {
-    Self {
-      queue: Mutex::new(VecDeque::with_capacity(
-        queue_capacity_samples.min(64 * 1024),
-      )),
+  /// Build a [`SharedState`] with a queue pre-allocated to its full
+  /// `queue_capacity_samples` bound. Pre-allocation at construction
+  /// (rather than on first producer write) keeps the producer-loop
+  /// lock window in [`AudioPlayer::write_samples`] to a pure
+  /// `VecDeque::extend` (O(chunk) memcpy with NO realloc possible),
+  /// so the cpal callback's `try_lock` window can't be inflated by
+  /// allocator time on a growing queue.
+  ///
+  /// # Errors
+  /// - [`Error::Backend`] if `try_reserve_exact` fails on the bounded
+  ///   queue capacity (e.g. tiny-RAM or fragmented-heap on the
+  ///   caller's host).
+  fn new(queue_capacity_samples: usize) -> Result<Self> {
+    let mut queue = VecDeque::new();
+    queue
+      .try_reserve_exact(queue_capacity_samples)
+      .map_err(|e| Error::Backend {
+        message: format!(
+          "AudioPlayer::with_device failed to pre-allocate queue capacity \
+           ({queue_capacity_samples} samples): {e}"
+        ),
+      })?;
+    Ok(Self {
+      queue: Mutex::new(queue),
       queue_capacity_samples,
       state: AtomicU8::new(STATE_STOPPED),
+      terminated: AtomicBool::new(false),
       volume_bits: AtomicU32::new(1.0_f32.to_bits()),
       callback_error: Mutex::new(None),
-    }
+    })
   }
 
   fn load_volume(&self) -> f32 {
@@ -366,7 +400,7 @@ impl AudioPlayer {
         message: "AudioPlayer: queue_capacity_frames * channels overflows usize".to_string(),
       })?;
 
-    let shared = Arc::new(SharedState::new(queue_capacity_samples));
+    let shared = Arc::new(SharedState::new(queue_capacity_samples)?);
 
     // cpal callback (audio I/O thread). Pulls from the queue, scales
     // by current volume, writes silence on underrun. Cloned `Arc`
@@ -521,10 +555,31 @@ impl AudioPlayer {
   /// (returns `Ok(())`). Calling `start` after `pause` resumes
   /// playback (equivalent to [`AudioPlayer::resume`]).
   ///
+  /// **Terminal-state contract.** [`AudioPlayer::stop`] is a
+  /// one-way terminal transition; once `stop()` returns, `start()`
+  /// rejects with [`Error::Backend`] ("...called on terminated
+  /// player...") rather than re-arming the producer surface. The
+  /// caller MUST construct a fresh [`AudioPlayer`] to resume
+  /// playback. The cpal stream is preserved across `stop()` only so
+  /// `Drop` can join the I/O thread cleanly — it is NOT a hook for
+  /// restarting the producer pipeline.
+  ///
   /// # Errors
+  /// - [`Error::Backend`] if [`AudioPlayer::stop`] has already been
+  ///   called on this player (one-way terminal latch).
   /// - [`Error::Backend`] if the cpal `Stream::play()` call fails,
   ///   or if the stream has already been dropped by a prior `stop`.
   pub fn start(&mut self) -> Result<()> {
+    // FIX 1: one-way terminal latch. Checked FIRST so a post-stop
+    // `start()` doesn't re-arm `state = STATE_RUNNING` and let
+    // subsequent `write_samples()` slip past its `STATE_STOPPED`
+    // gate. Acquire-load pairs with the Release-store in `stop()`.
+    if self.shared.terminated.load(Ordering::Acquire) {
+      return Err(Error::Backend {
+        message: "AudioPlayer::start called on terminated player — construct a new AudioPlayer"
+          .to_string(),
+      });
+    }
     self.take_callback_error()?;
     let stream = self.stream.as_ref().ok_or_else(|| Error::Backend {
       message: "AudioPlayer::start: stream has been dropped (post-stop)".to_string(),
@@ -541,9 +596,20 @@ impl AudioPlayer {
   /// calls still buffer into the queue but no audio is emitted.
   /// Mirrors `MLXAudioCore.AudioPlayer.pause()` (streaming branch).
   ///
+  /// **Terminal-state contract.** Rejects on a terminated player
+  /// (see [`AudioPlayer::start`] / [`AudioPlayer::stop`]).
+  ///
   /// # Errors
+  /// - [`Error::Backend`] if [`AudioPlayer::stop`] has already been
+  ///   called on this player (one-way terminal latch).
   /// - [`Error::Backend`] if the cpal `Stream::pause()` call fails.
   pub fn pause(&mut self) -> Result<()> {
+    if self.shared.terminated.load(Ordering::Acquire) {
+      return Err(Error::Backend {
+        message: "AudioPlayer::pause called on terminated player — construct a new AudioPlayer"
+          .to_string(),
+      });
+    }
     self.take_callback_error()?;
     let stream = self.stream.as_ref().ok_or_else(|| Error::Backend {
       message: "AudioPlayer::pause: stream has been dropped (post-stop)".to_string(),
@@ -559,33 +625,70 @@ impl AudioPlayer {
   /// `togglePlayPause()` resuming branch (`playerNode.play()` +
   /// `isPlaying = true`).
   ///
+  /// **Terminal-state contract.** Rejects on a terminated player
+  /// (see [`AudioPlayer::start`] / [`AudioPlayer::stop`]). The
+  /// dedicated `resume`-named error message keeps the call-site
+  /// signal clear (the producer that called `resume()` after a
+  /// stop got the same one-way-latch rejection `start()` would
+  /// have surfaced).
+  ///
   /// # Errors
+  /// - [`Error::Backend`] if [`AudioPlayer::stop`] has already been
+  ///   called on this player (one-way terminal latch).
   /// - [`Error::Backend`] if the cpal `Stream::play()` call fails.
   pub fn resume(&mut self) -> Result<()> {
+    if self.shared.terminated.load(Ordering::Acquire) {
+      return Err(Error::Backend {
+        message: "AudioPlayer::resume called on terminated player — construct a new AudioPlayer"
+          .to_string(),
+      });
+    }
     self.start()
   }
 
   /// Stop playback immediately. Drops every queued sample, pauses
-  /// the cpal stream (we don't tear it down so a subsequent
-  /// [`AudioPlayer::start`] still works), and clears any captured
-  /// callback error. Mirrors `stopStreaming()`.
+  /// the cpal stream, and clears any captured callback error.
+  /// Mirrors `stopStreaming()`.
   ///
-  /// **Terminal-state contract.** After `stop()` returns, subsequent
-  /// [`AudioPlayer::write_samples`] calls reject with
-  /// [`Error::Backend`] ("...called after stop()") to honor the
-  /// [`super::output_stream::AudioOutputStream::stop`] contract —
-  /// late producer chunks MUST NOT accumulate silently and replay
-  /// on a later `start()` / [`AudioPlayer::resume`]. This is a hard
-  /// terminal state for the *write* path; the player itself can be
-  /// re-started (the cpal stream is preserved) but the producer
-  /// must not push more samples until a coordinated restart of the
-  /// upstream pipeline. Pause is the soft-state alternative (see
-  /// [`AudioPlayer::pause`] — pause-state writes still buffer for
-  /// [`AudioPlayer::resume`]).
+  /// **Terminal-state contract.** `stop()` is a **one-way terminal
+  /// transition**: after it returns, every subsequent producer-side
+  /// method ([`AudioPlayer::start`], [`AudioPlayer::pause`],
+  /// [`AudioPlayer::resume`], [`AudioPlayer::write_samples`])
+  /// rejects with [`Error::Backend`] containing
+  /// "terminated"/"after stop()" so late producer chunks MUST NOT
+  /// accumulate silently and replay on a later `start()` — honoring
+  /// the [`super::output_stream::AudioOutputStream::stop`] contract.
+  /// The one-way latch (`SharedState::terminated`) is checked BEFORE
+  /// `state` on every entry so a `start(); stop(); start();`
+  /// sequence cannot re-arm `state = STATE_RUNNING` and slip
+  /// post-stop writes past the producer gate.
+  ///
+  /// The cpal stream is preserved across `stop()` only so `Drop` can
+  /// join the I/O thread cleanly — it is NOT a hook for restarting
+  /// the producer pipeline. The caller MUST construct a fresh
+  /// [`AudioPlayer`] to resume playback. Pause is the soft-state
+  /// alternative (see [`AudioPlayer::pause`] — pause-state writes
+  /// still buffer for [`AudioPlayer::resume`]).
+  ///
+  /// `stop()` itself is idempotent and ALWAYS succeeds at moving
+  /// the player to the terminated state — even if the underlying
+  /// cpal `Stream::pause()` returns an error, the latch is set
+  /// FIRST so re-entry on a half-stopped player is consistently
+  /// rejected.
   ///
   /// # Errors
   /// - [`Error::Backend`] if the cpal `Stream::pause()` call fails.
+  ///   Note: the terminal latch is already set by this point, so
+  ///   subsequent producer calls still reject correctly.
   pub fn stop(&mut self) -> Result<()> {
+    // Set the one-way terminal latch FIRST (and unconditionally).
+    // Any subsequent producer-side call (including a re-entrant
+    // `stop()` on a poisoned half-stopped player) checks this latch
+    // BEFORE `state`, so the terminal contract holds even if the
+    // cpal `Stream::pause()` below returns an error and we bail
+    // early. Release-store pairs with Acquire-loads in `start` /
+    // `pause` / `resume` / `write_samples`.
+    self.shared.terminated.store(true, Ordering::Release);
     self.shared.state.store(STATE_STOPPED, Ordering::Release);
     if let Some(stream) = self.stream.as_ref() {
       stream.pause().map_err(|e| Error::Backend {
@@ -619,8 +722,8 @@ impl AudioPlayer {
   ///
   /// # Errors
   /// - [`Error::Backend`] if [`AudioPlayer::stop`] has been called
-  ///   on this player. `stop()` is the terminal state — writes after
-  ///   stop are rejected outright to honor the
+  ///   on this player. `stop()` is a one-way terminal latch — writes
+  ///   after stop are rejected outright to honor the
   ///   [`super::output_stream::AudioOutputStream::stop`] contract
   ///   ("any queued samples MUST be dropped; subsequent
   ///   `write_samples` calls MUST return `Err`"). Pause-state writes
@@ -635,14 +738,24 @@ impl AudioPlayer {
   /// - [`Error::Backend`] if a prior cpal callback error was
   ///   captured.
   pub fn write_samples(&mut self, samples: &[f32]) -> Result<usize> {
+    // FIX 1: one-way terminal latch FIRST, before reading `state`.
+    // A naive `state == STATE_STOPPED` gate is insufficient because
+    // `start()` unconditionally re-arms `state = STATE_RUNNING`; the
+    // sequence `start(); stop(); start(); write_samples(...)` would
+    // otherwise slip past the gate and silently replay post-stop
+    // chunks on the re-armed stream. Acquire-load pairs with the
+    // Release-store in `stop()`.
+    if self.shared.terminated.load(Ordering::Acquire) {
+      return Err(Error::Backend {
+        message: "AudioPlayer::write_samples called after stop() — player is terminated"
+          .to_string(),
+      });
+    }
     self.take_callback_error()?;
 
-    // FIX 1: terminal-state gate. `STATE_STOPPED` is the closed
-    // state per `AudioOutputStream::stop`'s contract — accepting
-    // writes here would let post-stop samples accumulate and play
-    // on a later `start()`/`resume()`. Acquire-load pairs with the
-    // Release-store in `stop()`. Pause-state writes still buffer
-    // (the cpal callback gates on STATE_RUNNING separately).
+    // Pre-`start()` writes are also rejected — the cpal stream isn't
+    // play()ing yet, so accumulating samples here would replay on
+    // the first `start()` rather than start cleanly.
     let state = self.shared.state.load(Ordering::Acquire);
     if state == STATE_STOPPED {
       return Err(Error::Backend {
@@ -678,23 +791,61 @@ impl AudioPlayer {
       }
     }
 
-    // FIX 2: per-chunk lock acquisition. Each inner-loop iteration
-    // takes the queue lock for ~one chunk's `extend` so the cpal
-    // callback's `try_lock` window is bounded by `WRITE_CHUNK_MAX`
-    // samples, not the full payload length.
+    // FIX 2: per-chunk lock acquisition with NO per-chunk
+    // `reserve_exact`. The queue is pre-allocated to
+    // `queue_capacity_samples` at construction (see
+    // `SharedState::new` via `try_reserve_exact`), and the
+    // whole-payload overflow check above guarantees
+    // `q.len() + samples.len() <= queue_capacity_samples` — so
+    // `VecDeque::extend` here is a pure O(chunk.len()) memcpy with
+    // NO realloc possible. Allocator time CANNOT inflate the lock
+    // window and the cpal callback's `try_lock` window stays
+    // bounded by the per-chunk `extend` duration (microseconds at
+    // WRITE_CHUNK_MAX = 4096 samples).
     for chunk in samples.chunks(WRITE_CHUNK_MAX) {
       let mut q = match self.shared.queue.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
       };
-      // `reserve_exact` BEFORE `extend` to keep allocation cost out
-      // of the contention window (if the underlying buffer needs to
-      // grow, do that under the lock but in one shot rather than the
-      // amortized doubling `extend` would do mid-stream).
-      q.reserve_exact(chunk.len());
       q.extend(chunk.iter().copied());
     }
     Ok(samples.len())
+  }
+
+  /// **Test-only** accessor for the underlying `VecDeque`'s raw
+  /// `capacity()`. Used by the audio playback integration tests to
+  /// assert the FIX 2 invariant: `SharedState::new` pre-allocates
+  /// the bounded `queue_capacity_samples` once at construction via
+  /// `try_reserve_exact`, so the producer loop's `extend` can't
+  /// realloc mid-stream (no allocator time inflates the
+  /// callback's `try_lock` window).
+  ///
+  /// `pub` (not `pub(crate)`) so the integration test (in
+  /// `mlxrs/tests/audio_playback.rs`, outside the crate) can reach
+  /// it; `#[doc(hidden)]` so it doesn't pollute the public docs.
+  /// Returns `>= queue_capacity_samples()` per `try_reserve_exact`'s
+  /// "AT LEAST `additional` more" contract.
+  #[doc(hidden)]
+  #[must_use]
+  pub fn _test_queue_underlying_capacity(&self) -> usize {
+    match self.shared.queue.lock() {
+      Ok(g) => g.capacity(),
+      Err(poisoned) => poisoned.into_inner().capacity(),
+    }
+  }
+
+  /// **Test-only** accessor for the configured queue capacity bound
+  /// in samples (`queue_capacity_frames * channels.count()`),
+  /// computed once in [`AudioPlayer::with_device`]. Pairs with
+  /// [`AudioPlayer::_test_queue_underlying_capacity`] to assert the
+  /// FIX 2 pre-allocation invariant in tests.
+  ///
+  /// `pub` + `#[doc(hidden)]` for the same integration-test-reach
+  /// reason as [`AudioPlayer::_test_queue_underlying_capacity`].
+  #[doc(hidden)]
+  #[must_use]
+  pub fn _test_queue_capacity_samples(&self) -> usize {
+    self.shared.queue_capacity_samples
   }
 
   /// Block until the playback queue has drained. The cpal callback
