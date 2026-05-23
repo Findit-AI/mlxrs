@@ -2162,47 +2162,460 @@ impl DoRALinear {
   }
 }
 
+// ──────────────────────── BaseEmbedding / DoRAEmbedding ────────────────────────
+
+/// The base embedding a [`DoRAEmbedding`] wraps — the *dense* `Embedding` weight
+/// `[num_embeddings, dims]` (the per-token lookup table). Mirrors mlx-lm's
+/// `nn.Embedding` (the `tuner/dora.py::DoRAEmbedding` base, `tuner/dora.py:179`).
+///
+/// **Dense-only by design** — mlx-lm's `tuner/dora.py::DoRAEmbedding.from_base`
+/// raises `ValueError("DoRAEmbedding does not yet support quantization.")`
+/// (`tuner/dora.py:141-142`), so a *quantized* embedding base is not a valid
+/// DoRA target upstream and is not modeled here either; the enum carries only a
+/// [`BaseEmbedding::Dense`] arm to keep parity with mlx-lm's surface.
+///
+/// Distinct from [`BaseLinear`] because (a) the forward path is a row gather
+/// (`take_axis(weight, ids, 0)`), not a matmul, and (b) the LoRA factor
+/// orientation is swapped: `lora_a` is `[num_embeddings, r]` (gathered by token
+/// id), `lora_b` is `[r, dims]` — the opposite convention from the
+/// [`BaseLinear`]-flavored [`AdapterParams`] (`lora_a` `[input, r]`,
+/// `lora_b` `[r, output]`). The embedding-orientation factor shapes are
+/// validated by a `validate_embedding_factor_shapes` helper paralleling the
+/// linear `validate_factor_shapes` cross-check.
+#[derive(Debug)]
+pub enum BaseEmbedding {
+  /// Dense embedding: `weight` is `[num_embeddings, dims]`.
+  Dense {
+    /// `[num_embeddings, dims]` dense embedding lookup table.
+    weight: Array,
+  },
+}
+
+impl BaseEmbedding {
+  /// Build a dense embedding base from a `[num_embeddings, dims]` weight.
+  /// Verifies the weight is rank-2.
+  pub fn dense(weight: Array) -> Result<Self> {
+    let shape = weight.shape();
+    if shape.len() != 2 {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "BaseEmbedding::dense: weight must be 2-D [num_embeddings, dims], got {shape:?}"
+        ),
+      });
+    }
+    Ok(BaseEmbedding::Dense { weight })
+  }
+
+  /// The `[num_embeddings, dims]` embedding weight.
+  pub fn weight(&self) -> &Array {
+    match self {
+      BaseEmbedding::Dense { weight } => weight,
+    }
+  }
+
+  /// `num_embeddings` — the embedding table's leading axis.
+  fn num_embeddings(&self) -> Result<usize> {
+    self
+      .weight()
+      .shape()
+      .first()
+      .copied()
+      .ok_or_else(|| Error::ShapeMismatch {
+        message: "embedding weight has rank 0; cannot determine num_embeddings".to_string(),
+      })
+  }
+
+  /// `dims` — the embedding table's trailing axis (the per-token vector width).
+  fn dims(&self) -> Result<usize> {
+    self
+      .weight()
+      .shape()
+      .get(1)
+      .copied()
+      .ok_or_else(|| Error::ShapeMismatch {
+        message: "embedding weight has rank < 2; cannot determine dims".to_string(),
+      })
+  }
+
+  /// Per-token lookup: `take_axis(weight, ids, axis=0)`, mirroring
+  /// mlx-lm `self.embedding(x)` (`tuner/dora.py:199`) / `nn.Embedding.__call__`.
+  /// `ids` carries integer token indices; output dtype matches `weight`.
+  fn lookup(&self, ids: &Array) -> Result<Array> {
+    self.weight().take_axis(ids, 0)
+  }
+
+  /// Embedding-as-linear: `x @ weightᵀ`, the tied-weight LM-head path
+  /// (mlx-lm `nn.Embedding.as_linear`, used by `DoRAEmbedding.as_linear`,
+  /// `tuner/dora.py:213`). Output shape `[..., num_embeddings]`.
+  fn as_linear(&self, x: &Array) -> Result<Array> {
+    let wt = self.weight().transpose()?;
+    x.matmul(&wt)
+  }
+}
+
+/// A DoRA-wrapped embedding layer — mlx-lm
+/// `tuner/dora.py::DoRAEmbedding` (`tuner/dora.py:131-225`).
+///
+/// DoRA on an `Embedding` augments the lookup table with a learned per-row
+/// magnitude `m = ‖W‖₂ along axis 1` (one magnitude per token row) and the
+/// LoRA factors `lora_a` `[num_embeddings, r]` (gathered by token id) /
+/// `lora_b` `[r, dims]` — note this is the **opposite** factor orientation from
+/// [`DoRALinear`] (where `lora_a` is `[input_dims, r]`), exactly mirroring
+/// mlx-lm's `tuner/dora.py:187-192` vs `tuner/dora.py:78-83`.
+///
+/// Construct via [`DoRAEmbedding::new`]; the layer exposes the two distinct
+/// forward modes [`forward`](Self::forward) (token-id lookup) and
+/// [`as_linear`](Self::as_linear) (the tied-weight LM-head matmul,
+/// `tuner/dora.py:212-224`), plus [`fuse`](Self::fuse) which folds the adapter
+/// into a fresh dense [`BaseEmbedding`].
+///
+/// **Quantized base is intentionally rejected at construction** — mlx-lm's own
+/// `DoRAEmbedding.from_base` (`tuner/dora.py:141-142`) raises for a
+/// `QuantizedEmbedding` ("DoRAEmbedding does not yet support quantization."),
+/// so this surface stays a faithful 1:1 port and offers no
+/// `BaseEmbedding::Quantized` arm.
+#[derive(Debug)]
+pub struct DoRAEmbedding {
+  base: BaseEmbedding,
+  params: AdapterParams,
+  magnitude: Array,
+  scale: f32,
+}
+
+impl DoRAEmbedding {
+  /// Wrap `base` with the low-rank `params` and `scale` for the DoRA
+  /// embedding forward. Validates the **embedding-orientation** factor shapes
+  /// (`lora_a` `[num_embeddings, r]`, `lora_b` `[r, dims]` — cross-checked
+  /// against `base.num_embeddings()` / `base.dims()`) and requires a magnitude
+  /// `m` of shape `[num_embeddings]` in `params`, taken from
+  /// `params.magnitude` (loaded from `adapters.safetensors`).
+  pub fn new(base: BaseEmbedding, params: AdapterParams, scale: f32) -> Result<Self> {
+    validate_embedding_factor_shapes(&base, &params, "DoRAEmbedding")?;
+    let magnitude = match &params.magnitude {
+      Some(m) => m.try_clone()?,
+      None => {
+        return Err(Error::Backend {
+          message: "DoRAEmbedding::new: DoRA requires a magnitude `m` (loaded from \
+                    adapters.safetensors), got None"
+            .to_string(),
+        });
+      }
+    };
+    // `m` is the per-row norm: shape [num_embeddings].
+    let num_embeddings = base.num_embeddings()?;
+    let m_shape = magnitude.shape();
+    if m_shape.len() != 1 || m_shape[0] != num_embeddings {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "DoRAEmbedding::new: magnitude `m` must be [num_embeddings={num_embeddings}], \
+           got {m_shape:?}"
+        ),
+      });
+    }
+    Ok(Self {
+      base,
+      params,
+      magnitude,
+      scale,
+    })
+  }
+
+  /// The low-rank `scale`.
+  pub fn scale(&self) -> f32 {
+    self.scale
+  }
+
+  /// The wrapped base embedding.
+  pub fn base(&self) -> &BaseEmbedding {
+    &self.base
+  }
+
+  /// The DoRA per-row magnitude `m` (`[num_embeddings]`).
+  pub fn magnitude(&self) -> &Array {
+    &self.magnitude
+  }
+
+  /// Token-id lookup forward — mlx-lm
+  /// `tuner/dora.py::DoRAEmbedding.__call__` (`tuner/dora.py:198-210`):
+  ///
+  /// ```text
+  /// y       = embedding(x) = weight[x]           // [..., dims]   (per-token lookup)
+  /// z       = scale · (lora_a[x] @ lora_b)       // [..., dims]   (per-token low-rank)
+  /// out     = y + z                              // (dropout is identity at inference)
+  /// adapted = y + (z / scale)·scale = y + z      // PER-TOKEN adapted embedding (`adapted = y + z`)
+  /// denom   = ‖adapted‖₂  along axis = -1        // [...]
+  /// out     = (m[x] / denom)[..., None] · out
+  /// ```
+  ///
+  /// The renorm divisor is the L2 norm of each token's *adapted* embedding
+  /// (per-token, NOT a global row-norm of the table — that is the [`fuse`]
+  /// path). `x` carries integer token ids; the output dtype matches the base
+  /// weight's. Lazy.
+  ///
+  /// [`fuse`]: DoRAEmbedding::fuse
+  pub fn forward(&self, x: &Array) -> Result<Array> {
+    // y = weight[x] — per-token lookup, shape [..., dims].
+    let y = self.base.lookup(x)?;
+    // lora_a[x] — gather rows of [num_embeddings, r] by x, shape [..., r].
+    let la_gathered = self.params.lora_a.take_axis(x, 0)?;
+    // (lora_a[x] @ lora_b) — shape [..., dims].
+    let mut z = la_gathered.matmul(&self.params.lora_b)?;
+    z = scaled(&z, self.scale)?;
+    // mlx-lm casts the low-rank term to y's dtype before the add
+    // (`out = y + self.dropout(z).astype(y.dtype)`, `tuner/dora.py:201`).
+    let z = match y.dtype() {
+      Ok(dt) => z.astype(dt)?,
+      Err(_) => z,
+    };
+    let out = y.add(&z)?;
+
+    // adapted = y + z; denom = ‖adapted‖₂ along the LAST axis (per-token norm,
+    // `tuner/dora.py:204-205` — note `axis=-1` distinguishes this from the
+    // global `axis=1` row-norm of `fuse`).
+    let adapted = out.try_clone()?;
+    let denom = ops::linalg_full::norm(&adapted, 2.0, &[-1], false)?;
+    // m[x] — gather the per-row magnitude by x, shape [...].
+    let m_gathered = self.magnitude.take_axis(x, 0)?;
+    let norm_scale = m_gathered.divide(&denom)?;
+    // norm_scale[..., None] — append a trailing size-1 axis so it broadcasts
+    // against the [..., dims] `out` (mlx-lm `(m[x] / denom)[..., None] * out`,
+    // `tuner/dora.py:208`).
+    let norm_scale = norm_scale.expand_dims_axes(&[-1])?;
+    // Cast back to out's dtype (mlx-lm `(m[x] / denom)[..., None] * out` has
+    // out in y.dtype; m / denom is f32 from the norm, so cast for the multiply).
+    let norm_scale = match out.dtype() {
+      Ok(dt) => norm_scale.astype(dt)?,
+      Err(_) => norm_scale,
+    };
+    out.multiply(&norm_scale)
+  }
+
+  /// Tied-weight LM-head forward (`embedding.as_linear`) — mlx-lm
+  /// `tuner/dora.py::DoRAEmbedding.as_linear` (`tuner/dora.py:212-224`):
+  ///
+  /// ```text
+  /// y       = x @ weightᵀ                        // [..., num_embeddings]
+  /// z       = (x @ lora_bᵀ) @ lora_aᵀ            // [..., num_embeddings]
+  /// out     = y + (scale · z)
+  /// adapted = weight + (scale · lora_a) @ lora_b // [num_embeddings, dims] (GLOBAL)
+  /// denom   = ‖adapted‖₂ along axis = 1          // [num_embeddings]
+  /// out     = (m / denom) · out
+  /// ```
+  ///
+  /// Distinct from [`forward`](Self::forward) in two ways: (a) the renorm
+  /// divisor is the GLOBAL row-norm of the adapted embedding table (mlx-lm
+  /// `axis=1` on `adapted = self.embedding.weight + (scale · lora_a) @ lora_b`,
+  /// `tuner/dora.py:218-219`), and (b) `m` is broadcast (NOT gathered) — the
+  /// last axis is `num_embeddings`, matching `m`'s shape exactly. Lazy.
+  pub fn as_linear(&self, x: &Array) -> Result<Array> {
+    // y = x @ weightᵀ — shape [..., num_embeddings].
+    let y = self.base.as_linear(x)?;
+    // z = (x @ lora_bᵀ) @ lora_aᵀ (mlx-lm `tuner/dora.py:214`).
+    let lb_t = self.params.lora_b.transpose()?;
+    let la_t = self.params.lora_a.transpose()?;
+    let xb = x.matmul(&lb_t)?;
+    let z = xb.matmul(&la_t)?;
+    let scaled_z = scaled(&z, self.scale)?;
+    let scaled_z = match x.dtype() {
+      Ok(dt) => scaled_z.astype(dt)?,
+      Err(_) => scaled_z,
+    };
+    let out = y.add(&scaled_z)?;
+
+    // adapted = weight + (scale · lora_a) @ lora_b — GLOBAL [num_embeddings, dims].
+    let scaled_la = scaled(&self.params.lora_a, self.scale)?;
+    let delta = scaled_la.matmul(&self.params.lora_b)?;
+    let w = self.base.weight();
+    let delta = match w.dtype() {
+      Ok(dt) => delta.astype(dt)?,
+      Err(_) => delta,
+    };
+    let adapted = w.add(&delta)?;
+    let denom = ops::linalg_full::norm(&adapted, 2.0, &[1], false)?;
+    let norm_scale = self.magnitude.divide(&denom)?;
+    let norm_scale = match x.dtype() {
+      Ok(dt) => norm_scale.astype(dt)?,
+      Err(_) => norm_scale,
+    };
+    out.multiply(&norm_scale)
+  }
+
+  /// Fold the DoRA embedding adapter into the base weight — mlx-lm
+  /// `tuner/dora.py::DoRAEmbedding.fuse` (`tuner/dora.py:153-166`):
+  ///
+  /// ```text
+  /// W_adapted = weight + (scale · lora_a) @ lora_b           // [num_embeddings, dims]
+  /// W_fused   = (m / ‖W_adapted‖₂)[:, None] · W_adapted
+  /// ```
+  ///
+  /// Returns a plain dense [`BaseEmbedding`] whose lookup (and `as_linear`)
+  /// equals this layer's `as_linear` within fp tolerance. The
+  /// per-token `forward` does NOT equal the fused-base lookup because
+  /// `forward`'s renorm is per-token (`axis=-1` on `y + z`), distinct from
+  /// `fuse`'s global row-norm — exactly mirroring mlx-lm's split.
+  pub fn fuse(&self) -> Result<BaseEmbedding> {
+    let scaled_la = scaled(&self.params.lora_a, self.scale)?;
+    let delta = scaled_la.matmul(&self.params.lora_b)?;
+    let w = self.base.weight();
+    let delta = match w.dtype() {
+      Ok(dt) => delta.astype(dt)?,
+      Err(_) => delta,
+    };
+    let adapted = w.add(&delta)?;
+    let denom = ops::linalg_full::norm(&adapted, 2.0, &[1], false)?;
+    let norm_scale = self.magnitude.divide(&denom)?;
+    // norm_scale[:, None] — append a trailing size-1 axis so it broadcasts
+    // down each weight row (mlx-lm `norm_scale[:, None] * weight`,
+    // `tuner/dora.py:164`).
+    let norm_scale_col = norm_scale.expand_dims_axes(&[-1])?;
+    let fused_weight = norm_scale_col.multiply(&adapted)?;
+    BaseEmbedding::dense(fused_weight)
+  }
+}
+
+/// Validate `lora_a` / `lora_b` against an embedding base — the
+/// **embedding-orientation** factor shapes (`lora_a` `[num_embeddings, r]`,
+/// `lora_b` `[r, dims]`). Cross-checks the shared rank axis (`a[1] == b[0]`),
+/// `lora_a`'s leading axis against `num_embeddings`, and `lora_b`'s last axis
+/// against `dims` — so a wrong-shape factor is a recoverable
+/// [`Error::ShapeMismatch`] at construct/load time, not an opaque mlx-c failure
+/// on the first lookup. Mirrors [`validate_factor_shapes`] for the linear side.
+fn validate_embedding_factor_shapes(
+  base: &BaseEmbedding,
+  params: &AdapterParams,
+  who: &str,
+) -> Result<()> {
+  let a_shape = params.lora_a.shape();
+  let b_shape = params.lora_b.shape();
+  if a_shape.len() != 2 {
+    return Err(Error::ShapeMismatch {
+      message: format!("{who}: lora_a must be 2-D [num_embeddings, r], got {a_shape:?}"),
+    });
+  }
+  if b_shape.len() != 2 {
+    return Err(Error::ShapeMismatch {
+      message: format!("{who}: lora_b must be 2-D [r, dims], got {b_shape:?}"),
+    });
+  }
+  if a_shape[1] != b_shape[0] {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "{who}: rank mismatch — lora_a is [_, r={}] but lora_b is [r={}, _]",
+        a_shape[1], b_shape[0]
+      ),
+    });
+  }
+  let num_embeddings = base.num_embeddings()?;
+  if a_shape[0] != num_embeddings {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "{who}: lora_a leading axis ({}) must equal base num_embeddings ({num_embeddings})",
+        a_shape[0]
+      ),
+    });
+  }
+  let dims = base.dims()?;
+  if b_shape[1] != dims {
+    return Err(Error::ShapeMismatch {
+      message: format!(
+        "{who}: lora_b last axis ({}) must equal base dims ({dims})",
+        b_shape[1]
+      ),
+    });
+  }
+  Ok(())
+}
+
 // ──────────────────────────── LoraLayer ────────────────────────────
 
-/// A wrapped LoRA/DoRA linear layer — the unified runtime surface a
-/// per-usecase architecture dispatches an adapted weight-path through. Mirrors
-/// swift's `LoRALayer` protocol (`LoRA+Layers.swift` / `DoRA+Layers.swift`
-/// both conform), which the [`LoraLayers`] map stores polymorphically.
+/// A wrapped LoRA/DoRA layer — the unified runtime surface a per-usecase
+/// architecture dispatches an adapted weight-path through. Mirrors swift's
+/// `LoRALayer` protocol (`LoRA+Layers.swift` / `DoRA+Layers.swift` both
+/// conform), which the [`LoraLayers`] map stores polymorphically.
 ///
-/// Either [`LoraLayer::Lora`] or [`LoraLayer::Dora`], each carrying the
-/// concrete [`LoRALinear`] / [`DoRALinear`]; [`forward`](Self::forward) and
-/// [`fuse`](Self::fuse) forward to the variant.
+/// One of [`LoraLayer::Lora`], [`LoraLayer::Dora`], or [`LoraLayer::DoraEmbedding`],
+/// each carrying the concrete wrapped layer ([`LoRALinear`] / [`DoRALinear`] /
+/// [`DoRAEmbedding`]); [`forward`](Self::forward) dispatches to the variant.
+/// The two linear variants additionally expose [`fuse`](Self::fuse) (folding
+/// into a [`BaseLinear`]); the embedding variant exposes
+/// [`fuse_embedding`](Self::fuse_embedding).
+///
+/// The [`DoraEmbedding`](Self::DoraEmbedding) variant is the
+/// `mlx_lm/tuner/dora.py::DoRAEmbedding` port; the parallel LoRA-embedding
+/// variant (`mlx_lm/tuner/lora.py::LoRAEmbedding`) is the deferred follow-up
+/// described in the [module docs](self).
 #[derive(Debug)]
 pub enum LoraLayer {
   /// A LoRA-wrapped linear.
   Lora(LoRALinear),
   /// A DoRA-wrapped linear.
   Dora(DoRALinear),
+  /// A DoRA-wrapped embedding.
+  DoraEmbedding(DoRAEmbedding),
 }
 
 impl LoraLayer {
-  /// Forward through the wrapped layer (LoRA or DoRA). Lazy.
+  /// Forward through the wrapped layer (LoRA-linear / DoRA-linear / DoRA-embedding).
+  /// For [`DoraEmbedding`](Self::DoraEmbedding) `x` carries integer token ids
+  /// (see [`DoRAEmbedding::forward`]); for the linear variants `x` is the
+  /// activation matrix. Lazy.
   pub fn forward(&self, x: &Array) -> Result<Array> {
     match self {
       LoraLayer::Lora(l) => l.forward(x),
       LoraLayer::Dora(d) => d.forward(x),
+      LoraLayer::DoraEmbedding(d) => d.forward(x),
     }
   }
 
-  /// Fuse the wrapped layer into a plain [`BaseLinear`] (see
-  /// [`LoRALinear::fuse`] / [`DoRALinear::fuse`]).
+  /// Fuse a *linear* LoRA/DoRA layer into a plain [`BaseLinear`] (see
+  /// [`LoRALinear::fuse`] / [`DoRALinear::fuse`]). Returns
+  /// `Err(Error::Backend)` when the variant is [`DoraEmbedding`](Self::DoraEmbedding)
+  /// — embedding fuse returns a [`BaseEmbedding`], so use
+  /// [`fuse_embedding`](Self::fuse_embedding) for that.
   pub fn fuse(&self, dequantize: bool) -> Result<BaseLinear> {
     match self {
       LoraLayer::Lora(l) => l.fuse(dequantize),
       LoraLayer::Dora(d) => d.fuse(dequantize),
+      LoraLayer::DoraEmbedding(_) => Err(Error::Backend {
+        message: "LoraLayer::fuse: this is a DoRA embedding layer; call \
+                  `fuse_embedding` to obtain a `BaseEmbedding`"
+          .to_string(),
+      }),
     }
   }
 
-  /// The wrapped base linear.
-  pub fn base(&self) -> &BaseLinear {
+  /// Fuse a [`DoraEmbedding`](Self::DoraEmbedding) into a plain
+  /// [`BaseEmbedding`] (see [`DoRAEmbedding::fuse`]). Returns
+  /// `Err(Error::Backend)` for the linear variants — use [`fuse`](Self::fuse)
+  /// for those.
+  pub fn fuse_embedding(&self) -> Result<BaseEmbedding> {
     match self {
-      LoraLayer::Lora(l) => l.base(),
-      LoraLayer::Dora(d) => d.base(),
+      LoraLayer::DoraEmbedding(d) => d.fuse(),
+      LoraLayer::Lora(_) | LoraLayer::Dora(_) => Err(Error::Backend {
+        message: "LoraLayer::fuse_embedding: this is a linear LoRA/DoRA layer; call \
+                  `fuse` to obtain a `BaseLinear`"
+          .to_string(),
+      }),
+    }
+  }
+
+  /// The wrapped base *linear* — `Some(&BaseLinear)` for the linear variants,
+  /// `None` for [`DoraEmbedding`](Self::DoraEmbedding) (whose base is a
+  /// [`BaseEmbedding`], not a [`BaseLinear`] — use [`base_embedding`](Self::base_embedding)).
+  pub fn base(&self) -> Option<&BaseLinear> {
+    match self {
+      LoraLayer::Lora(l) => Some(l.base()),
+      LoraLayer::Dora(d) => Some(d.base()),
+      LoraLayer::DoraEmbedding(_) => None,
+    }
+  }
+
+  /// The wrapped base *embedding* — `Some(&BaseEmbedding)` for
+  /// [`DoraEmbedding`](Self::DoraEmbedding), `None` for the linear variants.
+  pub fn base_embedding(&self) -> Option<&BaseEmbedding> {
+    match self {
+      LoraLayer::DoraEmbedding(d) => Some(d.base()),
+      LoraLayer::Lora(_) | LoraLayer::Dora(_) => None,
     }
   }
 }
@@ -6136,5 +6549,449 @@ mod tests {
     assert_eq!(cfg.scale_for("anything"), 16.0);
     assert_eq!(cfg.rank_for("anything"), 4);
     assert!(!cfg.fan_in_fan_out());
+  }
+
+  // ═════════════════════════════ A2: DoRA — spec-named tests ═════════════════════════════
+  //
+  // Tests with the names called out by the A2 spec (#161). Some of these are
+  // (renamed) duplicates of pre-existing hand-traced tests; keeping both
+  // preserves the existing coverage *and* surfaces the spec-named tests in the
+  // test report (the spec asked for these exact names).
+
+  /// `dora_linear_forward_matches_python_reference` — assert the
+  /// [`DoRALinear::forward`] output matches a hand-traced scalar reference
+  /// derived from mlx-lm `tuner/dora.py::DoRALinear.__call__`
+  /// (`tuner/dora.py:111-128`).
+  ///
+  /// Setup: base `W = I_{[2,3]}` truncated, `lora_a = I_{[3,2]}` truncated,
+  /// `lora_b = I_2`, `scale = 2.0`, `x = [1, 2, 3]`. Picks `m = [3, 3]` so the
+  /// `m / ‖adapted‖₂` renorm is the identity, isolating the DoRA wiring against
+  /// the LoRA arithmetic; expected `out = [3, 6]`.
+  #[test]
+  fn dora_linear_forward_matches_python_reference() {
+    // adapted = W + scale·(lora_bᵀ @ lora_aᵀ) = [[3,0,0],[0,3,0]], ‖·‖₂ = [3,3].
+    // m = [3, 3] ⇒ renorm = identity. base(x) = [1, 2], scale·z = [2, 4] ⇒ [3, 6].
+    let m = Array::from_slice::<f32>(&[3.0, 3.0], &(2usize,)).unwrap();
+    let params = AdapterParams {
+      lora_a: lora_a(),
+      lora_b: lora_b(),
+      magnitude: Some(m),
+    };
+    let base = BaseLinear::dense(base_weight(), None).unwrap();
+    let layer = DoRALinear::new(base, params, 2.0).unwrap();
+    let x = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &(1, 3)).unwrap();
+    let mut out = layer.forward(&x).unwrap();
+    approx_eq(&out.to_vec::<f32>().unwrap(), &[3.0, 6.0], 1e-5);
+  }
+
+  /// `dora_linear_fuse_into_base_round_trip` — fuse the DoRA adapter into the
+  /// base, run the fused base's plain forward, assert it matches the un-fused
+  /// DoRA forward within fp tolerance (mlx-lm `tuner/dora.py:32-56` /
+  /// `DoRA+Layers.swift::fuse`).
+  #[test]
+  fn dora_linear_fuse_into_base_round_trip() {
+    let m = Array::from_slice::<f32>(&[1.5, 2.5], &(2usize,)).unwrap();
+    let params = AdapterParams {
+      lora_a: lora_a(),
+      lora_b: lora_b(),
+      magnitude: Some(m),
+    };
+    let base = BaseLinear::dense(base_weight(), None).unwrap();
+    let layer = DoRALinear::new(base, params, 2.0).unwrap();
+    let x = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &(1, 3)).unwrap();
+    let mut via_forward = layer.forward(&x).unwrap();
+    // Fuse, then run the fused base's plain forward — must match.
+    let fused = layer.fuse(false).unwrap();
+    let mut via_fused = fused.base_output(&x).unwrap();
+    approx_eq(
+      &via_fused.to_vec::<f32>().unwrap(),
+      &via_forward.to_vec::<f32>().unwrap(),
+      1e-4,
+    );
+  }
+
+  /// `dora_embedding_forward_matches_python_reference` — assert
+  /// [`DoRAEmbedding::forward`] matches a hand-traced scalar reference for
+  /// mlx-lm `tuner/dora.py::DoRAEmbedding.__call__` (`tuner/dora.py:198-210`).
+  ///
+  /// Setup: `weight = I_{[3, 3]}` (3 token rows, 3 dims), so for `x = [0, 2]`:
+  /// `y[0] = [1,0,0]`, `y[1] = [0,0,1]`. `lora_a = zeros([3, 2])` and
+  /// `lora_b = zeros([2, 3])` ⇒ `z = 0` ⇒ `adapted == y` ⇒ `denom = ‖y‖₂ = [1, 1]`.
+  /// Setting `m = [1, 1, 1]` gives `m[x] / denom = [1, 1]` ⇒ `out == y`,
+  /// which validates the gather + per-token renorm wiring against a known
+  /// fixed point of the DoRA computation.
+  #[test]
+  fn dora_embedding_forward_matches_python_reference() {
+    let num_embeddings = 3usize;
+    let dims = 3usize;
+    let r = 2usize;
+    // weight = I_3 (one-hot rows).
+    #[rustfmt::skip]
+    let weight = Array::from_slice::<f32>(
+      &[
+        1.0, 0.0, 0.0,
+        0.0, 1.0, 0.0,
+        0.0, 0.0, 1.0,
+      ],
+      &(num_embeddings, dims),
+    ).unwrap();
+    let base = BaseEmbedding::dense(weight).unwrap();
+
+    let lora_a = Array::zeros::<f32>(&(num_embeddings, r)).unwrap();
+    let lora_b = Array::zeros::<f32>(&(r, dims)).unwrap();
+    let m = Array::from_slice::<f32>(&[1.0, 1.0, 1.0], &(num_embeddings,)).unwrap();
+    let params = AdapterParams {
+      lora_a,
+      lora_b,
+      magnitude: Some(m),
+    };
+    let layer = DoRAEmbedding::new(base, params, 2.0).unwrap();
+
+    // Gather rows 0 and 2 ⇒ [[1,0,0], [0,0,1]].
+    let ids = Array::from_slice::<i32>(&[0, 2], &(2usize,)).unwrap();
+    let mut out = layer.forward(&ids).unwrap();
+    approx_eq(
+      &out.to_vec::<f32>().unwrap(),
+      &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+      1e-5,
+    );
+  }
+
+  /// Companion to [`dora_embedding_forward_matches_python_reference`] for a
+  /// **non-identity** DoRA renorm — set `m` to *half* the per-token adapted
+  /// norm so the per-token renorm halves the output. With `lora_*` zero,
+  /// `adapted = y` and `‖y‖₂ = [1, 1]`; `m = [0.5, 0.5, 0.5]` ⇒ `m[x] / denom
+  /// = [0.5, 0.5]` ⇒ `out = 0.5 · y`. Validates the per-token renorm wiring
+  /// distinguishes from the global `as_linear` renorm path.
+  #[test]
+  fn dora_embedding_forward_per_token_renorm_halves() {
+    let num_embeddings = 3usize;
+    let dims = 3usize;
+    let r = 2usize;
+    #[rustfmt::skip]
+    let weight = Array::from_slice::<f32>(
+      &[
+        1.0, 0.0, 0.0,
+        0.0, 1.0, 0.0,
+        0.0, 0.0, 1.0,
+      ],
+      &(num_embeddings, dims),
+    ).unwrap();
+    let base = BaseEmbedding::dense(weight).unwrap();
+    let lora_a = Array::zeros::<f32>(&(num_embeddings, r)).unwrap();
+    let lora_b = Array::zeros::<f32>(&(r, dims)).unwrap();
+    let m = Array::from_slice::<f32>(&[0.5, 0.5, 0.5], &(num_embeddings,)).unwrap();
+    let params = AdapterParams {
+      lora_a,
+      lora_b,
+      magnitude: Some(m),
+    };
+    let layer = DoRAEmbedding::new(base, params, 1.0).unwrap();
+    let ids = Array::from_slice::<i32>(&[1], &(1usize,)).unwrap();
+    let mut out = layer.forward(&ids).unwrap();
+    approx_eq(&out.to_vec::<f32>().unwrap(), &[0.0, 0.5, 0.0], 1e-5);
+  }
+
+  /// DoRAEmbedding's `as_linear` is the tied-weight LM-head path
+  /// (`tuner/dora.py:212-224`) — for a one-hot embedding table with zero
+  /// adapter, `as_linear(x) == x @ Iᵀ = x` modulo the global renorm
+  /// `(m / ‖weight‖₂)` which is `[1, 1, 1]` here ⇒ identity output.
+  #[test]
+  fn dora_embedding_as_linear_one_hot_identity() {
+    let num_embeddings = 3usize;
+    let dims = 3usize;
+    let r = 2usize;
+    #[rustfmt::skip]
+    let weight = Array::from_slice::<f32>(
+      &[
+        1.0, 0.0, 0.0,
+        0.0, 1.0, 0.0,
+        0.0, 0.0, 1.0,
+      ],
+      &(num_embeddings, dims),
+    ).unwrap();
+    let base = BaseEmbedding::dense(weight).unwrap();
+    let lora_a = Array::zeros::<f32>(&(num_embeddings, r)).unwrap();
+    let lora_b = Array::zeros::<f32>(&(r, dims)).unwrap();
+    // m = ‖weight‖₂ row-wise = [1, 1, 1] ⇒ renorm = identity globally.
+    let m = Array::from_slice::<f32>(&[1.0, 1.0, 1.0], &(num_embeddings,)).unwrap();
+    let params = AdapterParams {
+      lora_a,
+      lora_b,
+      magnitude: Some(m),
+    };
+    let layer = DoRAEmbedding::new(base, params, 2.0).unwrap();
+    // x = [[1, 2, 3]] ⇒ x @ Iᵀ = [1, 2, 3] ⇒ renormed = [1, 2, 3].
+    let x = Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &(1, 3)).unwrap();
+    let mut out = layer.as_linear(&x).unwrap();
+    approx_eq(&out.to_vec::<f32>().unwrap(), &[1.0, 2.0, 3.0], 1e-5);
+  }
+
+  /// [`DoRAEmbedding::fuse`] round-trip — fuse the adapter into a fresh dense
+  /// embedding and assert the fused weight's `as_linear` matches the un-fused
+  /// `as_linear` within fp tolerance (mlx-lm `tuner/dora.py:153-166`). The
+  /// `forward` path is per-token-renormed and intentionally distinct from
+  /// `fuse`; `as_linear` is the global-renorm path that fuse mirrors.
+  #[test]
+  fn dora_embedding_fuse_round_trip() {
+    let num_embeddings = 3usize;
+    let dims = 3usize;
+    let r = 2usize;
+    #[rustfmt::skip]
+    let weight = Array::from_slice::<f32>(
+      &[
+        1.0, 0.5, 0.0,
+        0.0, 1.0, 0.5,
+        0.5, 0.0, 1.0,
+      ],
+      &(num_embeddings, dims),
+    ).unwrap();
+    let base = BaseEmbedding::dense(weight).unwrap();
+    let lora_a =
+      Array::from_slice::<f32>(&[0.1, 0.0, 0.0, 0.1, 0.1, 0.1], &(num_embeddings, r)).unwrap();
+    let lora_b = Array::from_slice::<f32>(&[0.2, 0.0, 0.1, 0.0, 0.1, 0.2], &(r, dims)).unwrap();
+    let m = Array::from_slice::<f32>(&[1.5, 2.0, 1.2], &(num_embeddings,)).unwrap();
+    let params = AdapterParams {
+      lora_a,
+      lora_b,
+      magnitude: Some(m),
+    };
+    let layer = DoRAEmbedding::new(base, params, 2.0).unwrap();
+    let x = Array::from_slice::<f32>(&[1.0, 2.0, 0.5], &(1, dims)).unwrap();
+    let mut via_aslinear = layer.as_linear(&x).unwrap();
+    let fused = layer.fuse().unwrap();
+    let mut via_fused_aslinear = fused.as_linear(&x).unwrap();
+    approx_eq(
+      &via_fused_aslinear.to_vec::<f32>().unwrap(),
+      &via_aslinear.to_vec::<f32>().unwrap(),
+      1e-4,
+    );
+  }
+
+  /// DoRAEmbedding rejects a magnitude-less `AdapterParams` (LoRA-flavored
+  /// factors) at construction — same contract as [`DoRALinear`].
+  #[test]
+  fn dora_embedding_requires_magnitude() {
+    let num_embeddings = 3usize;
+    let dims = 3usize;
+    let r = 2usize;
+    let weight = Array::zeros::<f32>(&(num_embeddings, dims)).unwrap();
+    let base = BaseEmbedding::dense(weight).unwrap();
+    let lora_a = Array::zeros::<f32>(&(num_embeddings, r)).unwrap();
+    let lora_b = Array::zeros::<f32>(&(r, dims)).unwrap();
+    let params = AdapterParams {
+      lora_a,
+      lora_b,
+      magnitude: None,
+    };
+    let err = DoRAEmbedding::new(base, params, 1.0).unwrap_err();
+    assert!(matches!(err, Error::Backend { .. }));
+  }
+
+  /// DoRAEmbedding rejects a `lora_a` whose leading axis is not
+  /// `num_embeddings` (the embedding-orientation factor cross-check).
+  #[test]
+  fn dora_embedding_rejects_wrong_factor_shape() {
+    let num_embeddings = 3usize;
+    let dims = 3usize;
+    let r = 2usize;
+    let weight = Array::zeros::<f32>(&(num_embeddings, dims)).unwrap();
+    let base = BaseEmbedding::dense(weight).unwrap();
+    // bad: lora_a is [2, r] instead of [num_embeddings=3, r].
+    let bad_a = Array::zeros::<f32>(&(2usize, r)).unwrap();
+    let lora_b = Array::zeros::<f32>(&(r, dims)).unwrap();
+    let m = Array::zeros::<f32>(&(num_embeddings,)).unwrap();
+    let params = AdapterParams {
+      lora_a: bad_a,
+      lora_b,
+      magnitude: Some(m),
+    };
+    let err = DoRAEmbedding::new(base, params, 1.0).unwrap_err();
+    assert!(matches!(err, Error::ShapeMismatch { .. }));
+  }
+
+  /// `qdora_linear_forward_matches_python_reference` — assert the QDoRA
+  /// forward (DoRA over a quantized base) matches the dense DoRA forward
+  /// within affine-quantization error, exercising the `quantized_matmul` base
+  /// path against the dense baseline.
+  #[test]
+  fn qdora_linear_forward_matches_python_reference() {
+    let input_dims = 64usize;
+    let output_dims = 2usize;
+    let mut wdata = vec![1.0f32; input_dims];
+    wdata.extend(vec![0.5f32; input_dims]);
+    let dense_w = Array::from_slice::<f32>(&wdata, &(output_dims, input_dims)).unwrap();
+
+    let la = Array::full::<f32>(&(input_dims, 2usize), 0.01).unwrap();
+    let lb = Array::from_slice::<f32>(&[1.0, 0.0, 0.0, 1.0], &(2, 2)).unwrap();
+
+    // m derived from the *dense* adapted weight so dense and quantized share an
+    // identical magnitude vector — any difference is then quantization error
+    // alone (not a magnitude mismatch).
+    let dense_params_no_m = AdapterParams {
+      lora_a: la.try_clone().unwrap(),
+      lora_b: lb.try_clone().unwrap(),
+      magnitude: None,
+    };
+    let scale = 2.0f32;
+    let delta = lora_delta(&dense_params_no_m, scale).unwrap();
+    let adapted = dense_w.add(&delta).unwrap();
+    let m = ops::linalg_full::norm(&adapted, 2.0, &[1], false).unwrap();
+
+    let dense_base = BaseLinear::dense(dense_w.try_clone().unwrap(), None).unwrap();
+    let dense_layer = DoRALinear::new(
+      dense_base,
+      AdapterParams {
+        lora_a: la.try_clone().unwrap(),
+        lora_b: lb.try_clone().unwrap(),
+        magnitude: Some(m.try_clone().unwrap()),
+      },
+      scale,
+    )
+    .unwrap();
+    let x = Array::full::<f32>(&(1usize, input_dims), 1.0).unwrap();
+    let mut dense_out = dense_layer.forward(&x).unwrap();
+
+    let (w_q, scales, biases) = ops::quantized::quantize(&dense_w, 32, 8, "affine", None).unwrap();
+    let q_base =
+      BaseLinear::quantized(w_q, scales, biases, None, 32, 8, "affine".to_string()).unwrap();
+    let q_layer = DoRALinear::new(
+      q_base,
+      AdapterParams {
+        lora_a: la,
+        lora_b: lb,
+        magnitude: Some(m),
+      },
+      scale,
+    )
+    .unwrap();
+    let mut q_out = q_layer.forward(&x).unwrap();
+
+    approx_eq(
+      &q_out.to_vec::<f32>().unwrap(),
+      &dense_out.to_vec::<f32>().unwrap(),
+      2e-2,
+    );
+  }
+
+  /// `qdora_linear_fuse_round_trip` — fuse a QDoRA layer (`dequantize=true`)
+  /// into a dense base, assert the fused base's plain forward matches the
+  /// un-fused QDoRA forward within quantization error.
+  #[test]
+  fn qdora_linear_fuse_round_trip() {
+    let input_dims = 64usize;
+    let output_dims = 2usize;
+    let mut wdata = vec![1.0f32; input_dims];
+    wdata.extend(vec![0.5f32; input_dims]);
+    let dense_w = Array::from_slice::<f32>(&wdata, &(output_dims, input_dims)).unwrap();
+    let la = Array::full::<f32>(&(input_dims, 2usize), 0.01).unwrap();
+    let lb = Array::from_slice::<f32>(&[1.0, 0.0, 0.0, 1.0], &(2, 2)).unwrap();
+    let m = Array::from_slice::<f32>(&[1.5, 2.5], &(output_dims,)).unwrap();
+    let x = Array::full::<f32>(&(1usize, input_dims), 1.0).unwrap();
+
+    let (w_q, scales, biases) = ops::quantized::quantize(&dense_w, 32, 8, "affine", None).unwrap();
+    let q_base =
+      BaseLinear::quantized(w_q, scales, biases, None, 32, 8, "affine".to_string()).unwrap();
+    let q_layer = DoRALinear::new(
+      q_base,
+      AdapterParams {
+        lora_a: la,
+        lora_b: lb,
+        magnitude: Some(m),
+      },
+      2.0,
+    )
+    .unwrap();
+    let mut via_forward = q_layer.forward(&x).unwrap();
+    let fused = q_layer.fuse(true).unwrap();
+    assert!(matches!(fused, BaseLinear::Dense { .. }));
+    let mut via_fused = fused.base_output(&x).unwrap();
+    approx_eq(
+      &via_fused.to_vec::<f32>().unwrap(),
+      &via_forward.to_vec::<f32>().unwrap(),
+      2e-2,
+    );
+  }
+
+  /// `load_dora_adapter_from_safetensors` — write a small adapter directory
+  /// (`adapter_config.json` with `fine_tune_type: "dora"`, plus
+  /// `adapters.safetensors` carrying `lora_a` / `lora_b` / `m` for each
+  /// targeted path), load via the existing [`load_adapters`] entry, and
+  /// verify the resulting layers are [`LoraLayer::Dora`] with the right
+  /// magnitude shape.
+  #[test]
+  fn load_dora_adapter_from_safetensors() {
+    let tmp = std::env::temp_dir().join(format!("mlxrs_a2_dora_load_{}", std::process::id()));
+    std::fs::create_dir_all(&tmp).unwrap();
+    write_mock_adapter(&tmp, "dora", true);
+
+    let weights = toy_weights();
+    let layers = load_adapters(&weights, &tmp, None, 4).unwrap();
+    assert_eq!(layers.len(), 4);
+    for b in 0..4 {
+      let key = format!("model.layers.{b}.self_attn.q_proj");
+      match layers.get(&key) {
+        Some(LoraLayer::Dora(d)) => {
+          // magnitude must be shape [output_dims=2] per `write_mock_adapter`'s
+          // `m = [3, 3]` fixture.
+          assert_eq!(d.magnitude().shape(), &[2]);
+        }
+        other => panic!("expected DoRA layer at {key}, got {other:?}"),
+      }
+    }
+    std::fs::remove_dir_all(&tmp).ok();
+  }
+
+  /// `linear_to_dora_layers_grafts_correctly` — graft DoRA adapters into the
+  /// targeted linear paths of a synthetic model and verify only the targeted
+  /// layers are wrapped (and as the `Dora` variant), others are untouched.
+  /// Uses [`linear_to_lora_layers`] with a `fine_tune_type: "dora"` config —
+  /// the existing entrypoint is the "sibling" referenced in the A2 spec
+  /// (dispatches to [`DoRALinear`] via `LoraConfig::is_dora()`).
+  #[test]
+  fn linear_to_dora_layers_grafts_correctly() {
+    let weights = toy_weights();
+    // mlx-lm-native DoRA config: keys=["self_attn.q_proj"], rank=2.
+    let cfg = LoraConfig {
+      fine_tune_type: FineTuneType::Dora,
+      lora_parameters: LoraParameters {
+        rank: 2,
+        scale: Some(2.0),
+        alpha: None,
+        keys: Some(vec!["self_attn.q_proj".to_string()]),
+        dropout: None,
+      },
+      use_dora: false,
+      selection: AdapterSelection::MlxLm { num_layers: 16 },
+    };
+
+    // DoRA AdapterParams for each q_proj path — m chosen so the renorm is
+    // identity (‖adapted‖₂ = [3, 3] for these factors at scale 2.0).
+    let mut params = HashMap::new();
+    for b in 0..4 {
+      let path = format!("model.layers.{b}.self_attn.q_proj");
+      params.insert(
+        path,
+        AdapterParams {
+          lora_a: lora_a(),
+          lora_b: lora_b(),
+          magnitude: Some(Array::from_slice::<f32>(&[3.0, 3.0], &(2usize,)).unwrap()),
+        },
+      );
+    }
+
+    let layers = linear_to_lora_layers(&weights, &cfg, &params, None, 4).unwrap();
+    // Exactly 4 q_proj paths wrapped (one per block); k_proj and lm_head left
+    // untouched.
+    assert_eq!(layers.len(), 4);
+    for b in 0..4 {
+      let key = format!("model.layers.{b}.self_attn.q_proj");
+      assert!(
+        matches!(layers.get(&key), Some(LoraLayer::Dora(_))),
+        "expected DoRA layer at {key}"
+      );
+    }
+    assert!(!layers.contains_key("model.layers.0.self_attn.k_proj"));
+    assert!(!layers.contains_key("lm_head"));
   }
 }
