@@ -271,7 +271,10 @@ fn build_value_and_grad(closure: &Closure, argnums: &[i32]) -> Result<ClosureVal
   // only reachable with a non-empty slice, so `argnums.as_ptr()` is a
   // valid pointer to `argnums.len()` i32s in caller-owned storage and
   // mlx-c never performs pointer arithmetic on a NULL pointer.
-  debug_assert!(!argnums.is_empty(), "build_value_and_grad: empty argnums must be rejected at value_and_grad");
+  debug_assert!(
+    !argnums.is_empty(),
+    "build_value_and_grad: empty argnums must be rejected at value_and_grad"
+  );
   let argnums_ptr = argnums.as_ptr();
   // SAFETY: `closure.as_raw()` is a valid borrowed handle (alive for the call,
   // not retained by mlx past it); `argnums_ptr` is a valid pointer to

@@ -107,11 +107,7 @@ fn closure_constructor_failure_does_not_double_free_payload() {
     let g = grad(f, &[0]).unwrap();
     let x = Array::full::<f32>(&[0i32; 0], 2.0).unwrap();
     let mut grads = g(&[x]).unwrap();
-    assert!(approx_eq(
-      grads[0].item::<f32>().unwrap(),
-      captured,
-      1e-5
-    ));
+    assert!(approx_eq(grads[0].item::<f32>().unwrap(), captured, 1e-5));
   }
 }
 

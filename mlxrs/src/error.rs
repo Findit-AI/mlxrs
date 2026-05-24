@@ -479,8 +479,8 @@ extern "C" fn handler(msg: *const c_char, _data: *mut c_void) {
     // load-bearing inner phrase (NOT `ends_with`, since the trailing
     // `at <file>:<line>` varies by build root) so every variant is
     // covered without an explicit enumeration of the kinds.
-    let is_generic_closure_wrapper = s.starts_with("mlx_closure")
-      && s.contains("returned a non-zero value");
+    let is_generic_closure_wrapper =
+      s.starts_with("mlx_closure") && s.contains("returned a non-zero value");
     let _ = LAST.try_with(|c| {
       if let Ok(mut g) = c.try_borrow_mut() {
         if is_generic_closure_wrapper && g.is_some() {
