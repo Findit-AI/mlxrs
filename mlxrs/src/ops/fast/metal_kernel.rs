@@ -2,28 +2,35 @@
 //!
 //! Mirrors `mlx-swift`'s `Source/MLX/MLXFastKernel.swift` (the
 //! `MLXFast.MLXFastKernel` container + `MLXFast.metalKernel` factory) and the
-//! python `mlx.fast.metal_kernel` callable. The compiled `MetalKernel`
-//! handle is built once via `MetalKernel::new`; each invocation supplies an
+//! python `mlx.fast.metal_kernel` callable. The compiled [`MetalKernel`]
+//! handle is built once via [`MetalKernel::new`]; each invocation supplies an
 //! [`MetalKernelApplyConfig`] describing the per-call grid, thread-group,
 //! output shapes/dtypes, optional template arguments, optional init-value,
 //! and verbosity flag.
 //!
-//! ## Foundation slice (this commit)
-//!
-//! [`KernelTemplateArg`] (enum over `Bool` / `Int` / `Dtype`) and
-//! [`MetalKernelApplyConfig`] (per-call config builder) are pure-data Rust
-//! types — no FFI yet. The `MetalKernel` handle wrapper and the
-//! `mlx_fast_metal_kernel_apply` call shape land in the follow-up commit.
+//! Custom Metal kernels require a real Metal device at apply time;
+//! construction itself does not. The integration tests in
+//! `mlxrs/tests/ops_fast_metal_kernel.rs` cover the apply path behind a
+//! `#[cfg(target_os = "macos")] #[ignore]` gate so headless CI does not
+//! attempt to launch a Metal pipeline. Unit tests in this file cover the
+//! pure-Rust pieces (template-arg variants, config defaults / struct-update,
+//! constructor input validation including interior-NUL rejection).
 
-use crate::dtype::Dtype;
+use std::ffi::CString;
+
+use crate::{
+  array::Array,
+  dtype::Dtype,
+  error::{Error, Result, check, check_vector_array_handle},
+  stream::default_stream,
+};
 
 /// Template argument for a custom Metal kernel — `bool`, `i32`, or [`Dtype`].
 ///
 /// Mirrors `mlx-swift`'s `KernelTemplateArg` protocol (`Bool` / `Int` /
 /// `DType` impls in `MLXFastKernel.swift`) and the python `mlx.fast.metal_kernel`
 /// per-call template-args dict, surfaced here as a closed enum so the
-/// dispatcher in `MetalKernel::apply` (next commit) is exhaustive at compile
-/// time.
+/// dispatcher in [`MetalKernel::apply`] is exhaustive at compile time.
 ///
 /// Template arguments are referenced by name from the kernel source (e.g.
 /// `template <typename T, int N>` in MSL); the
@@ -42,7 +49,7 @@ pub enum KernelTemplateArg {
   Dtype(Dtype),
 }
 
-/// Per-call configuration for `MetalKernel::apply` (next commit).
+/// Per-call configuration for [`MetalKernel::apply`].
 ///
 /// Mirrors the keyword arguments of `MLXFastKernel.callAsFunction`
 /// (`grid`, `threadGroup`, `outputShapes`, `outputDTypes`, `template`,
@@ -52,8 +59,11 @@ pub enum KernelTemplateArg {
 /// the C handle before returning — the config is not retained across calls.
 ///
 /// `output_shapes.len()` must equal `output_dtypes.len()`; both must also
-/// equal the number of `output_names` declared when the parent `MetalKernel`
-/// was constructed. The apply path enforces these invariants.
+/// equal the number of `output_names` declared when the parent
+/// [`MetalKernel`] was constructed. [`MetalKernel::apply`] enforces these
+/// invariants and returns [`Error::ShapeMismatch`] on violation rather than
+/// passing through to mlx-c (where the failure surfaces only at JIT time
+/// with a less actionable message).
 ///
 /// `template` may be empty; an absent entry is equivalent to omitting the
 /// kwarg in the swift / python APIs.
@@ -120,6 +130,489 @@ impl MetalKernelApplyConfig {
       init_value: None,
       verbose: false,
     }
+  }
+}
+
+/// RAII guard for a temporary `mlx_vector_string`. Frees the underlying
+/// `std::vector<std::string>` on drop, including the sentinel NULL-ctx
+/// returned by a failed `_new` allocation (mlx-c `_free` is a defined no-op
+/// on NULL ctx).
+struct VectorStringGuard(mlxrs_sys::mlx_vector_string);
+impl Drop for VectorStringGuard {
+  fn drop(&mut self) {
+    // SAFETY: frees a handle this guard owns exactly once. `_free` is a
+    // defined no-op on NULL ctx so the post-failed-`_new` sentinel is safe.
+    // Runs during `Drop` / thread teardown: must not touch TLS, call
+    // `check()`, panic, or unwind across `extern "C"`; the rc is discarded
+    // silently per the crate's Drop convention.
+    unsafe {
+      let _ = mlxrs_sys::mlx_vector_string_free(self.0);
+    }
+  }
+}
+
+/// RAII guard for a temporary `mlx_vector_array`. Same Drop contract as
+/// [`VectorStringGuard`] — NULL-ctx-safe, never touches TLS, never panics.
+struct VectorArrayGuard(mlxrs_sys::mlx_vector_array);
+impl Drop for VectorArrayGuard {
+  fn drop(&mut self) {
+    // SAFETY: frees a handle this guard owns exactly once. `_free` is a
+    // defined no-op on NULL ctx (sentinel-handle pattern). Runs during
+    // `Drop` / thread teardown: discard rc silently.
+    unsafe {
+      let _ = mlxrs_sys::mlx_vector_array_free(self.0);
+    }
+  }
+}
+
+/// RAII guard for a per-call `mlx_fast_metal_kernel_config`. The config is
+/// freshly constructed and freed within [`MetalKernel::apply`]; the guard
+/// keeps it alive across the (fallible) `_add_*` / `_set_*` / `_apply` chain
+/// so an early `?` does not leak it.
+struct MetalKernelConfigGuard(mlxrs_sys::mlx_fast_metal_kernel_config);
+impl Drop for MetalKernelConfigGuard {
+  fn drop(&mut self) {
+    // SAFETY: frees a handle this guard owns exactly once. The C wrapper
+    // `mlx_fast_metal_kernel_config_free` deletes the underlying
+    // `mlx_fast_metal_kernel_config_cpp_*` (no-op on NULL ctx — sentinel
+    // pattern). Drop contract: no TLS, no panic, no unwind across FFI.
+    unsafe {
+      mlxrs_sys::mlx_fast_metal_kernel_config_free(self.0);
+    }
+  }
+}
+
+/// Build an `mlx_vector_string` from a slice of `&str` for a kernel-side
+/// argument list (input or output names). Interior NULs raise a backend-style
+/// error rather than panicking across the FFI boundary. Mirrors the pattern
+/// in `crate::io::save_gguf` (the `GgufMetadata::StringList` arm).
+fn build_vector_string(items: &[&str], context: &'static str) -> Result<VectorStringGuard> {
+  // SAFETY: `mlx_vector_string_new()` returns a fresh empty vector handle
+  // (NULL ctx on allocation failure, a defined-safe input to `_free`);
+  // wrapped in `VectorStringGuard` BEFORE the fallible appends so an early
+  // `?` frees it exactly once.
+  let vstr = unsafe { mlxrs_sys::mlx_vector_string_new() };
+  let guard = VectorStringGuard(vstr);
+  for s in items {
+    let cs = CString::new(*s).map_err(|_| Error::Backend {
+      message: format!(
+        "mlxrs::ops::fast::metal_kernel: {context} entry contains an interior NUL byte: {s:?}"
+      ),
+    })?;
+    // SAFETY: `vstr` is the valid vector owned by `guard`; `cs` is a valid
+    // in-scope NUL-terminated C string. mlx-c `push_back`s a `std::string`
+    // copy, retaining no pointer past the call; rc surfaced via `check()`.
+    check(unsafe { mlxrs_sys::mlx_vector_string_append_value(vstr, cs.as_ptr()) })?;
+  }
+  Ok(guard)
+}
+
+/// Convert a `&str` into a NUL-terminated `CString`, mapping interior NULs to
+/// a backend-style error.
+fn cstring_or_err(s: &str, context: &'static str) -> Result<CString> {
+  CString::new(s).map_err(|_| Error::Backend {
+    message: format!(
+      "mlxrs::ops::fast::metal_kernel: {context} contains an interior NUL byte: {s:?}"
+    ),
+  })
+}
+
+/// Compiled custom Metal kernel ready for repeated invocation via
+/// [`MetalKernel::apply`].
+///
+/// Mirrors `mlx-swift`'s `MLXFast.MLXFastKernel` and the python
+/// `mlx.fast.metal_kernel` callable. The kernel is constructed once via
+/// [`MetalKernel::new`] (mlx-c JIT-compiles + caches the Metal pipeline keyed
+/// on `name`); each [`MetalKernel::apply`] launch reuses it.
+///
+/// ## Threading
+///
+/// `MetalKernel` is intentionally `!Send` and `!Sync` because the underlying
+/// `mlx_fast_metal_kernel` is not concurrency-safe — the per-kernel
+/// `CustomKernelFunction` and the kernel cache it indexes into live behind
+/// the same thread-local mlx state as [`crate::Array`] and
+/// [`crate::Stream`]. The raw pointer in the wrapped handle is enough to
+/// make the auto-traits absent; no extra marker is needed.
+pub struct MetalKernel {
+  inner: mlxrs_sys::mlx_fast_metal_kernel,
+  output_names: Vec<String>,
+}
+
+impl std::fmt::Debug for MetalKernel {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    // Skip the raw FFI handle (a `*mut c_void` whose value is meaningless
+    // to a debugger user and would print as a uselessly-unstable hex). The
+    // declared output_names are the user-meaningful identifying info.
+    f.debug_struct("MetalKernel")
+      .field("output_names", &self.output_names)
+      .finish_non_exhaustive()
+  }
+}
+
+impl Drop for MetalKernel {
+  fn drop(&mut self) {
+    // SAFETY: frees a handle this struct owns exactly once. `_free` is a
+    // defined no-op on NULL ctx, so a sentinel handle from a failed `_new()`
+    // (caught in [`MetalKernel::new`] before being returned) is safe even on
+    // the unreachable path. Drop contract: no TLS, no `check()`, no panic,
+    // no unwind across `extern "C"`.
+    unsafe {
+      mlxrs_sys::mlx_fast_metal_kernel_free(self.inner);
+    }
+  }
+}
+
+impl MetalKernel {
+  /// Compile a new custom Metal kernel from MSL source.
+  ///
+  /// # Arguments
+  ///
+  /// - `name`: identifier (used by mlx-c as the cache key for the JIT-compiled
+  ///   Metal pipeline and in error messages).
+  /// - `input_names`: parameter names for the input arrays as they appear in
+  ///   the kernel signature mlx-c generates.
+  /// - `output_names`: parameter names for the output arrays as they appear in
+  ///   the kernel signature mlx-c generates. The wrapper records this list so
+  ///   [`MetalKernel::apply`] can validate that the per-call output-shape /
+  ///   output-dtype counts line up.
+  /// - `source`: the body of the Metal Shading Language kernel function (mlx-c
+  ///   wraps it with the auto-generated function signature).
+  /// - `header`: optional MSL header content prepended to the generated
+  ///   source (helpful for shared helper functions / includes). Pass `""` to
+  ///   skip — mlx-c accepts an empty header.
+  /// - `ensure_row_contiguous`: if `true`, mlx ensures input arrays are
+  ///   row-contiguous before the launch (at a copy-on-mismatch perf cost).
+  /// - `atomic_outputs`: if `true`, outputs are declared `device atomic<T>`
+  ///   in the generated signature for concurrent-write kernels.
+  ///
+  /// # Errors
+  ///
+  /// Returns [`Error::Backend`] if any of the four string arguments contains
+  /// an interior NUL byte (rejected before reaching mlx-c so the failure
+  /// surfaces as a recoverable [`Error`] rather than as an aborting C++
+  /// exception). Returns [`Error::Backend`] if mlx-c's
+  /// `mlx_fast_metal_kernel_new` fails — typically a JIT-compile error on the
+  /// user-supplied source.
+  pub fn new(
+    name: &str,
+    input_names: &[&str],
+    output_names: &[&str],
+    source: &str,
+    header: &str,
+    ensure_row_contiguous: bool,
+    atomic_outputs: bool,
+  ) -> Result<Self> {
+    // Install the error handler before any fallible FFI calls so a default
+    // printf+exit handler cannot fire on the first failure (mirrors the
+    // `ops::shape::concatenate` template).
+    crate::error::ensure_handler_installed();
+
+    let name_c = cstring_or_err(name, "`name`")?;
+    let source_c = cstring_or_err(source, "`source`")?;
+    let header_c = cstring_or_err(header, "`header`")?;
+
+    let input_names_guard = build_vector_string(input_names, "input_names")?;
+    let output_names_guard = build_vector_string(output_names, "output_names")?;
+
+    // SAFETY: `name_c` / `source_c` / `header_c` are valid in-scope
+    // NUL-terminated C strings; `input_names_guard.0` and
+    // `output_names_guard.0` are valid populated vector handles whose
+    // guards keep them alive across this call. mlx-c copies the strings +
+    // both vectors into its own `std::string` / `std::vector<std::string>`
+    // storage (the C wrapper invokes `mlx::core::fast::metal_kernel(...)`
+    // which constructs a fresh `CustomKernelFunction` from a `std::string`
+    // owned by the cache), retaining none of the Rust-side pointers past
+    // the call. On failure mlx-c returns a sentinel `{nullptr}` handle and
+    // reports the error via the installed handler; we recover that via
+    // `LAST` below.
+    let raw = unsafe {
+      mlxrs_sys::mlx_fast_metal_kernel_new(
+        name_c.as_ptr(),
+        input_names_guard.0,
+        output_names_guard.0,
+        source_c.as_ptr(),
+        header_c.as_ptr(),
+        ensure_row_contiguous,
+        atomic_outputs,
+      )
+    };
+    // Drop the temporary vector_string + CStrings only after the FFI call so
+    // mlx-c's read borrow is still live. Explicit drops document intent.
+    drop(input_names_guard);
+    drop(output_names_guard);
+    drop(name_c);
+    drop(source_c);
+    drop(header_c);
+
+    if raw.ctx.is_null() {
+      // Sentinel-handle pattern: mlx-c reported the failure via the error
+      // handler and returned `{nullptr}`. Drain `LAST` into `Err` so the
+      // backend message survives.
+      return Err(
+        crate::error::LAST
+          .with(|c| c.borrow_mut().take())
+          .unwrap_or(Error::Backend {
+            message: "mlx_fast_metal_kernel_new returned NULL handle".into(),
+          }),
+      );
+    }
+
+    Ok(Self {
+      inner: raw,
+      output_names: output_names.iter().map(|s| (*s).to_string()).collect(),
+    })
+  }
+
+  /// Number of output arrays this kernel produces, matching the
+  /// `output_names` slice passed to [`MetalKernel::new`].
+  pub fn output_arity(&self) -> usize {
+    self.output_names.len()
+  }
+
+  /// Output parameter names (the slice passed to [`MetalKernel::new`]).
+  pub fn output_names(&self) -> &[String] {
+    &self.output_names
+  }
+
+  /// Launch the kernel with `inputs` and the per-call `config`. Returns the
+  /// output arrays in the same order as `output_names` declared at
+  /// construction.
+  ///
+  /// # Errors
+  ///
+  /// - [`Error::ShapeMismatch`] if `config.output_shapes.len()` /
+  ///   `config.output_dtypes.len()` disagrees with the declared
+  ///   `output_names` count, or if those two `Vec`s disagree with each
+  ///   other.
+  /// - [`Error::Backend`] if a template-arg name contains an interior NUL
+  ///   byte (rejected before mlx-c).
+  /// - [`Error::Backend`] if any mlx-c `_set_*` / `_add_*` / `_apply` call
+  ///   reports an error (e.g. a runtime Metal pipeline failure).
+  pub fn apply(&self, inputs: &[&Array], config: &MetalKernelApplyConfig) -> Result<Vec<Array>> {
+    crate::error::ensure_handler_installed();
+
+    let expected = self.output_names.len();
+    if config.output_shapes.len() != expected {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "mlxrs::ops::fast::metal_kernel: output_shapes.len()={} does not match \
+           the kernel's declared output_names.len()={}",
+          config.output_shapes.len(),
+          expected
+        ),
+      });
+    }
+    if config.output_dtypes.len() != expected {
+      return Err(Error::ShapeMismatch {
+        message: format!(
+          "mlxrs::ops::fast::metal_kernel: output_dtypes.len()={} does not match \
+           the kernel's declared output_names.len()={}",
+          config.output_dtypes.len(),
+          expected
+        ),
+      });
+    }
+
+    // Resolve the stream FIRST so its cleared-thread poison guard fires
+    // before any allocation — matches `ops::quantized::quantize` / `svd`.
+    let stream = default_stream();
+
+    // SAFETY: `_config_new` returns a sentinel `{nullptr}` ctx on allocation
+    // failure (a defined-safe `_free` input); wrap in the RAII guard BEFORE
+    // the fallible `_add_*` / `_set_*` chain so an early `?` frees it. The
+    // sentinel itself is checked below.
+    let config_raw = unsafe { mlxrs_sys::mlx_fast_metal_kernel_config_new() };
+    let _config_guard = MetalKernelConfigGuard(config_raw);
+    if config_raw.ctx.is_null() {
+      return Err(
+        crate::error::LAST
+          .with(|c| c.borrow_mut().take())
+          .unwrap_or(Error::Backend {
+            message: "mlx_fast_metal_kernel_config_new returned NULL handle".into(),
+          }),
+      );
+    }
+
+    // Output arg slots — one (shape, dtype) per declared output_name.
+    for (shape, dtype) in config.output_shapes.iter().zip(config.output_dtypes.iter()) {
+      // SAFETY: `config_raw` is the valid handle owned by `_config_guard`;
+      // `shape.as_ptr()` is a live read-only buffer of `shape.len()` `c_int`s
+      // (`shape: &Vec<i32>` is borrowed for the full loop iteration). mlx-c
+      // copies into a `mlx::core::Shape` (`std::vector<int>`), retaining no
+      // pointer past the call; rc via `check()`. The `dtype` enum-to-raw
+      // conversion is a const map (`Dtype: Copy`).
+      check(unsafe {
+        mlxrs_sys::mlx_fast_metal_kernel_config_add_output_arg(
+          config_raw,
+          shape.as_ptr(),
+          shape.len(),
+          (*dtype).into(),
+        )
+      })?;
+    }
+
+    // Grid + thread-group (always required by the C config).
+    // SAFETY: `config_raw` is the valid handle owned by `_config_guard`;
+    // pure-value arguments, no pointer lifetimes; rc via `check()`.
+    check(unsafe {
+      mlxrs_sys::mlx_fast_metal_kernel_config_set_grid(
+        config_raw,
+        config.grid.0,
+        config.grid.1,
+        config.grid.2,
+      )
+    })?;
+    // SAFETY: as above; pure-value args, rc via `check()`.
+    check(unsafe {
+      mlxrs_sys::mlx_fast_metal_kernel_config_set_thread_group(
+        config_raw,
+        config.thread_group.0,
+        config.thread_group.1,
+        config.thread_group.2,
+      )
+    })?;
+
+    // Optional init-value (mlx-c skips the pre-fill when `_set_init_value`
+    // is never called; we match that contract by only forwarding `Some`).
+    if let Some(v) = config.init_value {
+      // SAFETY: as above; pure-value arg, rc via `check()`.
+      check(unsafe { mlxrs_sys::mlx_fast_metal_kernel_config_set_init_value(config_raw, v) })?;
+    }
+
+    // Always set verbose explicitly (mlx-c defaults to `false`; passing
+    // `false` is a no-op apart from honoring an explicit caller flag).
+    // SAFETY: as above; pure-value arg, rc via `check()`.
+    check(unsafe {
+      mlxrs_sys::mlx_fast_metal_kernel_config_set_verbose(config_raw, config.verbose)
+    })?;
+
+    // Template arguments — dispatch on the Rust enum to one of three mlx-c
+    // typed `_add_template_arg_*` calls. Each arg name needs a transient
+    // CString that must outlive its call.
+    for (arg_name, arg_value) in &config.template {
+      let name_c = cstring_or_err(arg_name.as_str(), "template-arg name")?;
+      match arg_value {
+        KernelTemplateArg::Bool(v) => {
+          // SAFETY: `config_raw` is the valid handle owned by `_config_guard`;
+          // `name_c.as_ptr()` is a valid in-scope NUL-terminated C string
+          // (live through the call). mlx-c copies the name into a
+          // `std::string` and stores the bool, retaining nothing past the
+          // call; rc via `check()`.
+          check(unsafe {
+            mlxrs_sys::mlx_fast_metal_kernel_config_add_template_arg_bool(
+              config_raw,
+              name_c.as_ptr(),
+              *v,
+            )
+          })?;
+        }
+        KernelTemplateArg::Int(v) => {
+          // SAFETY: as the Bool arm — borrowed in-scope C string + pure-value
+          // payload; rc via `check()`.
+          check(unsafe {
+            mlxrs_sys::mlx_fast_metal_kernel_config_add_template_arg_int(
+              config_raw,
+              name_c.as_ptr(),
+              *v,
+            )
+          })?;
+        }
+        KernelTemplateArg::Dtype(v) => {
+          // SAFETY: as the Bool arm — borrowed in-scope C string + the
+          // `Dtype: Copy` enum-to-raw const map; rc via `check()`.
+          check(unsafe {
+            mlxrs_sys::mlx_fast_metal_kernel_config_add_template_arg_dtype(
+              config_raw,
+              name_c.as_ptr(),
+              (*v).into(),
+            )
+          })?;
+        }
+      }
+      // `name_c` drops here, AFTER the FFI call — mlx-c retained nothing.
+    }
+
+    // Build the input `mlx_vector_array` from a contiguous Vec<mlx_array>
+    // (mlx_array is Copy). Mirrors `ops::shape::concatenate`'s
+    // CANONICAL VARIADIC-INPUT TEMPLATE.
+    let raw_inputs: Vec<mlxrs_sys::mlx_array> = inputs.iter().map(|a| a.0).collect();
+    // SAFETY: `raw_inputs` is a contiguous, live `Vec<mlx_array>`
+    // (`mlx_array` is `Copy`); `(ptr, len)` is a valid pair. mlx-c copies
+    // the handles into its own `std::vector` and does not retain the Rust
+    // pointer. Zero-length inputs are allowed (some kernels read no input
+    // arrays, e.g. an init-only generator) — `Vec::as_ptr()` on an empty
+    // Vec returns a non-null dangling pointer that mlx-c never dereferences
+    // when `len == 0`. The RAII guard frees the returned vector (NULL-ctx
+    // safe).
+    let inputs_vec =
+      unsafe { mlxrs_sys::mlx_vector_array_new_data(raw_inputs.as_ptr(), raw_inputs.len()) };
+    let _inputs_guard = VectorArrayGuard(inputs_vec);
+    if inputs_vec.ctx.is_null() {
+      return Err(
+        crate::error::LAST
+          .with(|c| c.borrow_mut().take())
+          .unwrap_or(Error::Backend {
+            message: "mlx_vector_array_new_data returned NULL handle".into(),
+          }),
+      );
+    }
+
+    // Allocate the output `mlx_vector_array` (out-param for `_apply`). The
+    // sentinel-handle check uses the shared crate helper.
+    // SAFETY: `mlx_vector_array_new()` returns a fresh empty out-param handle
+    // (NULL ctx on allocation failure, a defined-safe input to `_free`);
+    // wrapped in the RAII guard BEFORE the populating `_apply` call so any
+    // early return frees it.
+    let mut out_vec = unsafe { mlxrs_sys::mlx_vector_array_new() };
+    check_vector_array_handle(out_vec)?;
+    let _out_guard = VectorArrayGuard(out_vec);
+
+    // SAFETY:
+    // - `&mut out_vec` is the freshly allocated out-param handle (above) —
+    //   mlx-c overwrites it in place with the populated vector.
+    // - `self.inner` is the valid `mlx_fast_metal_kernel` handle this struct
+    //   owns; mlx-c borrows it for the call.
+    // - `inputs_vec` is the valid populated input vector owned by
+    //   `_inputs_guard` and kept alive across this call.
+    // - `config_raw` is the valid populated config owned by `_config_guard`
+    //   and kept alive across this call.
+    // - `stream` is the per-thread default GPU stream from `default_stream()`
+    //   (which installed the error handler + checked the cleared-thread
+    //   guard).
+    // - mlx-c retains none of these handles past the call; the rc is
+    //   surfaced via `check()`.
+    check(unsafe {
+      mlxrs_sys::mlx_fast_metal_kernel_apply(
+        &mut out_vec,
+        self.inner,
+        inputs_vec,
+        config_raw,
+        stream,
+      )
+    })?;
+
+    // Drain the populated output vector into `Vec<Array>` (mirrors
+    // `ops::quantized::drain_vector`). The per-element `mlx_array_new`
+    // out-params are wrapped in `Array` BEFORE the `_get` call so an early
+    // return frees them.
+    // SAFETY: pure read of a valid populated `mlx_vector_array`; mlx-c does
+    // not mutate or retain it and returns a plain length.
+    let n = unsafe { mlxrs_sys::mlx_vector_array_size(out_vec) };
+    let mut parts = Vec::with_capacity(n);
+    for i in 0..n {
+      // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle
+      // (NULL ctx) per the mlx-c convention; wrapped in `Array` FIRST so an
+      // early return frees it, then populated by the following `_get`.
+      let mut part = Array(unsafe { mlxrs_sys::mlx_array_new() });
+      // SAFETY: `&mut part.0` is the fresh out-param; `out_vec` is the valid
+      // populated vector and `i < n` is in range. mlx-c writes a fresh
+      // `mlx_array` handle into `part.0` (copies the inner shared_ptr — the
+      // vector still owns its own +1 reference). rc via `check()`.
+      check(unsafe { mlxrs_sys::mlx_vector_array_get(&mut part.0, out_vec, i) })?;
+      parts.push(part);
+    }
+
+    Ok(parts)
   }
 }
 
@@ -222,5 +715,64 @@ mod tests {
     assert_eq!(cfg.output_shapes.len(), cfg.output_dtypes.len());
     assert_eq!(cfg.output_shapes[1], vec![4, 4]);
     assert_eq!(cfg.output_dtypes[1], Dtype::I32);
+  }
+
+  // ───────────────────────── MetalKernel::new (validation) ─────────────────────────
+  //
+  // These tests cover the wrapper-side input validation that fires BEFORE
+  // the FFI call — interior-NUL rejection in `name` / `source` / `header` /
+  // input-output-name slices. The mlx-c `_new` call itself needs a real
+  // device only at apply time; construction does not, but to stay
+  // headless-CI-safe we exercise validation only.
+
+  fn assert_interior_nul(err: &Error, needle: &str) {
+    match err {
+      Error::Backend { message } => {
+        assert!(
+          message.contains("interior NUL byte"),
+          "expected interior-NUL message, got: {message:?}"
+        );
+        assert!(
+          message.contains(needle),
+          "expected message to mention {needle:?}, got: {message:?}"
+        );
+      }
+      other => panic!("expected Error::Backend with interior-NUL, got: {other:?}"),
+    }
+  }
+
+  #[test]
+  fn metal_kernel_new_rejects_interior_nul_in_name() {
+    let err = MetalKernel::new("bad\0name", &["a"], &["out"], "// noop", "", true, false)
+      .expect_err("interior NUL in name should be rejected");
+    assert_interior_nul(&err, "`name`");
+  }
+
+  #[test]
+  fn metal_kernel_new_rejects_interior_nul_in_source() {
+    let err = MetalKernel::new("k", &["a"], &["out"], "// bad\0", "", true, false)
+      .expect_err("interior NUL in source should be rejected");
+    assert_interior_nul(&err, "`source`");
+  }
+
+  #[test]
+  fn metal_kernel_new_rejects_interior_nul_in_header() {
+    let err = MetalKernel::new("k", &["a"], &["out"], "// noop", "hdr\0bad", true, false)
+      .expect_err("interior NUL in header should be rejected");
+    assert_interior_nul(&err, "`header`");
+  }
+
+  #[test]
+  fn metal_kernel_new_rejects_interior_nul_in_input_names() {
+    let err = MetalKernel::new("k", &["a\0b"], &["out"], "// noop", "", true, false)
+      .expect_err("interior NUL in input_names should be rejected");
+    assert_interior_nul(&err, "input_names");
+  }
+
+  #[test]
+  fn metal_kernel_new_rejects_interior_nul_in_output_names() {
+    let err = MetalKernel::new("k", &["a"], &["out\0bad"], "// noop", "", true, false)
+      .expect_err("interior NUL in output_names should be rejected");
+    assert_interior_nul(&err, "output_names");
   }
 }
