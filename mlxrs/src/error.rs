@@ -401,6 +401,28 @@ thread_local! {
   pub(crate) static LAST: RefCell<Option<Error>> = const { RefCell::new(None) };
 }
 
+/// Take (drain) the TLS `LAST` error slot. Returns `Some(Error)` if a backend
+/// error is pending, `None` otherwise. Used by trampolines and
+/// fallible-handle constructors to surface the most recent backend error
+/// alongside a NULL-ctx or non-zero rc return.
+#[inline]
+pub(crate) fn take_last() -> Option<Error> {
+  LAST.with(|c| c.borrow_mut().take())
+}
+
+/// Stash an error into the TLS `LAST` slot — for use from `extern "C"`
+/// trampolines that need to forward a Rust-side `Error` through the rc
+/// channel back to a safe-layer caller's `check(rc)`. Non-panicking
+/// `try_with`/`try_borrow_mut` keeps it safe under nested panics.
+#[inline]
+pub(crate) fn set_last(err: Error) {
+  let _ = LAST.try_with(|c| {
+    if let Ok(mut g) = c.try_borrow_mut() {
+      *g = Some(err);
+    }
+  });
+}
+
 /// The most recent backend error recorded on this thread, if any. Used by
 /// [`crate::diagnostics`] to surface mlx context when a panic follows a
 /// backend failure. Non-panicking: `try_with` keeps it safe during thread
