@@ -25,14 +25,22 @@
 //! Both `value_and_grad` and `grad` accept an `argnums: &[i32]` slice naming
 //! which positional inputs to differentiate. mlx-swift defaults `argnums` to
 //! `[0]` for the unary forms; we keep the explicit slice for full parity with
-//! mlx-c (callers can pass `&[0]` or any subset). When empty, mlx-c uses the
-//! "all inputs" default — see mlx-core `transforms.cpp::value_and_grad`.
+//! mlx-c (callers can pass `&[0]` or any subset). The slice MUST be
+//! non-empty: an empty `argnums` would name no inputs to differentiate
+//! against (the resulting grad-closure would be a no-op), and the
+//! underlying mlx-c entry point would receive a `NULL` data pointer
+//! alongside `argnums_num == 0` and construct a `std::vector<int>(NULL,
+//! NULL + 0)` — which, while typically benign in practice, is strictly
+//! pointer-arithmetic on a NULL pointer (technical UB under the C++
+//! standard). We reject `argnums.is_empty()` at the safe-wrapper boundary
+//! ([`value_and_grad`]) before reaching the FFI call so neither the
+//! semantic-no-op nor the spec-UB risk can surface.
 
 use std::rc::Rc;
 
 use crate::{
   Array,
-  error::{Result, check, check_vector_array_handle, ensure_handler_installed},
+  error::{Error, Result, check, check_vector_array_handle, ensure_handler_installed},
   stream::assert_streams_not_cleared,
   transforms::closure::{
     BoxedFn, Closure, ClosureValueAndGradGuard, VectorArrayGuard, drain_vector,
@@ -74,6 +82,20 @@ pub fn value_and_grad<F>(
 where
   F: Fn(&[Array]) -> Result<Vec<Array>> + 'static,
 {
+  // Empty `argnums` is rejected at the safe-wrapper boundary:
+  // - Semantically it would name no inputs to differentiate against (the
+  //   resulting grad-closure would be a no-op returning empty grads).
+  // - Mechanically the underlying mlx-c entry point
+  //   (`mlx_value_and_grad`) would receive a NULL data pointer alongside
+  //   `argnums_num == 0` and build `std::vector<int>(NULL, NULL + 0)` —
+  //   pointer arithmetic on NULL is technical UB under the C++ standard
+  //   ([expr.add]) even when the addend is 0. Failing fast here removes
+  //   both the no-op semantic and the spec-UB exposure.
+  if argnums.is_empty() {
+    return Err(Error::Backend {
+      message: "value_and_grad: argnums must be non-empty (at least one input index to differentiate w.r.t.)".into(),
+    });
+  }
   // The Rust closure `F` is shared across invocations of the returned `Fn`.
   // mlx-swift rebuilds the `mlx_closure` per inner call (no payload sharing
   // across calls); we do the same. `Rc<BoxedFn>` lets each call clone-and-
@@ -244,15 +266,18 @@ fn build_value_and_grad(closure: &Closure, argnums: &[i32]) -> Result<ClosureVal
   // would prevent us from seeing the post-set allocated ctx (which `set_`
   // writes into the LOCAL `vag` slot, not into any prior copy).
   let mut vag = unsafe { mlxrs_sys::mlx_closure_value_and_grad_new() };
-  let argnums_ptr = if argnums.is_empty() {
-    std::ptr::null()
-  } else {
-    argnums.as_ptr()
-  };
+  // `value_and_grad`'s public-API entry point rejects empty `argnums`
+  // (see [`value_and_grad`] doc + early-return); this private helper is
+  // only reachable with a non-empty slice, so `argnums.as_ptr()` is a
+  // valid pointer to `argnums.len()` i32s in caller-owned storage and
+  // mlx-c never performs pointer arithmetic on a NULL pointer.
+  debug_assert!(!argnums.is_empty(), "build_value_and_grad: empty argnums must be rejected at value_and_grad");
+  let argnums_ptr = argnums.as_ptr();
   // SAFETY: `closure.as_raw()` is a valid borrowed handle (alive for the call,
-  // not retained by mlx past it); `argnums_ptr` is NULL when len == 0 (mlx-c
-  // uses the "all inputs" default for an empty argnums) or a valid pointer to
-  // `argnums.len()` i32s in the slice's backing storage (mlx-c copies them).
+  // not retained by mlx past it); `argnums_ptr` is a valid pointer to
+  // `argnums.len()` i32s in the slice's backing storage (mlx-c copies them);
+  // empty `argnums` is rejected at the public-API boundary so this path is
+  // never reached with a NULL data pointer.
   // mlx-c's `_set_` on a NULL ctx allocates a fresh `std::function<…>` and
   // writes the pointer into `vag.ctx`, leaving `vag.ctx` non-null on success.
   check(unsafe {

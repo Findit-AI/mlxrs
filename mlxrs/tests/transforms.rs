@@ -143,6 +143,32 @@ fn closure_outlives_construction_scope() {
 
 // ──────────────────────── value_and_grad / grad ────────────────────────
 
+/// F2 contract: empty `argnums` must be rejected at the safe-wrapper
+/// boundary. mlx-c's `mlx_value_and_grad` would receive a NULL data
+/// pointer alongside `argnums_num == 0` and build
+/// `std::vector<int>(NULL, NULL + 0)` — pointer arithmetic on NULL is
+/// technical UB under the C++ standard ([expr.add]) even when the addend
+/// is 0. Failing fast here removes the spec-UB exposure (and the
+/// semantically-meaningless "differentiate w.r.t. nothing" call shape).
+#[test]
+fn value_and_grad_rejects_empty_argnums() {
+  let r = value_and_grad(|xs| Ok(vec![square(&xs[0])?]), &[]);
+  let err = r.err().expect("empty argnums must be rejected");
+  let msg = format!("{err}");
+  assert!(
+    msg.contains("non-empty"),
+    "expected rejection mentioning non-empty argnums; got: {msg}"
+  );
+  // grad delegates to value_and_grad so it must reject too.
+  let r = grad(|xs| Ok(vec![square(&xs[0])?]), &[]);
+  let err = r.err().expect("empty argnums must be rejected by grad");
+  let msg = format!("{err}");
+  assert!(
+    msg.contains("non-empty"),
+    "expected rejection mentioning non-empty argnums; got: {msg}"
+  );
+}
+
 /// f(x) = x^2; d/dx[x^2] = 2x; at x=3 → grad = 6, value = 9.
 #[test]
 fn value_and_grad_simple_quadratic() {
