@@ -107,8 +107,12 @@ impl Optimizer for SGD {
     if self.state.is_empty() {
       self.init(gradients)?;
     }
-    self.step_count += 1;
+    // Resolve scheduled LR at the PRE-increment step, then increment
+    // (matches Python `mlx.optimizers.Optimizer.apply_gradients` which
+    // updates `state[scheduled_param] = scheduler(self.step)` BEFORE
+    // `self.state["step"] = self.step + 1` — `optimizers.py:102..=106`).
     self.current_lr = self.learning_rate.current(self.step_count);
+    self.step_count += 1;
     let lr = self.current_lr;
 
     for (key, grad) in gradients {
@@ -241,9 +245,11 @@ mod tests {
 
   #[test]
   fn sgd_schedule_advances_lr_each_step() -> Result<()> {
-    // Schedule: lr(step) = 0.1 / step (just to verify dispatch). Initial
-    // lr is queried at step 0 (current_lr cached), then each
-    // apply_gradients bumps to the next step.
+    // Schedule: lr(step) = 0.1 / max(step, 1). The Python
+    // `apply_gradients` resolves scheduled parameters at the PRE-increment
+    // step (`optimizers.py:102..=106`), so the first call sees step 0
+    // (lr = 0.1 / max(0,1) = 0.1), the second call sees step 1 (also
+    // 0.1), and the third call sees step 2 (lr = 0.05).
     let sched: Box<dyn Fn(usize) -> f32> = Box::new(|step| 0.1 / (step as f32).max(1.0));
     let mut sgd = SGD::vanilla(LearningRate::Schedule(sched))?;
     let mut params: Weights = HashMap::new();
@@ -253,7 +259,46 @@ mod tests {
     sgd.apply_gradients(&grads, &mut params)?;
     assert!((sgd.learning_rate() - 0.1).abs() < 1e-6);
     sgd.apply_gradients(&grads, &mut params)?;
+    // step==1 → lr(1) = 0.1
+    assert!((sgd.learning_rate() - 0.1).abs() < 1e-6);
+    sgd.apply_gradients(&grads, &mut params)?;
+    // step==2 → lr(2) = 0.05
     assert!((sgd.learning_rate() - 0.05).abs() < 1e-6);
+    Ok(())
+  }
+
+  #[test]
+  fn optimizer_lr_schedule_resolves_at_pre_increment_step() -> Result<()> {
+    // Identity-of-step schedule: returns the step value as the LR. Verifies
+    // each apply_gradients resolves at the PRE-increment counter (Python
+    // semantics: scheduler is called with `self.step` BEFORE the
+    // increment, `optimizers.py:102..=106`).
+    let sched: Box<dyn Fn(usize) -> f32> = Box::new(|step| step as f32);
+    let mut sgd = SGD::vanilla(LearningRate::Schedule(sched))?;
+    let mut params: Weights = HashMap::new();
+    params.insert("w".into(), scalar(1.0)?);
+    let mut grads: Weights = HashMap::new();
+    grads.insert("w".into(), scalar(0.0)?); // zero grads keep params unchanged
+    sgd.apply_gradients(&grads, &mut params)?;
+    assert!(
+      (sgd.learning_rate() - 0.0).abs() < 1e-6,
+      "first call must see step 0, got {}",
+      sgd.learning_rate()
+    );
+    sgd.apply_gradients(&grads, &mut params)?;
+    assert!(
+      (sgd.learning_rate() - 1.0).abs() < 1e-6,
+      "second call must see step 1, got {}",
+      sgd.learning_rate()
+    );
+    sgd.apply_gradients(&grads, &mut params)?;
+    assert!(
+      (sgd.learning_rate() - 2.0).abs() < 1e-6,
+      "third call must see step 2, got {}",
+      sgd.learning_rate()
+    );
+    // step counter must still post-increment to N after N calls.
+    assert_eq!(sgd.step(), 3);
     Ok(())
   }
 }

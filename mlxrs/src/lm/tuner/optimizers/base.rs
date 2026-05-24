@@ -33,14 +33,18 @@ pub enum LearningRate {
   /// Fixed scalar learning rate (Python `float`).
   Fixed(f32),
   /// Step-driven schedule (Python `Callable[[step], float]`). The boxed
-  /// closure is called with the optimizer's 1-based step counter each time
-  /// [`Optimizer::apply_gradients`] is invoked.
+  /// closure is called with the optimizer's step counter each time
+  /// [`Optimizer::apply_gradients`] is invoked, BEFORE the step is
+  /// incremented (so the first call sees step 0, the second call sees
+  /// step 1, matching Python's `optimizers.py:102..=106`).
   Schedule(Box<dyn Fn(usize) -> f32>),
 }
 
 impl LearningRate {
-  /// Resolve the learning rate at `step` (1-based, as Python's `Optimizer`
-  /// increments `step` BEFORE the per-param update).
+  /// Resolve the learning rate at `step` (0-based at the first
+  /// `apply_gradients` call, matching Python's scheduled-parameter
+  /// resolution at `optimizers.py:102..=103` which runs BEFORE the step
+  /// counter is incremented at `optimizers.py:106`).
   pub fn current(&self, step: usize) -> f32 {
     match self {
       LearningRate::Fixed(v) => *v,
@@ -100,10 +104,14 @@ pub trait Optimizer {
   ///
   /// - Lazy-inits per-parameter state on first call (matching Python's
   ///   `if not self._initialized: self.init(gradients)` guard).
-  /// - Increments the internal step counter BEFORE the per-param update
-  ///   (matching Python's `self.state["step"] = self.step + 1` at
-  ///   `optimizers.py:106`).
-  /// - Resolves the learning-rate schedule (if any) at the new step.
+  /// - Resolves the learning-rate schedule (if any) at the PRE-increment
+  ///   step (matching Python's `state[scheduled_param] = scheduler(self.step)`
+  ///   at `optimizers.py:102..=103`), then increments the internal step
+  ///   counter (matching Python's `self.state["step"] = self.step + 1` at
+  ///   `optimizers.py:106`). Optimizers whose per-param formula uses the
+  ///   POST-increment step (e.g. Adam bias correction) read `step_count`
+  ///   AFTER the increment, matching Python's `step = self.step` reads in
+  ///   `apply_single`.
   /// - For each parameter present in `gradients`: looks up the matching
   ///   entry in `params`, computes the updated weight, and writes it back
   ///   into `params`. Parameters NOT in `gradients` are left untouched

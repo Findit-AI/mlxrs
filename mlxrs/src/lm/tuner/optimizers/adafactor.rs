@@ -198,10 +198,16 @@ impl Optimizer for Adafactor {
     if self.state.is_empty() {
       self.init(gradients)?;
     }
-    self.step_count += 1;
+    // Resolve scheduled LR at PRE-increment step, then increment
+    // (matches Python `optimizers.py:102..=106`). Adafactor's internal
+    // `step_f` (used for `beta_2 = 1 - step^decay_rate` and for the
+    // `relative_step` rsqrt branch) is read AFTER the increment to match
+    // Python `step = self.step` at `optimizers.py:808` which runs AFTER
+    // the base `apply_gradients` has already incremented `step`.
     if let Some(lr) = &self.learning_rate {
       self.current_lr = lr.current(self.step_count);
     }
+    self.step_count += 1;
     let step_f = self.step_count as f32;
     // β₂ at this step: 1 - step^decay_rate. We compute as a scalar tensor.
     let beta_2_val = 1.0 - step_f.powf(self.decay_rate);

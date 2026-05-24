@@ -75,8 +75,10 @@ impl Optimizer for Adagrad {
     if self.state.is_empty() {
       self.init(gradients)?;
     }
-    self.step_count += 1;
+    // Resolve scheduled LR at the PRE-increment step, then increment
+    // (matches Python `optimizers.py:102..=106`).
     self.current_lr = self.learning_rate.current(self.step_count);
+    self.step_count += 1;
     let eps_s = scalar(self.eps)?;
     let lr_s = scalar(self.current_lr)?;
     for (key, grad) in gradients {

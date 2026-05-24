@@ -83,8 +83,10 @@ impl Optimizer for RMSprop {
     if self.state.is_empty() {
       self.init(gradients)?;
     }
-    self.step_count += 1;
+    // Resolve scheduled LR at PRE-increment step, then increment
+    // (matches Python `optimizers.py:102..=106`).
     self.current_lr = self.learning_rate.current(self.step_count);
+    self.step_count += 1;
     let alpha_s = scalar(self.alpha)?;
     let one_minus_alpha = scalar(1.0 - self.alpha)?;
     let eps_s = scalar(self.eps)?;

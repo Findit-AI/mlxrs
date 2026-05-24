@@ -178,8 +178,13 @@ impl Optimizer for Adam {
     if self.state.is_empty() {
       self.init(gradients)?;
     }
-    self.step_count += 1;
+    // Resolve scheduled LR at the PRE-increment step, then increment
+    // (matches Python `optimizers.py:102..=106`). Adam's bias-correction
+    // term uses the POST-increment step (Python `step = self.step` at
+    // `optimizers.py:519` runs AFTER the increment), preserved here because
+    // `adam_step` reads `self.step_count` after the increment below.
     self.current_lr = self.learning_rate.current(self.step_count);
+    self.step_count += 1;
     for (key, grad) in gradients {
       let Some(param) = params.get(key) else {
         continue;
@@ -242,8 +247,10 @@ impl Optimizer for AdamW {
     if self.inner.state.is_empty() {
       self.inner.init(gradients)?;
     }
-    self.inner.step_count += 1;
+    // Resolve scheduled LR at PRE-increment step, then increment (Python
+    // `optimizers.py:102..=106`).
     self.inner.current_lr = self.inner.learning_rate.current(self.inner.step_count);
+    self.inner.step_count += 1;
     let lr = self.inner.current_lr;
     let decay_factor = scalar(1.0 - lr * self.weight_decay)?;
     for (key, grad) in gradients {
@@ -320,8 +327,10 @@ impl Optimizer for Adamax {
     if self.state.is_empty() {
       self.init(gradients)?;
     }
-    self.step_count += 1;
+    // Resolve scheduled LR at PRE-increment step, then increment (Python
+    // `optimizers.py:102..=106`).
     self.current_lr = self.learning_rate.current(self.step_count);
+    self.step_count += 1;
     let (b1, b2) = self.betas;
     let b1_s = scalar(b1)?;
     let b2_s = scalar(b2)?;

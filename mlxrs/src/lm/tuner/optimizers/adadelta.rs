@@ -88,8 +88,10 @@ impl Optimizer for AdaDelta {
     if self.state.is_empty() {
       self.init(gradients)?;
     }
-    self.step_count += 1;
+    // Resolve scheduled LR at the PRE-increment step, then increment
+    // (matches Python `optimizers.py:102..=106`).
     self.current_lr = self.learning_rate.current(self.step_count);
+    self.step_count += 1;
     let rho_s = scalar(self.rho)?;
     let one_minus_rho = scalar(1.0 - self.rho)?;
     let eps_s = scalar(self.eps)?;
