@@ -243,7 +243,7 @@ fn closure_user_error_propagates_through_grad() {
   )
   .unwrap();
   let x = Array::full::<f32>(&[0i32; 0], 3.0).unwrap();
-  let err = g(&[x]).err().expect("user error must surface");
+  let err = g(&[x]).expect_err("user error must surface");
   let msg = format!("{err}");
   assert!(
     msg.contains("USER_ERROR_PAYLOAD"),
@@ -270,7 +270,7 @@ fn closure_user_panic_propagates_through_grad_as_error() {
   )
   .unwrap();
   let x = Array::full::<f32>(&[0i32; 0], 3.0).unwrap();
-  let err = g(&[x]).err().expect("user panic must surface as Err");
+  let err = g(&[x]).expect_err("user panic must surface as Err");
   let msg = format!("{err}");
   assert!(
     msg.contains("USER_PANIC_PAYLOAD"),
