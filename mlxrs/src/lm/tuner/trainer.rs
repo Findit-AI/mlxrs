@@ -127,14 +127,19 @@ impl Default for TrainingArgs {
 
 /// Token-level masked cross-entropy loss for next-token prediction.
 ///
-/// Mirrors Python `default_loss` (`trainer.py:86..=99`).
+/// Mirrors Python `default_loss` (`trainer.py:86..=99`), with an exclusive
+/// upper bound on the mask (`steps < length` instead of Python's
+/// `steps <= length`) to drop the first padded token from the supervised
+/// targets. Matches the masking pattern used by mlx-lm's own DWQ trainer
+/// (`mlx_lm/quant/dwq.py:115` — `mx.arange(1, 1 + targets.shape[1]) <
+/// lengths[:, 1:]`).
 ///
 /// ```text
 /// inputs  = batch[:, :-1]
 /// targets = batch[:, 1:]
 /// logits  = model(inputs)
 /// steps   = arange(1, T+1)
-/// mask    = (steps >= lengths[:, 0:1]) & (steps <= lengths[:, 1:])
+/// mask    = (steps >= lengths[:, 0:1]) & (steps < lengths[:, 1:])
 /// ce      = cross_entropy(logits, targets) * mask
 /// ntoks   = mask.sum()
 /// loss    = ce.astype(float32).sum() / ntoks
@@ -145,6 +150,12 @@ impl Default for TrainingArgs {
 /// - tokens at positions `[0, offset)` are the prompt prefix (excluded from
 ///   the loss);
 /// - tokens at positions `[offset, length)` are the completion (included).
+///
+/// The shifted target at position `length - 1` corresponds to the FIRST
+/// padded slot in the unshifted batch (`batch[:, length]` after pad), so
+/// the exclusive upper bound excludes it from the supervised loss — the
+/// training signal never asks the model to predict the pad token 0 from
+/// the last real completion token.
 ///
 /// Returns `(loss_scalar, ntoks_scalar)` — both 0D `Array`s in f32.
 ///
@@ -186,8 +197,12 @@ pub fn default_loss<M: Model>(model: &M, batch: &Array, lengths: &Array) -> Resu
   // steps = arange(1, targets.shape[1] + 1) → [1..T]
   let t_dim = targets.shape()[1] as f32;
   let steps = Array::arange(1.0, t_dim + 1.0, 1.0)?;
-  // mask = (steps >= lengths[:, 0:1]) & (steps <= lengths[:, 1:])
+  // mask = (steps >= lengths[:, 0:1]) & (steps < lengths[:, 1:])
   // lengths[:, 0:1] is [B, 1]; lengths[:, 1:] is [B, 1].
+  // Exclusive upper bound (`<`) drops the supervised target at
+  // `step == length`, which corresponds to the FIRST padded slot in the
+  // un-shifted batch. See the function's doc-comment for the off-by-one
+  // analysis + mlx-lm DWQ reference.
   let offset = crate::ops::indexing::slice(lengths, &[0, 0], &[b_dim, 1], &[1, 1])?;
   let length = crate::ops::indexing::slice(lengths, &[0, 1], &[b_dim, 2], &[1, 1])?;
   // arange returns f32; cast steps to the same dtype as offset (int)
@@ -196,8 +211,8 @@ pub fn default_loss<M: Model>(model: &M, batch: &Array, lengths: &Array) -> Resu
   let offset_f = offset.astype(Dtype::F32)?;
   let length_f = length.astype(Dtype::F32)?;
   let ge = comparison::greater_equal(&steps, &offset_f)?;
-  let le = comparison::less_equal(&steps, &length_f)?;
-  let mask = logical::logical_and(&ge, &le)?;
+  let lt = comparison::less(&steps, &length_f)?;
+  let mask = logical::logical_and(&ge, &lt)?;
   // Cross-entropy (reduction="none") → [B, T]
   let ce = perplexity::cross_entropy_none(&logits, &targets)?;
   // ce * mask
@@ -758,8 +773,12 @@ mod tests {
   fn default_loss_matches_masked_cross_entropy() -> Result<()> {
     // FakeModel returns uniform vocab=8 logits regardless of input. We
     // construct a small [B=1, S=3] batch with lengths=(1,3): mask is at
-    // positions [1..=3] which intersects the [S-1=2]-element target at
-    // positions {1, 2} → 2 tokens contribute.
+    // positions {step : step >= 1 && step < 3} = {1, 2} of the [S-1=2]-
+    // element target → 2 tokens contribute. The exclusive upper bound
+    // (`<`) doesn't change this case because the target range stops at
+    // T=2 (steps never reach step==length=3); see
+    // `default_loss_excludes_padded_target_at_length_boundary` for the
+    // regression that exercises the boundary.
     let model = FakeModel;
     // batch [B=1, S=3]: tokens [1, 2, 3]
     let batch = Array::from_slice::<i32>(&[1, 2, 3], &(1, 3))?;
@@ -772,6 +791,40 @@ mod tests {
     assert!((loss_v - 8.0_f32.ln()).abs() < 1e-4, "got loss {loss_v}");
     // mask at positions {1,2} of the 2-element target → ntoks=2.
     assert!((ntoks_v - 2.0).abs() < 1e-6, "got ntoks {ntoks_v}");
+    Ok(())
+  }
+
+  #[test]
+  fn default_loss_excludes_padded_target_at_length_boundary() -> Result<()> {
+    // Construct a [B=1, S=4] batch with lengths=(0, 2). Valid tokens are
+    // at positions [0, 2): batch[0], batch[1]. Positions batch[2..4) are
+    // padding (zeros). After shifting, targets has [S-1=3] positions:
+    //   target[0] = batch[1] (valid)
+    //   target[1] = batch[2] (PAD — boundary)
+    //   target[2] = batch[3] (PAD)
+    // The mask `steps >= offset && steps < length` with offset=0 and
+    // length=2 keeps steps ∈ {1} (since arange runs over [1, 4)):
+    //   step 1: 1 >= 0 AND 1 < 2 → ✓ (target[0] = batch[1] = valid)
+    //   step 2: 2 >= 0 AND 2 < 2 → ✗ (would be target[1] = batch[2] = PAD)
+    //   step 3: 3 >= 0 AND 3 < 2 → ✗
+    // Old code with `<=` would have INCLUDED step 2 (the boundary pad),
+    // counting batch[2] = 0 as a supervised target and skewing training
+    // toward predicting the pad token. ntoks must be 1, not 2.
+    let model = FakeModel;
+    let batch = Array::from_slice::<i32>(&[1, 2, 0, 0], &(1, 4))?;
+    let lengths = Array::from_slice::<i32>(&[0, 2], &(1, 2))?;
+    let (mut loss, mut ntoks) = default_loss(&model, &batch, &lengths)?;
+    let loss_v = loss.item::<f32>()?;
+    let ntoks_v = ntoks.item::<f32>()?;
+    assert!(
+      (ntoks_v - 1.0).abs() < 1e-6,
+      "expected ntoks=1 (boundary pad excluded by `<` upper bound), got {ntoks_v}",
+    );
+    // Single supervised token, uniform logits over vocab=8 → loss = log(8).
+    assert!(
+      (loss_v - 8.0_f32.ln()).abs() < 1e-4,
+      "expected loss=log(8) for single supervised token, got {loss_v}",
+    );
     Ok(())
   }
 
