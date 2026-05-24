@@ -104,7 +104,10 @@ impl Adafactor {
     relative_step: bool,
     warmup_init: bool,
   ) -> Result<Self> {
-    let current_lr = learning_rate.as_ref().map(|lr| lr.current(0)).unwrap_or(0.0);
+    let current_lr = learning_rate
+      .as_ref()
+      .map(|lr| lr.current(0))
+      .unwrap_or(0.0);
     Ok(Self {
       learning_rate,
       eps,
@@ -146,11 +149,7 @@ impl Adafactor {
       let dtype = param.dtype()?;
       let row = Array::full::<f32>(&row_shape.as_slice(), 0.0)?.astype(dtype)?;
       let col = Array::full::<f32>(&col_shape.as_slice(), 0.0)?.astype(dtype)?;
-      Ok(AdafactorState::Factored {
-        row,
-        col,
-        exp_avg,
-      })
+      Ok(AdafactorState::Factored { row, col, exp_avg })
     } else {
       Ok(AdafactorState::NonFactored {
         exp_avg_sq: zeros_like(param)?,
@@ -168,11 +167,7 @@ impl Adafactor {
   fn compute_learning_rate(&self, parameter_rms: &Array) -> Result<Array> {
     let step = self.step_count as f32;
     let relative_step = if self.relative_step {
-      let min_step = if self.warmup_init {
-        1e-6 * step
-      } else {
-        1e-2
-      };
+      let min_step = if self.warmup_init { 1e-6 * step } else { 1e-2 };
       let rsqrt_step = step.sqrt().recip();
       min_step.min(rsqrt_step)
     } else {
@@ -224,13 +219,12 @@ impl Optimizer for Adafactor {
       // update = g² + ε₁
       let g_sq = arithmetic::square(grad)?;
       let update = arithmetic::add(&g_sq, &eps0)?;
-      let st = self.state.remove(key).unwrap_or(self.init_state_for(param)?);
+      let st = self
+        .state
+        .remove(key)
+        .unwrap_or(self.init_state_for(param)?);
       let (new_state, mut update_arr) = match st {
-        AdafactorState::Factored {
-          row,
-          col,
-          exp_avg,
-        } => {
+        AdafactorState::Factored { row, col, exp_avg } => {
           let ndim = grad.ndim();
           let row_axis = (ndim - 1) as i32;
           let col_axis = (ndim - 2) as i32;
@@ -381,9 +375,15 @@ mod tests {
     // reduced to a closed-form scalar in two lines).
     let mut adafactor = Adafactor::default_python()?;
     let mut params: Weights = HashMap::new();
-    params.insert("w".into(), Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3])?);
+    params.insert(
+      "w".into(),
+      Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3])?,
+    );
     let mut grads: Weights = HashMap::new();
-    grads.insert("w".into(), Array::from_slice::<f32>(&[0.1, 0.2, 0.3], &[3])?);
+    grads.insert(
+      "w".into(),
+      Array::from_slice::<f32>(&[0.1, 0.2, 0.3], &[3])?,
+    );
     adafactor.apply_gradients(&grads, &mut params)?;
     let mut got = params["w"].try_clone()?;
     let v: Vec<f32> = got.to_vec()?;

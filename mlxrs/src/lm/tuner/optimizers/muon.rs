@@ -213,9 +213,15 @@ mod tests {
     // plain momentum SGD (with weight decay).
     let mut muon = Muon::default_with_lr(0.01)?;
     let mut params: Weights = HashMap::new();
-    params.insert("w".into(), Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3])?);
+    params.insert(
+      "w".into(),
+      Array::from_slice::<f32>(&[1.0, 2.0, 3.0], &[3])?,
+    );
     let mut grads: Weights = HashMap::new();
-    grads.insert("w".into(), Array::from_slice::<f32>(&[0.1, 0.2, 0.3], &[3])?);
+    grads.insert(
+      "w".into(),
+      Array::from_slice::<f32>(&[0.1, 0.2, 0.3], &[3])?,
+    );
     muon.apply_gradients(&grads, &mut params)?;
     let mut got = params["w"].try_clone()?;
     let v: Vec<f32> = got.to_vec()?;

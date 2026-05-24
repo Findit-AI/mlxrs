@@ -21,8 +21,7 @@
 //! capture set — enables runtime composition (e.g. building a vec of
 //! schedules from a config file).
 
-use crate::Result;
-use crate::error::Error;
+use crate::{Result, error::Error};
 
 /// Schedule closure shape: `Fn(step) -> learning_rate`.
 pub type Schedule = Box<dyn Fn(usize) -> f32>;

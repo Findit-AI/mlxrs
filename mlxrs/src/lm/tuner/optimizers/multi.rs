@@ -44,10 +44,7 @@ pub struct MultiOptimizer {
 impl MultiOptimizer {
   /// Construct a [`MultiOptimizer`]. `filters.len()` MUST equal
   /// `optimizers.len() - 1` (the last optimizer is the fallback).
-  pub fn new(
-    optimizers: Vec<Box<dyn Optimizer>>,
-    filters: Vec<FilterFn>,
-  ) -> Result<Self> {
+  pub fn new(optimizers: Vec<Box<dyn Optimizer>>, filters: Vec<FilterFn>) -> Result<Self> {
     if optimizers.is_empty() {
       return Err(Error::Backend {
         message: "MultiOptimizer: at least one optimizer is required".into(),
@@ -175,7 +172,10 @@ mod tests {
   #[test]
   fn multi_rejects_wrong_filter_count() {
     let res = MultiOptimizer::new(
-      vec![Box::new(SGD::vanilla(0.1).unwrap()), Box::new(SGD::vanilla(0.1).unwrap())],
+      vec![
+        Box::new(SGD::vanilla(0.1).unwrap()),
+        Box::new(SGD::vanilla(0.1).unwrap()),
+      ],
       vec![], // need exactly 1 filter for 2 optimizers
     );
     assert!(res.is_err());

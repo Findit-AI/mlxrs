@@ -286,11 +286,7 @@ pub struct Adamax {
 
 impl Adamax {
   /// Construct an [`Adamax`] optimizer.
-  pub fn new(
-    learning_rate: impl Into<LearningRate>,
-    betas: (f32, f32),
-    eps: f32,
-  ) -> Result<Self> {
+  pub fn new(learning_rate: impl Into<LearningRate>, betas: (f32, f32), eps: f32) -> Result<Self> {
     if eps < 0.0 {
       return Err(crate::error::Error::Backend {
         message: format!("Adamax: epsilon must be >= 0, got {eps}"),

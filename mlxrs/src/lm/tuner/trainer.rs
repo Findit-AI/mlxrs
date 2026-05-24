@@ -152,11 +152,7 @@ impl Default for TrainingArgs {
 /// forward per step, unlike inference). A future grad-accumulation
 /// micro-batching pass through this fn would re-evaluate the same logits
 /// — caller controls invocation count.
-pub fn default_loss<M: Model>(
-  model: &M,
-  batch: &Array,
-  lengths: &Array,
-) -> Result<(Array, Array)> {
+pub fn default_loss<M: Model>(model: &M, batch: &Array, lengths: &Array) -> Result<(Array, Array)> {
   let shape = batch.shape();
   let (_b, s) = match shape.as_slice() {
     [b, s] => (*b, *s),
@@ -586,7 +582,13 @@ where
   let mut window_steps = 0usize;
   let mut window_secs = 0.0_f32;
   let mut trained_tokens = 0usize;
-  let mut iter = iterate_batches(train_dataset, args.batch_size, args.max_seq_length, true, None)?;
+  let mut iter = iterate_batches(
+    train_dataset,
+    args.batch_size,
+    args.max_seq_length,
+    true,
+    None,
+  )?;
   for it in 1..=args.iters {
     // Pre-step validation: at it == 1, every steps_per_eval, and at the
     // last iteration (Python trainer.py:286..=317).
@@ -610,11 +612,9 @@ where
       }
     }
     let step_start = Instant::now();
-    let batch = iter
-      .next()
-      .ok_or_else(|| Error::Backend {
-        message: "train: batch iterator exhausted unexpectedly (loop=true should never end)".into(),
-      })??;
+    let batch = iter.next().ok_or_else(|| Error::Backend {
+      message: "train: batch iterator exhausted unexpectedly (loop=true should never end)".into(),
+    })??;
     // Compute loss + grad scalars. We use a small closure that re-evaluates
     // the model's forward pass at the current params + batch — the
     // gradient is computed w.r.t. each Array in `current_params_vec` by
@@ -842,10 +842,7 @@ mod tests {
     let dataset = FakeDataset::new(4, 6); // 1 batch per pass
     let model = FakeModel;
     let mut params: Weights = HashMap::new();
-    params.insert(
-      "w".into(),
-      Array::full::<f32>(&[0i32; 0], 1.0)?,
-    );
+    params.insert("w".into(), Array::full::<f32>(&[0i32; 0], 1.0)?);
     let mut sgd = SGD::vanilla(0.01)?;
     let mut cb = CountingCallback {
       train_reports: 0,
