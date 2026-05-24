@@ -96,7 +96,7 @@ impl MultiOptimizer {
 impl Optimizer for MultiOptimizer {
   fn init(&mut self, params: &Weights) -> Result<()> {
     let split = self.split_dictionary(params)?;
-    for (opt, p) in self.optimizers.iter_mut().zip(split.into_iter()) {
+    for (opt, p) in self.optimizers.iter_mut().zip(split) {
       opt.init(&p)?;
     }
     Ok(())

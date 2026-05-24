@@ -362,11 +362,6 @@ impl Optimizer for Adafactor {
 mod tests {
   use super::*;
 
-  fn read_scalar(a: &Array) -> Result<f32> {
-    let mut clone = a.try_clone()?;
-    clone.item::<f32>()
-  }
-
   #[test]
   fn adafactor_1d_param_runs_one_step_without_error() -> Result<()> {
     // 1D tensors take the NonFactored branch. Verify the step completes

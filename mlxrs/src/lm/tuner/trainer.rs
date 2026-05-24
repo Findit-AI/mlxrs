@@ -29,9 +29,9 @@
 //! - **Adapter checkpoint save / final save** (`mx.save_safetensors`) —
 //!   delegated to the caller via the [`TrainingCallback::on_save`] hook
 //!   (NOT auto-saved by [`train`]). Rust idiom: don't write to disk inside
-//!   library code unless the caller explicitly asks; the
-//!   [`safetensors`](crate::io::safetensors) module exposes the load/save
-//!   primitives the caller composes.
+//!   library code unless the caller explicitly asks; the [`crate::io`]
+//!   module exposes the safetensors / GGUF load+save primitives the
+//!   caller composes.
 //! - **`mx.metal.is_available()` / `mx.set_wired_limit(...)` /
 //!   `mx.get_cache_memory()` / `mx.clear_cache()` / `mx.get_peak_memory()`**
 //!   — call sites are no-ops in v1 (mlxrs's memory module covers the same
@@ -408,13 +408,13 @@ impl<D: Dataset> Iterator for BatchIter<'_, D> {
       // Yates seeded by `rng_state` (advanced per restart so each pass
       // shuffles differently). Without: in-order.
       self.order = (0..self.batch_idx.len()).collect();
-      if self.shuffle_seed.is_some() {
-        if let Some(seed) = self.rng_state {
-          fisher_yates_shuffle(&mut self.order, seed);
-          // Advance the seed for the next loop pass so successive
-          // re-shuffles are distinct (and not the same permutation).
-          self.rng_state = Some(seed.wrapping_add(1));
-        }
+      if self.shuffle_seed.is_some()
+        && let Some(seed) = self.rng_state
+      {
+        fisher_yates_shuffle(&mut self.order, seed);
+        // Advance the seed for the next loop pass so successive
+        // re-shuffles are distinct (and not the same permutation).
+        self.rng_state = Some(seed.wrapping_add(1));
       }
       self.cursor = 0;
       if self.order.is_empty() {
@@ -440,7 +440,7 @@ fn build_batch<D: Dataset>(dataset: &D, indices: &[usize], max_seq_length: usize
   // Pad to one plus nearest multiple of pad_to (32) or max_seq_length.
   let pad_to = 32usize;
   let max_in_batch = *lengths.iter().max().unwrap_or(&0);
-  let mut max_len_in_batch = 1 + pad_to * ((max_in_batch + pad_to - 1) / pad_to);
+  let mut max_len_in_batch = 1 + pad_to * max_in_batch.div_ceil(pad_to);
   if max_len_in_batch > max_seq_length {
     max_len_in_batch = max_seq_length;
   }
@@ -552,6 +552,7 @@ where
 /// `loss_fn` takes `(model, tokens, lengths)` and returns
 /// `(loss_scalar, ntoks_scalar)`. The defaults are [`default_loss`]; pass
 /// a custom closure for specialized losses (label smoothing, KD, etc.).
+#[allow(clippy::too_many_arguments)]
 pub fn train<M, D, O, L, C>(
   model: &M,
   optimizer: &mut O,
@@ -592,24 +593,24 @@ where
   for it in 1..=args.iters {
     // Pre-step validation: at it == 1, every steps_per_eval, and at the
     // last iteration (Python trainer.py:286..=317).
-    if let Some(val) = val_dataset {
-      if it == 1 || it % args.steps_per_eval == 0 || it == args.iters {
-        let val_start = Instant::now();
-        let val_loss = evaluate(
-          model,
-          val,
-          args.batch_size,
-          args.val_batches,
-          args.max_seq_length,
-          |m, b, l| (loss_fn)(m, b, l),
-        )?;
-        let val_time = val_start.elapsed().as_secs_f32();
-        callback.on_val_loss_report(&ValInfo {
-          iteration: it.saturating_sub(1),
-          val_loss,
-          val_time,
-        });
-      }
+    if let Some(val) = val_dataset
+      && (it == 1 || it % args.steps_per_eval == 0 || it == args.iters)
+    {
+      let val_start = Instant::now();
+      let val_loss = evaluate(
+        model,
+        val,
+        args.batch_size,
+        args.val_batches,
+        args.max_seq_length,
+        |m, b, l| (loss_fn)(m, b, l),
+      )?;
+      let val_time = val_start.elapsed().as_secs_f32();
+      callback.on_val_loss_report(&ValInfo {
+        iteration: it.saturating_sub(1),
+        val_loss,
+        val_time,
+      });
     }
     let step_start = Instant::now();
     let batch = iter.next().ok_or_else(|| Error::Backend {
@@ -777,9 +778,9 @@ mod tests {
   #[test]
   fn iterate_batches_emits_expected_shape_for_known_dataset_size() -> Result<()> {
     let dataset = FakeDataset::new(8, 4); // 8 examples × len 4
-    let mut iter = iterate_batches(&dataset, 4, 64, false, None)?;
+    let iter = iterate_batches(&dataset, 4, 64, false, None)?;
     let mut count = 0;
-    while let Some(b) = iter.next() {
+    for b in iter {
       let b = b?;
       assert_eq!(b.tokens.shape()[0], 4);
       assert_eq!(b.lengths.shape(), &[4, 2]);
@@ -866,7 +867,7 @@ mod tests {
       &dataset,
       Some(&dataset),
       &args,
-      |m, b, l| default_loss(m, b, l),
+      default_loss,
       &mut cb,
     )?;
     // 6 iters @ steps_per_report=2 → 3 windows (it=2,4,6).
