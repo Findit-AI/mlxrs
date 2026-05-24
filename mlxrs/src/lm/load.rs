@@ -1182,16 +1182,19 @@ pub enum CommitOutcome {
 /// so a new save's shards can never overwrite an older checkpoint's
 /// shards on disk regardless of clock or process; (3) the shard publish
 /// uses an **atomic no-replace `hard_link`** rather than a `rename` —
-/// `link(2)` succeeds creating a second directory entry for the
-/// tempfile's inode or fails `EEXIST`, with no replace window, so a
-/// pre-existing final path (collision-resistant `gen_id` collision,
-/// stale leftover, or hostile / racing peer) surfaces as
+/// `link(2)` succeeds creating a second directory entry at the FINAL
+/// path or fails `EEXIST`, with no replace window, so a pre-existing
+/// **final-path** entry (collision-resistant `gen_id` collision, stale
+/// leftover, or a peer racing for the same FINAL name) surfaces as
 /// [`crate::Error::ShardPathCollision`] in a single syscall — a
 /// `symlink_metadata` + `rename` pre-check would have a TOCTOU gap
 /// where `rename(2)` silently REPLACES the racing peer's bytes between
 /// the stat and the rename. The index continues to use `rename` (its
 /// commit semantics ARE "the latest rename wins"; it intentionally
-/// overwrites the OLD index).
+/// overwrites the OLD index). **The `EEXIST` failure mode protects
+/// against collisions at the FINAL shard path only; it does NOT
+/// protect against staging-directory races on the temp NAME — see the
+/// "Hostile-directory caveat" below.**
 ///
 /// Steps, in reference order:
 ///
@@ -1212,12 +1215,17 @@ pub enum CommitOutcome {
 ///    final path yet.** Any failure here removes every staged tempfile.
 /// 5. **Publish — single commit point.** Every shard tempfile is
 ///    published to its final shard name FIRST via an **atomic no-
-///    replace `hard_link`** (`link(2)`): a second directory entry is
-///    created for the tempfile's inode, or the call fails `EEXIST` and
-///    the save aborts with [`crate::Error::ShardPathCollision`] (no
-///    silent-replace window — unlike `rename(2)`); the tempfile is then
+///    replace `hard_link`** (`link(2)`) on the temp PATHNAME: a second
+///    directory entry is created at the final shard path pointing at
+///    whatever inode the temp NAME currently resolves to, or the call
+///    fails `EEXIST` and the save aborts with
+///    [`crate::Error::ShardPathCollision`] (no silent-replace window at
+///    the FINAL path — unlike `rename(2)`); the tempfile is then
 ///    unlinked, freeing the temp name while the inode survives via the
-///    final-path entry. The parent directory is `fsync`ed so those
+///    final-path entry. **`hard_link` operates by pathname**, so the
+///    inode that ends up published is the inode the temp NAME resolves
+///    to AT THE LINK CALL — see the "Hostile-directory caveat" below
+///    for what that means when the staging directory is user-writable. The parent directory is `fsync`ed so those
 ///    `link` + unlink entries are durable. The staged index is then
 ///    atomically `rename`d over `model.safetensors.index.json` LAST
 ///    (preceded by a `symlink_metadata` check — `NotFound` proceeds,
@@ -1263,6 +1271,40 @@ pub enum CommitOutcome {
 /// commit `fsync_dir` failure would propagate as `Err` and drop the
 /// staged config-tempfile guard (deleting its tempfile via [`Drop`]),
 /// leaving NEW weights+index visible against the OLD config.
+///
+/// # Hostile-directory caveat
+///
+/// Shards are written through [`crate::io::save_safetensors_to_file`]
+/// (fd-bound — every byte goes to the inode this function opened) and
+/// published via `std::fs::hard_link(temp_path, final_path)` + unlink.
+/// The fd-bound write itself is protected against `unlink + symlink`
+/// write-redirection on the temp NAME: the bytes go to the inode the
+/// crate opened, regardless of what the temp directory entry currently
+/// points to.
+///
+/// **However, the publication step links BY PATHNAME.** If the staging
+/// directory (`save_path`) is user-writable, an attacker with write
+/// access can `unlink(temp_path)` and substitute their own file at the
+/// same name AT ANY TIME between the `O_EXCL` create and the
+/// `hard_link` — including after the fd-bound write and fsync. The
+/// `hard_link` then resolves the temp pathname to the attacker's inode
+/// and atomically publishes IT at the final shard name; the fd-written
+/// bytes survive only as an orphan inode no directory entry points to.
+/// `linkat` / `renameat` with a directory fd do NOT close this race —
+/// they anchor the parent directory but still look the temp entry up by
+/// name. The `EEXIST` failure mode described above only protects
+/// against pre-existing entries (or concurrent peers) at the **FINAL**
+/// shard path; it does NOT protect against staging-directory races on
+/// the temp NAME.
+///
+/// **For full hostile-directory safety**, pass a `save_path` that is
+/// a **trusted (not user-writable) directory** — the simplest and most
+/// portable solution. The publication step is then safe because no
+/// unprivileged attacker can substitute the temp entry between fsync
+/// and link. See the **"Scope of this guarantee"** section of
+/// [`crate::io::save_safetensors_to_file`] for the broader discussion
+/// of publication-step trust requirements (and the platform-specific
+/// fd-bound publish primitives this crate does NOT provide).
 ///
 /// **Prior-generation shards on disk.** This implementation **does not**
 /// inline-prune `model*.safetensors` files left over from earlier
@@ -1412,26 +1454,43 @@ pub fn save_model(
   //
   //    a. Publish every shard tempfile to its final shard name FIRST via
   //       an **atomic no-replace `hard_link`**. `link(2)` (`std::fs::
-  //       hard_link`) creates a new directory entry pointing at the same
-  //       inode as the tempfile, or fails with `EEXIST` (`ErrorKind::
-  //       AlreadyExists`) — atomically, with no replace window. Unlike a
-  //       `symlink_metadata` pre-check + `rename` sequence (which has a
-  //       TOCTOU gap where a concurrent writer can race in between the
-  //       stat and the rename; `rename(2)` then SILENTLY replaces the
-  //       racing peer's bytes), `hard_link` cannot overwrite — it either
-  //       creates the final directory entry or returns the collision
-  //       error in a single syscall. The tempfile is then unlinked: the
-  //       inode survives via the new final-path entry (refcount stays at
-  //       1), so no bytes are lost. Each shard basename also carries a
-  //       collision-resistant `gen_id`
-  //       (`model-gen-{ts_us}-{pid}-{ctr}-…`) making the collision
-  //       statistically unreachable; `hard_link`'s atomic no-replace is
-  //       the fail-closed defense in depth on the residual hostile /
-  //       racing case. A collision (or other IO failure) here leaves any
-  //       still-staged shard + the staged index as tempfiles, which are
-  //       cleaned up before propagating. Already-published shards remain
-  //       on disk as silently-invisible files (the OLD index, if any,
-  //       still points to its OLD shard names — which are untouched).
+  //       hard_link`) creates a new directory entry at `final_path`
+  //       pointing at whatever inode the temp PATHNAME currently
+  //       resolves to, or fails with `EEXIST` (`ErrorKind::
+  //       AlreadyExists`) — atomically, with no replace window AT THE
+  //       FINAL PATH. Unlike a `symlink_metadata` pre-check + `rename`
+  //       sequence (which has a TOCTOU gap where a concurrent writer
+  //       can race in between the stat and the rename; `rename(2)`
+  //       then SILENTLY replaces the racing peer's bytes at the final
+  //       path), `hard_link` cannot overwrite a pre-existing final-path
+  //       entry — it either creates the final directory entry or
+  //       returns the collision error in a single syscall. The tempfile
+  //       is then unlinked: the inode survives via the new final-path
+  //       entry (refcount stays at 1), so no bytes are lost. Each shard
+  //       basename also carries a collision-resistant `gen_id`
+  //       (`model-gen-{ts_us}-{pid}-{ctr}-…`) making a FINAL-PATH
+  //       collision statistically unreachable; `hard_link`'s atomic
+  //       no-replace is the fail-closed defense in depth on the
+  //       residual final-path-collision case (`gen_id` collision,
+  //       stale leftover, or a peer racing for the same FINAL name).
+  //       A collision (or other IO failure) here leaves any still-
+  //       staged shard + the staged index as tempfiles, which are
+  //       cleaned up before propagating. Already-published shards
+  //       remain on disk as silently-invisible files (the OLD index,
+  //       if any, still points to its OLD shard names — which are
+  //       untouched).
+  //
+  //       Hostile-directory caveat: `hard_link` resolves the temp
+  //       PATHNAME at the link call — so if `save_path` is user-
+  //       writable, an attacker who can `unlink(tmp) + create(tmp,
+  //       attacker's inode)` between fsync and the link below will
+  //       cause `final_path` to publish THEIR inode rather than the
+  //       fd-written one. The `EEXIST` branch above does NOT catch
+  //       this (it only catches collisions at the FINAL path).
+  //       Defense lives at the caller layer — see the
+  //       "Hostile-directory caveat" section in `save_model`'s doc
+  //       comment for the full discussion and the
+  //       trusted-staging-directory mitigation.
   //
   //       Same-filesystem guarantee: `open_excl_temp_shard` creates the
   //       tempfile in `final_path.parent()` (so tmp + final_path always
@@ -1448,11 +1507,14 @@ pub fn save_model(
         let _ = std::fs::remove_file(tmp);
       }
       Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-        // Atomic no-replace caught a colliding final path (the
-        // statistically-unreachable `gen_id` collision, a stale
-        // leftover, or a hostile / racing peer). Clean every still-
-        // unpublished shard tempfile (including this one) + the
-        // staged index, then surface the collision.
+        // Atomic no-replace caught a pre-existing entry at the FINAL
+        // path (the statistically-unreachable `gen_id` collision, a
+        // stale leftover, or a peer racing for the same FINAL name).
+        // Note this does NOT catch staging-directory races on the
+        // temp NAME — see the "Hostile-directory caveat" in
+        // `save_model`'s doc comment. Clean every still-unpublished
+        // shard tempfile (including this one) + the staged index,
+        // then surface the collision.
         for (leftover, _) in &staged_shards[idx..] {
           let _ = std::fs::remove_file(leftover);
         }
@@ -2114,6 +2176,20 @@ pub(crate) fn fsync_dir(path: &Path) -> std::io::Result<()> {
 /// [`Error::DurabilityWarning`] with `committed: true` — the NEW
 /// `config.json` IS observable on disk, but the directory-entry write may
 /// not yet be durable (matching the [`save`] driver's contract).
+///
+/// # Hostile-directory caveat
+///
+/// The body is written fd-bound (every byte goes to the inode this
+/// function opened) but published via `std::fs::rename(temp_path,
+/// config_path)`, which operates BY PATHNAME. If `config_path`'s
+/// parent directory is user-writable, an attacker with write access
+/// can `unlink(temp_path)` and substitute their own file at the same
+/// name between the fsync and the rename, causing the published
+/// `config.json` to be the attacker's inode rather than the fd-written
+/// one. Mirror of [`save_model`]'s "Hostile-directory caveat": use a
+/// trusted (not user-writable) parent directory for full safety. See
+/// the "Scope of this guarantee" section of
+/// [`crate::io::save_safetensors_to_file`] for the broader discussion.
 pub fn save_config(config: &str, config_path: &Path) -> Result<()> {
   let staged = stage_config(config, config_path)?;
   match commit_staged_config(staged, config_path)? {
@@ -2321,6 +2397,20 @@ fn commit_staged_config(mut staged: StagedConfig, config_path: &Path) -> Result<
 /// (pass [`PerLayerQuantization::default`](crate::lm::quant::PerLayerQuantization)
 /// for an unquantized model). Any step's recoverable failure is the
 /// [`Error`] that step produced.
+///
+/// # Hostile-directory caveat
+///
+/// `save` inherits the publication-step trust requirement from both
+/// [`save_model`] (shards + index `hard_link` / `rename`) and
+/// [`save_config`] (config `rename`): every publish operates BY
+/// PATHNAME in `dst_path`. If `dst_path` is user-writable, an attacker
+/// can substitute the temp entries between fsync and publish, causing
+/// the final shards / index / config to point at the attacker's
+/// inodes rather than the fd-written ones. **For full hostile-
+/// directory safety, pass a trusted (not user-writable) `dst_path`.**
+/// See the "Hostile-directory caveat" sections on [`save_model`] /
+/// [`save_config`] and the "Scope of this guarantee" section of
+/// [`crate::io::save_safetensors_to_file`] for the broader discussion.
 pub fn save(
   dst_path: &Path,
   weights: &Weights,
@@ -4907,20 +4997,19 @@ mod save_tests {
     let _ = std::fs::remove_dir_all(&dir);
   }
 
-  /// **R1 standalone-file-semantics test (non-zero cursor case).** The
-  /// public `save_safetensors_to_file` is documented as the fd-bound
-  /// equivalent of [`crate::io::save_safetensors_view`] (which
-  /// creates / truncates the target). A caller may legitimately reuse a
-  /// `File` they pre-filled and seek to a non-zero offset; without the
-  /// internal rewind in `save_safetensors_to_file`, the safetensors
-  /// header would be written at the current cursor and the prefix
-  /// would be stale prefilled bytes — producing a corrupt file that
-  /// `load_safetensors` could not parse, while the writer returned
+  /// **Happy-path: prefilled file at non-zero cursor → clean
+  /// safetensors.** Without the internal rewind in
+  /// `save_safetensors_to_file`, a caller-supplied `File` at a non-zero
+  /// cursor would receive a safetensors header at the current cursor +
+  /// stale prefilled bytes as the prefix — producing a corrupt file
+  /// that `load_safetensors` could not parse, while the writer returned
   /// `Ok(())`. This test pre-fills the file with 100 bytes, seeks to
   /// byte 50, drives the writer with a small array, and asserts the
   /// reload succeeds + the on-disk size equals exactly the new
   /// safetensors payload size (no leading 50 bytes of garbage, no
-  /// trailing 50 bytes of garbage).
+  /// trailing 50 bytes of garbage). Documents the destructive truncate
+  /// is part of the happy-path contract — see the "Destructive
+  /// mutation" section of `save_safetensors_to_file`'s doc comment.
   #[test]
   fn save_safetensors_to_file_truncates_prefilled_file_at_nonzero_offset() {
     use std::io::{Seek, SeekFrom, Write as _};
@@ -4979,19 +5068,19 @@ mod save_tests {
     let _ = std::fs::remove_dir_all(&dir);
   }
 
-  /// **R1 standalone-file-semantics test (longer-prefill case).** A
-  /// caller may hand `save_safetensors_to_file` a `File` they already
-  /// wrote a much larger blob into, seeked back to byte 0, intending to
-  /// overwrite it with a smaller payload. Without the internal
-  /// `set_len(0)` truncate, the new (shorter) safetensors would be
-  /// written at the head + the trailing portion of the old blob would
-  /// remain as stale tail bytes — the resulting file's prefix would
-  /// parse but its overall byte length would lie about the payload
-  /// size, and downstream tooling that mmaps / hashes / verifies the
-  /// whole file would see garbage past the safetensors EOF. Pre-fills
-  /// 10000 bytes, rewinds to 0, writes a small payload, asserts the
-  /// final file size matches a fresh small payload (well under 10000)
-  /// and reloads correctly.
+  /// **Happy-path: prefilled file longer than new payload → trailing
+  /// bytes truncated.** Without the internal `set_len(0)` truncate, a
+  /// caller-supplied `File` that already held a much larger blob would
+  /// retain the trailing tail bytes after the new (shorter)
+  /// safetensors — the resulting file's prefix would parse but its
+  /// overall byte length would lie about the payload size, and
+  /// downstream tooling that mmaps / hashes / verifies the whole file
+  /// would see garbage past the safetensors EOF. Pre-fills 10000 bytes,
+  /// rewinds to 0, writes a small payload, asserts the final file size
+  /// matches a fresh small payload (well under 10000) and reloads
+  /// correctly. Documents the destructive truncate is part of the
+  /// happy-path contract — see the "Destructive mutation" section of
+  /// `save_safetensors_to_file`'s doc comment.
   #[test]
   fn save_safetensors_to_file_truncates_prefilled_file_longer_than_new_payload() {
     use std::io::{Seek, SeekFrom, Write as _};
@@ -5039,6 +5128,594 @@ mod save_tests {
        count as the path-based writer on a fresh file (proves set_len(0) truncated \
        trailing prefill); fd={on_disk}, control={control_size}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// **Defense-in-depth: interior-NUL in metadata key leaves file
+  /// untouched.** Verifies the structural ordering inside
+  /// `save_safetensors_to_file`: input-validation `Err` from
+  /// `build_string_map` (interior-NUL in a metadata key) returns BEFORE
+  /// the destructive `seek(0)` + `set_len(0)`, so a caller-owned
+  /// prefilled file is byte-identical to its pre-call state on this
+  /// error path.
+  ///
+  /// NOT a contract — see the "Destructive mutation" section of
+  /// `save_safetensors_to_file`'s doc comment. Callers MUST NOT rely on
+  /// byte preservation across save failures; use the fd-bound
+  /// tempfile-staging pattern (open a same-directory `O_EXCL` `File`,
+  /// pass it to `save_safetensors_to_file`, `sync_all`, then `rename` /
+  /// `hard_link` to the final path — the open/write/fsync/drop fd-bound
+  /// steps are exemplified by `save_model` above at lines 1359-1372) to
+  /// preserve the fd-bound write-redirection mitigation through the
+  /// staging write. The fd-bound mitigation covers the WRITE PATH only;
+  /// the publication step (`rename` / `hard_link` by `temp_path`) is
+  /// pathname-based and still subject to directory-entry substitution
+  /// any time after the `O_EXCL` create and before publication (not
+  /// just after fsync). See the "Scope of this guarantee" caveat in
+  /// `save_safetensors_to_file`'s doc comment (its `# Destructive
+  /// mutation` doc section) for the publication-race options. This test
+  /// guards the defense-in-depth ordering does not regress, not a
+  /// behavioral contract callers can depend on.
+  #[test]
+  fn save_safetensors_to_file_preserves_existing_file_on_interior_nul_metadata() {
+    let dir = fresh_dir("load1-fd-r2-nul-meta");
+    let path = dir.join("preexisting_meta.safetensors");
+    // Pre-fill the file with known content (NOT a valid safetensors —
+    // we are testing that the file is left UNCHANGED on Err, not that
+    // it's still loadable). The byte sequence is arbitrary; the
+    // assertion is byte-equality to `original_bytes`.
+    let original_bytes: &[u8] = b"existing valid safetensors payload here";
+    std::fs::write(&path, original_bytes).unwrap();
+    let original_len = original_bytes.len() as u64;
+    // Sanity: file is exactly the prefill before the call.
+    assert_eq!(
+      std::fs::metadata(&path).unwrap().len(),
+      original_len,
+      "pre-call: file size must equal prefill length"
+    );
+
+    let mut file = std::fs::OpenOptions::new()
+      .read(true)
+      .write(true)
+      .open(&path)
+      .unwrap();
+    let array = Array::from_slice::<f32>(&[1.0_f32, 2.0], &(2usize,)).unwrap();
+    let mut bad_metadata: HashMap<String, String> = HashMap::new();
+    // Interior NUL in the key — `CString::new` rejects this, so
+    // `build_string_map` returns `Err` before any FFI call.
+    bad_metadata.insert("key\0with-nul".to_string(), "value".to_string());
+
+    let result = crate::io::save_safetensors_to_file(
+      &mut file,
+      std::iter::once(("name", &array)),
+      &bad_metadata,
+    );
+
+    // The call must surface an interior-NUL `Error::Backend`.
+    assert!(
+      result.is_err(),
+      "expected Err from interior-NUL in metadata key, got Ok"
+    );
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+      err_msg.contains("NUL") || err_msg.contains("nul"),
+      "expected an interior-NUL error message, got: {err_msg}"
+    );
+
+    // Defense-in-depth: the file must be byte-identical to the prefill
+    // because `build_string_map` rejected the interior-NUL key BEFORE
+    // the destructive truncate ran. A regression that re-ordered the
+    // truncate ahead of the validation step would zero this file.
+    drop(file);
+    let bytes_after = std::fs::read(&path).unwrap();
+    assert_eq!(
+      bytes_after, original_bytes,
+      "DEFENSE-IN-DEPTH REGRESSION: input-validation Err from build_string_map must \
+       return before the destructive seek+set_len so a caller-owned prefilled file is \
+       byte-identical to its pre-call state on this error path. NOT a contract — see \
+       save_safetensors_to_file's Destructive mutation doc section."
+    );
+    assert_eq!(
+      bytes_after.len() as u64,
+      original_len,
+      "post-call: file size must still equal prefill length"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// **Defense-in-depth: interior-NUL in array name leaves file
+  /// untouched.** Symmetric to the metadata-key case above, exercising
+  /// the OTHER fallible map-build site (`build_array_map`). Verifies
+  /// the structural ordering: input-validation `Err` from
+  /// `build_array_map` returns BEFORE the destructive truncate.
+  ///
+  /// NOT a contract — see the "Destructive mutation" section of
+  /// `save_safetensors_to_file`'s doc comment. Callers MUST NOT rely on
+  /// byte preservation across save failures.
+  #[test]
+  fn save_safetensors_to_file_preserves_existing_file_on_interior_nul_array_name() {
+    let dir = fresh_dir("load1-fd-r2-nul-name");
+    let path = dir.join("preexisting_name.safetensors");
+    let original_bytes: &[u8] = b"another distinct prefilled payload, array-name path";
+    std::fs::write(&path, original_bytes).unwrap();
+    let original_len = original_bytes.len() as u64;
+    assert_eq!(
+      std::fs::metadata(&path).unwrap().len(),
+      original_len,
+      "pre-call: file size must equal prefill length"
+    );
+
+    let mut file = std::fs::OpenOptions::new()
+      .read(true)
+      .write(true)
+      .open(&path)
+      .unwrap();
+    let array = Array::from_slice::<f32>(&[3.0_f32, 4.0, 5.0], &(3usize,)).unwrap();
+    let good_metadata: HashMap<String, String> = HashMap::new();
+
+    // Interior NUL in the array name — `build_array_map`'s
+    // `CString::new(k)` rejects this and returns `Err` BEFORE any FFI
+    // call.
+    let bad_name = "arr\0with-nul";
+    let result = crate::io::save_safetensors_to_file(
+      &mut file,
+      std::iter::once((bad_name, &array)),
+      &good_metadata,
+    );
+
+    assert!(
+      result.is_err(),
+      "expected Err from interior-NUL in array name, got Ok"
+    );
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+      err_msg.contains("NUL") || err_msg.contains("nul"),
+      "expected an interior-NUL error message, got: {err_msg}"
+    );
+
+    drop(file);
+    let bytes_after = std::fs::read(&path).unwrap();
+    assert_eq!(
+      bytes_after, original_bytes,
+      "DEFENSE-IN-DEPTH REGRESSION (array-name path): input-validation Err from \
+       build_array_map must return before the destructive seek+set_len so a \
+       caller-owned prefilled file is byte-identical to its pre-call state on this \
+       error path. NOT a contract — see save_safetensors_to_file's Destructive \
+       mutation doc section."
+    );
+    assert_eq!(
+      bytes_after.len() as u64,
+      original_len,
+      "post-call: file size must still equal prefill length"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// **Defense-in-depth: empty-metadata save succeeds through the
+  /// NULL-sentinel guard.** Verifies the `ctx.is_null()` check in
+  /// `build_string_map` (installed to surface a hypothetical
+  /// `mlx_map_string_to_string_new()` allocation-failure sentinel) does
+  /// not reject valid handles: with empty metadata the insert loop runs
+  /// zero times, so the structural NULL guard is the only filter
+  /// between the `_new()` and the caller. A bug that inverted the
+  /// predicate or compared the wrong field would surface here as an
+  /// `Err` on the most common save shape. The structural test below
+  /// verifies the source carries the explicit check.
+  ///
+  /// NOT a contract — verifies the defense-in-depth ordering does not
+  /// regress on the success path. See `save_safetensors_to_file`'s
+  /// Destructive mutation doc section.
+  #[test]
+  fn save_safetensors_to_file_empty_metadata_succeeds_post_r3_null_check() {
+    let dir = fresh_dir("load1-fd-r3-empty-meta-ok");
+    let path = dir.join("empty_meta_ok.safetensors");
+    let mut file = std::fs::OpenOptions::new()
+      .read(true)
+      .write(true)
+      .create_new(true)
+      .open(&path)
+      .unwrap();
+    let arr = Array::from_slice::<f32>(&[1.5_f32, 2.5, 3.5], &(3usize,)).unwrap();
+    // Empty `HashMap<String, String>` metadata is the shape that
+    // bypasses every `_insert` call in `build_string_map`, so the
+    // structural `is_null()` guard is the only thing between a
+    // hypothetical NULL-ctx sentinel from `_new()` and the caller. A
+    // valid (non-NULL) handle must pass through unchanged.
+    let empty_metadata: HashMap<String, String> = HashMap::new();
+    crate::io::save_safetensors_to_file(&mut file, std::iter::once(("w", &arr)), &empty_metadata)
+      .expect(
+        "DEFENSE-IN-DEPTH REGRESSION: empty-metadata save_safetensors_to_file must \
+         succeed — the NULL-sentinel guard in build_string_map must not reject valid \
+         handles. See save_safetensors_to_file's Destructive mutation doc section.",
+      );
+    file.sync_all().unwrap();
+    drop(file);
+
+    let mut loaded = crate::io::load_safetensors(&path).unwrap();
+    assert_eq!(loaded.len(), 1, "round-trip must yield exactly one array");
+    let w = loaded.get_mut("w").unwrap().to_vec::<f32>().unwrap();
+    assert_eq!(
+      w,
+      vec![1.5, 2.5, 3.5],
+      "round-trip values must match the pre-save array"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// **Defense-in-depth structural: map-helper NULL-sentinel guards.**
+  /// Real allocation failure inside `mlx_map_string_to_array_new()` /
+  /// `mlx_map_string_to_string_new()` cannot be deterministically
+  /// injected from a unit test (no allocator-fault hook is plumbed
+  /// through to the C++ vendored map ctor), and the empty-input shape
+  /// makes EVERY post-construction defensive `_insert` call a no-op so
+  /// behavioral coverage cannot trip the NULL path on a real machine.
+  /// This test reads `mlxrs/src/io.rs` and asserts both `build_array_map`
+  /// and `build_string_map` carry an explicit `ctx.is_null()` check
+  /// immediately after the corresponding `_new()` constructor, and
+  /// drain `crate::error::LAST` rather than peek. A regression that
+  /// removes either check (e.g. a refactor that drops the guard or
+  /// reorders the call past the file mutation) will fail this test.
+  ///
+  /// Guards the defense-in-depth ordering, not a byte-preservation
+  /// contract — see `save_safetensors_to_file`'s Destructive mutation
+  /// doc section.
+  #[test]
+  fn build_map_helpers_carry_r3_null_sentinel_check() {
+    // Read the SOURCE we shipped (not the compiled binary) so a future
+    // edit that deletes the guard fails this test deterministically,
+    // independent of inlining / optimization. The path is relative to
+    // the cargo manifest dir of the `mlxrs` crate.
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/io.rs"))
+      .expect("must be able to read mlxrs/src/io.rs to verify NULL-sentinel guards");
+
+    // Locate `fn build_array_map` and assert the body contains an
+    // explicit `is_null()` predicate AND a `mlx_map_string_to_array_new`
+    // call within the same logical region. We slice the source at the
+    // function header and check the next ~3 KiB — comfortably larger
+    // than either helper body but small enough that any NULL check
+    // found belongs to the function it follows.
+    let array_fn = src
+      .find("fn build_array_map")
+      .expect("build_array_map must exist in io.rs");
+    let array_window = &src[array_fn..(array_fn + 3000).min(src.len())];
+    assert!(
+      array_window.contains("mlx_map_string_to_array_new"),
+      "DEFENSE-IN-DEPTH STRUCTURAL: build_array_map must still call \
+       mlx_map_string_to_array_new"
+    );
+    assert!(
+      array_window.contains("ctx.is_null()"),
+      "DEFENSE-IN-DEPTH STRUCTURAL REGRESSION: build_array_map must check \
+       `guard.0.ctx.is_null()` immediately after `mlx_map_string_to_array_new()` to \
+       surface allocation-failure sentinels; the check appears to have been removed."
+    );
+
+    let string_fn = src
+      .find("fn build_string_map")
+      .expect("build_string_map must exist in io.rs");
+    let string_window = &src[string_fn..(string_fn + 3000).min(src.len())];
+    assert!(
+      string_window.contains("mlx_map_string_to_string_new"),
+      "DEFENSE-IN-DEPTH STRUCTURAL: build_string_map must still call \
+       mlx_map_string_to_string_new"
+    );
+    assert!(
+      string_window.contains("ctx.is_null()"),
+      "DEFENSE-IN-DEPTH STRUCTURAL REGRESSION: build_string_map must check \
+       `guard.0.ctx.is_null()` immediately after `mlx_map_string_to_string_new()` — \
+       without this guard, an allocation failure on the empty-metadata save path \
+       returns a NULL-ctx sentinel through `Ok(NULL)` to the caller. The check \
+       appears to have been removed."
+    );
+
+    // Both windows must also drain LAST (not peek). The drain is the
+    // crate's `crate::error::take_last()` / `LAST.with(...).take()`
+    // idiom; either spelling is acceptable — but SOMETHING must
+    // consume the TLS so a stale Err does not poison the next call.
+    let drains_last = |window: &str| {
+      window.contains("take_last()")
+        || window.contains("LAST.with")
+        || window.contains("crate::error::take_last")
+    };
+    assert!(
+      drains_last(array_window),
+      "DEFENSE-IN-DEPTH STRUCTURAL: build_array_map's NULL branch must DRAIN \
+       crate::error::LAST (via take_last() or LAST.with(..).take()), not peek \
+       — leaving a stale Err in the TLS pollutes later mlx-c calls on this thread."
+    );
+    assert!(
+      drains_last(string_window),
+      "DEFENSE-IN-DEPTH STRUCTURAL: build_string_map's NULL branch must DRAIN \
+       crate::error::LAST (via take_last() or LAST.with(..).take()), not peek \
+       — leaving a stale Err in the TLS pollutes later mlx-c calls on this thread."
+    );
+  }
+
+  /// **Defense-in-depth structural: writer-new precedes truncate.**
+  /// `mlx_io_writer_new` allocates a `cwriter_holder` +
+  /// `std::shared_ptr<CWriter>` inside its `try`/`catch` (vendored
+  /// `mlx-c/mlx/c/private/io.h:126-129` +
+  /// `mlx-c/mlx/c/io_types.cpp:48-54`) and converts a `std::bad_alloc`
+  /// (or any other exception) into a `mlx_io_writer({nullptr})`
+  /// sentinel. Real allocation failure inside that ctor cannot be
+  /// deterministically injected from a unit test (no allocator-fault
+  /// hook is plumbed through to the vendored C++ ctor), so this test
+  /// guards the structural ordering: it reads `mlxrs/src/io.rs` and
+  /// asserts the lexical ordering — (1) `mlx_io_writer_new` is called
+  /// BEFORE `seek(SeekFrom::Start(0))`, (2) an explicit
+  /// `ctx.is_null()` check appears within ~10 lines of
+  /// `mlx_io_writer_new`, (3) a `take_last()` (or
+  /// `crate::error::take_last`) drain appears within ~20 lines of
+  /// `mlx_io_writer_new`, (4) `set_len(0)` appears AFTER the
+  /// `is_null()` check.
+  ///
+  /// Guards the defense-in-depth ordering, not a byte-preservation
+  /// contract — see `save_safetensors_to_file`'s Destructive mutation
+  /// doc section.
+  #[test]
+  fn save_safetensors_to_file_writer_new_precedes_truncate_r4_structural() {
+    // Read the SOURCE we shipped (not the compiled binary) so a future
+    // edit that re-orders the writer ctor past the truncate fails this
+    // test deterministically, independent of inlining / optimization.
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/io.rs"))
+      .expect("must be able to read mlxrs/src/io.rs to verify writer-precedes-truncate ordering");
+
+    // Restrict the search to the `save_safetensors_to_file` function
+    // body so unrelated occurrences (the `WriterGuard` impl, the
+    // vtable factory, the `cb_seek` callback) cannot satisfy the
+    // assertions by accident.
+    let fn_start = src
+      .find("pub fn save_safetensors_to_file")
+      .expect("save_safetensors_to_file must exist in io.rs");
+    // The next sibling item header in this file is the
+    // `// ─────── mlx_io_writer backed by &mut File ──────` divider
+    // immediately followed by `struct WriterState`. Slice up to that
+    // point to capture only the function body.
+    let fn_tail = src[fn_start..]
+      .find("struct WriterState")
+      .expect("WriterState declaration must follow save_safetensors_to_file in io.rs");
+    let body = &src[fn_start..fn_start + fn_tail];
+
+    // Locate each landmark by byte offset within the function body so
+    // we can compare lexical ordering directly.
+    let writer_new_off = body.find("mlx_io_writer_new(").expect(
+      "DEFENSE-IN-DEPTH STRUCTURAL: save_safetensors_to_file must construct the \
+       mlx_io_writer via `mlx_io_writer_new(...)`; the writer-new call appears to \
+       have been removed or renamed.",
+    );
+    let seek_off = body.find("seek(SeekFrom::Start(0))").expect(
+      "DEFENSE-IN-DEPTH STRUCTURAL: save_safetensors_to_file must rewind via \
+       `seek(SeekFrom::Start(0))`; the rewind appears to have been removed or renamed.",
+    );
+    let set_len_off = body.find("set_len(0)").expect(
+      "DEFENSE-IN-DEPTH STRUCTURAL: save_safetensors_to_file must truncate via \
+       `set_len(0)`; the truncate appears to have been removed or renamed.",
+    );
+
+    // Invariant 1: writer-new BEFORE seek.
+    assert!(
+      writer_new_off < seek_off,
+      "DEFENSE-IN-DEPTH STRUCTURAL REGRESSION: `mlx_io_writer_new(...)` must appear \
+       BEFORE `seek(SeekFrom::Start(0))` inside save_safetensors_to_file so an \
+       allocation failure in the writer ctor surfaces as Err before the destructive \
+       truncate. Current ordering has writer-new at byte {writer_new_off} and \
+       seek at byte {seek_off}.",
+    );
+
+    // Invariant 2: explicit `is_null()` check within 10 lines after writer-new.
+    let post_writer_new = &body[writer_new_off..];
+    let next_lines: Vec<&str> = post_writer_new.lines().take(11).collect();
+    let null_check_window = next_lines.join("\n");
+    assert!(
+      null_check_window.contains(".ctx.is_null()") || null_check_window.contains("ctx.is_null()"),
+      "DEFENSE-IN-DEPTH STRUCTURAL REGRESSION: within 10 lines after \
+       `mlx_io_writer_new(...)` there must be an explicit `.ctx.is_null()` check \
+       that drains the NULL-ctx sentinel before any destructive file mutation. \
+       The check appears to have been removed.",
+    );
+
+    // Invariant 3: `take_last()` (or `crate::error::take_last`) drain
+    // within 20 lines after writer-new.
+    let drain_lines: Vec<&str> = post_writer_new.lines().take(21).collect();
+    let drain_window = drain_lines.join("\n");
+    assert!(
+      drain_window.contains("take_last()") || drain_window.contains("crate::error::take_last"),
+      "DEFENSE-IN-DEPTH STRUCTURAL REGRESSION: within 20 lines after \
+       `mlx_io_writer_new(...)` there must be a `take_last()` (or \
+       `crate::error::take_last`) DRAIN of the TLS error slot — peeking would \
+       leave a stale Err and poison the next unrelated mlx-c call on this thread. \
+       The drain appears to have been removed or replaced with a peek.",
+    );
+
+    // Invariant 4: `set_len(0)` AFTER the `is_null()` check.
+    let null_check_local_off = null_check_window
+      .find("ctx.is_null()")
+      .expect("invariant-2 guard above asserted this exists; cannot fail here");
+    let null_check_abs_off = writer_new_off + null_check_local_off;
+    assert!(
+      null_check_abs_off < set_len_off,
+      "DEFENSE-IN-DEPTH STRUCTURAL REGRESSION: `set_len(0)` must appear AFTER the \
+       `ctx.is_null()` check so a NULL-ctx writer sentinel cannot bypass the guard \
+       and trigger the destructive truncate. Current ordering has the null check at \
+       byte {null_check_abs_off} and set_len at byte {set_len_off}.",
+    );
+  }
+
+  /// **Defense-in-depth behavioral: writer-construction reached on
+  /// happy path.** Pre-fills a file with 50 bytes, then calls
+  /// `save_safetensors_to_file` with valid empty metadata and one tiny
+  /// array. Asserts the call returns `Ok(())` AND that the file ends up
+  /// bearing the safetensors header bytes (a valid `load_safetensors`
+  /// round-trip), proving the writer-construction is still reached and
+  /// the write still happens after the structural reorder. The
+  /// structural test above is the primary guard; this behavioral one
+  /// documents the happy path so a future refactor that BREAKS the
+  /// write itself fails fast.
+  #[test]
+  fn save_safetensors_to_file_writer_construction_precedes_truncate() {
+    let dir = fresh_dir("load1-fd-r4-writer-precedes-truncate");
+    let path = dir.join("prefilled_50_bytes.safetensors");
+    {
+      let mut prefill = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+      std::io::Write::write_all(&mut prefill, &[0xA5_u8; 50]).unwrap();
+      prefill.sync_all().unwrap();
+    }
+    // Reopen at the start so the existing 50-byte prefix would corrupt
+    // the safetensors header without the rewind+truncate. On the happy
+    // path the structural ordering still produces a valid round-trippable
+    // file because writer-new succeeded and the truncate ran before the
+    // write.
+    let mut file = std::fs::OpenOptions::new()
+      .read(true)
+      .write(true)
+      .open(&path)
+      .unwrap();
+    let arr = Array::from_slice::<f32>(&[7.0_f32, 8.0, 9.0], &(3usize,)).unwrap();
+    let empty_metadata: HashMap<String, String> = HashMap::new();
+    crate::io::save_safetensors_to_file(&mut file, std::iter::once(("v", &arr)), &empty_metadata)
+      .expect(
+        "DEFENSE-IN-DEPTH REGRESSION: happy-path save_safetensors_to_file with \
+         empty metadata must succeed (writer construction reached + write completed)",
+      );
+    file.sync_all().unwrap();
+    drop(file);
+
+    // Round-trip the file: a valid safetensors header (which
+    // `load_safetensors` parses) is the proof that the truncate +
+    // write both happened after the writer-new succeeded.
+    let mut loaded = crate::io::load_safetensors(&path).unwrap();
+    assert_eq!(
+      loaded.len(),
+      1,
+      "DEFENSE-IN-DEPTH REGRESSION: round-trip must yield exactly one array \
+       (saved one)"
+    );
+    let v = loaded.get_mut("v").unwrap().to_vec::<f32>().unwrap();
+    assert_eq!(
+      v,
+      vec![7.0, 8.0, 9.0],
+      "DEFENSE-IN-DEPTH REGRESSION: round-trip values must match the pre-save \
+       array — a mismatch would indicate the write did not run or wrote stale \
+       prefix bytes"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// **Documents the destructive contract for MLX-internal errors.**
+  /// Pre-fills a file with 50 bytes, then calls
+  /// `save_safetensors_to_file` with a zero-element `Array` that mlx-c
+  /// rejects inside `mlx_save_safetensors_writer`. Asserts the call
+  /// returns `Err` AND that the file is truncated to 0 bytes (NOT
+  /// preserved).
+  ///
+  /// This is the EXPECTED behavior per the "Destructive mutation"
+  /// section of `save_safetensors_to_file`'s doc comment — once the
+  /// defense-in-depth ordering has cleared (Rust map builds, FFI map
+  /// ctors, FFI writer ctor all `Ok`), the function commits to the
+  /// destructive `seek(0)` + `set_len(0)` before invoking
+  /// `mlx_save_safetensors_writer`. Any error from the writer (eval
+  /// failure, MLX-internal array-set rejection, header-build failure,
+  /// write-callback failure) leaves the file in a truncated /
+  /// partially-mutated state. Callers that need atomic-replace
+  /// semantics must use the fd-bound tempfile-staging pattern (open a
+  /// same-directory `O_EXCL` `File`, pass it to
+  /// `save_safetensors_to_file`, `sync_all`, then `rename` /
+  /// `hard_link` to the final path — the open/write/fsync/drop
+  /// fd-bound steps are exemplified by `save_model` above at lines
+  /// 1359-1372). The fd-bound mitigation protects the WRITE PATH from
+  /// `unlink + symlink` redirection; the publication step (`rename` /
+  /// `hard_link` by `temp_path`) is pathname-based and still subject
+  /// to directory-entry substitution any time after the `O_EXCL`
+  /// create and before publication (not just after fsync). See the
+  /// "Scope of this guarantee" caveat in
+  /// `save_safetensors_to_file`'s doc comment (its `# Destructive
+  /// mutation` doc section) for the publication-race options. Do NOT
+  /// use the path-taking `save_safetensors_view` for atomic
+  /// replacement: it reopens by name and reintroduces the write-path
+  /// TOCTOU window LOAD-1 closed.
+  ///
+  /// A regression that "fixed" this by preserving the prefill on a
+  /// writer-error would silently change the function's contract; this
+  /// test catches such a regression by asserting the file IS
+  /// destructively truncated on the writer-error path.
+  #[test]
+  fn save_safetensors_to_file_truncates_on_mlx_internal_error_zero_element_array() {
+    let dir = fresh_dir("load1-fd-destructive-zero-elem");
+    let path = dir.join("destructive_contract.safetensors");
+    let original_bytes: &[u8] = &[0xC3_u8; 50];
+    std::fs::write(&path, original_bytes).unwrap();
+    let original_len = original_bytes.len() as u64;
+    assert_eq!(
+      std::fs::metadata(&path).unwrap().len(),
+      original_len,
+      "pre-call: file size must equal prefill length"
+    );
+
+    let mut file = std::fs::OpenOptions::new()
+      .read(true)
+      .write(true)
+      .open(&path)
+      .unwrap();
+    // A zero-element array constructs successfully in Rust (see e.g.
+    // `embeddings::colvision` tests), so all the up-front validation +
+    // FFI ctor steps succeed (input maps build, writer-new returns
+    // non-NULL). mlx-c's safetensors writer then rejects the
+    // zero-element shape inside `mlx_save_safetensors_writer` — AFTER
+    // the destructive `seek(0)` + `set_len(0)` have already run. This
+    // exercises the "Partially mutated or zero-length" branch of the
+    // documented Destructive mutation contract.
+    let zero_arr = Array::from_slice::<f32>(&[], &(0usize,)).unwrap();
+    let empty_metadata: HashMap<String, String> = HashMap::new();
+
+    let result = crate::io::save_safetensors_to_file(
+      &mut file,
+      std::iter::once(("zero", &zero_arr)),
+      &empty_metadata,
+    );
+
+    assert!(
+      result.is_err(),
+      "expected Err from save_safetensors_to_file on a zero-element array — mlx-c's \
+       safetensors writer rejects this shape. If the writer started accepting \
+       zero-element arrays, pick another MLX-internal-rejection trigger to keep \
+       coverage of the destructive-contract path."
+    );
+
+    drop(file);
+    let post_len = std::fs::metadata(&path).unwrap().len();
+    // The destructive `seek(0)` + `set_len(0)` run BEFORE
+    // `mlx_save_safetensors_writer` is invoked, so the file is
+    // truncated to 0 bytes (or written as a partial safetensors
+    // header if mlx-c emitted some bytes before rejecting the
+    // zero-element shape). The strict assertion the documented
+    // contract makes is "not byte-identical to the prefill" — the
+    // file is partially mutated or zero-length. Asserting
+    // `post_len < original_len` covers both cases (early reject ⇒
+    // 0 bytes; mid-stream reject ⇒ some bytes of partial header).
+    // The original prefill (50 bytes of 0xC3) is not a valid
+    // safetensors prefix, so a `post_len == original_len` with
+    // byte-identical contents is the regression we are guarding
+    // against.
+    assert!(
+      post_len < original_len,
+      "DESTRUCTIVE CONTRACT: save_safetensors_to_file MUST destructively mutate the \
+       file on an MLX-internal writer error (the destructive seek+set_len runs \
+       before mlx_save_safetensors_writer is invoked). The file size went from \
+       {original_len} bytes to {post_len} bytes — if this assertion fires because \
+       the file is BYTE-IDENTICAL to the prefill, the function silently regained a \
+       byte-preservation contract it explicitly disclaims. See \
+       save_safetensors_to_file's Destructive mutation doc section."
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
   }
 }
