@@ -11,6 +11,7 @@
 use std::{
   env,
   path::{Path, PathBuf},
+  process::Command,
 };
 
 // ───── Submodule revision pins ─────
@@ -79,13 +80,14 @@ fn main() {
     }
   }
 
-  // Submodule revision check — guard against silent drift between the
-  // vendored submodule HEAD and the SHA mlx-c's FetchContent expects. The
-  // sentinel-file preflight above only proves the source tree exists; with
-  // FETCHCONTENT_SOURCE_DIR_* below, cmake never enforces GIT_TAG, so a
-  // stale/manually-checked-out submodule would build the wrong version.
-  // Best-effort: skipped (returns Ok) for packaged-crate consumers without
-  // git metadata, or if `git` itself is unavailable.
+  // Submodule revision check — verify each vendored submodule is at the
+  // pinned commit recorded in EXPECTED_*_REV. The sentinel-file preflight
+  // above only proves the source tree exists; with FETCHCONTENT_SOURCE_DIR_*
+  // below, cmake never enforces GIT_TAG, so a stale checkout (e.g. forgot
+  // `git submodule update` after a rebase) would otherwise silently build
+  // against the wrong upstream. See `check_submodule_rev` doc for the
+  // trust boundary (same level as `~/.cargo/registry/`: we trust the user
+  // to not tamper with their own vendored sources).
   check_submodule_rev(&mlx_root, EXPECTED_MLX_REV, "mlx").unwrap_or_else(|msg| panic!("{msg}"));
   check_submodule_rev(&gguflib_root, EXPECTED_GGUFLIB_REV, "gguflib")
     .unwrap_or_else(|msg| panic!("{msg}"));
@@ -234,22 +236,44 @@ fn main() {
   // frameworks.
 }
 
-/// Verify a vendored submodule's HEAD matches the expected commit SHA.
+/// Verify the vendored submodule is checked out at the pinned upstream
+/// revision recorded in [`EXPECTED_MLX_REV`] / [`EXPECTED_GGUFLIB_REV`].
 ///
-/// `FETCHCONTENT_SOURCE_DIR_*` bypasses cmake's GIT_TAG enforcement, so a
-/// drifted submodule (manual `git checkout`, or a missed lockstep update
-/// when mlx-c bumps its FetchContent pin) would silently build the wrong
-/// version. This check closes that hole.
+/// # Trust boundary
 ///
-/// Best-effort semantics — returns `Ok(())` if:
-///   * The submodule path has no `.git` (packaged-crate / tarball case
-///     where git metadata is stripped — the sentinel-file preflight +
-///     pinned `Cargo.toml` version are the trust anchor instead).
-///   * `git rev-parse` itself fails (no `git` on PATH, etc.) — we don't
-///     want to brick the build over a missing tool.
+/// This check confirms the submodule is INITIALIZED and at the expected
+/// COMMIT. It does NOT verify the working-tree contents are byte-identical
+/// to that commit. A developer with write access to the vendored worktree
+/// can locally modify or replace tracked files; this check will pass if
+/// `HEAD` still points to the pinned commit.
 ///
-/// Returns `Err(msg)` with an actionable remediation message if `git`
-/// reports a different SHA than expected.
+/// The trust model is the same as for files under `~/.cargo/registry/`:
+/// we trust the user to not tamper with their own vendored sources. If
+/// the user accidentally drifts (e.g. forgot to run `git submodule update`
+/// after a rebase), the HEAD-mismatch check catches that. If the user
+/// actively tampers, that is outside this build script's threat model.
+///
+/// Callers needing stricter integrity should:
+/// 1. Build from a clean checkout (`git clone` + `git submodule update --init --recursive`)
+/// 2. Or use cargo's vendored-sources mechanism with checksum verification
+///
+/// # Errors
+///
+/// Returns `Err` if:
+/// - The submodule directory exists with `.git` metadata BUT `git rev-parse HEAD`
+///   reports a different commit than expected. Remediation: run
+///   `git submodule update --init --recursive` from the parent repo.
+/// - The git command starts but reports non-zero exit (broken metadata,
+///   safety rejection, etc.). Remediation: re-initialize the submodule.
+///
+/// Returns `Ok(())` (intentional skip) if:
+/// - The submodule directory has no `.git` metadata. This happens when the
+///   crate is consumed as a packaged tarball (e.g. from crates.io) where the
+///   submodule was vendored as a plain directory. The packaging machinery is
+///   trusted to have captured the correct revision.
+/// - The `git` command cannot be executed (`Command::output()` returns Err).
+///   This typically means git is not on the PATH; we cannot verify, but we
+///   should not block the build for users who legitimately lack git.
 fn check_submodule_rev(
   submodule_path: &Path,
   expected: &str,
@@ -257,11 +281,9 @@ fn check_submodule_rev(
 ) -> Result<(), String> {
   // A live submodule checkout has either a `.git` directory (standalone
   // clone) or a `.git` file (gitlink form, typical when nested under a
-  // superproject). Either form means git can resolve HEAD here.
+  // superproject). Either form means git can resolve HEAD here. Absence
+  // is the packaged-tarball case — see docstring "Returns Ok" bullet 1.
   if !submodule_path.join(".git").exists() {
-    // Packaged-crate / tarball case — `cargo publish` strips .git but the
-    // EXPECTED_*_REV consts + pinned crate version on crates.io are the
-    // trust anchor. Skip without failing the build.
     return Ok(());
   }
 
@@ -270,16 +292,30 @@ fn check_submodule_rev(
     None => return Ok(()), // non-UTF-8 path; can't pass to git CLI, best-effort skip.
   };
 
-  let output = match std::process::Command::new("git")
+  let output = match Command::new("git")
     .args(["-C", path_str, "rev-parse", "HEAD"])
     .output()
   {
     Ok(o) => o,
-    Err(_) => return Ok(()), // git not available; best-effort skip.
+    Err(_) => return Ok(()), // git not on PATH; best-effort skip (process never launched).
   };
 
   if !output.status.success() {
-    return Ok(()); // git reported failure (maybe a partial checkout); best-effort skip.
+    // Process started but reported failure — broken gitfile, unreadable
+    // gitdir, safe-directory rejection, partial checkout, etc. Fail
+    // closed so drift protection isn't accidentally disabled by corrupt
+    // metadata (R2 hardening preserved through simplification).
+    return Err(format!(
+      "vendored submodule `{friendly_name}` at {} has git metadata but \
+       `git rev-parse HEAD` failed (exit {:?}, stderr: {}). Cannot verify \
+       pinned revision. Re-initialize the submodule:\n\
+       \tgit submodule deinit -f {}\n\
+       \tgit submodule update --init --recursive",
+      submodule_path.display(),
+      output.status.code(),
+      String::from_utf8_lossy(&output.stderr).trim_end(),
+      submodule_path.display(),
+    ));
   }
 
   let actual = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -301,6 +337,7 @@ fn check_submodule_rev(
       submodule_path.display(),
     ));
   }
+
   Ok(())
 }
 
