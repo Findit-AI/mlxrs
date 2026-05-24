@@ -108,8 +108,10 @@ pub enum RotateKind {
 /// # Preconditions
 ///
 /// - `dst.len() == src.len() == src_w * src_h * channels`.
+/// - `src_w * src_h * channels` does not overflow `usize` (panics
+///   explicitly via `checked_mul` rather than wrapping silently).
 ///
-/// Asserted **unconditionally** (release-too).
+/// All asserted **unconditionally** (release-too).
 #[inline]
 #[doc(hidden)]
 pub fn rotate_buf_u8_scalar(
@@ -120,7 +122,12 @@ pub fn rotate_buf_u8_scalar(
   channels: usize,
   rotation: RotateKind,
 ) {
-  let elements = src_w * src_h * channels;
+  let elements = src_w
+    .checked_mul(src_h)
+    .and_then(|wh| wh.checked_mul(channels))
+    .unwrap_or_else(|| {
+      panic!("rotate_buf_u8_scalar: dimensions {src_w}x{src_h}x{channels} overflow usize")
+    });
   assert_eq!(
     src.len(),
     elements,
@@ -179,7 +186,12 @@ unsafe fn rotate_buf_u8_channels4_neon(
   rotation: RotateKind,
 ) {
   let channels = 4usize;
-  let elements = src_w * src_h * channels;
+  let elements = src_w
+    .checked_mul(src_h)
+    .and_then(|wh| wh.checked_mul(channels))
+    .unwrap_or_else(|| {
+      panic!("rotate_buf_u8_channels4_neon: dimensions {src_w}x{src_h}x4 overflow usize")
+    });
   assert_eq!(
     src.len(),
     elements,
@@ -279,6 +291,20 @@ unsafe fn rotate_buf_u8_channels4_neon(
 ///
 /// - `src.len() == dst.len() == src_w * src_h * channels` — asserted
 ///   unconditionally.
+/// - `src_w * src_h * channels` does not overflow `usize` — checked
+///   via `checked_mul` BEFORE the size-equality assertions, so a
+///   wrapped product can never sneak past the size checks and let the
+///   unsafe NEON kernel compute offsets from unwrapped loop dims (the
+///   wired [`crate::vlm::image::rotate_buf`] caller already
+///   pre-checks, but this public entry is reachable directly).
+///
+/// # Panics
+///
+/// Panics explicitly (not silently wraps) on `src_w * src_h *
+/// channels` `usize` overflow — the only correct response when a
+/// caller has supplied dimensions that cannot fit a contiguous
+/// buffer, since silently wrapping would let an under-sized buffer
+/// satisfy the size-equality assertion and reach the unsafe kernel.
 ///
 /// # Correctness class
 ///
@@ -293,7 +319,18 @@ pub fn rotate_buf_u8(
   channels: usize,
   rotation: RotateKind,
 ) {
-  let elements = src_w * src_h * channels;
+  // Checked dimension math BEFORE the size-equality assertions:
+  // wrapping `src_w * src_h * channels` in release mode could
+  // otherwise produce a small `elements` that an under-sized
+  // `src` / `dst` would satisfy, letting the unsafe NEON kernel
+  // compute per-pixel offsets from unwrapped loop dims and issue
+  // out-of-bounds `vld1q_u8` / `write_unaligned` (UB).
+  let elements = src_w
+    .checked_mul(src_h)
+    .and_then(|wh| wh.checked_mul(channels))
+    .unwrap_or_else(|| {
+      panic!("simd::vlm::rotate_buf_u8: dimensions {src_w}x{src_h}x{channels} overflow usize")
+    });
   assert_eq!(
     src.len(),
     elements,
@@ -316,7 +353,8 @@ pub fn rotate_buf_u8(
   {
     if channels == 4 && crate::simd::is_neon_available() {
       // SAFETY: NEON gated; channels == 4 confirmed; size preconditions
-      // asserted above.
+      // asserted above; `elements` derived via `checked_mul` so per-
+      // pixel offsets cannot overflow into stale ranges.
       unsafe { rotate_buf_u8_channels4_neon(dst, src, src_w, src_h, rotation) };
       return;
     }
@@ -445,6 +483,27 @@ mod tests {
     let s = vec![0u8; 3]; // WRONG: should be 2*2*4 = 16
     let mut d = vec![0u8; 16];
     rotate_buf_u8(&mut d, &s, 2, 2, 4, RotateKind::Rotate90);
+  }
+
+  /// Wrap-arith defence: even though the wired `rotate_buf_u8_via_c5`
+  /// caller pre-checks `src_w * src_h * channels` via `checked_mul`,
+  /// the public dispatcher entry is reachable directly (e.g. via a
+  /// `pub use` from a future caller, or via the in-crate `unsafe`
+  /// neighbours that share the symbol). A wrapping multiply in
+  /// release mode would otherwise let a small `elements` value pass
+  /// the size-equality assertion and reach the unsafe NEON kernel —
+  /// where the per-pixel offset math (computed from the unwrapped
+  /// loop dims) would compute out-of-bounds offsets and trigger UB.
+  /// `checked_mul` must therefore land BEFORE the asserts.
+  #[test]
+  #[should_panic(expected = "overflow usize")]
+  fn rotate_buf_u8_panics_on_dimension_overflow() {
+    // src_w * src_h would already saturate (usize::MAX/2 + 1) * 2 → wrap.
+    // We give a small `src` + `dst` so allocation succeeds and the
+    // dimension overflow is the only failure mode.
+    let s = vec![0u8; 16];
+    let mut d = vec![0u8; 16];
+    rotate_buf_u8(&mut d, &s, usize::MAX / 2 + 1, 2, 4, RotateKind::Rotate90);
   }
 
   #[test]

@@ -312,10 +312,11 @@ pub fn get_mel_banks_kaldi(
     fft_bin_width,
     mel_low,
     mel_delta,
-  );
+  )?;
   // SAFETY: the C11 dispatcher's init contract guarantees every cell
   // of the `bank_len`-prefix of `spare` is initialized before
-  // returning; `bank_len <= bank.capacity()` per `try_reserve_exact`.
+  // returning `Ok(())`; `bank_len <= bank.capacity()` per
+  // `try_reserve_exact`.
   unsafe { bank.set_len(bank_len) };
 
   let bins = Array::from_slice::<f32>(&bank, &[num_bins_i32, num_fft_bins_i32])?;
@@ -370,15 +371,15 @@ fn build_kaldi_window(win_type: KaldiWindow, win_size: usize) -> Result<Array> {
     KaldiWindow::Hamming => crate::simd::audio::window::kaldi_window(
       crate::simd::audio::window::KaldiWindowKind::Hamming,
       win_size,
-    ),
+    )?,
     KaldiWindow::Hanning => crate::simd::audio::window::kaldi_window(
       crate::simd::audio::window::KaldiWindowKind::Hanning,
       win_size,
-    ),
+    )?,
     KaldiWindow::Rectangular => crate::simd::audio::window::kaldi_window(
       crate::simd::audio::window::KaldiWindowKind::Rectangular,
       win_size,
-    ),
+    )?,
     KaldiWindow::Povey => {
       // Povey: scalar loop, `(0.5 - 0.5 * cos(theta)).powf(0.85)`.
       let mut buf: Vec<f32> = Vec::new();

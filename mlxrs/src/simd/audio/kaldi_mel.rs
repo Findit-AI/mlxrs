@@ -94,6 +94,8 @@ use core::arch::aarch64::{
   vdupq_n_f32, vld1q_f32, vmaxq_f32, vminq_f32, vmulq_f32, vst1q_f32, vsubq_f32,
 };
 
+use crate::error::{Error, Result};
+
 /// Kaldi `mel_scale_kaldi(hz) = 1127 * ln(1 + hz / 700)` (mirrors
 /// `crate::audio::features::mel_scale_kaldi` — kept local so this
 /// module is self-contained without a public re-export).
@@ -169,8 +171,15 @@ pub fn get_mel_banks_kaldi_scalar(
 /// pre-pass builds `mel_values[k] = mel_scale_kaldi(fft_bin_width *
 /// k)`; then per-row 4-lane NEON tile over `mel_values`.
 ///
-/// `mel_values` is heap-allocated once per call (length `num_fft_bins`),
-/// which matches the per-call lifetime of the caller's bank buffer.
+/// `mel_values` is heap-allocated once per call (length `num_fft_bins`)
+/// via fallible `try_reserve_exact` — matches the public
+/// [`get_mel_banks_kaldi_rows`] dispatcher's allocation discipline and
+/// the wider crate convention that request-scaled allocations surface
+/// as recoverable [`Error::OutOfMemory`] rather than aborting the
+/// process. Without this, an adversarial / fuzzer-supplied
+/// `num_fft_bins` could trigger an infallible `Vec::with_capacity`
+/// abort in the NEON path while the scalar fallback would have
+/// returned `Err`.
 ///
 /// # Safety
 ///
@@ -178,6 +187,11 @@ pub fn get_mel_banks_kaldi_scalar(
 ///    discharged by [`get_mel_banks_kaldi_rows`].
 /// 2. `out.len() == num_bins * num_fft_bins` — asserted
 ///    **unconditionally** here.
+///
+/// # Errors
+///
+/// - [`Error::OutOfMemory`] if reserving the `num_fft_bins`-length
+///   `mel_values` cache fails.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 #[target_feature(enable = "neon")]
@@ -188,7 +202,7 @@ unsafe fn get_mel_banks_kaldi_neon(
   fft_bin_width: f32,
   mel_low: f32,
   mel_delta: f32,
-) {
+) -> Result<()> {
   assert_eq!(
     out.len(),
     num_bins * num_fft_bins,
@@ -199,8 +213,15 @@ unsafe fn get_mel_banks_kaldi_neon(
     num_bins * num_fft_bins,
   );
 
-  // Stage 1: scalar pre-pass for `mel_values[k]`.
-  let mut mel_values: Vec<f32> = Vec::with_capacity(num_fft_bins);
+  // Stage 1: scalar pre-pass for `mel_values[k]`. Fallible allocation
+  // (`try_reserve_exact`) matches the public dispatcher's contract —
+  // the scalar arm of the wider `get_mel_banks_kaldi` path returns
+  // `Err(Error::OutOfMemory)` for oversized inputs; this NEON path
+  // would previously have aborted via `Vec::with_capacity`.
+  let mut mel_values: Vec<f32> = Vec::new();
+  mel_values
+    .try_reserve_exact(num_fft_bins)
+    .map_err(|_| Error::OutOfMemory)?;
   for k in 0..num_fft_bins {
     mel_values.push(mel_scale_kaldi(fft_bin_width * k as f32));
   }
@@ -281,6 +302,7 @@ unsafe fn get_mel_banks_kaldi_neon(
       }
     }
   }
+  Ok(())
 }
 
 /// Public dispatcher: build a `(num_bins, num_fft_bins)` Kaldi mel
@@ -297,7 +319,15 @@ unsafe fn get_mel_banks_kaldi_neon(
 /// # Initialization contract
 ///
 /// **Every f32 of `out` is written before this returns** (zero-width
-/// rows write 0.0; non-zero rows write the per-cell triangle value).
+/// rows write 0.0; non-zero rows write the per-cell triangle value)
+/// — provided this returns `Ok(())`. On `Err`, no init guarantee.
+///
+/// # Errors
+///
+/// - [`Error::OutOfMemory`] if the NEON arm's internal `mel_values`
+///   cache (length `num_fft_bins`) cannot be reserved. The scalar arm
+///   does not allocate, so it is infallible — wrapped in `Ok(())` for
+///   signature parity.
 ///
 /// # Correctness class
 ///
@@ -315,7 +345,7 @@ pub fn get_mel_banks_kaldi_rows(
   fft_bin_width: f32,
   mel_low: f32,
   mel_delta: f32,
-) {
+) -> Result<()> {
   assert_eq!(
     out.len(),
     num_bins * num_fft_bins,
@@ -331,18 +361,17 @@ pub fn get_mel_banks_kaldi_rows(
   {
     if crate::simd::is_neon_available() {
       // SAFETY: NEON gated; slice-length precondition asserted above;
-      // the kernel writes every cell of `out`.
+      // the kernel writes every cell of `out` on success.
       unsafe {
-        get_mel_banks_kaldi_neon(
+        return get_mel_banks_kaldi_neon(
           out,
           num_bins,
           num_fft_bins,
           fft_bin_width,
           mel_low,
           mel_delta,
-        )
-      };
-      return;
+        );
+      }
     }
   }
   get_mel_banks_kaldi_scalar(
@@ -353,6 +382,7 @@ pub fn get_mel_banks_kaldi_rows(
     mel_low,
     mel_delta,
   );
+  Ok(())
 }
 
 #[cfg(test)]
@@ -405,7 +435,8 @@ mod tests {
       w,
       mel_low,
       mel_delta,
-    );
+    )
+    .expect("realistic params should not OOM");
     // SAFETY: kernel contract initializes every slot.
     unsafe { out.set_len(num_bins * num_fft_bins) };
     out
@@ -465,7 +496,8 @@ mod tests {
       fft_bin_width,
       mel_low,
       mel_delta,
-    );
+    )
+    .expect("small collapsed-row params should not OOM");
     // SAFETY: kernel writes every slot.
     unsafe { out.set_len(num_bins * num_fft_bins) };
     for (i, &v) in out.iter().enumerate() {
@@ -480,6 +512,38 @@ mod tests {
   fn kaldi_mel_panics_on_size_mismatch() {
     let mut out: Vec<f32> = Vec::with_capacity(3); // WRONG
     let spare = out.spare_capacity_mut();
-    get_mel_banks_kaldi_rows(&mut spare[..3], 2, 4, 30.0, 100.0, 50.0);
+    // The pre-alloc size-equality assertion fires before any Result
+    // can be returned; the `let _ =` keeps the test's intent clear
+    // (we are asserting on the panic, not on the Result value).
+    let _ = get_mel_banks_kaldi_rows(&mut spare[..3], 2, 4, 30.0, 100.0, 50.0);
+  }
+
+  /// Structural assertion: the dispatcher returns `Result<()>` so the
+  /// NEON arm's request-scaled `mel_values` allocation can surface as
+  /// recoverable [`Error::OutOfMemory`] instead of an infallible
+  /// `Vec::with_capacity` abort. Without this signature shape the
+  /// NEON path could abort while the scalar-arm path returned `Err`
+  /// — an inconsistency that breaks the wider crate's
+  /// allocation-discipline convention.
+  ///
+  /// (We cannot deterministically synthesize a `num_fft_bins` that
+  /// OOMs on this host without overrunning the test process's address
+  /// space; the contract is enforced at the type level — the call
+  /// below MUST be a `Result` for the test to compile.)
+  #[test]
+  fn kaldi_mel_dispatcher_returns_result_for_fallible_allocation() {
+    let num_bins = 2usize;
+    let num_fft_bins = 4usize;
+    let mut out: Vec<f32> = Vec::with_capacity(num_bins * num_fft_bins);
+    let spare = out.spare_capacity_mut();
+    let r: Result<(), super::Error> = get_mel_banks_kaldi_rows(
+      &mut spare[..num_bins * num_fft_bins],
+      num_bins,
+      num_fft_bins,
+      30.0,
+      100.0,
+      50.0,
+    );
+    assert!(r.is_ok(), "small input should not OOM");
   }
 }

@@ -575,11 +575,13 @@ fn symmetric_window(
 
   // C12 SIMD: dispatch to the symmetric-window NEON kernel
   // (`simd::audio::window::symmetric_window`). The dispatcher does
-  // its own `Vec::with_capacity(n)` + `spare_capacity_mut` +
+  // its own fallible `try_reserve_exact(n)` + `spare_capacity_mut` +
   // `set_len(n)` internally; we feed the result straight into
   // `Array::from_slice`. The kernel's `n >= 2` precondition is
-  // already satisfied (asserted above).
-  let buf = crate::simd::audio::window::symmetric_window(kind, n);
+  // already satisfied (asserted above), and its only fallible step
+  // is the request-scaled output reservation — which surfaces here
+  // as `Error::OutOfMemory`.
+  let buf = crate::simd::audio::window::symmetric_window(kind, n)?;
   Array::from_slice::<f32>(&buf, &[n_i32])
 }
 

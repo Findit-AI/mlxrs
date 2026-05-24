@@ -83,6 +83,8 @@ use core::arch::aarch64::{
   vmulq_f32, vmulq_n_f32, vnegq_f32, vst1q_f32, vsubq_f32,
 };
 
+use crate::error::{Error, Result};
+
 /// The symmetric-window kinds the dispatcher handles. Mirrors
 /// [`crate::audio::dsp`]'s `hann_window` / `hamming_window` /
 /// `blackman_window` / `bartlett_window` triple. Each kind selects a
@@ -130,12 +132,22 @@ pub enum KaldiWindowKind {
 ///
 /// - `n >= 2` (asserted unconditionally; matches the caller's `n < 2`
 ///   error path which returns `Error::Backend` upstream).
+///
+/// # Errors
+///
+/// - [`Error::OutOfMemory`] if reserving the `n`-element output `Vec`
+///   fails. Uses fallible `try_reserve_exact` (matches the wider
+///   crate's request-scaled allocation discipline — the pre-SIMD
+///   `dsp::symmetric_window` and Povey arm already use fallible
+///   reservation; the new NEON dispatchers used to drop this via
+///   `Vec::with_capacity`).
 #[inline]
 #[doc(hidden)]
-pub fn symmetric_window_scalar(kind: SymWindowKind, n: usize) -> Vec<f32> {
+pub fn symmetric_window_scalar(kind: SymWindowKind, n: usize) -> Result<Vec<f32>> {
   assert!(n >= 2, "symmetric_window_scalar: n must be >= 2 (got {n})");
   let denom = (n - 1) as f32;
-  let mut out: Vec<f32> = Vec::with_capacity(n);
+  let mut out: Vec<f32> = Vec::new();
+  out.try_reserve_exact(n).map_err(|_| Error::OutOfMemory)?;
   match kind {
     SymWindowKind::Hann => {
       for k in 0..n {
@@ -161,7 +173,7 @@ pub fn symmetric_window_scalar(kind: SymWindowKind, n: usize) -> Vec<f32> {
       }
     }
   }
-  out
+  Ok(out)
 }
 
 /// Scalar reference: build a Kaldi window. Mirrors
@@ -171,12 +183,18 @@ pub fn symmetric_window_scalar(kind: SymWindowKind, n: usize) -> Vec<f32> {
 /// # Preconditions
 ///
 /// - `n >= 2`.
+///
+/// # Errors
+///
+/// - [`Error::OutOfMemory`] if reserving the `n`-element output `Vec`
+///   fails (same rationale as [`symmetric_window_scalar`]).
 #[inline]
 #[doc(hidden)]
-pub fn kaldi_window_scalar(kind: KaldiWindowKind, n: usize) -> Vec<f32> {
+pub fn kaldi_window_scalar(kind: KaldiWindowKind, n: usize) -> Result<Vec<f32>> {
   assert!(n >= 2, "kaldi_window_scalar: n must be >= 2 (got {n})");
   let denom = (n - 1) as f32;
-  let mut out: Vec<f32> = Vec::with_capacity(n);
+  let mut out: Vec<f32> = Vec::new();
+  out.try_reserve_exact(n).map_err(|_| Error::OutOfMemory)?;
   match kind {
     KaldiWindowKind::Hamming => {
       for k in 0..n {
@@ -194,7 +212,7 @@ pub fn kaldi_window_scalar(kind: KaldiWindowKind, n: usize) -> Vec<f32> {
       out.resize(n, 1.0);
     }
   }
-  out
+  Ok(out)
 }
 
 // ─── NEON cosine polynomial ───────────────────────────────────────────
@@ -333,10 +351,20 @@ unsafe fn theta_neon_4(k_base: u32, inv_denom_times_2pi: f32) -> float32x4_t {
 ///
 /// 1. NEON must be available.
 /// 2. `out.len() == n` and `n >= 2`.
+///
+/// # Errors
+///
+/// - [`Error::OutOfMemory`] from the Bartlett delegation / cos-tail
+///   scalar fallback when allocating a transient `Vec<f32>` for the
+///   tail samples (length `n`).
 #[cfg(target_arch = "aarch64")]
 #[inline]
 #[target_feature(enable = "neon")]
-unsafe fn symmetric_window_neon(kind: SymWindowKind, out: &mut [MaybeUninit<f32>], n: usize) {
+unsafe fn symmetric_window_neon(
+  kind: SymWindowKind,
+  out: &mut [MaybeUninit<f32>],
+  n: usize,
+) -> Result<()> {
   assert_eq!(
     out.len(),
     n,
@@ -350,11 +378,11 @@ unsafe fn symmetric_window_neon(kind: SymWindowKind, out: &mut [MaybeUninit<f32>
     // No cosine — pure linear ramp. SIMD pays off less here; just
     // delegate to scalar (the actual instruction count is ~3 ops/lane
     // which the auto-vectorizer covers cleanly).
-    let v = symmetric_window_scalar(kind, n);
+    let v = symmetric_window_scalar(kind, n)?;
     for (i, &x) in v.iter().enumerate() {
       out[i].write(x);
     }
-    return;
+    return Ok(());
   }
 
   let denom = (n - 1) as f32;
@@ -408,11 +436,12 @@ unsafe fn symmetric_window_neon(kind: SymWindowKind, out: &mut [MaybeUninit<f32>
 
   // Tail: `n % 4` samples — scalar.
   if body_len < n {
-    let tail = symmetric_window_scalar(kind, n);
+    let tail = symmetric_window_scalar(kind, n)?;
     for i in body_len..n {
       out[i].write(tail[i]);
     }
   }
+  Ok(())
 }
 
 /// NEON 4-lane Kaldi window builder (Hamming / Hanning / Rectangular
@@ -421,10 +450,19 @@ unsafe fn symmetric_window_neon(kind: SymWindowKind, out: &mut [MaybeUninit<f32>
 /// # Safety
 ///
 /// NEON must be available; `out.len() == n` and `n >= 2`.
+///
+/// # Errors
+///
+/// - [`Error::OutOfMemory`] from the cos-tail scalar fallback when
+///   allocating a transient `Vec<f32>` for the tail samples.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 #[target_feature(enable = "neon")]
-unsafe fn kaldi_window_neon(kind: KaldiWindowKind, out: &mut [MaybeUninit<f32>], n: usize) {
+unsafe fn kaldi_window_neon(
+  kind: KaldiWindowKind,
+  out: &mut [MaybeUninit<f32>],
+  n: usize,
+) -> Result<()> {
   assert_eq!(
     out.len(),
     n,
@@ -438,7 +476,7 @@ unsafe fn kaldi_window_neon(kind: KaldiWindowKind, out: &mut [MaybeUninit<f32>],
     for slot in out.iter_mut() {
       slot.write(1.0);
     }
-    return;
+    return Ok(());
   }
 
   let denom = (n - 1) as f32;
@@ -465,11 +503,12 @@ unsafe fn kaldi_window_neon(kind: KaldiWindowKind, out: &mut [MaybeUninit<f32>],
   }
 
   if body_len < n {
-    let tail = kaldi_window_scalar(kind, n);
+    let tail = kaldi_window_scalar(kind, n)?;
     for i in body_len..n {
       out[i].write(tail[i]);
     }
   }
+  Ok(())
 }
 
 /// Build a symmetric window of length `n` (`>= 2`). Routes to NEON on
@@ -479,11 +518,20 @@ unsafe fn kaldi_window_neon(kind: KaldiWindowKind, out: &mut [MaybeUninit<f32>],
 ///
 /// - `n >= 2` — asserted unconditionally.
 ///
+/// # Errors
+///
+/// - [`Error::OutOfMemory`] when reserving the `n`-element output
+///   `Vec` (or the cos-tail / Bartlett scalar-delegation `Vec`)
+///   fails. Uses fallible `try_reserve_exact` so an adversarial /
+///   fuzzer-supplied `n` (within the caller's `n < 2` guard but
+///   above the host's memory ceiling) surfaces as a recoverable
+///   error rather than aborting the process via `Vec::with_capacity`.
+///
 /// # Correctness class
 ///
 /// `Tolerance` (`abs = 1e-6, rel = 1e-6`) — polynomial cos
 /// approximation, ~3 ULP worst-case per cos eval.
-pub fn symmetric_window(kind: SymWindowKind, n: usize) -> Vec<f32> {
+pub fn symmetric_window(kind: SymWindowKind, n: usize) -> Result<Vec<f32>> {
   assert!(
     n >= 2,
     "simd::audio::window::symmetric_window: n must be >= 2 (got {n})"
@@ -492,15 +540,21 @@ pub fn symmetric_window(kind: SymWindowKind, n: usize) -> Vec<f32> {
   #[cfg(target_arch = "aarch64")]
   {
     if crate::simd::is_neon_available() {
-      let mut v: Vec<f32> = Vec::with_capacity(n);
+      // Fallible reservation: matches the wider crate's request-scaled
+      // allocation discipline. Without this, an oversized `n` aborts
+      // the process via `Vec::with_capacity`; the scalar arm's
+      // `try_reserve_exact` already returned `Err` in the same shape.
+      let mut v: Vec<f32> = Vec::new();
+      v.try_reserve_exact(n).map_err(|_| Error::OutOfMemory)?;
       let spare: &mut [MaybeUninit<f32>] = v.spare_capacity_mut();
-      // SAFETY: NEON gated; spare is sized exactly to `n`; the kernel
-      // initializes every slot (body + tail). cap was sized to `n`.
+      // SAFETY: NEON gated; spare is sized exactly to `n` after the
+      // fallible reservation above; the kernel initializes every slot
+      // (body + tail) on `Ok(())`.
       unsafe {
-        symmetric_window_neon(kind, &mut spare[..n], n);
+        symmetric_window_neon(kind, &mut spare[..n], n)?;
         v.set_len(n);
       }
-      return v;
+      return Ok(v);
     }
   }
   symmetric_window_scalar(kind, n)
@@ -513,10 +567,14 @@ pub fn symmetric_window(kind: SymWindowKind, n: usize) -> Vec<f32> {
 /// `crate::audio::features::build_kaldi_window` handles Povey
 /// directly).
 ///
+/// # Errors
+///
+/// - [`Error::OutOfMemory`] — same shape as [`symmetric_window`].
+///
 /// # Correctness class
 ///
 /// `Tolerance`.
-pub fn kaldi_window(kind: KaldiWindowKind, n: usize) -> Vec<f32> {
+pub fn kaldi_window(kind: KaldiWindowKind, n: usize) -> Result<Vec<f32>> {
   assert!(
     n >= 2,
     "simd::audio::window::kaldi_window: n must be >= 2 (got {n})"
@@ -525,15 +583,16 @@ pub fn kaldi_window(kind: KaldiWindowKind, n: usize) -> Vec<f32> {
   #[cfg(target_arch = "aarch64")]
   {
     if crate::simd::is_neon_available() {
-      let mut v: Vec<f32> = Vec::with_capacity(n);
+      let mut v: Vec<f32> = Vec::new();
+      v.try_reserve_exact(n).map_err(|_| Error::OutOfMemory)?;
       let spare: &mut [MaybeUninit<f32>] = v.spare_capacity_mut();
-      // SAFETY: NEON gated; spare sized to `n`; kernel initializes
-      // every slot.
+      // SAFETY: NEON gated; spare sized to `n` after the fallible
+      // reservation above; kernel initializes every slot on `Ok(())`.
       unsafe {
-        kaldi_window_neon(kind, &mut spare[..n], n);
+        kaldi_window_neon(kind, &mut spare[..n], n)?;
         v.set_len(n);
       }
-      return v;
+      return Ok(v);
     }
   }
   kaldi_window_scalar(kind, n)
@@ -560,6 +619,7 @@ mod tests {
         return Vec::new();
       }
       symmetric_window_scalar(kind, n)
+        .expect("test-sized window should not OOM")
         .into_iter()
         .map(|x| x as f64)
         .collect()
@@ -570,6 +630,7 @@ mod tests {
         return Vec::new();
       }
       symmetric_window(kind, n)
+        .expect("test-sized window should not OOM")
         .into_iter()
         .map(|x| x as f64)
         .collect()
@@ -587,6 +648,7 @@ mod tests {
         return Vec::new();
       }
       kaldi_window_scalar(kind, n)
+        .expect("test-sized window should not OOM")
         .into_iter()
         .map(|x| x as f64)
         .collect()
@@ -597,6 +659,7 @@ mod tests {
         return Vec::new();
       }
       kaldi_window(kind, n)
+        .expect("test-sized window should not OOM")
         .into_iter()
         .map(|x| x as f64)
         .collect()
@@ -653,8 +716,8 @@ mod tests {
   #[test]
   fn kaldi_window_rectangular_scalar_matches_dispatcher_exact() {
     // Rectangular is constant 1.0 — bit-exact match.
-    let s = kaldi_window_scalar(KaldiWindowKind::Rectangular, 17);
-    let d = kaldi_window(KaldiWindowKind::Rectangular, 17);
+    let s = kaldi_window_scalar(KaldiWindowKind::Rectangular, 17).expect("17 should not OOM");
+    let d = kaldi_window(KaldiWindowKind::Rectangular, 17).expect("17 should not OOM");
     assert_eq!(s, d);
     assert!(s.iter().all(|&x| x == 1.0));
   }
@@ -664,7 +727,7 @@ mod tests {
   #[test]
   fn symmetric_window_endpoint_pins() {
     let n = 17;
-    let hann = symmetric_window(SymWindowKind::Hann, n);
+    let hann = symmetric_window(SymWindowKind::Hann, n).expect("n=17 should not OOM");
     assert!(
       hann[0].abs() < 1e-5,
       "Hann start should be ~0 (got {})",
@@ -681,7 +744,7 @@ mod tests {
       hann[(n - 1) / 2]
     );
 
-    let ham = symmetric_window(SymWindowKind::Hamming, n);
+    let ham = symmetric_window(SymWindowKind::Hamming, n).expect("n=17 should not OOM");
     assert!(
       (ham[0] - 0.08).abs() < 1e-5,
       "Hamming start should be ~0.08 (got {})",
@@ -698,13 +761,48 @@ mod tests {
   #[test]
   fn window_length_pins() {
     for n in [2_usize, 3, 4, 8, 16, 17, 100, 1024] {
-      assert_eq!(symmetric_window(SymWindowKind::Hann, n).len(), n);
-      assert_eq!(symmetric_window(SymWindowKind::Hamming, n).len(), n);
-      assert_eq!(symmetric_window(SymWindowKind::Blackman, n).len(), n);
-      assert_eq!(symmetric_window(SymWindowKind::Bartlett, n).len(), n);
-      assert_eq!(kaldi_window(KaldiWindowKind::Hamming, n).len(), n);
-      assert_eq!(kaldi_window(KaldiWindowKind::Hanning, n).len(), n);
-      assert_eq!(kaldi_window(KaldiWindowKind::Rectangular, n).len(), n);
+      assert_eq!(
+        symmetric_window(SymWindowKind::Hann, n)
+          .expect("small n should not OOM")
+          .len(),
+        n
+      );
+      assert_eq!(
+        symmetric_window(SymWindowKind::Hamming, n)
+          .expect("small n should not OOM")
+          .len(),
+        n
+      );
+      assert_eq!(
+        symmetric_window(SymWindowKind::Blackman, n)
+          .expect("small n should not OOM")
+          .len(),
+        n
+      );
+      assert_eq!(
+        symmetric_window(SymWindowKind::Bartlett, n)
+          .expect("small n should not OOM")
+          .len(),
+        n
+      );
+      assert_eq!(
+        kaldi_window(KaldiWindowKind::Hamming, n)
+          .expect("small n should not OOM")
+          .len(),
+        n
+      );
+      assert_eq!(
+        kaldi_window(KaldiWindowKind::Hanning, n)
+          .expect("small n should not OOM")
+          .len(),
+        n
+      );
+      assert_eq!(
+        kaldi_window(KaldiWindowKind::Rectangular, n)
+          .expect("small n should not OOM")
+          .len(),
+        n
+      );
     }
   }
 
@@ -719,5 +817,52 @@ mod tests {
   #[should_panic(expected = "simd::audio::window::kaldi_window: n must be >= 2")]
   fn kaldi_window_panics_on_n_lt_2() {
     let _ = kaldi_window(KaldiWindowKind::Hamming, 1);
+  }
+
+  /// Wrap-arith / OOM defence: requesting a window with `n` equal to
+  /// `usize::MAX` must fail with [`Error::OutOfMemory`] (the
+  /// fallible `try_reserve_exact` rejects the request) rather than
+  /// abort the process via `Vec::with_capacity`.
+  ///
+  /// `usize::MAX` × 4 bytes (the per-element size of f32) is ~16 EiB
+  /// — far above any host allocator's ceiling. The scalar arm
+  /// fallible-allocates first, so we exercise both `symmetric_window`
+  /// and `kaldi_window` (which contain the NEON-path allocation +
+  /// the scalar tail allocation respectively).
+  #[test]
+  fn symmetric_window_returns_err_on_extreme_size() {
+    let r = symmetric_window(SymWindowKind::Hann, usize::MAX);
+    assert!(
+      matches!(r, Err(super::Error::OutOfMemory)),
+      "symmetric_window(Hann, usize::MAX) must return Err(OutOfMemory), got {r:?}"
+    );
+    // Cover Blackman + Bartlett arms too (each has its own
+    // allocation site — Blackman goes through the cos-tile body,
+    // Bartlett delegates to the scalar reference which itself
+    // try_reserve_exacts).
+    let r = symmetric_window(SymWindowKind::Blackman, usize::MAX);
+    assert!(matches!(r, Err(super::Error::OutOfMemory)));
+    let r = symmetric_window(SymWindowKind::Bartlett, usize::MAX);
+    assert!(matches!(r, Err(super::Error::OutOfMemory)));
+  }
+
+  /// Same as [`symmetric_window_returns_err_on_extreme_size`] but for
+  /// the Kaldi window dispatcher. Hamming + Hanning go through the
+  /// cos-tile path; Rectangular fills via `slot.write(1.0)` directly
+  /// from the spare capacity of the pre-allocated `Vec` (so the
+  /// `try_reserve_exact` is the gate).
+  #[test]
+  fn kaldi_window_returns_err_on_extreme_size() {
+    for kind in [
+      KaldiWindowKind::Hamming,
+      KaldiWindowKind::Hanning,
+      KaldiWindowKind::Rectangular,
+    ] {
+      let r = kaldi_window(kind, usize::MAX);
+      assert!(
+        matches!(r, Err(super::Error::OutOfMemory)),
+        "kaldi_window({kind:?}, usize::MAX) must return Err(OutOfMemory), got {r:?}"
+      );
+    }
   }
 }
