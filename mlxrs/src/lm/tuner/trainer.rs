@@ -280,7 +280,24 @@ pub fn default_loss<M: Model>(model: &M, batch: &Array, lengths: &Array) -> Resu
   let mask_f = mask.astype(Dtype::F32)?;
   let ce_masked = arithmetic::multiply(&ce, &mask_f)?;
   // ntoks = mask.sum() (int)
-  let ntoks = reduction::sum(&mask_f, false)?;
+  let mut ntoks = reduction::sum(&mask_f, false)?;
+  // Reject zero-supervised-token batches BEFORE the divide rather than
+  // producing NaN/Inf downstream (train accumulates `loss * ntoks` and
+  // evaluate divides by `total_tokens`; both would silently poison
+  // metrics if any batch contained only prompt-only / fully-truncated
+  // rows under the exclusive `<` upper bound). The check forces an eval
+  // on `ntoks` one division earlier than the caller's `.item::<f32>()`
+  // would; the trade-off is an explicit, actionable error vs a silent
+  // numerical fault.
+  let ntoks_count = ntoks.item::<f32>()?;
+  if ntoks_count == 0.0 {
+    return Err(Error::Backend {
+      message: "default_loss: batch produced 0 supervised tokens after applying the length mask. \
+                All examples in the batch are too short (prompt-only or fully truncated) or have \
+                length <= 1. Filter such examples upstream."
+        .into(),
+    });
+  }
   // loss = ce.astype(f32).sum() / ntoks
   let ce_sum = reduction::sum(&ce_masked.astype(Dtype::F32)?, false)?;
   let loss = arithmetic::divide(&ce_sum, &ntoks)?;
@@ -701,10 +718,16 @@ where
   let total_optim_steps = args.iters / args.grad_accumulation_steps;
   // Periodic-report window accumulators. `window_steps` is OPTIMIZER
   // STEPS in the current report window, `window_secs` is the cumulative
-  // wall-clock time across all microbatches that fed those steps.
+  // wall-clock time across all microbatches that fed those steps,
+  // `window_microbatches` is the per-microbatch count used to denominate
+  // the mean train loss (mirrors mlx-lm's per-microbatch loss semantic —
+  // dividing by `window_steps` instead would inflate the reported loss
+  // by `grad_accumulation_steps×` for every callback / log line / early-
+  // stop monitor).
   let mut window_loss = 0.0_f32;
   let mut window_tokens = 0.0_f32;
   let mut window_steps = 0usize;
+  let mut window_microbatches = 0usize;
   let mut window_secs = 0.0_f32;
   let mut trained_tokens = 0usize;
   // Gradient-accumulation state. `accumulated_grads` collects the SUM of
@@ -765,6 +788,7 @@ where
     accum_count += 1;
     window_loss += loss_f;
     window_tokens += ntoks_f;
+    window_microbatches += 1;
     trained_tokens += ntoks_f as usize;
     window_micro_secs += micro_start.elapsed().as_secs_f32();
     // Optimizer step fires only when the accumulation window is full.
@@ -790,8 +814,15 @@ where
     let is_last_optim_step = optim_step == total_optim_steps;
     // Periodic train-loss report (cadence in OPTIMIZER STEPS).
     if optim_step.is_multiple_of(args.steps_per_report) || is_last_optim_step {
-      let mean_loss = if window_steps > 0 {
-        window_loss / (window_steps as f32)
+      // Mean train loss is denominated by COMPLETED MICROBATCHES, not by
+      // optimizer-step count: `window_loss` aggregates one summand per
+      // microbatch (line ~767), so dividing by `window_steps` (=
+      // window_microbatches / grad_accumulation_steps) inflates the
+      // reported loss by `grad_accumulation_steps×`. See trainer module
+      // doc note + the F1 regression test
+      // `grad_accumulation_steps_4_reports_constant_loss_at_2_not_8`.
+      let mean_loss = if window_microbatches > 0 {
+        window_loss / (window_microbatches as f32)
       } else {
         0.0
       };
@@ -816,6 +847,7 @@ where
       window_loss = 0.0;
       window_tokens = 0.0;
       window_steps = 0;
+      window_microbatches = 0;
       window_secs = 0.0;
     }
     // Periodic mid-training eval (cadence in OPTIMIZER STEPS). Fires
@@ -1490,6 +1522,127 @@ mod tests {
       &mut cb,
     )?;
     assert_eq!(opt.apply_calls, 7);
+    Ok(())
+  }
+
+  // ─────────── F1-R2 — report-loss denominator parity with mlx-lm ───────────
+
+  /// Recording callback: captures `train_loss` from every
+  /// `on_train_loss_report` call. Used to prove the report denominator
+  /// matches the per-microbatch loss (mlx-lm parity) instead of the
+  /// optimizer-step count (which would inflate every reported loss by
+  /// `grad_accumulation_steps×`).
+  struct LossRecordingCallback {
+    losses: Vec<f32>,
+  }
+  impl TrainingCallback for LossRecordingCallback {
+    fn on_train_loss_report(&mut self, info: &TrainInfo) {
+      self.losses.push(info.train_loss);
+    }
+  }
+
+  #[test]
+  fn grad_accumulation_steps_4_reports_constant_loss_at_2_not_8() -> Result<()> {
+    // Regression for the R2 inflation bug: when each microbatch's loss is
+    // constant 2.0 and `grad_accumulation_steps = 4`, summing one term per
+    // microbatch into `window_loss` and then dividing by `window_steps`
+    // (which only increments per completed accumulation window) produced
+    // an 8.0 reported loss — every callback / log line / early-stop
+    // monitor saw the per-microbatch loss multiplied by 4×.
+    //
+    // After the fix, the denominator is the completed-microbatch count, so
+    // every report fires at the true per-microbatch loss 2.0.
+    let dataset = FakeDataset::new(4, 6);
+    let model = FakeModel;
+    let mut params: Weights = HashMap::new();
+    params.insert("w".into(), Array::full::<f32>(&[0i32; 0], 1.0)?);
+    let mut opt = CountingOptimizer {
+      apply_calls: 0,
+      step_count: 0,
+      lr: 0.0,
+    };
+    let mut cb = LossRecordingCallback { losses: Vec::new() };
+    // Constant-loss mock: returns (loss=2.0, ntoks=1.0) for every
+    // microbatch, regardless of inputs. Drives `window_loss` to grow by
+    // exactly +2.0 per microbatch so the inflation factor is unambiguous.
+    let const_loss_fn =
+      |_m: &FakeModel, _batch: &Array, _lengths: &Array| -> Result<(Array, Array)> {
+        let loss = Array::full::<f32>(&[0i32; 0], 2.0)?;
+        let ntoks = Array::full::<f32>(&[0i32; 0], 1.0)?;
+        Ok((loss, ntoks))
+      };
+    let args = TrainingArgs {
+      iters: 12,
+      grad_accumulation_steps: 4,
+      // 12 microbatches / 4 = 3 optimizer steps. steps_per_report=1 fires
+      // a report on EVERY optimizer step, so we get 3 callbacks
+      // (windows of 4 microbatches each, all with constant per-microbatch
+      // loss = 2.0).
+      steps_per_report: 1,
+      steps_per_eval: 100,
+      steps_per_save: 100,
+      batch_size: 4,
+      max_seq_length: 64,
+      val_batches: Some(1),
+      acknowledge_no_real_gradients: true,
+      ..TrainingArgs::default()
+    };
+    train(
+      &model,
+      &mut opt,
+      &mut params,
+      &dataset,
+      None,
+      &args,
+      const_loss_fn,
+      &mut cb,
+    )?;
+    assert_eq!(
+      cb.losses.len(),
+      3,
+      "iters=12 + grad_accumulation_steps=4 + steps_per_report=1 must fire 3 train-loss reports; got {}",
+      cb.losses.len(),
+    );
+    for (i, &loss) in cb.losses.iter().enumerate() {
+      assert!(
+        (loss - 2.0).abs() < 1e-6,
+        "report #{i} train_loss = {loss}, expected 2.0 (per-microbatch loss); pre-R2 bug \
+         reported 8.0 because `window_loss / window_steps` divided 4×constant-2.0 by 1 \
+         optimizer-step",
+      );
+    }
+    Ok(())
+  }
+
+  // ─────────── F2-R2 — default_loss rejects zero-supervised-token batches ───────────
+
+  #[test]
+  fn default_loss_rejects_zero_token_batch_after_mask() -> Result<()> {
+    // Construct a [B=2, S=2] batch where BOTH rows have lengths=(0, 1).
+    // - Shifted targets has T=S-1=1 position; arange runs over [1, 2).
+    // - Mask is `steps >= 0 && steps < 1` over step ∈ {1}: never true.
+    // After R1's exclusive `<` upper bound, mask.sum() == 0 → without the
+    // R2 zero-token guard, `ce_sum / ntoks` produced NaN/Inf and poisoned
+    // every downstream accumulator (`train`'s `window_loss`, `evaluate`'s
+    // `total_loss`) silently. The fix is to return an explicit `Backend`
+    // error before the divide so the caller filters the offending rows.
+    let model = FakeModel;
+    // Two rows, two tokens each; padding is fine since the mask zeros
+    // every position out anyway.
+    let batch = Array::from_slice::<i32>(&[0, 0, 0, 0], &(2, 2))?;
+    // Both rows: offset=0, length=1.
+    let lengths = Array::from_slice::<i32>(&[0, 1, 0, 1], &(2, 2))?;
+    let err = default_loss(&model, &batch, &lengths)
+      .expect_err("expected default_loss to reject zero-token batch");
+    match err {
+      Error::Backend { message } => {
+        assert!(
+          message.contains("0 supervised tokens"),
+          "expected message to mention '0 supervised tokens', got: {message}",
+        );
+      }
+      other => panic!("expected Error::Backend, got: {other:?}"),
+    }
     Ok(())
   }
 }
