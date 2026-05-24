@@ -6,27 +6,28 @@
 //! and `mlx.core.{value_and_grad,grad,vjp,jvp,custom_function,custom_vjp,
 //! checkpoint,eval,async_eval}` on the Python side.
 //!
-//! ## API surface (autograd + eval chunk)
+//! ## API surface (custom-VJP chunk)
 //!
 //! - [`crate::transforms::closure::Closure`] — RAII wrapper over
-//!   `mlx_closure` (foundation; landed in the previous chunk).
+//!   `mlx_closure` (foundation).
 //! - [`crate::transforms::autograd::value_and_grad`] /
-//!   [`crate::transforms::autograd::grad`] — return a Rust closure that, when
-//!   invoked on a slice of [`crate::Array`], runs the forward pass and
-//!   computes gradients with respect to a chosen subset of inputs.
-//! - [`crate::transforms::autograd::vjp`] /
-//!   [`crate::transforms::autograd::jvp`] — one-shot vector-Jacobian and
-//!   Jacobian-vector products over a user function evaluated at `primals`.
+//!   [`crate::transforms::autograd::grad`] / [`crate::transforms::autograd::vjp`]
+//!   / [`crate::transforms::autograd::jvp`] — autograd.
+//! - [`crate::transforms::custom::custom_vjp`] /
+//!   [`crate::transforms::custom::custom_function`] — wrap a forward function
+//!   with a user-defined backward (cotangent) function, overriding the
+//!   autograd-derived VJP.
 //! - [`crate::transforms::eval::eval`] /
-//!   [`crate::transforms::eval::async_eval`] — synchronously / asynchronously
-//!   materialize the lazy graph rooted at a batch of arrays.
+//!   [`crate::transforms::eval::async_eval`] — bulk eval / async-eval.
 //!
-//! Custom-VJP and checkpoint land in the subsequent chunks.
+//! Checkpoint lands in the next chunk.
 
 pub mod autograd;
 pub mod closure;
+pub mod custom;
 pub mod eval;
 
 pub use autograd::{grad, jvp, value_and_grad, vjp};
 pub use closure::Closure;
+pub use custom::{custom_function, custom_vjp};
 pub use eval::{async_eval, eval};
