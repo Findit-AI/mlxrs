@@ -162,3 +162,9 @@ required-features = ["audio"]
 name = "simd_rgb_widen"
 harness = false
 required-features = ["vlm"]
+
+# C1 PCM decode bench — gated on the `audio` feature.
+[[bench]]
+name = "simd_pcm_decode"
+harness = false
+required-features = ["audio"]

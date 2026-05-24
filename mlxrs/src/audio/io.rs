@@ -614,26 +614,82 @@ fn push_samples(buf: &GenericAudioBufferRef<'_>, out: &mut Vec<f32>, cap: usize)
       }
     }
     GenericAudioBufferRef::S16(b) => {
-      let divisor = int_divisor(16)?;
+      let _ = int_divisor(16)?; // validate the bits arm (for parity + error shape)
       reserve_under_cap(out, b.samples_interleaved(), cap)?;
-      for s in b.iter_interleaved() {
-        out.push(f32::from(s) / divisor);
-      }
+      // C1 SIMD widen — collect the symphonia interleaved iterator
+      // into a contiguous `Vec<i16>` once, then dispatch the NEON
+      // s16-to-f32 normalizer over it in one shot. This keeps the
+      // (1) cap discipline above and (2) the per-iteration sample
+      // count contract intact, but removes the per-sample push +
+      // divide loop.
+      //
+      // The materialization step (`buf_i16`) is bounded by
+      // `b.samples_interleaved()` (already cap-checked) and uses
+      // `try_reserve_exact` so an adversarial decoder cannot trigger
+      // an infallible abort here. The subsequent dispatcher writes
+      // into the pre-reserved spare capacity of `out` (the f32 sample
+      // buffer) — no second copy.
+      //
+      // Multi-channel interleaved layout is preserved: `iter_interleaved`
+      // yields samples in `[ch0_t0, ch1_t0, ..., ch0_t1, ch1_t1, ...]`
+      // order, exactly what the f32 output buffer is contracted to
+      // carry.
+      let n = b.samples_interleaved();
+      let mut buf_i16: Vec<i16> = Vec::new();
+      buf_i16
+        .try_reserve_exact(n)
+        .map_err(|_| Error::OutOfMemory)?;
+      buf_i16.extend(b.iter_interleaved());
+      let spare: &mut [core::mem::MaybeUninit<f32>] = out.spare_capacity_mut();
+      crate::simd::audio::pcm_decode::s16_to_f32_normalize(&mut spare[..n], &buf_i16);
+      // SAFETY: dispatcher's function-level contract initializes
+      // every f32 of `spare[..n]`; `out.len() + n <= cap` was
+      // guaranteed by `reserve_under_cap`; capacity for `n` more
+      // slots was reserved there too.
+      unsafe { out.set_len(out.len() + n) };
     }
     GenericAudioBufferRef::S24(b) => {
       // `i24.inner()` returns the `[-2^23, 2^23)` value as `i32`.
       let divisor = int_divisor(24)?;
       reserve_under_cap(out, b.samples_interleaved(), cap)?;
-      for s in b.iter_interleaved() {
-        out.push(s.inner() as f32 / divisor);
-      }
+      // C1 SIMD widen — collect the symphonia i24 iterator
+      // (`.inner()` → i32 in `[-2^23, 2^23)`) into a contiguous
+      // Vec<i32> once, then dispatch the NEON s32-to-f32 normalizer
+      // with the 24-bit divisor (`1.0 / 2^23`). Same shape as the
+      // S16 arm.
+      let n = b.samples_interleaved();
+      let mut buf_i32: Vec<i32> = Vec::new();
+      buf_i32
+        .try_reserve_exact(n)
+        .map_err(|_| Error::OutOfMemory)?;
+      buf_i32.extend(b.iter_interleaved().map(|s| s.inner()));
+      let inv_scale = 1.0_f32 / divisor;
+      let spare: &mut [core::mem::MaybeUninit<f32>] = out.spare_capacity_mut();
+      crate::simd::audio::pcm_decode::s32_to_f32_normalize(&mut spare[..n], &buf_i32, inv_scale);
+      // SAFETY: dispatcher's contract initializes every f32 in
+      // `spare[..n]`; cap + capacity discharged by
+      // `reserve_under_cap`.
+      unsafe { out.set_len(out.len() + n) };
     }
     GenericAudioBufferRef::S32(b) => {
       let divisor = int_divisor(32)?;
       reserve_under_cap(out, b.samples_interleaved(), cap)?;
-      for s in b.iter_interleaved() {
-        out.push(s as f32 / divisor);
-      }
+      // C1 SIMD widen — collect symphonia's i32 iterator into a
+      // contiguous Vec<i32>, then dispatch the NEON s32-to-f32
+      // normalizer with the 32-bit divisor (`1.0 / 2^31`).
+      let n = b.samples_interleaved();
+      let mut buf_i32: Vec<i32> = Vec::new();
+      buf_i32
+        .try_reserve_exact(n)
+        .map_err(|_| Error::OutOfMemory)?;
+      buf_i32.extend(b.iter_interleaved());
+      let inv_scale = 1.0_f32 / divisor;
+      let spare: &mut [core::mem::MaybeUninit<f32>] = out.spare_capacity_mut();
+      crate::simd::audio::pcm_decode::s32_to_f32_normalize(&mut spare[..n], &buf_i32, inv_scale);
+      // SAFETY: dispatcher's contract initializes every f32 in
+      // `spare[..n]`; cap + capacity discharged by
+      // `reserve_under_cap`.
+      unsafe { out.set_len(out.len() + n) };
     }
   }
   Ok(())
