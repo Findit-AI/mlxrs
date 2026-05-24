@@ -98,7 +98,7 @@ fn closure_constructor_failure_does_not_double_free_payload() {
     let captured = i as f32;
     let f = custom_vjp(
       move |xs| Ok(vec![square(&xs[0])?]),
-      move |primals, _outputs, _cot| {
+      move |primals, _cot, _outputs| {
         let dims = primals[0].shape();
         Ok(vec![Array::full::<f32>(&&dims[..], captured)?])
       },
@@ -320,7 +320,7 @@ fn jvp_matches_directional_derivative() {
 fn custom_vjp_overrides_autograd() {
   let f = custom_vjp(
     |xs| Ok(vec![square(&xs[0])?]),
-    |primals, _outputs, _cot| {
+    |primals, _cot, _outputs| {
       // Ignore the cotangent, return a constant 42 in primal-shape.
       let dims = primals[0].shape();
       Ok(vec![Array::full::<f32>(&&dims[..], 42.0)?])
