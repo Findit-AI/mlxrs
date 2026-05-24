@@ -18,6 +18,8 @@ fn main() {
   println!("cargo:rerun-if-changed=build.rs");
   println!("cargo:rerun-if-changed=wrapper.h");
   println!("cargo:rerun-if-changed=vendor/mlx-c");
+  println!("cargo:rerun-if-changed=vendor/mlx");
+  println!("cargo:rerun-if-changed=vendor/gguflib");
   println!("cargo:rerun-if-changed=shim/mlxrs_shim.cpp");
 
   // Target check — M1 is macOS arm64 only.
@@ -31,16 +33,49 @@ fn main() {
   }
 
   // Submodule check — fail fast if user forgot --recurse-submodules.
+  // Three submodules under vendor/: mlx-c (which we cmake-configure
+  // directly), and mlx + gguflib (which mlx-c's CMakeLists.txt and mlx's
+  // io/CMakeLists.txt would otherwise FetchContent over the network, but
+  // which we redirect to these local paths via FETCHCONTENT_SOURCE_DIR_*
+  // below for offline builds).
   let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-  let mlx_c_root = manifest_dir.join("vendor/mlx-c");
-  if !mlx_c_root.join("CMakeLists.txt").exists() {
-    panic!(
-      "vendor/mlx-c/CMakeLists.txt missing. Run:\n\
-             \tgit submodule update --init --recursive"
-    );
+  let vendor_dir = manifest_dir.join("vendor");
+  let mlx_c_root = vendor_dir.join("mlx-c");
+  let mlx_root = vendor_dir.join("mlx");
+  let gguflib_root = vendor_dir.join("gguflib");
+  for (name, root, sentinel) in [
+    ("mlx-c", &mlx_c_root, "CMakeLists.txt"),
+    ("mlx", &mlx_root, "CMakeLists.txt"),
+    ("gguflib", &gguflib_root, "gguflib.c"),
+  ] {
+    if !root.join(sentinel).exists() {
+      panic!(
+        "vendor/{name}/{sentinel} missing. Run:\n\
+               \tgit submodule update --init --recursive"
+      );
+    }
   }
 
   // CMake invocation. cmake-rs installs to ${dst}/lib/, ${dst}/include/.
+  //
+  // FETCHCONTENT_SOURCE_DIR_<uppercaseName> is cmake's standard override
+  // for FetchContent_Declare: when set, cmake skips the GIT_REPOSITORY
+  // clone for that dependency and uses the local path as the source dir,
+  // then proceeds to build it in-place exactly as if it had fetched it.
+  // We wire two:
+  //   * FETCHCONTENT_SOURCE_DIR_MLX  → redirects mlx-c/CMakeLists.txt's
+  //     `FetchContent_Declare(mlx GIT_REPOSITORY ... GIT_TAG v0.31.2)`.
+  //   * FETCHCONTENT_SOURCE_DIR_GGUFLIB → redirects mlx core's
+  //     mlx/io/CMakeLists.txt's `FetchContent_Declare(gguflib ... GIT_TAG
+  //     8fa6eb65236618e28fd7710a0fba565f7faa1848)` (active when
+  //     MLX_BUILD_GGUF is ON — its unconditional upstream default).
+  // The vendored submodule pins MUST match these GIT_TAG values. If a
+  // future mlx-c bump changes the mlx pin, or a future mlx bump changes
+  // the gguflib pin, the corresponding submodule under vendor/ must be
+  // updated in lockstep (`git submodule update --remote` followed by an
+  // explicit `git checkout <newtag>` inside the submodule).
+  // Ref: https://cmake.org/cmake/help/latest/module/FetchContent.html
+  //      #variable:FETCHCONTENT_SOURCE_DIR_%3CuppercaseName%3E
   let dst = cmake::Config::new(&mlx_c_root)
     .define("BUILD_SHARED_LIBS", "OFF")
     .define("MLX_C_BUILD_EXAMPLES", "OFF")
@@ -49,6 +84,16 @@ fn main() {
     .define("MLX_BUILD_PYTHON_BINDINGS", "OFF")
     .define("CMAKE_CXX_STANDARD", "20")
     .define("CMAKE_BUILD_TYPE", "Release")
+    .define(
+      "FETCHCONTENT_SOURCE_DIR_MLX",
+      mlx_root.to_str().expect("mlx vendor path is valid UTF-8"),
+    )
+    .define(
+      "FETCHCONTENT_SOURCE_DIR_GGUFLIB",
+      gguflib_root
+        .to_str()
+        .expect("gguflib vendor path is valid UTF-8"),
+    )
     .build();
 
   // mlx-c's CMakeLists only does install(TARGETS mlxc ...), so libmlxc.a
@@ -101,26 +146,32 @@ fn main() {
   });
 
   // First-party C++ shim for mlx::core APIs that mlx-c does not expose
-  // (currently just `clear_streams`). Compiled against the FetchContent'd
-  // mlx C++ headers and linked alongside libmlx. cc emits its own
+  // (currently just `clear_streams`). Compiled against the mlx C++ headers
+  // and linked alongside libmlx. cc emits its own
   // `cargo:rustc-link-lib=static=mlxrs_shim` + search-path directives HERE,
   // i.e. BEFORE the `static=mlx` directive below, so a single-pass linker
   // (GNU ld) resolves the shim's `mlx::core::clear_streams` reference into
   // libmlx. macOS ld64 is order-insensitive for archives but we keep the
   // correct order regardless.
-  let mlx_src = build_dir.join("_deps/mlx-src");
-  if !mlx_src.join("mlx/stream.h").exists() {
+  //
+  // Header source: `vendor/mlx/` directly. With FETCHCONTENT_SOURCE_DIR_MLX
+  // wired above, cmake does NOT clone into `_deps/mlx-src/` — it uses the
+  // vendored submodule path as the cmake source dir in-place. Pointing the
+  // shim include at the submodule source guarantees the shim sees the same
+  // tagged-v0.31.2 headers that libmlx.a was compiled from, byte-identical
+  // to what FetchContent would have cloned.
+  if !mlx_root.join("mlx/stream.h").exists() {
     panic!(
       "mlx C++ headers not found at {} (expected mlx/stream.h). The shim \
-             needs the FetchContent'd mlx-src tree.",
-      mlx_src.display()
+             needs the vendored mlx submodule.",
+      mlx_root.display()
     );
   }
   cc::Build::new()
     .cpp(true)
     .std("c++20")
     .file("shim/mlxrs_shim.cpp")
-    .include(&mlx_src)
+    .include(&mlx_root)
     .compile("mlxrs_shim");
 
   // Link declarations.
