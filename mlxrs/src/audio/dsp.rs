@@ -2515,27 +2515,31 @@ fn lfilter_f64(b: &[f64], a: &[f64], x: &[f64]) -> Result<Vec<f64>> {
   }
 
   // C9 / [#154]: biquad fast path — `state_len == 2`, `b.len() ==
-  // a.len() == 3` (the actual BS.1770 K-weighting workload).
-  // Benchmarks (M2 Pro, release, 2026-05-24, `simd_lfilter.rs`)
-  // measured a ~1.13× speedup over the generic loop at every benched
-  // size (1024 → 65536, including the 48 kHz × 1 s K-weighting
-  // fixture); the dispatcher is wired here. The hand-unrolled
-  // body produces bit-identical output for any 3-tap biquad
-  // (asserted by `biquad_bit_exact_vs_generic_*` tests in
-  // [`crate::simd::audio::lfilter`]).
-  if state_len == 2 && b_norm.len() == 3 && a_norm.len() == 3 {
-    // The biquad kernel is in-place; the out-of-place public wrapper
-    // needs `y` to be `n_samples` long before the kernel runs. The
-    // single-pass copy is dwarfed by the per-sample 4-mul / 4-add
-    // body (memcpy at ~50 GB/s, biquad at ~270 Melem/s = 2.16 GB/s
-    // for f64).
-    y.extend_from_slice(x);
-    crate::simd::audio::lfilter::lfilter_biquad(&mut y, &b_norm, &a_norm);
-    return Ok(y);
-  }
+  // a.len() == 3` — is NOT wired in this out-of-place path.
+  //
+  // The hand-unrolled biquad kernel in `simd::audio::lfilter` is
+  // in-place; routing the out-of-place wrapper through it required an
+  // extra `extend_from_slice(x)` full-buffer memcpy before the kernel
+  // ran. Out-of-place benches (M2 Pro, release, 2026-05-24,
+  // `simd_lfilter.rs` `lfilter_biquad_out_of_place/n=*` groups) showed
+  // the `extend + in_place_kernel` dispatch losing 1-3% to the
+  // single-pass `generic_out_of_place` reference at mid sizes
+  // (16k-65k samples — within run-to-run variance) AND only mixed
+  // wins elsewhere. The realistic-workload context here also matters:
+  // the public out-of-place `lfilter_f64` is NOT the K-weighting hot
+  // path — `integrated_loudness` calls `lfilter_f64_in_place` directly
+  // through `k_weight_channel`, so the in-place arm (wired below in
+  // `lfilter_f64_in_place`) IS the consumer that matters.
+  //
+  // Per the user directive 2026-05-24 ("KEEP wiring only if benchmark
+  // proves > scalar at the actually-wired paths; prefer revert when
+  // in doubt"), this arm is reverted. The single-pass generic loop
+  // below handles `state_len == 2` along with all other shapes.
 
   // General direct-form II transposed recurrence (matching the reference's
-  // per-sample loop body byte-for-byte) — for non-biquad / non-FIR shapes.
+  // per-sample loop body byte-for-byte) — for non-biquad / non-FIR shapes
+  // AND for `state_len == 2` (the biquad-dispatcher fast-path was tried
+  // and reverted; see comment above).
   let mut state: Vec<f64> = Vec::new();
   state
     .try_reserve_exact(state_len)
@@ -2674,14 +2678,47 @@ fn lfilter_f64_in_place(b: &[f64], a: &[f64], x: &mut [f64]) -> Result<()> {
   // a.len() == 3` (the actual BS.1770 K-weighting workload — the
   // chain through this kernel from [`k_weight_channel`] is the hot
   // path of [`integrated_loudness`]). Benchmarks (M2 Pro, release,
-  // 2026-05-24, `simd_lfilter.rs`, `lfilter_k_weight_chain` group)
-  // measured a ~1.13× speedup over the generic loop on the actual
-  // 1 s @ 48 kHz K-weighting chain (HS → HP): 239 Melem/s scalar
-  // generic vs 270 Melem/s biquad dispatcher. The hand-unrolled body
-  // is bit-identical to the generic loop for any 3-tap biquad (asserted
-  // by `biquad_bit_exact_vs_generic_*` tests in
-  // [`crate::simd::audio::lfilter`]); LUFS measurements through
-  // [`integrated_loudness`] remain byte-identical to pre-C9 output.
+  // authoritative re-run 2026-05-24, `simd_lfilter.rs`,
+  // `lfilter_k_weight_chain` group; criterion `--warm-up-time 1
+  // --measurement-time 2 --sample-size 30`, captured to
+  // `/tmp/c9-r2-bench-authoritative.txt`) measured a +30% to +53%
+  // speedup over the generic loop on the K-weighting HS → HP chain
+  // across all benched lengths on the current run:
+  //
+  // ```text
+  // n        generic         biquad_dispatch    dispatch vs generic
+  // 48000    160 Melem/s     245 Melem/s        +52.7%
+  // 192000   174 Melem/s     251 Melem/s        +44.4%
+  // 480000   185 Melem/s     242 Melem/s        +30.5%
+  // ```
+  //
+  // The single-stage `lfilter_biquad/n=*` lane sweep also shows
+  // dispatch at +44% to +62% over generic across 1024 → 480000
+  // samples (covering 4 s and 10 s @ 48 kHz — the realistic
+  // `k_weight_channel` consumer range, which receives FULL audio
+  // channels). The hand-unrolled body is bit-identical to the generic
+  // loop for any 3-tap biquad (asserted by `biquad_bit_exact_vs_generic_*`
+  // tests in [`crate::simd::audio::lfilter`]); LUFS measurements
+  // through [`integrated_loudness`] remain byte-identical to pre-C9
+  // output.
+  //
+  // CAVEAT: see `simd::audio::lfilter` module docs for cross-run
+  // baseline-stability caveats — generic baselines dropped ~21-35%
+  // between the prior `6728548` and current `feb477c` runs (in-place
+  // rows: 27.6% to 34.6%; K-weight rows: 20.9% to 31.9%). Dispatch
+  // values also drifted across runs (e.g. in-place dispatch at
+  // `n=1024` moved from 487 → 543 Melem/s, about +11.5%, and the
+  // K-weighting rows moved by roughly -3% to -5% per row) but
+  // dispatch consistently beat the generic baseline in BOTH runs
+  // at every benched length. The inflated current-run ratios above
+  // (+30% to +62%) are substantially driven by the depressed
+  // generic baseline rather than a newly-established dispatch
+  // improvement. The KEEP-WIRED ship decision is grounded on the
+  // CONSERVATIVE lower-bound win read from the prior run's own
+  // row-paired ratios (+3.0% to +4.7% on the in-place sweep,
+  // +8.1% to +9.4% on the K-weighting chain; SAME-RUN ratios from
+  // a single prior run, NOT a cross-run mixed envelope), not on
+  // the current run's inflated numbers.
   if state_len == 2 && b_norm.len() == 3 && a_norm.len() == 3 {
     crate::simd::audio::lfilter::lfilter_biquad(x, &b_norm, &a_norm);
     return Ok(());
