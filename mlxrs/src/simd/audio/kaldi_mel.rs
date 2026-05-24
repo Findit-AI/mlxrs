@@ -117,8 +117,18 @@ fn mel_scale_kaldi(hz: f32) -> f32 {
 /// # Preconditions
 ///
 /// - `out.len() == num_bins * num_fft_bins`.
+/// - `num_bins * num_fft_bins` does not overflow `usize` — checked
+///   explicitly via `checked_mul` rather than wrapping silently.
 ///
-/// Asserted **unconditionally** (release-too).
+/// All asserted **unconditionally** (release-too).
+///
+/// # Panics
+///
+/// Panics explicitly (not silently wraps) on `num_bins * num_fft_bins`
+/// `usize` overflow — the only correct response when caller dims
+/// cannot fit a contiguous buffer, since silently wrapping would let
+/// an under-sized buffer satisfy the size-equality assertion and reach
+/// the per-cell init loop.
 ///
 /// # Initialization contract
 ///
@@ -134,14 +144,17 @@ pub fn get_mel_banks_kaldi_scalar(
   mel_low: f32,
   mel_delta: f32,
 ) {
+  let elements = num_bins.checked_mul(num_fft_bins).unwrap_or_else(|| {
+    panic!("get_mel_banks_kaldi_scalar: dimensions {num_bins}x{num_fft_bins} overflow usize")
+  });
   assert_eq!(
     out.len(),
-    num_bins * num_fft_bins,
+    elements,
     "get_mel_banks_kaldi_scalar: out.len() ({}) must equal num_bins * num_fft_bins ({} * {} = {})",
     out.len(),
     num_bins,
     num_fft_bins,
-    num_bins * num_fft_bins,
+    elements,
   );
 
   for m in 0..num_bins {
@@ -187,6 +200,12 @@ pub fn get_mel_banks_kaldi_scalar(
 ///    discharged by [`get_mel_banks_kaldi_rows`].
 /// 2. `out.len() == num_bins * num_fft_bins` — asserted
 ///    **unconditionally** here.
+/// 3. `num_bins * num_fft_bins` does not overflow `usize` — checked
+///    via `checked_mul` BEFORE the size-equality assertion, so a
+///    wrapped product can never sneak past the size check and let the
+///    NEON kernel compute per-row offsets `m * num_fft_bins` from
+///    unwrapped loop dims (which would issue out-of-bounds
+///    `vst1q_f32` / `vld1q_f32`).
 ///
 /// # Errors
 ///
@@ -203,14 +222,17 @@ unsafe fn get_mel_banks_kaldi_neon(
   mel_low: f32,
   mel_delta: f32,
 ) -> Result<()> {
+  let elements = num_bins.checked_mul(num_fft_bins).unwrap_or_else(|| {
+    panic!("get_mel_banks_kaldi_neon: dimensions {num_bins}x{num_fft_bins} overflow usize")
+  });
   assert_eq!(
     out.len(),
-    num_bins * num_fft_bins,
+    elements,
     "get_mel_banks_kaldi_neon: out.len() ({}) must equal num_bins * num_fft_bins ({} * {} = {})",
     out.len(),
     num_bins,
     num_fft_bins,
-    num_bins * num_fft_bins,
+    elements,
   );
 
   // Stage 1: scalar pre-pass for `mel_values[k]`. Fallible allocation
@@ -315,6 +337,19 @@ unsafe fn get_mel_banks_kaldi_neon(
 /// # Preconditions
 ///
 /// - `out.len() == num_bins * num_fft_bins` — asserted unconditionally.
+/// - `num_bins * num_fft_bins` does not overflow `usize` — checked
+///   via `checked_mul` BEFORE the size-equality assertion, so a
+///   wrapped product can never sneak past the size check and let the
+///   inner kernels (scalar / NEON) compute per-row offsets from
+///   unwrapped loop dims (same defect class as C5 `rotate_buf_u8`).
+///
+/// # Panics
+///
+/// Panics explicitly (not silently wraps) on `num_bins * num_fft_bins`
+/// `usize` overflow. Signature stays infallible-with-panic on
+/// overflow (no `Result` lift) — the existing `Result<()>` only
+/// carries the NEON arm's `Error::OutOfMemory` for the `mel_values`
+/// cache.
 ///
 /// # Initialization contract
 ///
@@ -346,15 +381,25 @@ pub fn get_mel_banks_kaldi_rows(
   mel_low: f32,
   mel_delta: f32,
 ) -> Result<()> {
+  // Checked dimension math BEFORE the size-equality assertion: wrapping
+  // `num_bins * num_fft_bins` in release mode could otherwise produce a
+  // small `elements` that an under-sized `out` would satisfy, letting
+  // either inner kernel compute per-row offsets from unwrapped loop
+  // dims (same defect class as C5 `rotate_buf_u8`).
+  let elements = num_bins.checked_mul(num_fft_bins).unwrap_or_else(|| {
+    panic!(
+      "simd::audio::get_mel_banks_kaldi_rows: dimensions {num_bins}x{num_fft_bins} overflow usize"
+    )
+  });
   assert_eq!(
     out.len(),
-    num_bins * num_fft_bins,
+    elements,
     "simd::audio::get_mel_banks_kaldi_rows: out.len() ({}) must equal num_bins * num_fft_bins \
      ({} * {} = {})",
     out.len(),
     num_bins,
     num_fft_bins,
-    num_bins * num_fft_bins,
+    elements,
   );
 
   #[cfg(target_arch = "aarch64")]
@@ -545,5 +590,34 @@ mod tests {
       50.0,
     );
     assert!(r.is_ok(), "small input should not OOM");
+  }
+
+  /// Wrap-arith defence (same defect class as C5 `rotate_buf_u8`):
+  /// `num_bins * num_fft_bins` MUST be evaluated via `checked_mul` —
+  /// a wrapping multiply in release mode would otherwise let an
+  /// under-sized (here zero-length) `out` satisfy the size-equality
+  /// assertion (`out.len() == wrapped_elements`), reaching either
+  /// inner kernel where per-row offsets (`m * num_fft_bins`) would
+  /// then be computed from the unwrapped loop dims and produce
+  /// out-of-bounds NEON stores. The Codex-cited adversarial case:
+  /// `num_bins = usize::MAX / 4 + 1, num_fft_bins = 4` wraps the
+  /// product to `4` (one slot per bin would no longer be enough; the
+  /// wrapped value is in fact `0` on 64-bit hosts where the product
+  /// overflows the high bit).
+  ///
+  /// `checked_mul` is therefore the only correct gate; this test
+  /// pins the explicit panic message so a future refactor cannot
+  /// regress to a plain multiply.
+  #[test]
+  #[should_panic(expected = "overflow usize")]
+  fn kaldi_mel_panics_on_dimension_overflow() {
+    let num_bins = usize::MAX / 4 + 1;
+    let num_fft_bins = 4usize;
+    // `out.len() == 0` deliberately — if the wrapping multiply went
+    // unchecked it would produce a small `elements` that this
+    // zero-length slice could satisfy, letting the inner loop reach.
+    let mut out: Vec<f32> = Vec::new();
+    let spare = out.spare_capacity_mut();
+    let _ = get_mel_banks_kaldi_rows(spare, num_bins, num_fft_bins, 30.0, 100.0, 50.0);
   }
 }

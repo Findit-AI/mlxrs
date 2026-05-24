@@ -343,28 +343,44 @@ unsafe fn theta_neon_4(k_base: u32, inv_denom_times_2pi: f32) -> float32x4_t {
   }
 }
 
+/// Per-sample scalar formula for a symmetric window — used by the
+/// NEON arm's tail (`n % 4` samples, `≤ 3`) and the Bartlett path,
+/// neither of which need to allocate a transient `Vec<f32>` of length
+/// `n` since the cells are computed directly into `out` slot-by-slot.
+///
+/// `denom` is `(n - 1) as f32` (hoisted by the caller — single
+/// per-call division setup).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn symmetric_window_sample(kind: SymWindowKind, k: usize, denom: f32) -> f32 {
+  let theta = 2.0 * PI * (k as f32) / denom;
+  match kind {
+    SymWindowKind::Hann => 0.5 * (1.0 - theta.cos()),
+    SymWindowKind::Hamming => 0.54 - 0.46 * theta.cos(),
+    SymWindowKind::Blackman => 0.42 - 0.5 * theta.cos() + 0.08 * (2.0 * theta).cos(),
+    SymWindowKind::Bartlett => 1.0 - 2.0 * (k as f32 - denom / 2.0).abs() / denom,
+  }
+}
+
 /// NEON 4-lane symmetric window builder. Writes `out` (length `n`)
 /// with the window samples; takes the same kind enum as the
-/// dispatcher. Bartlett bypasses the cosine path.
+/// dispatcher. Bartlett bypasses the cosine path and writes its
+/// linear ramp directly into `out`.
 ///
 /// # Safety
 ///
 /// 1. NEON must be available.
 /// 2. `out.len() == n` and `n >= 2`.
 ///
-/// # Errors
-///
-/// - [`Error::OutOfMemory`] from the Bartlett delegation / cos-tail
-///   scalar fallback when allocating a transient `Vec<f32>` for the
-///   tail samples (length `n`).
+/// Infallible (returns `()`) — all writes target the caller-supplied
+/// `out` slice (the public dispatcher's pre-reserved `Vec<f32>` spare
+/// capacity). Codex R2 C12 removed the transient full-size `Vec<f32>`
+/// from both the Bartlett path and the cos-tile tail, so this inner
+/// fn no longer allocates.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 #[target_feature(enable = "neon")]
-unsafe fn symmetric_window_neon(
-  kind: SymWindowKind,
-  out: &mut [MaybeUninit<f32>],
-  n: usize,
-) -> Result<()> {
+unsafe fn symmetric_window_neon(kind: SymWindowKind, out: &mut [MaybeUninit<f32>], n: usize) {
   assert_eq!(
     out.len(),
     n,
@@ -374,18 +390,22 @@ unsafe fn symmetric_window_neon(
   );
   assert!(n >= 2, "symmetric_window_neon: n must be >= 2 (got {n})");
 
+  let denom = (n - 1) as f32;
+
   if matches!(kind, SymWindowKind::Bartlett) {
-    // No cosine — pure linear ramp. SIMD pays off less here; just
-    // delegate to scalar (the actual instruction count is ~3 ops/lane
-    // which the auto-vectorizer covers cleanly).
-    let v = symmetric_window_scalar(kind, n)?;
-    for (i, &x) in v.iter().enumerate() {
-      out[i].write(x);
+    // No cosine — pure linear ramp. Compute directly into `out` per
+    // sample (each cell is just `1 - 2*|k - (n-1)/2| / (n-1)`); the
+    // pre-fix path delegated to `symmetric_window_scalar` which
+    // allocated a transient full-size Vec<f32> in addition to the
+    // dispatcher's pre-reserved output — violating the intended
+    // pre-kernel allocation gate (Codex R2 C12). The auto-vectorizer
+    // covers the per-element ramp cleanly.
+    for (k, slot) in out.iter_mut().enumerate().take(n) {
+      slot.write(symmetric_window_sample(kind, k, denom));
     }
-    return Ok(());
+    return;
   }
 
-  let denom = (n - 1) as f32;
   let inv_denom_times_2pi = 2.0 * PI_F / denom;
   let body_len = n - (n % 4);
 
@@ -434,14 +454,29 @@ unsafe fn symmetric_window_neon(
     }
   }
 
-  // Tail: `n % 4` samples — scalar.
-  if body_len < n {
-    let tail = symmetric_window_scalar(kind, n)?;
-    for i in body_len..n {
-      out[i].write(tail[i]);
-    }
+  // Tail: at most 3 samples (`n % 4`). Compute each cell DIRECTLY
+  // into `out` via the per-sample scalar formula. Pre-fix path
+  // delegated to `symmetric_window_scalar(kind, n)` which allocated a
+  // transient full-size `Vec<f32>` of length `n` — could OOM for
+  // adversarial inputs that the one-buffer path would have succeeded
+  // on (Codex R2 C12). Per-sample computation: 0 allocation, max 3
+  // iterations.
+  for (k, slot) in out.iter_mut().enumerate().take(n).skip(body_len) {
+    slot.write(symmetric_window_sample(kind, k, denom));
   }
-  Ok(())
+}
+
+/// Per-sample scalar formula for a Kaldi window (cosine kinds only —
+/// `Rectangular` is special-cased before this is called).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn kaldi_window_sample(kind: KaldiWindowKind, k: usize, denom: f32) -> f32 {
+  let theta = 2.0 * PI * (k as f32) / denom;
+  match kind {
+    KaldiWindowKind::Hamming => 0.54 - 0.46 * theta.cos(),
+    KaldiWindowKind::Hanning => 0.5 - 0.5 * theta.cos(),
+    KaldiWindowKind::Rectangular => 1.0,
+  }
 }
 
 /// NEON 4-lane Kaldi window builder (Hamming / Hanning / Rectangular
@@ -451,18 +486,13 @@ unsafe fn symmetric_window_neon(
 ///
 /// NEON must be available; `out.len() == n` and `n >= 2`.
 ///
-/// # Errors
-///
-/// - [`Error::OutOfMemory`] from the cos-tail scalar fallback when
-///   allocating a transient `Vec<f32>` for the tail samples.
+/// Infallible (returns `()`) — all writes target the caller-supplied
+/// `out` slice; no internal allocation. Codex R2 C12 removed the
+/// transient full-size `Vec<f32>` from the cos-tile tail.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 #[target_feature(enable = "neon")]
-unsafe fn kaldi_window_neon(
-  kind: KaldiWindowKind,
-  out: &mut [MaybeUninit<f32>],
-  n: usize,
-) -> Result<()> {
+unsafe fn kaldi_window_neon(kind: KaldiWindowKind, out: &mut [MaybeUninit<f32>], n: usize) {
   assert_eq!(
     out.len(),
     n,
@@ -476,7 +506,7 @@ unsafe fn kaldi_window_neon(
     for slot in out.iter_mut() {
       slot.write(1.0);
     }
-    return Ok(());
+    return;
   }
 
   let denom = (n - 1) as f32;
@@ -502,13 +532,16 @@ unsafe fn kaldi_window_neon(
     }
   }
 
-  if body_len < n {
-    let tail = kaldi_window_scalar(kind, n)?;
-    for i in body_len..n {
-      out[i].write(tail[i]);
-    }
+  // Tail: at most 3 samples (`n % 4`). Compute each cell DIRECTLY
+  // into `out` via the per-sample scalar formula. Pre-fix path
+  // delegated to `kaldi_window_scalar(kind, n)` which allocated a
+  // transient full-size `Vec<f32>` of length `n` — could OOM for
+  // adversarial inputs that the one-buffer path would have succeeded
+  // on (Codex R2 C12). Per-sample computation: 0 allocation, max 3
+  // iterations.
+  for (k, slot) in out.iter_mut().enumerate().take(n).skip(body_len) {
+    slot.write(kaldi_window_sample(kind, k, denom));
   }
-  Ok(())
 }
 
 /// Build a symmetric window of length `n` (`>= 2`). Routes to NEON on
@@ -521,11 +554,14 @@ unsafe fn kaldi_window_neon(
 /// # Errors
 ///
 /// - [`Error::OutOfMemory`] when reserving the `n`-element output
-///   `Vec` (or the cos-tail / Bartlett scalar-delegation `Vec`)
-///   fails. Uses fallible `try_reserve_exact` so an adversarial /
-///   fuzzer-supplied `n` (within the caller's `n < 2` guard but
-///   above the host's memory ceiling) surfaces as a recoverable
-///   error rather than aborting the process via `Vec::with_capacity`.
+///   `Vec` fails. Uses fallible `try_reserve_exact` so an
+///   adversarial / fuzzer-supplied `n` (within the caller's `n < 2`
+///   guard but above the host's memory ceiling) surfaces as a
+///   recoverable error rather than aborting the process via
+///   `Vec::with_capacity`. The NEON inner fn does NOT allocate (the
+///   Bartlett path and the cos-tile tail both write directly into
+///   `out` slot-by-slot — Codex R2 C12 removed the pre-fix transient
+///   full-size `Vec<f32>`).
 ///
 /// # Correctness class
 ///
@@ -544,14 +580,17 @@ pub fn symmetric_window(kind: SymWindowKind, n: usize) -> Result<Vec<f32>> {
       // allocation discipline. Without this, an oversized `n` aborts
       // the process via `Vec::with_capacity`; the scalar arm's
       // `try_reserve_exact` already returned `Err` in the same shape.
+      // This is now the SOLE allocation site for the NEON path (Codex
+      // R2 C12 removed the inner fn's transient full-size `Vec<f32>`
+      // in the Bartlett + cos-tile-tail paths).
       let mut v: Vec<f32> = Vec::new();
       v.try_reserve_exact(n).map_err(|_| Error::OutOfMemory)?;
       let spare: &mut [MaybeUninit<f32>] = v.spare_capacity_mut();
       // SAFETY: NEON gated; spare is sized exactly to `n` after the
       // fallible reservation above; the kernel initializes every slot
-      // (body + tail) on `Ok(())`.
+      // (body + tail) before returning (the inner fn is infallible).
       unsafe {
-        symmetric_window_neon(kind, &mut spare[..n], n)?;
+        symmetric_window_neon(kind, &mut spare[..n], n);
         v.set_len(n);
       }
       return Ok(v);
@@ -583,13 +622,17 @@ pub fn kaldi_window(kind: KaldiWindowKind, n: usize) -> Result<Vec<f32>> {
   #[cfg(target_arch = "aarch64")]
   {
     if crate::simd::is_neon_available() {
+      // Single allocation site for the NEON path (Codex R2 C12
+      // removed the inner fn's transient full-size `Vec<f32>` in the
+      // cos-tile-tail path).
       let mut v: Vec<f32> = Vec::new();
       v.try_reserve_exact(n).map_err(|_| Error::OutOfMemory)?;
       let spare: &mut [MaybeUninit<f32>] = v.spare_capacity_mut();
       // SAFETY: NEON gated; spare sized to `n` after the fallible
-      // reservation above; kernel initializes every slot on `Ok(())`.
+      // reservation above; kernel initializes every slot before
+      // returning (the inner fn is infallible).
       unsafe {
-        kaldi_window_neon(kind, &mut spare[..n], n)?;
+        kaldi_window_neon(kind, &mut spare[..n], n);
         v.set_len(n);
       }
       return Ok(v);
@@ -825,10 +868,10 @@ mod tests {
   /// abort the process via `Vec::with_capacity`.
   ///
   /// `usize::MAX` × 4 bytes (the per-element size of f32) is ~16 EiB
-  /// — far above any host allocator's ceiling. The scalar arm
-  /// fallible-allocates first, so we exercise both `symmetric_window`
-  /// and `kaldi_window` (which contain the NEON-path allocation +
-  /// the scalar tail allocation respectively).
+  /// — far above any host allocator's ceiling. The dispatcher's
+  /// `try_reserve_exact(n)` is now the SOLE allocation site (Codex
+  /// R2 C12 removed the NEON arm's transient full-size `Vec<f32>`
+  /// in the Bartlett path + cos-tile tail).
   #[test]
   fn symmetric_window_returns_err_on_extreme_size() {
     let r = symmetric_window(SymWindowKind::Hann, usize::MAX);
@@ -836,10 +879,8 @@ mod tests {
       matches!(r, Err(super::Error::OutOfMemory)),
       "symmetric_window(Hann, usize::MAX) must return Err(OutOfMemory), got {r:?}"
     );
-    // Cover Blackman + Bartlett arms too (each has its own
-    // allocation site — Blackman goes through the cos-tile body,
-    // Bartlett delegates to the scalar reference which itself
-    // try_reserve_exacts).
+    // Cover Blackman + Bartlett arms too — the dispatcher's
+    // pre-kernel `try_reserve_exact(n)` is the gate for all kinds.
     let r = symmetric_window(SymWindowKind::Blackman, usize::MAX);
     assert!(matches!(r, Err(super::Error::OutOfMemory)));
     let r = symmetric_window(SymWindowKind::Bartlett, usize::MAX);
@@ -863,6 +904,106 @@ mod tests {
         matches!(r, Err(super::Error::OutOfMemory)),
         "kaldi_window({kind:?}, usize::MAX) must return Err(OutOfMemory), got {r:?}"
       );
+    }
+  }
+
+  /// Codex R2 C12 fix verification: NEON arm of `symmetric_window`
+  /// MUST write tail samples (`n % 4` ≤ 3) DIRECTLY into the
+  /// pre-reserved output, not through a transient
+  /// `symmetric_window_scalar(kind, n)` call that allocates a second
+  /// full-size `Vec<f32>` (which would violate the dispatcher's
+  /// pre-kernel allocation gate and could OOM for adversarial `n`
+  /// that the one-buffer path would have succeeded on).
+  ///
+  /// Structural assertion: we cannot deterministically synthesize a
+  /// host-specific allocation pressure that triggers the transient
+  /// OOM while the one-buffer path succeeds, but we CAN verify the
+  /// observable contract — for every `n` with a non-zero tail (`n %
+  /// 4 != 0`), the dispatcher output must match the scalar reference
+  /// element-by-element under the polynomial-cos tolerance. After
+  /// the refactor, this exercises the per-sample tail formula.
+  #[test]
+  fn symmetric_window_neon_does_not_double_allocate_on_non_multiple_of_4_tail() {
+    // n = 5 → body_len = 4, tail = 1 sample.
+    // n = 7 → body_len = 4, tail = 3 samples.
+    // n = 9 → body_len = 8, tail = 1 sample.
+    // n = 100 mod 4 == 0 → no tail (control case).
+    for n in [5_usize, 7, 9, 100] {
+      for kind in [
+        SymWindowKind::Hann,
+        SymWindowKind::Hamming,
+        SymWindowKind::Blackman,
+      ] {
+        let s = symmetric_window_scalar(kind, n).expect("test-sized window should not OOM");
+        let d = symmetric_window(kind, n).expect("test-sized window should not OOM");
+        assert_eq!(s.len(), n, "scalar length pin (kind={kind:?}, n={n})");
+        assert_eq!(d.len(), n, "dispatcher length pin (kind={kind:?}, n={n})");
+        for (i, (a, b)) in s.iter().zip(d.iter()).enumerate() {
+          let diff = (a - b).abs();
+          let tol = 1e-5_f32.max(1e-5_f32 * a.abs());
+          assert!(
+            diff <= tol,
+            "tail-handling mismatch at kind={kind:?} n={n} i={i}: \
+             scalar={a} dispatcher={b} diff={diff} tol={tol}"
+          );
+        }
+      }
+    }
+  }
+
+  /// Codex R2 C12 fix verification (Bartlett-specific): the NEON
+  /// arm's Bartlett path MUST write its linear ramp directly into
+  /// the pre-reserved output, NOT delegate to
+  /// `symmetric_window_scalar(SymWindowKind::Bartlett, n)` (which
+  /// allocates a transient full-size `Vec<f32>` and would violate
+  /// the dispatcher's pre-kernel allocation gate).
+  ///
+  /// Observable assertion: dispatcher matches scalar Bartlett
+  /// formula `1 - 2*|k - (n-1)/2| / (n-1)` exactly (no cos
+  /// approximation involved — Bartlett uses a closed-form linear
+  /// ramp on both paths).
+  #[test]
+  fn symmetric_window_bartlett_neon_writes_directly_to_out() {
+    for n in [5_usize, 7, 8, 9, 100, 1024] {
+      let s = symmetric_window_scalar(SymWindowKind::Bartlett, n)
+        .expect("test-sized Bartlett should not OOM");
+      let d =
+        symmetric_window(SymWindowKind::Bartlett, n).expect("test-sized Bartlett should not OOM");
+      assert_eq!(s.len(), n);
+      assert_eq!(d.len(), n);
+      // Bartlett has no cos approximation — must be bit-exact.
+      for (i, (a, b)) in s.iter().zip(d.iter()).enumerate() {
+        assert_eq!(
+          a, b,
+          "Bartlett scalar/dispatcher must match exactly at n={n} i={i}: \
+           scalar={a} dispatcher={b}"
+        );
+      }
+    }
+  }
+
+  /// Codex R2 C12 fix verification (Kaldi cos-kinds tail): mirrors
+  /// [`symmetric_window_neon_does_not_double_allocate_on_non_multiple_of_4_tail`]
+  /// for the Kaldi dispatcher. Hamming + Hanning go through the
+  /// cos-tile body + per-sample tail.
+  #[test]
+  fn kaldi_window_neon_does_not_double_allocate_on_non_multiple_of_4_tail() {
+    for n in [5_usize, 7, 9, 100] {
+      for kind in [KaldiWindowKind::Hamming, KaldiWindowKind::Hanning] {
+        let s = kaldi_window_scalar(kind, n).expect("test-sized kaldi window should not OOM");
+        let d = kaldi_window(kind, n).expect("test-sized kaldi window should not OOM");
+        assert_eq!(s.len(), n);
+        assert_eq!(d.len(), n);
+        for (i, (a, b)) in s.iter().zip(d.iter()).enumerate() {
+          let diff = (a - b).abs();
+          let tol = 1e-5_f32.max(1e-5_f32 * a.abs());
+          assert!(
+            diff <= tol,
+            "tail-handling mismatch at kind={kind:?} n={n} i={i}: \
+             scalar={a} dispatcher={b} diff={diff} tol={tol}"
+          );
+        }
+      }
     }
   }
 }

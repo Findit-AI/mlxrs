@@ -100,10 +100,19 @@ use core::arch::aarch64::{
 ///
 /// - `out.len() == n_mels * n_freqs`.
 /// - `f_pts.len() == n_mels + 2`.
+/// - `n_mels * n_freqs` does not overflow `usize` — checked
+///   explicitly via `checked_mul` rather than wrapping silently.
 ///
-/// Both asserted **unconditionally** (release-too) because `out` is
+/// All asserted **unconditionally** (release-too) because `out` is
 /// `MaybeUninit<f32>` — a short-iteration would leave slots
 /// uninitialized and a caller `set_len` would expose them.
+///
+/// # Panics
+///
+/// Panics explicitly (not silently wraps) on `n_mels * n_freqs`
+/// `usize` overflow — same defect class as C5 `rotate_buf_u8`.
+/// Silently wrapping would let an under-sized `out` satisfy the
+/// size-equality assertion and reach the per-cell init loop.
 ///
 /// # Initialization contract
 ///
@@ -118,14 +127,17 @@ pub fn mel_filter_bank_rows_scalar(
   n_mels: usize,
 ) {
   let n_freqs = all_freqs.len();
+  let elements = n_mels.checked_mul(n_freqs).unwrap_or_else(|| {
+    panic!("mel_filter_bank_rows_scalar: dimensions {n_mels}x{n_freqs} overflow usize")
+  });
   assert_eq!(
     out.len(),
-    n_mels * n_freqs,
+    elements,
     "mel_filter_bank_rows_scalar: out.len() ({}) must equal n_mels * n_freqs ({} * {} = {})",
     out.len(),
     n_mels,
     n_freqs,
-    n_mels * n_freqs,
+    elements,
   );
   assert_eq!(
     f_pts.len(),
@@ -167,6 +179,12 @@ pub fn mel_filter_bank_rows_scalar(
 ///    discharged by [`mel_filter_bank_rows`].
 /// 2. `out.len() == n_mels * n_freqs` and `f_pts.len() == n_mels + 2`
 ///    — both asserted **unconditionally** here.
+/// 3. `n_mels * n_freqs` does not overflow `usize` — checked via
+///    `checked_mul` BEFORE the size-equality assertion, so a wrapped
+///    product can never sneak past the size check and let the NEON
+///    kernel compute per-row offsets `m * n_freqs` from unwrapped
+///    loop dims (which would issue out-of-bounds `vst1q_f32` /
+///    `vld1q_f32`).
 #[cfg(target_arch = "aarch64")]
 #[inline]
 #[target_feature(enable = "neon")]
@@ -177,14 +195,17 @@ unsafe fn mel_filter_bank_rows_neon(
   n_mels: usize,
 ) {
   let n_freqs = all_freqs.len();
+  let elements = n_mels.checked_mul(n_freqs).unwrap_or_else(|| {
+    panic!("mel_filter_bank_rows_neon: dimensions {n_mels}x{n_freqs} overflow usize")
+  });
   assert_eq!(
     out.len(),
-    n_mels * n_freqs,
+    elements,
     "mel_filter_bank_rows_neon: out.len() ({}) must equal n_mels * n_freqs ({} * {} = {})",
     out.len(),
     n_mels,
     n_freqs,
-    n_mels * n_freqs,
+    elements,
   );
   assert_eq!(
     f_pts.len(),
@@ -287,6 +308,18 @@ unsafe fn mel_filter_bank_rows_neon(
 ///
 /// - `out.len() == n_mels * all_freqs.len()` — asserted unconditionally.
 /// - `f_pts.len() == n_mels + 2` — asserted unconditionally.
+/// - `n_mels * all_freqs.len()` does not overflow `usize` — checked
+///   via `checked_mul` BEFORE the size-equality assertion (same
+///   defect class as C5 `rotate_buf_u8` and the sibling C11
+///   `get_mel_banks_kaldi_rows`).
+///
+/// # Panics
+///
+/// Panics explicitly (not silently wraps) on `n_mels * n_freqs`
+/// `usize` overflow — the only correct response when caller dims
+/// cannot fit a contiguous buffer, since silently wrapping would let
+/// an under-sized buffer satisfy the size-equality assertion and reach
+/// either inner kernel.
 ///
 /// # Initialization contract
 ///
@@ -307,14 +340,22 @@ pub fn mel_filter_bank_rows(
   n_mels: usize,
 ) {
   let n_freqs = all_freqs.len();
+  // Checked dimension math BEFORE the size-equality assertion: wrapping
+  // `n_mels * n_freqs` in release mode could otherwise produce a small
+  // `elements` that an under-sized `out` would satisfy, letting either
+  // inner kernel compute per-row offsets from unwrapped loop dims
+  // (same defect class as C5 `rotate_buf_u8`).
+  let elements = n_mels.checked_mul(n_freqs).unwrap_or_else(|| {
+    panic!("simd::audio::mel_filter_bank_rows: dimensions {n_mels}x{n_freqs} overflow usize")
+  });
   assert_eq!(
     out.len(),
-    n_mels * n_freqs,
+    elements,
     "simd::audio::mel_filter_bank_rows: out.len() ({}) must equal n_mels * n_freqs ({} * {} = {})",
     out.len(),
     n_mels,
     n_freqs,
-    n_mels * n_freqs,
+    elements,
   );
   assert_eq!(
     f_pts.len(),
@@ -463,5 +504,37 @@ mod tests {
     let mut out: Vec<f32> = Vec::with_capacity(6);
     let spare = out.spare_capacity_mut();
     mel_filter_bank_rows(&mut spare[..6], &all_freqs, &f_pts, 2);
+  }
+
+  /// Wrap-arith defence (same defect class as C5 `rotate_buf_u8` /
+  /// the sibling C11 `get_mel_banks_kaldi_rows`): `n_mels * n_freqs`
+  /// MUST be evaluated via `checked_mul`. A wrapping multiply in
+  /// release mode would otherwise let an under-sized (here
+  /// zero-length) `out` satisfy the size-equality assertion,
+  /// reaching either inner kernel where per-row offsets
+  /// (`m * n_freqs`) would then be computed from the unwrapped loop
+  /// dims and produce out-of-bounds NEON stores. Adversarial case:
+  /// `n_mels = usize::MAX / 4 + 1, n_freqs = 4` wraps the product.
+  ///
+  /// `f_pts` here is `vec![0.0; n_mels + 2]` only nominally — we
+  /// never reach the `f_pts.len()` assert because the `checked_mul`
+  /// panic fires first. (Allocating `n_mels + 2` f32s for an
+  /// adversarial `n_mels` is itself infeasible; we deliberately use
+  /// the unwrapped `n_mels` only as a plain `usize` argument and
+  /// skip building `f_pts` of the correct length — the
+  /// `checked_mul` overflow guard runs strictly before the
+  /// `f_pts.len()` assert in the new ordering.)
+  #[test]
+  #[should_panic(expected = "overflow usize")]
+  fn mel_filter_bank_panics_on_dimension_overflow() {
+    let n_mels = usize::MAX / 4 + 1;
+    let all_freqs = vec![0.0_f32; 4]; // n_freqs = 4 → n_mels * n_freqs overflows
+    // `f_pts` skipped — we never reach its assert because the
+    // `checked_mul` panic fires first (asserted by `#[should_panic]`'s
+    // message match).
+    let f_pts = vec![0.0_f32; 4];
+    let mut out: Vec<f32> = Vec::new();
+    let spare = out.spare_capacity_mut();
+    mel_filter_bank_rows(spare, &all_freqs, &f_pts, n_mels);
   }
 }
