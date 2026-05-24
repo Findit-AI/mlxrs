@@ -96,9 +96,20 @@ impl Closure {
     // unwinding before the `catch` clause returns a NULL closure to us.
     // Therefore the NULL-ctx return path below MUST NOT reclaim the box
     // ourselves — that would double-free / UAF.
-    let inner = unsafe {
-      mlxrs_sys::mlx_closure_new_func_payload(Some(trampoline), payload_ptr, Some(destroy_payload))
-    };
+    // In production we call mlx-c directly. In `cfg(test)` builds we route
+    // through a swappable function pointer (`test_seam::closure_new_fn`) so
+    // unit tests can inject a NULL-returning stub that exercises the
+    // `inner.ctx.is_null()` branch where the pre-fix F1 double-free lived —
+    // see the `tests::closure_new_returns_err_*` cases in this file. The
+    // `#[cfg(test)]` arm defaults to the same FFI symbol; test stubs satisfy
+    // the same ABI + ownership contract (see `test_seam` docs), so the
+    // unsafe contract is identical between the two arms.
+    // SAFETY: `trampoline` and `destroy_payload` have the exact extern "C"
+    // signatures mlx-c expects; `payload_ptr` is a freshly leaked
+    // `Box<BoxedFn>` whose ownership transfers to mlx-c's shared_ptr per
+    // the contract documented above. The `#[cfg(test)]` arm is functionally
+    // identical (defaults to the same FFI symbol).
+    let inner = unsafe { call_closure_new_ffi(payload_ptr) };
     if inner.ctx.is_null() {
       // mlx-c already owns `payload_ptr` via the
       // `std::shared_ptr<void>(payload, dtor)` it constructed at the top
@@ -142,6 +153,63 @@ impl Drop for Closure {
     unsafe {
       let _ = mlxrs_sys::mlx_closure_free(self.inner);
     }
+  }
+}
+
+// ──────────────────────── FFI call indirection ────────────────────────
+
+/// Invoke `mlx_closure_new_func_payload` (production) or the test-seam stub
+/// (`#[cfg(test)]`). Kept in a single helper so the safety annotation lives in
+/// exactly one place — see [`Closure::new`] and the `test_seam` docs for the
+/// ownership contract on `payload_ptr`.
+///
+/// # Safety
+/// Caller must ensure `payload_ptr` was produced by `Box::into_raw` on a
+/// `Box<BoxedFn>` and that ownership is hereby transferred to mlx-c's
+/// `shared_ptr<void>(payload, destroy_payload)`. The `#[cfg(test)]` arm
+/// routes through a swappable function pointer that defaults to the same
+/// FFI symbol; swapped-in stubs must satisfy the identical ABI + ownership
+/// contract.
+#[inline]
+unsafe fn call_closure_new_ffi(payload_ptr: *mut c_void) -> mlxrs_sys::mlx_closure {
+  #[cfg(not(test))]
+  // SAFETY: forwarded from caller; this is the production direct-FFI arm.
+  unsafe {
+    mlxrs_sys::mlx_closure_new_func_payload(Some(trampoline), payload_ptr, Some(destroy_payload))
+  }
+  #[cfg(test)]
+  // SAFETY: forwarded from caller; the seam defaults to the same FFI symbol.
+  unsafe {
+    (test_seam::closure_new_fn())(Some(trampoline), payload_ptr, Some(destroy_payload))
+  }
+}
+
+/// Invoke `mlx_closure_custom_new_func_payload` (production) or the test-seam
+/// stub (`#[cfg(test)]`). Same single-call-site rationale as
+/// [`call_closure_new_ffi`].
+///
+/// # Safety
+/// Caller must ensure `payload_ptr` was produced by `Box::into_raw` on a
+/// `Box<BoxedFn3>` and that ownership transfers to mlx-c's `shared_ptr`.
+#[inline]
+unsafe fn call_closure_custom_new_ffi(payload_ptr: *mut c_void) -> mlxrs_sys::mlx_closure_custom {
+  #[cfg(not(test))]
+  // SAFETY: forwarded from caller; production direct-FFI arm.
+  unsafe {
+    mlxrs_sys::mlx_closure_custom_new_func_payload(
+      Some(trampoline_custom),
+      payload_ptr,
+      Some(destroy_payload_3),
+    )
+  }
+  #[cfg(test)]
+  // SAFETY: forwarded from caller; seam defaults to the same FFI symbol.
+  unsafe {
+    (test_seam::closure_custom_new_fn())(
+      Some(trampoline_custom),
+      payload_ptr,
+      Some(destroy_payload_3),
+    )
   }
 }
 
@@ -413,13 +481,12 @@ where
   // destructor runs `destroy_payload_3(payload_ptr)` during unwinding
   // before the `catch` clause returns NULL. Therefore the NULL-ctx return
   // path below MUST NOT reclaim the box — that would double-free / UAF.
-  let inner = unsafe {
-    mlxrs_sys::mlx_closure_custom_new_func_payload(
-      Some(trampoline_custom),
-      payload_ptr,
-      Some(destroy_payload_3),
-    )
-  };
+  // Production: direct FFI; tests: route through the swappable seam so the
+  // NULL-ctx branch (which used to double-free in F1) is exercised
+  // deterministically by `tests::closure_custom_new_returns_err_*`.
+  // SAFETY: `payload_ptr` is a freshly leaked `Box<BoxedFn3>` whose
+  // ownership transfers to mlx-c per the contract documented above.
+  let inner = unsafe { call_closure_custom_new_ffi(payload_ptr) };
   if inner.ctx.is_null() {
     // mlx-c already owns `payload_ptr` via its `shared_ptr<void>`; the
     // shared_ptr destructor has run (or will run on the natural drop
@@ -497,4 +564,345 @@ extern "C" fn destroy_payload_3(payload: *mut c_void) {
     // SAFETY: payload is a Box<BoxedFn3> we created; reclaim ownership once.
     let _: Box<BoxedFn3> = unsafe { Box::from_raw(payload.cast::<BoxedFn3>()) };
   }));
+}
+
+// ─────────────────────────── test seam ───────────────────────────
+
+/// Test-only function-pointer indirection over the mlx-c closure constructors.
+///
+/// Production builds (`#[cfg(not(test))]`) call
+/// `mlxrs_sys::mlx_closure_*_new_func_payload` directly: zero indirection,
+/// zero overhead. The compiler eliminates this module entirely.
+///
+/// In `#[cfg(test)]` builds the constructor call in `Closure::new` /
+/// `closure_custom_new` routes through a [`std::sync::Mutex`]-protected
+/// function pointer here, defaulting to the real mlx-c symbol. The unit
+/// tests below swap in a deterministic stub that simulates mlx-c's
+/// shared_ptr-then-throw failure mode (invokes the destructor we registered,
+/// then returns NULL ctx) to exercise the `inner.ctx.is_null()` branch
+/// where the pre-fix F1 double-free lived. Without this seam the NULL-ctx
+/// branch is unreachable from Rust (we cannot inject OOM into mlx-c) and
+/// CI would be blind to a regression that re-introduced the reclaim.
+///
+/// Tests acquire the mutex via [`ScopedClosureCtor`] / [`ScopedCustomCtor`]
+/// for the duration of a single `Closure::new` / `closure_custom_new`
+/// call, restoring the real FFI symbol on drop (panic-safe). The mutex
+/// also serializes the seam-test cases — combined with `--test-threads=1`
+/// this is belt-and-suspenders against cross-test interference.
+#[cfg(test)]
+pub(crate) mod test_seam {
+  use std::sync::{Mutex, OnceLock};
+
+  use super::*;
+
+  /// Function-pointer type matching `mlx_closure_new_func_payload`'s ABI.
+  pub(crate) type ClosureNewFn = unsafe extern "C" fn(
+    fun: Option<
+      unsafe extern "C" fn(
+        *mut mlxrs_sys::mlx_vector_array,
+        mlxrs_sys::mlx_vector_array,
+        *mut c_void,
+      ) -> c_int,
+    >,
+    payload: *mut c_void,
+    dtor: Option<unsafe extern "C" fn(*mut c_void)>,
+  ) -> mlxrs_sys::mlx_closure;
+
+  /// Function-pointer type matching `mlx_closure_custom_new_func_payload`'s ABI.
+  pub(crate) type ClosureCustomNewFn = unsafe extern "C" fn(
+    fun: Option<
+      unsafe extern "C" fn(
+        *mut mlxrs_sys::mlx_vector_array,
+        mlxrs_sys::mlx_vector_array,
+        mlxrs_sys::mlx_vector_array,
+        mlxrs_sys::mlx_vector_array,
+        *mut c_void,
+      ) -> c_int,
+    >,
+    payload: *mut c_void,
+    dtor: Option<unsafe extern "C" fn(*mut c_void)>,
+  ) -> mlxrs_sys::mlx_closure_custom;
+
+  fn closure_new_slot() -> &'static Mutex<ClosureNewFn> {
+    static SLOT: OnceLock<Mutex<ClosureNewFn>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(mlxrs_sys::mlx_closure_new_func_payload))
+  }
+
+  fn closure_custom_new_slot() -> &'static Mutex<ClosureCustomNewFn> {
+    static SLOT: OnceLock<Mutex<ClosureCustomNewFn>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(mlxrs_sys::mlx_closure_custom_new_func_payload))
+  }
+
+  /// Read the currently-installed constructor (default: real mlx-c symbol).
+  pub(crate) fn closure_new_fn() -> ClosureNewFn {
+    *closure_new_slot()
+      .lock()
+      .expect("closure_new_slot poisoned")
+  }
+
+  /// Read the currently-installed custom-VJP constructor.
+  pub(crate) fn closure_custom_new_fn() -> ClosureCustomNewFn {
+    *closure_custom_new_slot()
+      .lock()
+      .expect("closure_custom_new_slot poisoned")
+  }
+
+  /// RAII guard: replace [`closure_new_fn`] with `stub` for the guard's
+  /// lifetime, restore the real FFI symbol on drop. Acquires the seam
+  /// mutex to serialize concurrent seam-test cases.
+  pub(crate) struct ScopedClosureCtor {
+    prev: ClosureNewFn,
+  }
+
+  impl ScopedClosureCtor {
+    pub(crate) fn install(stub: ClosureNewFn) -> Self {
+      let mut slot = closure_new_slot()
+        .lock()
+        .expect("closure_new_slot poisoned");
+      let prev = *slot;
+      *slot = stub;
+      Self { prev }
+    }
+  }
+
+  impl Drop for ScopedClosureCtor {
+    fn drop(&mut self) {
+      // Restore previous (real-FFI) symbol even if the test panicked.
+      let mut slot = closure_new_slot()
+        .lock()
+        .expect("closure_new_slot poisoned");
+      *slot = self.prev;
+    }
+  }
+
+  /// Mirror of [`ScopedClosureCtor`] for the custom-VJP constructor seam.
+  pub(crate) struct ScopedCustomCtor {
+    prev: ClosureCustomNewFn,
+  }
+
+  impl ScopedCustomCtor {
+    pub(crate) fn install(stub: ClosureCustomNewFn) -> Self {
+      let mut slot = closure_custom_new_slot()
+        .lock()
+        .expect("closure_custom_new_slot poisoned");
+      let prev = *slot;
+      *slot = stub;
+      Self { prev }
+    }
+  }
+
+  impl Drop for ScopedCustomCtor {
+    fn drop(&mut self) {
+      let mut slot = closure_custom_new_slot()
+        .lock()
+        .expect("closure_custom_new_slot poisoned");
+      *slot = self.prev;
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  //! Deterministic regression tests for F1 (NULL-ctx UAF) via the
+  //! [`test_seam`] function-pointer indirection.
+  //!
+  //! Pre-fix `Closure::new` and `closure_custom_new` reclaimed the payload
+  //! via `Box::from_raw(payload_ptr.cast())` when mlx-c returned a NULL
+  //! `ctx`. Per `mlx-c/mlx/c/closure.cpp` lines 70 / 471 mlx-c constructs a
+  //! `std::shared_ptr<void>(payload, dtor)` as the first statement of the
+  //! `try` block, so on any later throw the shared_ptr destructor has
+  //! already invoked the registered Rust destructor (`destroy_payload` /
+  //! `destroy_payload_3`) during stack unwinding — the Rust-side reclaim
+  //! was a double-free / UAF.
+  //!
+  //! We can't deterministically inject OOM into mlx-c, so the integration
+  //! tests in `tests/transforms.rs` only ever exercise the success path
+  //! where `inner.ctx` is non-null — meaning a regression that
+  //! re-introduced the reclaim would not surface in CI. These tests close
+  //! that gap by swapping in a stub constructor that simulates the
+  //! shared_ptr-then-throw failure mode: it invokes the registered
+  //! destructor (proving mlx-c-side ownership transfer happened) and
+  //! returns NULL `ctx`. A destructor-invocation counter then asserts that
+  //! Rust did NOT also reclaim the box (count stays at 1, not 2).
+
+  use std::sync::atomic::{AtomicUsize, Ordering};
+
+  use super::{
+    test_seam::{ClosureCustomNewFn, ClosureNewFn, ScopedClosureCtor, ScopedCustomCtor},
+    *,
+  };
+
+  // ────────────── Closure::new NULL-ctx regression test ──────────────
+
+  /// Per-test destructor-invocation counter for `destroy_payload`. The
+  /// stub reads + bumps it; the test asserts the final count.
+  static CLOSURE_DTOR_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+  /// Stub that simulates mlx-c's NULL-after-throw path for
+  /// `mlx_closure_new_func_payload`:
+  ///   1. Invoke the registered destructor on `payload` (mirroring the
+  ///      `shared_ptr<void>(payload, dtor)` destructor that runs during
+  ///      stack unwinding when the C++ ctor throws).
+  ///   2. Return an `mlx_closure` with NULL `ctx` (mirroring the value the
+  ///      `catch` clause returns to Rust).
+  ///
+  /// If `Closure::new` reclaims the payload via `Box::from_raw` on the
+  /// NULL-ctx branch (the pre-fix bug), that's a second drop on the same
+  /// pointer → ASAN double-free / UB. Post-fix it must NOT reclaim, so the
+  /// destructor count after the call stays at exactly 1.
+  unsafe extern "C" fn stub_closure_new_invokes_dtor_then_returns_null(
+    _fun: Option<
+      unsafe extern "C" fn(
+        *mut mlxrs_sys::mlx_vector_array,
+        mlxrs_sys::mlx_vector_array,
+        *mut c_void,
+      ) -> c_int,
+    >,
+    payload: *mut c_void,
+    dtor: Option<unsafe extern "C" fn(*mut c_void)>,
+  ) -> mlxrs_sys::mlx_closure {
+    CLOSURE_DTOR_CALLS.fetch_add(1, Ordering::SeqCst);
+    if let Some(d) = dtor {
+      // SAFETY: `d` is `destroy_payload` (our own `extern "C"` fn), called
+      // exactly once on the `payload` mlx-c received — same contract as
+      // the real mlx-c implementation when its `try` block throws after
+      // shared_ptr construction.
+      unsafe { d(payload) };
+    }
+    mlxrs_sys::mlx_closure {
+      ctx: ptr::null_mut(),
+    }
+  }
+
+  /// Stub that returns NULL `ctx` WITHOUT invoking the destructor: models
+  /// the "alternate path" referenced by the SAFETY comment in
+  /// `Closure::new` where mlx-c surfaces a NULL closure without ever
+  /// constructing the shared_ptr. Per the documented contract the Rust
+  /// wrapper accepts a tiny leak here over an undefined-behavior reclaim.
+  /// The test asserts NO destructor call AND no UB.
+  unsafe extern "C" fn stub_closure_new_returns_null_no_dtor(
+    _fun: Option<
+      unsafe extern "C" fn(
+        *mut mlxrs_sys::mlx_vector_array,
+        mlxrs_sys::mlx_vector_array,
+        *mut c_void,
+      ) -> c_int,
+    >,
+    _payload: *mut c_void,
+    _dtor: Option<unsafe extern "C" fn(*mut c_void)>,
+  ) -> mlxrs_sys::mlx_closure {
+    mlxrs_sys::mlx_closure {
+      ctx: ptr::null_mut(),
+    }
+  }
+
+  #[test]
+  fn closure_new_returns_err_without_double_free_when_ffi_returns_null_after_invoking_destructor() {
+    CLOSURE_DTOR_CALLS.store(0, Ordering::SeqCst);
+    let _guard =
+      ScopedClosureCtor::install(stub_closure_new_invokes_dtor_then_returns_null as ClosureNewFn);
+
+    // User closure body never runs (stub returns NULL before trampoline
+    // dispatch); we only need a `Fn(&[Array]) -> Result<Vec<Array>>` to
+    // satisfy the type bound. `Array` is `!Clone`, so return an empty Vec
+    // instead of cloning the input.
+    let result = Closure::new(|_xs: &[Array]| Ok(Vec::<Array>::new()));
+
+    assert!(
+      result.is_err(),
+      "Closure::new must surface Err when mlx-c returns NULL ctx"
+    );
+
+    // CRITICAL F1 regression assert: the stub invoked the destructor
+    // exactly ONCE; the production code must NOT have reclaimed the box
+    // a second time. Pre-fix this would have been 2 (double-free) and
+    // ASAN/Miri would also trigger; in release it's a silent UAF.
+    assert_eq!(
+      CLOSURE_DTOR_CALLS.load(Ordering::SeqCst),
+      1,
+      "F1 REGRESSION: pre-fix Box::from_raw on the NULL-ctx branch would \
+       have produced count=2 (double-free / UAF). Post-fix the destructor \
+       runs exactly once (stub-invoked); Rust must not reclaim."
+    );
+  }
+
+  #[test]
+  fn closure_new_returns_err_without_uaf_when_ffi_returns_null_without_invoking_destructor() {
+    // Reset shared counter (other test ran first or not — doesn't matter
+    // because this stub doesn't bump it; we just assert it stayed zero
+    // for THIS invocation by reading delta).
+    let baseline = CLOSURE_DTOR_CALLS.load(Ordering::SeqCst);
+    let _guard = ScopedClosureCtor::install(stub_closure_new_returns_null_no_dtor as ClosureNewFn);
+
+    // Same reasoning as above re: `Array: !Clone` and stub-never-dispatches.
+    let result = Closure::new(|_xs: &[Array]| Ok(Vec::<Array>::new()));
+
+    assert!(
+      result.is_err(),
+      "Closure::new must surface Err when mlx-c returns NULL ctx (no-dtor path)"
+    );
+    // No destructor calls in this path: the leak-over-UAF contract.
+    assert_eq!(
+      CLOSURE_DTOR_CALLS.load(Ordering::SeqCst),
+      baseline,
+      "stub did not invoke destructor; counter must not advance — and \
+       crucially Rust must not call Box::from_raw on a pointer mlx-c \
+       still owns (would be UAF on later mlx-c shared_ptr drop)."
+    );
+  }
+
+  // ─────── closure_custom_new NULL-ctx regression test ───────
+
+  /// Same counter discipline as [`CLOSURE_DTOR_CALLS`], for the
+  /// `BoxedFn3` payload (`destroy_payload_3`).
+  static CUSTOM_DTOR_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+  unsafe extern "C" fn stub_closure_custom_new_invokes_dtor_then_returns_null(
+    _fun: Option<
+      unsafe extern "C" fn(
+        *mut mlxrs_sys::mlx_vector_array,
+        mlxrs_sys::mlx_vector_array,
+        mlxrs_sys::mlx_vector_array,
+        mlxrs_sys::mlx_vector_array,
+        *mut c_void,
+      ) -> c_int,
+    >,
+    payload: *mut c_void,
+    dtor: Option<unsafe extern "C" fn(*mut c_void)>,
+  ) -> mlxrs_sys::mlx_closure_custom {
+    CUSTOM_DTOR_CALLS.fetch_add(1, Ordering::SeqCst);
+    if let Some(d) = dtor {
+      // SAFETY: `d` is `destroy_payload_3`, invoked exactly once on the
+      // `payload` mlx-c received.
+      unsafe { d(payload) };
+    }
+    mlxrs_sys::mlx_closure_custom {
+      ctx: ptr::null_mut(),
+    }
+  }
+
+  #[test]
+  fn closure_custom_new_returns_err_without_double_free_when_ffi_returns_null_after_invoking_destructor()
+   {
+    CUSTOM_DTOR_CALLS.store(0, Ordering::SeqCst);
+    let _guard = ScopedCustomCtor::install(
+      stub_closure_custom_new_invokes_dtor_then_returns_null as ClosureCustomNewFn,
+    );
+
+    let result = closure_custom_new(|_p: &[Array], _o: &[Array], _c: &[Array]| Ok(Vec::new()));
+
+    assert!(
+      result.is_err(),
+      "closure_custom_new must surface Err when mlx-c returns NULL ctx"
+    );
+
+    // F1 regression assert for the BoxedFn3 path.
+    assert_eq!(
+      CUSTOM_DTOR_CALLS.load(Ordering::SeqCst),
+      1,
+      "F1 REGRESSION (custom-VJP): pre-fix Box::from_raw on the NULL-ctx \
+       branch would have produced count=2 (double-free / UAF). Post-fix \
+       the destructor runs exactly once (stub-invoked); Rust must not reclaim."
+    );
+  }
 }
