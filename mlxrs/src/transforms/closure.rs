@@ -85,22 +85,34 @@ impl Closure {
 
     // SAFETY: `trampoline::<F>` and `destroy_payload` are both `extern "C"`
     // with the exact signatures mlx-c expects. `payload_ptr` is a freshly
-    // boxed `Box<BoxedFn>` whose lifetime is now owned by the C side until
-    // `destroy_payload` runs. No early returns can leak: this is the only
-    // fallible point and we manually reclaim the box on the error path below.
+    // boxed `Box<BoxedFn>` whose lifetime is transferred to mlx-c by this
+    // call: mlx-c IMMEDIATELY wraps it in `std::shared_ptr<void>(payload,
+    // dtor)` as the very first statement of its `try` block (see vendored
+    // `mlx-c/mlx/c/closure.cpp::mlx_closure_new_func_payload`, line 70).
+    // From that point on, the shared_ptr OWNS the payload — even if any
+    // later allocation inside the same `try` throws (e.g. the lambda
+    // capture or `mlx_closure_new_(cpp_closure)`), the shared_ptr's
+    // destructor runs `destroy_payload(payload_ptr)` as part of stack
+    // unwinding before the `catch` clause returns a NULL closure to us.
+    // Therefore the NULL-ctx return path below MUST NOT reclaim the box
+    // ourselves — that would double-free / UAF.
     let inner = unsafe {
       mlxrs_sys::mlx_closure_new_func_payload(Some(trampoline), payload_ptr, Some(destroy_payload))
     };
     if inner.ctx.is_null() {
-      // mlx-c never invoked our trampoline / destructor; reclaim the box
-      // ourselves before reporting the error.
-      // SAFETY: `payload_ptr` is exactly the pointer returned by
-      // `Box::into_raw` a few lines above and has not been observed by any
-      // other code (mlx-c bailed before storing it). Single ownership is
-      // restored to this `Box`, which is dropped immediately.
-      unsafe {
-        let _: Box<BoxedFn> = Box::from_raw(payload_ptr.cast());
-      }
+      // mlx-c already owns `payload_ptr` via the
+      // `std::shared_ptr<void>(payload, dtor)` it constructed at the top
+      // of its `try` block. If the C++ ctor threw post-shared_ptr-
+      // construction, the shared_ptr destructor has ALREADY released the
+      // payload via `destroy_payload`. Reclaiming with `Box::from_raw`
+      // here would be a double-free / UAF.
+      //
+      // We accept the (tiny) leak on the alternate path where mlx-c
+      // returns NULL without ever constructing the shared_ptr (i.e. the
+      // `mlx_closure_new_()` infallible sentinel constructor on the
+      // catch arm somehow surfaced NULL — not currently observed in any
+      // mlx-c codepath but a defensive consideration). Leak is strictly
+      // preferable to UAF.
       return Err(crate::error::take_last().unwrap_or(Error::Backend {
         message: "mlx_closure_new_func_payload returned NULL ctx".into(),
       }));
@@ -390,9 +402,17 @@ where
   ensure_handler_installed();
   let boxed: Box<BoxedFn3> = Box::new(Box::new(f));
   let payload_ptr: *mut c_void = Box::into_raw(boxed).cast();
-  // SAFETY: trampoline + destructor have correct signatures; payload is a
-  // freshly leaked `Box<BoxedFn3>` whose ownership is now with the C side
-  // until `destroy_payload_3` runs.
+  // SAFETY: trampoline + destructor have correct signatures. `payload_ptr` is
+  // a freshly leaked `Box<BoxedFn3>` whose lifetime is transferred to mlx-c
+  // by this call: mlx-c IMMEDIATELY wraps it in
+  // `std::shared_ptr<void>(payload, dtor)` as the first statement of its
+  // `try` block (see vendored
+  // `mlx-c/mlx/c/closure.cpp::mlx_closure_custom_new_func_payload`,
+  // line 471). From that point on the shared_ptr OWNS the payload — even
+  // if any later allocation inside the same `try` throws, the shared_ptr
+  // destructor runs `destroy_payload_3(payload_ptr)` during unwinding
+  // before the `catch` clause returns NULL. Therefore the NULL-ctx return
+  // path below MUST NOT reclaim the box — that would double-free / UAF.
   let inner = unsafe {
     mlxrs_sys::mlx_closure_custom_new_func_payload(
       Some(trampoline_custom),
@@ -401,10 +421,12 @@ where
     )
   };
   if inner.ctx.is_null() {
-    // SAFETY: reclaim the box mlx-c never observed (single-owner restore).
-    unsafe {
-      let _: Box<BoxedFn3> = Box::from_raw(payload_ptr.cast());
-    }
+    // mlx-c already owns `payload_ptr` via its `shared_ptr<void>`; the
+    // shared_ptr destructor has run (or will run on the natural drop
+    // path) and released the payload via `destroy_payload_3`. DO NOT
+    // reclaim manually — that would be a double-free / UAF. Same
+    // rationale as `Closure::new` above: accept a (tiny) leak on the
+    // unobserved-NULL path over a deterministic UAF.
     return Err(crate::error::take_last().unwrap_or(Error::Backend {
       message: "mlx_closure_custom_new_func_payload returned NULL ctx".into(),
     }));
