@@ -448,9 +448,21 @@ where
 /// direct path-based saves where the caller accepts the path semantics
 /// (creates / truncates the target).
 ///
-/// Returns an error if the underlying `File` write fails (surfaced
-/// through the captured `WriterState::err`) or if mlx-c raises (surfaced
-/// via the installed error handler).
+/// **Standalone-file overwrite semantics.** The function rewinds the
+/// supplied `File` to offset 0 and truncates it to length 0 before
+/// invoking mlx-c. This matches [`save_safetensors_view`] (which
+/// creates / truncates the target path), so a caller passing a
+/// prefilled `File` at a non-zero offset gets a clean safetensors at
+/// the start of the file rather than a prefix-corrupted payload, and
+/// a caller passing a `File` longer than the new payload gets the
+/// trailing bytes truncated rather than left as stale tail data. The
+/// rewind + truncate are no-ops for the in-tree atomic-save callers
+/// (which pass freshly-`O_EXCL`-created empty files), so there is no
+/// observable behavior change for those paths.
+///
+/// Returns an error if the rewind / truncate fails, if the underlying
+/// `File` write fails (surfaced through the captured `WriterState::err`),
+/// or if mlx-c raises (surfaced via the installed error handler).
 pub fn save_safetensors_to_file<'a, I>(
   file: &mut File,
   arrays: I,
@@ -459,6 +471,20 @@ pub fn save_safetensors_to_file<'a, I>(
 where
   I: IntoIterator<Item = (&'a str, &'a Array)>,
 {
+  // R1-fix: ensure the file starts as a clean canvas — rewind to byte
+  // 0 and truncate. Without these, a prefilled `File` handed in at a
+  // non-zero cursor would receive a prefix-corrupted safetensors
+  // (mlx-c's `cb_write` writes at the current cursor), and a
+  // prefilled `File` longer than the new payload would retain stale
+  // trailing bytes after the new (shorter) safetensors. Both surfaces
+  // are propagated as `Error::Backend` with the same `save_safetensors_to_file:`
+  // prefix the rest of this function uses, so logs stay greppable.
+  file.seek(SeekFrom::Start(0)).map_err(|e| Error::Backend {
+    message: format!("save_safetensors_to_file: failed to rewind file to byte 0: {e}"),
+  })?;
+  file.set_len(0).map_err(|e| Error::Backend {
+    message: format!("save_safetensors_to_file: failed to truncate file: {e}"),
+  })?;
   let amap = build_array_map(arrays)?;
   let amap_guard = ArrayMapGuard(amap);
   let mmap = build_string_map(metadata)?;

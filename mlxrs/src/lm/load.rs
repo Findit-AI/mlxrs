@@ -4906,4 +4906,139 @@ mod save_tests {
 
     let _ = std::fs::remove_dir_all(&dir);
   }
+
+  /// **R1 standalone-file-semantics test (non-zero cursor case).** The
+  /// public `save_safetensors_to_file` is documented as the fd-bound
+  /// equivalent of [`crate::io::save_safetensors_view`] (which
+  /// creates / truncates the target). A caller may legitimately reuse a
+  /// `File` they pre-filled and seek to a non-zero offset; without the
+  /// internal rewind in `save_safetensors_to_file`, the safetensors
+  /// header would be written at the current cursor and the prefix
+  /// would be stale prefilled bytes — producing a corrupt file that
+  /// `load_safetensors` could not parse, while the writer returned
+  /// `Ok(())`. This test pre-fills the file with 100 bytes, seeks to
+  /// byte 50, drives the writer with a small array, and asserts the
+  /// reload succeeds + the on-disk size equals exactly the new
+  /// safetensors payload size (no leading 50 bytes of garbage, no
+  /// trailing 50 bytes of garbage).
+  #[test]
+  fn save_safetensors_to_file_truncates_prefilled_file_at_nonzero_offset() {
+    use std::io::{Seek, SeekFrom, Write as _};
+    let dir = fresh_dir("load1-fd-prefilled-nonzero");
+    let path = dir.join("prefilled_nonzero.safetensors");
+    // Pre-fill the file with 100 bytes of obviously-not-safetensors data,
+    // then seek to byte 50. The writer must reset to byte 0 + truncate
+    // before writing — otherwise the on-disk bytes would start with the
+    // first 50 prefill bytes and the safetensors payload would follow at
+    // offset 50, yielding an unparseable file.
+    let mut f = std::fs::OpenOptions::new()
+      .read(true)
+      .write(true)
+      .create(true)
+      .truncate(true)
+      .open(&path)
+      .unwrap();
+    f.write_all(&[0xAB_u8; 100]).unwrap();
+    f.seek(SeekFrom::Start(50)).unwrap();
+    let arr = Array::from_slice::<f32>(&[1.0_f32, 2.0, 3.0, 4.0], &(4usize,)).unwrap();
+    let mut meta: HashMap<String, String> = HashMap::new();
+    meta.insert("format".to_string(), "mlx".to_string());
+    crate::io::save_safetensors_to_file(&mut f, std::iter::once(("w", &arr)), &meta).unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    // The file must now parse as a clean safetensors with exactly the
+    // one array we wrote — no leading garbage from the prefill prefix.
+    let mut loaded = crate::io::load_safetensors(&path).unwrap();
+    assert_eq!(loaded.len(), 1, "expected exactly one tensor in the file");
+    let w = loaded.get_mut("w").unwrap().to_vec::<f32>().unwrap();
+    assert_eq!(w, vec![1.0, 2.0, 3.0, 4.0]);
+    // And the on-disk size must equal exactly the fresh safetensors
+    // payload size — written-via-`save_safetensors_view` to a control
+    // path with the same array + metadata. A retained prefill prefix
+    // or suffix would push the size past the control. We can't hard-
+    // code the byte count because mlx-c's JSON-header layout (key
+    // order, whitespace) is an implementation detail, but parity with
+    // the path-based writer is the contract this fix establishes.
+    let control_path = dir.join("control.safetensors");
+    let mut control_arrays: HashMap<String, &Array> = HashMap::new();
+    control_arrays.insert("w".to_string(), &arr);
+    crate::io::save_safetensors_view(
+      &control_path,
+      control_arrays.iter().map(|(k, &v)| (k.as_str(), v)),
+      &meta,
+    )
+    .unwrap();
+    let on_disk = std::fs::metadata(&path).unwrap().len();
+    let control_size = std::fs::metadata(&control_path).unwrap().len();
+    assert_eq!(
+      on_disk, control_size,
+      "fd-bound writer on a prefilled-at-offset-50 file must produce the same \
+       byte count as the path-based writer on a fresh file (proves rewind+truncate \
+       wiped the 100-byte prefill); fd={on_disk}, control={control_size}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// **R1 standalone-file-semantics test (longer-prefill case).** A
+  /// caller may hand `save_safetensors_to_file` a `File` they already
+  /// wrote a much larger blob into, seeked back to byte 0, intending to
+  /// overwrite it with a smaller payload. Without the internal
+  /// `set_len(0)` truncate, the new (shorter) safetensors would be
+  /// written at the head + the trailing portion of the old blob would
+  /// remain as stale tail bytes — the resulting file's prefix would
+  /// parse but its overall byte length would lie about the payload
+  /// size, and downstream tooling that mmaps / hashes / verifies the
+  /// whole file would see garbage past the safetensors EOF. Pre-fills
+  /// 10000 bytes, rewinds to 0, writes a small payload, asserts the
+  /// final file size matches a fresh small payload (well under 10000)
+  /// and reloads correctly.
+  #[test]
+  fn save_safetensors_to_file_truncates_prefilled_file_longer_than_new_payload() {
+    use std::io::{Seek, SeekFrom, Write as _};
+    let dir = fresh_dir("load1-fd-prefilled-longer");
+    let path = dir.join("prefilled_longer.safetensors");
+    let mut f = std::fs::OpenOptions::new()
+      .read(true)
+      .write(true)
+      .create(true)
+      .truncate(true)
+      .open(&path)
+      .unwrap();
+    // 10000 bytes of obviously-not-safetensors data, then rewind to 0.
+    f.write_all(&[0xCD_u8; 10000]).unwrap();
+    f.seek(SeekFrom::Start(0)).unwrap();
+    let arr = Array::from_slice::<f32>(&[7.0_f32, 8.0, 9.0], &(3usize,)).unwrap();
+    let mut meta: HashMap<String, String> = HashMap::new();
+    meta.insert("format".to_string(), "mlx".to_string());
+    crate::io::save_safetensors_to_file(&mut f, std::iter::once(("w", &arr)), &meta).unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    let mut loaded = crate::io::load_safetensors(&path).unwrap();
+    assert_eq!(loaded.len(), 1);
+    let w = loaded.get_mut("w").unwrap().to_vec::<f32>().unwrap();
+    assert_eq!(w, vec![7.0, 8.0, 9.0]);
+    // Final file size must equal exactly a fresh control write — any
+    // retained trailing prefill (the bytes past the new shorter
+    // payload) would push it past the control. The control is
+    // `save_safetensors_view` on a fresh path with the same single
+    // array + metadata.
+    let control_path = dir.join("control.safetensors");
+    let mut control_arrays: HashMap<String, &Array> = HashMap::new();
+    control_arrays.insert("w".to_string(), &arr);
+    crate::io::save_safetensors_view(
+      &control_path,
+      control_arrays.iter().map(|(k, &v)| (k.as_str(), v)),
+      &meta,
+    )
+    .unwrap();
+    let on_disk = std::fs::metadata(&path).unwrap().len();
+    let control_size = std::fs::metadata(&control_path).unwrap().len();
+    assert_eq!(
+      on_disk, control_size,
+      "fd-bound writer on a 10000-byte-prefilled file must produce the same byte \
+       count as the path-based writer on a fresh file (proves set_len(0) truncated \
+       trailing prefill); fd={on_disk}, control={control_size}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+  }
 }
