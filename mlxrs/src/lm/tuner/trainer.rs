@@ -153,7 +153,7 @@ pub struct TrainingArgs {
   /// ported). Default is `false` so a future production caller cannot
   /// accidentally run a long training job thinking the model is being
   /// updated. When `false`, [`train`] returns
-  /// [`Error::Backend`](crate::error::Error::Backend) pointing at this
+  /// [`Error::Backend`] pointing at this
   /// field; set to `true` to opt into the mechanics-only training path.
   ///
   /// **No Python parity:** this field is mlxrs-specific (Python's
@@ -789,7 +789,7 @@ where
     window_micro_secs = 0.0;
     let is_last_optim_step = optim_step == total_optim_steps;
     // Periodic train-loss report (cadence in OPTIMIZER STEPS).
-    if optim_step % args.steps_per_report == 0 || is_last_optim_step {
+    if optim_step.is_multiple_of(args.steps_per_report) || is_last_optim_step {
       let mean_loss = if window_steps > 0 {
         window_loss / (window_steps as f32)
       } else {
@@ -822,12 +822,12 @@ where
     // both on the regular cadence and at the final optimizer step (so
     // the caller always sees an end-of-training validation).
     if let Some(val) = val_dataset
-      && (optim_step % args.steps_per_eval == 0 || is_last_optim_step)
+      && (optim_step.is_multiple_of(args.steps_per_eval) || is_last_optim_step)
     {
       run_val(model, val, args, optim_step, callback, &loss_fn)?;
     }
     // Periodic save hook (cadence in OPTIMIZER STEPS).
-    if optim_step % args.steps_per_save == 0 {
+    if optim_step.is_multiple_of(args.steps_per_save) {
       callback.on_save(optim_step, &args.adapter_file)?;
     }
   }
