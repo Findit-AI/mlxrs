@@ -1,0 +1,131 @@
+# mlxrs 封装质量质检报告 — 最终汇总
+
+**日期:** 2026-05-27 ~ 2026-05-28
+**范围:** 140,654 行 Rust 代码，25 个审查单元，20 个 QCR
+**方法:** 每模块 4 专家团并行（忠实度/Rust质量/性能/对抗），逐行对比上游源码
+**上游:** mlx-lm (Python), mlx-vlm (Python), mlx-audio (Python), mlx-audio-swift (Swift), mlx-swift-lm (Swift), mlx-c (C)
+
+---
+
+## 总体评价
+
+**mlxrs 是一个工程质量极高的 Rust 封装项目。** 20 个 QCR 的 80 份独立审查报告中：
+
+- **0 个 CRITICAL 发现**
+- **1 个 HIGH 发现**（Display::fmt 潜在 UB）
+- **1 个 MODERATE 发现**（SentencePiece PieceType 丢失）
+- **5 个 LOW 发现**（API 验证、迁移债务）
+- **多个发现表明 mlxrs 比上游 Python/Swift 实现更好**
+
+---
+
+## HIGH 发现 (1)
+
+### H1. Display::fmt 缺少 NULL 检查（潜在 UB）
+**文件:** `array/conversion.rs:376`
+**问题:** `CStr::from_ptr(mlxrs_sys::mlx_string_data(s.0))` 未检查 NULL。如果 `mlx_string_data` 返回 NULL（mlx-c 错误路径），`CStr::from_ptr(NULL)` 是即时 UB。
+**修复:** 在 `CStr::from_ptr` 前添加 `if ptr.is_null() { return write!(f, "Array(<null>)"); }`
+
+---
+
+## MODERATE 发现 (1)
+
+### M1. SentencePiece `from_tokenizer_json` 丢失 PieceType
+**文件:** `tokenizer/sentencepiece.rs:789`
+**问题:** 从 tokenizer.json 加载时，所有 piece 被标记为 `Normal`，丢失 Byte/Control/UserDefined 类型信息。protobuf 路径（.model 文件）正确保留类型。
+**影响:** 当前消费者（STT）用 protobuf 路径不受影响。未来非音频调用者用 JSON 路径时，byte-fallback 编码和 control-token 跳过将不工作。
+
+---
+
+## LOW 发现 (5)
+
+### L1. `to_vec`/`as_slice` 用 `assert!` 而非返回 `Err`
+**文件:** `array/conversion.rs:113, 149`
+**问题:** `assert!(!ptr.is_null(), ...)` 在生产代码中 panic。应改为 `if ptr.is_null() { return Err(...) }`
+
+### L2. 零元素数组连续性判断错误
+**文件:** `array/conversion.rs:99-101`
+**问题:** `is_row_contiguous()` 在 `len==0` 检查之前调用。零元素数组的连续性无意义，应先检查长度。
+
+### L3. `Error::Backend(String)` 迁移债务
+**问题:** 97 个构造点分布在 28 个文件中仍使用已弃用的自由格式字符串变体。所有 typed 变体已存在。
+**主要位置:** tokenizer/sentencepiece.rs (16), audio/playback/player.rs (9), audio/stt/streaming/session.rs (9)
+
+### L4. `Error::ShapeMismatch(String)` 迁移债务
+**问题:** 16 个构造点分布在 10 个文件中。
+**主要位置:** lm/generate.rs (4), ops/shape.rs (3)
+
+### L5. `Error::FileSlotIo` 死代码
+**问题:** 完整定义了 payload 类型但 0 个构造点。
+
+---
+
+## 代码重复问题
+
+### D1. `VectorArrayGuard` 重复 6 次
+**文件:** arithmetic.rs, shape.rs, indexing.rs, linalg_full.rs, quantized.rs, metal_kernel.rs
+**建议:** 提取到 `crate::ffi::VectorArrayGuard`
+
+### D2. `opt_array` / `drain_vector` 重复 3-5 次
+**文件:** quantized.rs, linalg_basic.rs, linalg_full.rs, metal_kernel.rs
+**建议:** 提取到共享内部模块
+
+---
+
+## mlxrs 优于上游的实现
+
+| 改进 | 上游问题 | mlxrs 方案 |
+|------|---------|-----------|
+| 原子保存 | Python 直接写入，崩溃可能损坏 | O_EXCL tmpfile + fsync + atomic publish |
+| GGUF fail-fast | Python 先加载权重再验证 | 验证在多 GB 权重加载之前 |
+| TOCTOU 安全 | Python 使用 path-based 操作 | fd-bound writer |
+| PIL resize | 依赖 PIL | 自研 kernel，bit-exact 匹配 |
+| Feature cache key | Python `\|`-join 存在 aliasing | injective 编码 (`s:`/`l:`/`b:` 前缀) |
+| ColVision MaxSim | Python 零填充导致 signed embedding 错误 | `-inf` masking 修复 |
+| Kaldi preemphasis | mlx-audio 第一个样本 passthrough（错误） | 匹配 kaldi-asr `y[0] = x[0] * (1-p)` |
+| PCM 归一化 | mlx-audio 不对称 32768/32767 导致 1-LSB 漂移 | 对称 32768 约定 |
+| Chat template | - | DeepSeek V32 `drop_thinking_messages` 修复了上游遗漏的 developer role |
+| RoPE 频率 | Python 用 MLX array 计算 | host 端 f64 计算再窄化，更高精度 |
+| WiredLimitGuard | Swift 依赖 GIL 隐式序列化 | 引用计数 guard，比 Swift 更正确 |
+| ISTFT Spectrum 类型 | bare array 无法区分奇偶 n_fft | 结构体携带全部分析元数据 |
+
+---
+
+## 未封装的 mlx-c 操作（~35 个）
+
+高优先级：
+- `mlx_stop_gradient` — 训练关键
+- `mlx_tensordot` — 常用线性代数
+- `mlx_median` — 常用统计
+- `mlx_moveaxis`, `mlx_roll`, `mlx_tile` — 常用形状操作
+- `mlx_diagonal`, `mlx_trace`, `mlx_tril/triu` — 矩阵操作
+- `mlx_scatter` 变体 — 索引更新
+- `mlx_slice_update` 变体 — 原地更新
+
+---
+
+## 模块级评分
+
+| 模块 | 行数 | 评分 | 关键发现 |
+|------|------|------|---------|
+| array/ | 1,882 | A | 1 HIGH (Display UB), 2 LOW |
+| ops/ 基础 | 5,131 | A | ~25 op 未封装 |
+| ops/ 高级 | 2,117 | A | 代码重复 |
+| transforms/ | 1,925 | A+ | 零问题 |
+| memory/ | 1,103 | A+ | 比 Swift 更正确 |
+| error/dtype/device/stream/shape | ~70K | A+ | 零问题 |
+| io.rs | 62K | A | 3 minor nits |
+| lm/cache/ | 10,637 | A+ | 零逻辑 bug |
+| lm/load + gguf | 8,208 | A+ | 比上游更好 |
+| lm/generate + session | 6,800 | A | 极端 temp overflow (documented) |
+| lm/lora + quant | 13,728 | A+ | 零 bug |
+| lm/tuner + nn | 13,177 | A+ | 零 bug |
+| lm/model + factory | ~5,000 | A | 1 minor error variant smell |
+| vlm/ | 14,043 | A+ | 零问题 |
+| audio/ DSP | 9,542 | A | 1 cosmetic error string |
+| audio/ IO + playback | 5,455 | A+ | 零问题 |
+| audio/ models | 5,917 | A+ | 零问题 |
+| tokenizer/ | 14,032 | A | 1 MODERATE (PieceType) |
+| embeddings/ | 8,645 | A+ | 零问题 |
+| simd/ | 8,913 | A+ | 零问题 |
+| 跨模块一致性 | - | A | 迁移债务 (97 Backend + 16 ShapeMismatch) |
