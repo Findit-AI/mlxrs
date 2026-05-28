@@ -1772,3 +1772,443 @@ fn kvc4_batch_rotating_update_in_place_propagates_to_vec_failure() {
      regression in any of finalize / update_concat / update_in_place."
   );
 }
+
+// ── #260 coverage gaps: copy / nbytes / right-pad finalize / decode-guard /
+//    rolled-mask values / left-padded mask / max_size==0 placeholder ─────────
+//
+// The behaviors below were the genuinely-uncovered public-API surface of
+// `BatchRotatingKvCache` (the existing suite above covers the ring
+// state-machine, from_state guards, rank-safety and to_vec-propagation
+// paths). Every expected value is hand-traced from the cited mlx-lm
+// `cache.py` lines and the module's own `make_mask`/`finalize` ports.
+
+/// `copy()` (mlx-lm `copy.deepcopy`, cache.py reference-class contract):
+/// MLX value semantics make the copy independent even though `Array::
+/// try_clone` is refcount-sharing — the cache only ever *reassigns* its
+/// arrays. Hand-trace: copy a populated rotated cache, advance ONLY the
+/// original, and assert the copy's buffer/offset/meta are frozen at the
+/// copy point while the original moved on.
+#[test]
+fn batch_rotating_copy_is_independent() {
+  let mut c = BatchRotatingKvCache::new(4, &[0, 0]);
+  // Prefill S=3 then one decode → fills the ring (off=4, idx=4, buffer
+  // [0,1,2,3]/[10,11,12,13]).
+  let p = kvb(&[&[0.0, 1.0, 2.0], &[10.0, 11.0, 12.0]]);
+  c.update(&p, &p).unwrap();
+  let d = kvb(&[&[3.0], &[13.0]]);
+  c.update(&d, &d).unwrap();
+  assert_eq!(c.offset(), 4);
+
+  // Snapshot the copy's frozen view.
+  let copy = c.copy().unwrap();
+  let copy_meta = copy.meta_state();
+  let copy_off = copy.offset();
+  let mut copy_keys = {
+    let st = copy.state().unwrap();
+    st.into_iter().next().unwrap()
+  };
+  let copy_keys_v = copy_keys.to_vec::<f32>().unwrap();
+  assert_eq!(copy_off, 4);
+  assert_eq!(
+    copy_keys_v,
+    vec![0.0, 1.0, 2.0, 3.0, 10.0, 11.0, 12.0, 13.0]
+  );
+
+  // Advance ONLY the original: a wrapping in-place decode at slot 0 →
+  // physical ring order [4,1,2,3] (cache.py:1243-1251). off 4→5.
+  let d2 = kvb(&[&[4.0], &[14.0]]);
+  c.update(&d2, &d2).unwrap();
+  assert_eq!(c.offset(), 5, "original advanced");
+
+  // The copy is FROZEN at the copy point — buffer, offset and meta all
+  // unchanged (independence; no shared-buffer mutation leaked through).
+  assert_eq!(copy.offset(), 4, "copy offset frozen");
+  assert_eq!(copy.meta_state(), copy_meta, "copy meta frozen");
+  let mut copy_keys2 = {
+    let st = copy.state().unwrap();
+    st.into_iter().next().unwrap()
+  };
+  assert_eq!(
+    copy_keys2.to_vec::<f32>().unwrap(),
+    copy_keys_v,
+    "copy keys buffer frozen after original mutated"
+  );
+}
+
+/// `nbytes()` (mlx-lm `BatchRotatingKVCache.nbytes`, cache.py:1480-1484):
+/// `keys.nbytes + values.nbytes`, `0` when empty. The byte count is the
+/// array's OWN deterministic size (NOT the process-global `peak_memory`
+/// counter), so it is exactly assertable: a `[B,1,L,1]` f32 buffer is
+/// `B*L*4` bytes, and keys+values doubles it. Also assert monotonic
+/// growth (`>=`) as the ring fills, per the project's no-magnitude rule.
+#[test]
+fn batch_rotating_nbytes_exact_and_monotonic() {
+  let mut c = BatchRotatingKvCache::new(8, &[0, 0]);
+  assert_eq!(c.nbytes(), 0, "empty cache reports 0 bytes");
+
+  // Prefill S=3 (B=2). Buffer is [2,1,3,1] f32 for BOTH keys and values:
+  // size = 2*1*3*1 = 6 elements * 4 bytes = 24 bytes each → 48 total.
+  let p = kvb(&[&[0.0, 1.0, 2.0], &[10.0, 11.0, 12.0]]);
+  c.update(&p, &p).unwrap();
+  assert_eq!(
+    c.nbytes(),
+    2 * (2 * 3 * 4),
+    "keys+values of a [2,1,3,1] f32 buffer"
+  );
+  let after_prefill = c.nbytes();
+
+  // A single-token decode grows the physical ring (S==1 grow branch,
+  // cache.py:1218-1232). The grow PRE-ALLOCATES up to the window in one
+  // step: new_size = min(BATCH_ROTATING_STEP=256, max_size - _offset) =
+  // min(256, 8-3) = 5 rows concatenated onto the existing 3 → buffer
+  // seq-len = 3 + 5 = 8 (== max_size, the full window). Exact:
+  // [2,1,8,1] f32 → 2*(2*8*4) = 128 bytes. (NOT a grow-by-1: that only
+  // happens when max_size - _offset == 1, e.g. the max_size=4 caches
+  // elsewhere in this file.)
+  let d = kvb(&[&[3.0], &[13.0]]);
+  c.update(&d, &d).unwrap();
+  assert_eq!(
+    c.nbytes(),
+    2 * (2 * 8 * 4),
+    "S==1 grow pre-allocates the full window → buffer [2,1,8,1]"
+  );
+  assert!(
+    c.nbytes() >= after_prefill,
+    "nbytes is monotonic as the ring fills"
+  );
+}
+
+/// `prepare_right_padding` arms `_lengths` and BLOCKS S==1 decoding until
+/// `finalize` (mlx-lm raises `RuntimeError: finalize() should be called
+/// before decoding`, ported as a recoverable `Err` at cache.py:1208-1214 /
+/// the `self.lengths.is_some()` guard in `update_in_place`). Hand-trace:
+///   * after `prepare_right_padding(right_padding=[1,0])` a single-token
+///     update MUST Err (NOT silently decode against stale right-pad);
+///   * a SECOND pre-finalize update MUST ALSO Err and leave the cache state
+///     byte-identical — the guard persists across repeated failed updates
+///     until a SUCCESSFUL finalize (it is not consumed by the first reject;
+///     this is the real invariant — a broken update that errored but cleared
+///     the guard would otherwise let decode #2 through, then a no-op finalize
+///     would mask it);
+///   * `finalize` clears `_lengths` — and because `_lengths = lengths +
+///     offset` (cache.py:1282) makes the finalize roll `max(0, offset -
+///     _lengths) = max(0, -lengths) = 0` when called in the canonical
+///     prepare→finalize order (no intervening offset change is even
+///     possible — decoding is blocked), the buffer/offset are UNCHANGED;
+///   * the decode then succeeds.
+#[test]
+fn batch_rotating_prepare_blocks_decode_until_finalize() {
+  let mut c = BatchRotatingKvCache::new(8, &[0, 0]);
+  // Prefill S=4 (right-padded rows). off [0,0]+4 = [4,4], buffer kept
+  // verbatim (empty _update_concat branch). DISTINCT keys vs values
+  // (Codex finding 2, round 2): `state()` is `[keys, values, offset,
+  // left_padding]`, so a regression corrupting ONLY the `values` buffer (or
+  // swapping K/V) on the Err path must be observable — that requires K != V
+  // in the buffer. The value rows are the key rows + 100 so every retained
+  // id is distinct between the two buffers.
+  let kp = kvb(&[&[1.0, 2.0, 3.0, 0.0], &[4.0, 5.0, 0.0, 0.0]]);
+  let vp = kvb(&[&[101.0, 102.0, 103.0, 100.0], &[104.0, 105.0, 100.0, 100.0]]);
+  c.update(&kp, &vp).unwrap();
+  assert_eq!(iv(&c.batch_offset().unwrap()), vec![4, 4]);
+  let off_before = iv(&c.batch_offset().unwrap());
+  let lp_before = iv(&c.left_padding_arr().unwrap());
+  // meta_state() = [max_size, _offset, _idx, rotated] — pins the ring
+  // cursor / scalar offset / rotated flag (the state a broken update that
+  // mutated before erroring would corrupt).
+  let meta_before = c.meta_state();
+  // Snapshot the ENTIRE `state()` vector — every array, not just `state()[0]`
+  // (keys). `state()` = `[keys, values, offset, left_padding]`; a values-only
+  // mutation or a K/V swap on the rejected path is invisible if only keys are
+  // compared. The keys/values buffers are F32, offset/left_padding are I32, so
+  // each is read with its own dtype and compared element-wise. Returns
+  // `(f32 buffers [keys, values], i32 metadata [offset, left_padding])`.
+  //
+  // Each array is materialized via `ops::contiguous` before `to_vec`: once the
+  // ring over-allocates / grows, `state()` hands back a strided `seq_slice`
+  // view that `to_vec` rejects with `NonContiguous`, so a row-contiguous copy
+  // is taken first (it is a no-op refcount bump when already contiguous).
+  let state_snapshot = |c: &BatchRotatingKvCache| -> (Vec<Vec<f32>>, Vec<Vec<i32>>) {
+    let st = c.state().unwrap();
+    assert_eq!(
+      st.len(),
+      4,
+      "state() must be [keys, values, offset, left_padding]"
+    );
+    let mut buffers = Vec::with_capacity(2);
+    let mut meta = Vec::with_capacity(2);
+    for (i, a) in st.into_iter().enumerate() {
+      let mut a = mlxrs::ops::shape::contiguous(&a, false).unwrap();
+      if i < 2 {
+        buffers.push(a.to_vec::<f32>().unwrap()); // keys, values (F32)
+      } else {
+        meta.push(a.to_vec::<i32>().unwrap()); // offset, left_padding (I32)
+      }
+    }
+    (buffers, meta)
+  };
+  let state_before = state_snapshot(&c);
+  // Sanity: keys (state[0]) and values (state[1]) really are distinct, so the
+  // full-state compare can discriminate a V-only corruption / K/V swap.
+  assert_ne!(
+    state_before.0[0], state_before.0[1],
+    "test setup must use distinct K vs V so a values-only mutation is observable"
+  );
+
+  // Arm right-padding: max(right_padding)=1 > 0 → _lengths = [2,3]+offset.
+  c.prepare_right_padding(&[2, 3], &[1, 0]).unwrap();
+
+  // A single-token decode is now REJECTED (finalize must precede decode).
+  // DISTINCT decode keys vs values, mirroring the prefill, so a broken Err
+  // path that wrote V before erroring would leave a detectable footprint.
+  let dk = kvb(&[&[6.0], &[6.0]]);
+  let dv = kvb(&[&[106.0], &[106.0]]);
+  assert!(
+    c.update(&dk, &dv).is_err(),
+    "S==1 decode with _lengths armed must Err (finalize() first)"
+  );
+
+  // CRITICAL (Codex finding 2): the decode guard must persist across
+  // REPEATED failed updates until a SUCCESSFUL finalize — not merely block
+  // the first decode. A broken `update_in_place` that returns Err YET
+  // cleared the pending-lengths guard would let this SECOND pre-finalize
+  // update through (and below, a no-op finalize would mask it). Attempt a
+  // second S==1 update BEFORE finalize and assert it STILL errors AND
+  // leaves every observable state accessor byte-identical to the snapshot
+  // taken before ANY rejected update — proving the guard (and the whole
+  // cache) is untouched by the failed updates.
+  assert!(
+    c.update(&dk, &dv).is_err(),
+    "a SECOND S==1 decode before finalize must STILL Err — the guard \
+     persists across repeated failed updates, it is not consumed by one"
+  );
+  // State fully unmutated after BOTH rejected decodes (offset / left_padding
+  // / ring meta / buffer contents all frozen at the pre-rejection snapshot).
+  assert_eq!(
+    iv(&c.batch_offset().unwrap()),
+    off_before,
+    "offset unchanged after the repeated rejected decodes"
+  );
+  assert_eq!(
+    iv(&c.left_padding_arr().unwrap()),
+    lp_before,
+    "left_padding unchanged after the repeated rejected decodes"
+  );
+  assert_eq!(
+    c.meta_state(),
+    meta_before,
+    "ring meta (_offset/_idx/rotated) unchanged after the repeated rejected decodes"
+  );
+  // FULL `state()` (keys AND values, plus the embedded offset/left_padding
+  // arrays) byte-identical to the pre-rejection snapshot. Comparing the whole
+  // vector — not just `state()[0]` — catches a regression that corrupts ONLY
+  // the values buffer (a K/V desync retry-safety bug) on the Err path.
+  assert_eq!(
+    state_snapshot(&c),
+    state_before,
+    "every state() array (keys, values, offset, left_padding) unchanged after \
+     the repeated rejected decodes — a values-only mutation on the Err path \
+     would surface here as a K/V desync"
+  );
+
+  // finalize clears _lengths; roll is max(0, offset-_lengths)=max(0,-len)=0
+  // in the canonical order, so buffer/offset/left_padding are unchanged.
+  c.finalize().unwrap();
+  assert_eq!(
+    iv(&c.batch_offset().unwrap()),
+    off_before,
+    "no-op finalize roll"
+  );
+  assert_eq!(iv(&c.left_padding_arr().unwrap()), lp_before);
+  // Full state() still matches the snapshot after the no-op finalize roll
+  // (keys AND values both frozen).
+  assert_eq!(state_snapshot(&c), state_before);
+
+  // After finalize the decode succeeds (S==1 grow branch: buffer 4 → 5,
+  // off [4,4] → [5,5]) — proving finalize genuinely UNBLOCKS decode rather
+  // than the guard simply never having armed.
+  let (k, v) = c.update(&dk, &dv).unwrap();
+  assert_eq!(k.shape(), vec![2, 1, 5, 1]);
+  assert_eq!(v.shape(), vec![2, 1, 5, 1]);
+  assert_eq!(iv(&c.batch_offset().unwrap()), vec![5, 5]);
+  // The post-finalize state keeps K and V distinct (the success path also
+  // routes keys→keys and values→values, not a swap), and the appended column
+  // (s index 4 of row 0) holds the decode token: keys=6, values=106. Read via
+  // the contiguous `state()` buffers rather than the non-contiguous grow-branch
+  // return view.
+  let state_after_decode = state_snapshot(&c);
+  let (keys_buf, values_buf) = (&state_after_decode.0[0], &state_after_decode.0[1]);
+  assert_ne!(
+    keys_buf, values_buf,
+    "post-finalize success path keeps keys and values distinct (no K/V swap)"
+  );
+  assert_eq!(keys_buf[4], 6.0, "decoded key id appended to keys buffer");
+  assert_eq!(
+    values_buf[4], 106.0,
+    "decoded value id appended to values buffer"
+  );
+}
+
+/// `make_mask` N==1 ROLLED mask VALUES (mlx-lm cache.py:1330-1357) — the
+/// existing `batch_rotating_make_mask_distinct_override` only asserts the
+/// rolled mask's last-dim SHAPE. Here the full rolled bit pattern is
+/// hand-traced so the `mx.roll(mask, idx+1, axis=-1)` step is genuinely
+/// exercised (an off-by-one or wrong-direction roll would change these
+/// bits). B=1, max_size=4, window_size=2.
+///
+/// DIRECTION-DISCRIMINATING by construction: the production roll is RIGHT
+/// (`roll_last_axis` = `concat([a[L-s:], a[:L-s]])`, mlx `out[i]=a[(i-s)%L]`,
+/// confirmed against `batch_rotating.rs:1358-1385`). We drive TWO decodes so
+/// the roll amount is `idx+1 = 3` over a width-4 mask. Because `3 != width/2
+/// (=2)`, a RIGHT roll and a LEFT roll of the SAME pre-roll mask produce
+/// DIFFERENT patterns (right-by-3 = `[0,1,1,0]`; left-by-3 = right-by-1 =
+/// `[1,0,0,1]`). The single-decode `roll by idx+1 = 2 == width/2` case the
+/// prior version asserted was direction-BLIND (left-by-2 and right-by-2 both
+/// give `[1,1,0,0]`); this two-decode width-4 scenario pins direction.
+#[test]
+fn batch_rotating_make_mask_n1_rolled_values() {
+  let mut c = BatchRotatingKvCache::new(4, &[0]);
+  // Prefill S=4 fills the ring: off=4, idx=4, rotated=false, lp=[0].
+  let p = kvb(&[&[0.0, 1.0, 2.0, 3.0]]);
+  c.update(&p, &p).unwrap();
+  // Decode 1 (S=1) wraps: idx(4)==max_size → rotated=true, idx=0; lp -= 1 =
+  // [-1]; idx += 1 = 1. off=5.
+  let d = kvb(&[&[4.0]]);
+  c.update(&d, &d).unwrap();
+  assert_eq!(c.offset(), 5);
+  // Decode 2 (S=1): no wrap (idx(1)!=max_size), already rotated → lp -= 1 =
+  // [-2]; idx += 1 = 2. off=6. Now `idx+1 = 3` is the make_mask roll amount.
+  let d2 = kvb(&[&[5.0]]);
+  c.update(&d2, &d2).unwrap();
+  assert_eq!(c.offset(), 6);
+
+  match c.make_mask(1, Some(2), false).unwrap() {
+    MaskMode::Array(mut m) => {
+      // Hand-trace (cache.py:1330-1355):
+      //   ws = 2; offset = min(max_size-1=3, _offset=6) = 3.
+      //   base = causal&windowed(N=1, offset=3, ws=2):
+      //     total=4; rinds=[0,1,2,3]; linds=arange(3,4)=[3].
+      //     causal 3>=rinds = [1,1,1,1]; windowed 3<rinds+2=[2,3,4,5] →
+      //     [0,0,1,1]; base = [0,0,1,1].
+      //   trim_size = idx(2) - max_size(4) + int(N>1=0) = -2 → 0.
+      //   rotated = (N==1) && (self.rotated || idx>=max_size) = true.
+      //   lp -= trim(0)+int(rotated=1)=1 → [-3].
+      //   pad_term = rinds(>=[-3]) = [1,1,1,1]; mask = base & pad = [0,0,1,1].
+      //   rotated → idx=2 (2<max_size); roll(mask, idx+1=3, axis=-1) RIGHT:
+      //     out=[a[L-s:L], a[0:L-s]] with L=4,s=3 → [a[1:4], a[0:1]]
+      //         = [[0,1,1], [0]] = [0,1,1,0].
+      //   (A LEFT roll by 3 would give right-by-1 = [1,0,0,1] — DIFFERENT,
+      //    so this asserted pattern pins the roll DIRECTION, not just shape.)
+      assert_eq!(m.shape(), vec![1, 1, 1, 4]);
+      let bits: Vec<u8> = m
+        .to_vec::<bool>()
+        .unwrap()
+        .into_iter()
+        .map(|b| b as u8)
+        .collect();
+      // Sanity: the asserted (right-roll) pattern MUST differ from the
+      // reverse (left-roll) pattern, else the test could not catch a
+      // reversed roll. left-by-3 of [0,0,1,1] == right-by-1 == [1,0,0,1].
+      let reverse_roll = vec![1u8, 0, 0, 1];
+      assert_ne!(
+        bits, reverse_roll,
+        "roll amount idx+1=3 over width 4 must make direction observable \
+         (right-by-3 != left-by-3); otherwise the assert below is direction-blind"
+      );
+      assert_eq!(
+        bits,
+        vec![0, 1, 1, 0],
+        "windowed mask [0,0,1,1] rolled RIGHT by idx+1=3 → [0,1,1,0]"
+      );
+    }
+    _ => panic!("rotated N==1 make_mask must materialize the rolled mask"),
+  }
+}
+
+/// `make_mask` N>1 with NON-ZERO `left_padding` (mlx-lm cache.py:1349):
+/// `mask &= rinds >= expand_dims(left_padding, (1,2,3))` masks out each
+/// row's left-pad columns. The existing override test uses `left_padding=
+/// [0,0]` (no padding term); this hand-traces the per-row padded columns.
+#[test]
+fn batch_rotating_make_mask_left_padded_columns() {
+  // max_size=8 (large → no trim/rotate at this offset), left_padding=[2,0].
+  let mut c = BatchRotatingKvCache::new(8, &[2, 0]);
+  let p = kvb(&[&[0.0, 1.0, 2.0], &[10.0, 11.0, 12.0]]);
+  c.update(&p, &p).unwrap(); // off=3, idx=3, rotated=false, lp stays [2,0].
+
+  match c.make_mask(3, None, false).unwrap() {
+    MaskMode::Array(mut m) => {
+      // Hand-trace:
+      //   ws = max_size = 8; offset = min(7, 3) = 3.
+      //   base = causal(N=3, offset=3, ws=8): total=6; linds=[3,4,5];
+      //     rinds=[0..5]; ws(8)<total(6)? no → plain causal:
+      //       q3:[1,1,1,1,0,0] q4:[1,1,1,1,1,0] q5:[1,1,1,1,1,1].
+      //   trim_size = idx(3)-8+int(N>1=1)=-4 → 0; rotated=false (N>1).
+      //   lp delta = 0 → lp stays [2,0].
+      //   pad_term = rinds >= lp:
+      //     row0(lp2): [0,0,1,1,1,1]   row1(lp0): [1,1,1,1,1,1].
+      //   mask = base & pad_term (broadcast to [B,1,N,total]=[2,1,3,6]):
+      //     row0: q3[0,0,1,1,0,0] q4[0,0,1,1,1,0] q5[0,0,1,1,1,1]
+      //     row1: q3[1,1,1,1,0,0] q4[1,1,1,1,1,0] q5[1,1,1,1,1,1]
+      assert_eq!(m.shape(), vec![2, 1, 3, 6]);
+      let bits: Vec<u8> = m
+        .to_vec::<bool>()
+        .unwrap()
+        .into_iter()
+        .map(|b| b as u8)
+        .collect();
+      assert_eq!(
+        bits,
+        vec![
+          // batch row 0 (left_padding 2 → first two columns masked)
+          0, 0, 1, 1, 0, 0, //
+          0, 0, 1, 1, 1, 0, //
+          0, 0, 1, 1, 1, 1, //
+          // batch row 1 (left_padding 0 → plain causal)
+          1, 1, 1, 1, 0, 0, //
+          1, 1, 1, 1, 1, 0, //
+          1, 1, 1, 1, 1, 1, //
+        ],
+        "per-row left-padding masks each row's pad columns"
+      );
+    }
+    _ => panic!("BatchRotatingKVCache.make_mask(N>1) must materialize a mask"),
+  }
+}
+
+/// The `max_size == 0` constructor PLACEHOLDER (the value `from_state`
+/// opens with before `set_meta_state` restores the real `max_size`) is
+/// rejected on direct use of `update` and `make_mask` with a recoverable
+/// `Err`, never a panic / degenerate mask (Copilot review #3271308764 /
+/// #3271119572). A user who builds `new(0, ..)` directly and skips meta
+/// restore must not drive the degenerate `trim_size`/`offset==0` math.
+#[test]
+fn batch_rotating_max_size_zero_placeholder_is_rejected() {
+  let mut c = BatchRotatingKvCache::new(0, &[0, 0]);
+  let p = kvb(&[&[1.0], &[2.0]]);
+  assert!(
+    c.update(&p, &p).is_err(),
+    "update against the max_size==0 placeholder must Err"
+  );
+  // The rejected update did not populate the cache.
+  assert!(c.is_empty(), "no partial mutation on the rejected update");
+  assert!(
+    c.make_mask(1, None, false).is_err(),
+    "make_mask against the max_size==0 placeholder must Err"
+  );
+  // A non-empty `from_state`-style restore that LEAVES max_size==0 is also
+  // rejected by the structural guard (max_size must be >= 1 for a buffer).
+  let k = kvb(&[&[1.0], &[2.0]]);
+  let v = kvb(&[&[1.0], &[2.0]]);
+  let off = Array::from_slice::<i32>(&[1, 1], &(2usize,)).unwrap();
+  let lp = Array::from_slice::<i32>(&[0, 0], &(2usize,)).unwrap();
+  let bad_meta = vec![
+    "0".to_string(), // max_size = 0 with a non-empty buffer
+    "1".to_string(),
+    "1".to_string(),
+    "false".to_string(),
+  ];
+  assert!(
+    from_state("BatchRotatingKVCache", vec![k, v, off, lp], &bad_meta).is_err(),
+    "non-empty restore with max_size==0 must be rejected"
+  );
+}
