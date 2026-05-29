@@ -18,7 +18,7 @@ use mlxrs::{
   embeddings::{
     DEFAULT_NORMALIZE_EPS, PoolingStrategy, SWIFT_L2_EPS, cls_pooling, cosine_similarity,
     cosine_similarity_matrix, first_token_pooling, l2_normalize, l2_normalize_eps,
-    last_token_pooling, layer_norm, max_pooling, mean_pooling, normalize, pool,
+    last_token_pooling, layer_norm, max_pooling, mean_pooling, normalize, pool, pool_post,
     pooling_from_st_config_bytes, pooling_from_st_config_path, pooling_from_st_config_str,
     rms_norm, truncate_last_dim,
   },
@@ -2183,4 +2183,210 @@ fn f32_paths_bit_identical_after_dtype_fix() {
 
   let mut np = normalize(&x, 2.0, -1, true, DEFAULT_NORMALIZE_EPS).unwrap();
   assert!(vclose(&np.to_vec::<f32>().unwrap(), &[0.6, 0.8]));
+}
+
+// ════════════════ #260 coverage: pool_post tail, PoolingStrategy
+// as_str/Display/IsVariant + from_mode("last") alias, and
+// truncate_last_dim rank-1/rank-3 / None-passthrough truncation. ════════
+//
+// pooling.rs `pool_post` (the shared normalize/dimension/layer-norm tail
+// `pool` runs after the strategy reduction, also called directly by
+// `encode` on a model's trained `pooled_output`) had ZERO coverage — it
+// was not even imported by this test module. These pin its documented
+// step order (LayerNorm|RMSNorm → matryoshka truncation → L2-normalize),
+// its no-transform passthrough, and its equivalence to the `pool`
+// dispatcher tail. The PoolingStrategy `as_str`/Display/IsVariant accessor
+// surface and the `from_mode("last")` alias were likewise untested, as
+// were `truncate_last_dim` on rank-1 / rank-3 (only rank-2 was covered).
+
+// ───────────────── pool_post: the shared post-pool tail ─────────────────
+
+#[test]
+fn pool_post_no_transform_is_passthrough() {
+  // All flags off / dimension None → `pool_post` returns the pooled vector
+  // unchanged (the documented by-value no-copy passthrough).
+  let x = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
+  let mut p = pool_post(x, false, None, false, false).unwrap();
+  assert_eq!(p.shape(), vec![2, 2]);
+  assert_eq!(p.to_vec::<f32>().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+}
+
+#[test]
+fn pool_post_truncate_only() {
+  // dimension=Some(2), no norm: matryoshka-truncate the last axis to 2.
+  // Same gather as `truncate_last_dim_basic`: (2,3) -> (2,2) keeping cols
+  // 0..2 of each row.
+  let x = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0], &(2, 3)).unwrap();
+  let mut p = pool_post(x, false, Some(2), false, false).unwrap();
+  assert_eq!(p.shape(), vec![2, 2]);
+  assert!(vclose(&p.to_vec::<f32>().unwrap(), &[1.0, 2.0, 4.0, 5.0]));
+}
+
+#[test]
+fn pool_post_normalize_only_yields_unit_rows() {
+  // normalize=true only: L2-normalize. [3,4] -> [0.6,0.8] (||.||=5).
+  let x = Array::from_slice(&[3.0_f32, 4.0], &(1, 2)).unwrap();
+  let mut p = pool_post(x, true, None, false, false).unwrap();
+  assert_eq!(p.shape(), vec![1, 2]);
+  assert!(vclose(&p.to_vec::<f32>().unwrap(), &[0.6, 0.8]));
+}
+
+#[test]
+fn pool_post_truncate_then_normalize_order() {
+  // Documented step order is truncate (dimension) BEFORE L2-normalize, so
+  // each row is truncated to its first `dimension` entries and THEN scaled
+  // to unit norm over those entries. Row0 [3,4,99] -trunc2-> [3,4]
+  // -norm-> [0.6,0.8]; row1 [0,5,12] -trunc2-> [0,5] -norm-> [0,1].
+  let x = Array::from_slice(&[3.0_f32, 4.0, 99.0, 0.0, 5.0, 12.0], &(2, 3)).unwrap();
+  let mut p = pool_post(x, true, Some(2), false, false).unwrap();
+  assert_eq!(p.shape(), vec![2, 2]);
+  assert!(vclose(&p.to_vec::<f32>().unwrap(), &[0.6, 0.8, 0.0, 1.0]));
+}
+
+#[test]
+fn pool_post_equivalent_to_pool_dispatcher_tail() {
+  // `pool_post` IS the tail `pool` runs after the strategy reduction, so
+  // for every (normalize, dimension, layer_norm, rms_norm) combination,
+  // `pool_post(mean_pooling(emb, mask), ..flags) == pool(emb, mask, Mean,
+  // ..flags)`. This pins that the factored-out tail (used by `encode` on a
+  // trained pooled_output) matches the dispatcher exactly — including the
+  // RMSNorm path's RMS_NORM_EPS and the LayerNorm-wins-when-both-set rule
+  // — without re-deriving each path's eps here.
+  let (emb, mask) = fixture();
+  for (normalize, dim, ln, rms) in [
+    (false, None, false, false),
+    (true, None, false, false),
+    (false, Some(1), false, false),
+    (true, Some(1), false, false),
+    (false, None, true, false), // layer-norm
+    (false, None, false, true), // rms-norm
+    (true, None, true, false),  // layer-norm + normalize
+    (false, None, true, true),  // both set -> layer-norm wins
+  ] {
+    let pooled = mean_pooling(&emb, &mask).unwrap();
+    let mut via_post = pool_post(pooled, normalize, dim, ln, rms).unwrap();
+    let mut via_pool = pool(&emb, &mask, PoolingStrategy::Mean, normalize, dim, ln, rms).unwrap();
+    assert_eq!(
+      via_post.shape(),
+      via_pool.shape(),
+      "shape mismatch for (norm={normalize}, dim={dim:?}, ln={ln}, rms={rms})"
+    );
+    assert!(
+      vclose(
+        &via_post.to_vec::<f32>().unwrap(),
+        &via_pool.to_vec::<f32>().unwrap()
+      ),
+      "pool_post must equal pool tail for (norm={normalize}, dim={dim:?}, ln={ln}, rms={rms})"
+    );
+  }
+}
+
+// ───────────── PoolingStrategy: as_str / Display / IsVariant ─────────────
+
+#[test]
+fn pooling_strategy_as_str_canonical_names() {
+  // The canonical lowercase mode strings (python `pool_by_config` modes +
+  // swift `Pooling.Strategy` display names).
+  assert_eq!(PoolingStrategy::Mean.as_str(), "mean");
+  assert_eq!(PoolingStrategy::Cls.as_str(), "cls");
+  assert_eq!(PoolingStrategy::First.as_str(), "first");
+  assert_eq!(PoolingStrategy::Last.as_str(), "last");
+  assert_eq!(PoolingStrategy::Max.as_str(), "max");
+  assert_eq!(PoolingStrategy::None.as_str(), "none");
+}
+
+#[test]
+fn pooling_strategy_display_matches_as_str() {
+  // `#[display("{}", self.as_str())]` — Display must equal as_str().
+  for s in [
+    PoolingStrategy::Mean,
+    PoolingStrategy::Cls,
+    PoolingStrategy::First,
+    PoolingStrategy::Last,
+    PoolingStrategy::Max,
+    PoolingStrategy::None,
+  ] {
+    assert_eq!(format!("{s}"), s.as_str());
+  }
+}
+
+#[test]
+fn pooling_strategy_is_variant_predicates() {
+  // derive_more::IsVariant generates `is_<variant>()` snake_case
+  // predicates. Each is true for its own variant and false for the others.
+  assert!(PoolingStrategy::Mean.is_mean());
+  assert!(PoolingStrategy::Cls.is_cls());
+  assert!(PoolingStrategy::First.is_first());
+  assert!(PoolingStrategy::Last.is_last());
+  assert!(PoolingStrategy::Max.is_max());
+  assert!(PoolingStrategy::None.is_none());
+
+  // Cross-checks: a couple of variants are NOT another variant.
+  assert!(!PoolingStrategy::Mean.is_cls());
+  assert!(!PoolingStrategy::Cls.is_mean());
+  assert!(!PoolingStrategy::First.is_last());
+  assert!(!PoolingStrategy::Last.is_first());
+  assert!(!PoolingStrategy::None.is_max());
+}
+
+#[test]
+fn pooling_strategy_from_mode_last_alias() {
+  // The impl accepts BOTH "lasttoken" (python `_SUPPORTED_POOL_MODES`) and
+  // the "last" alias (swift strategy name) for `PoolingStrategy::Last`. The
+  // pre-existing `pooling_strategy_from_mode` test only exercises
+  // "lasttoken"; this pins the "last" alias.
+  assert_eq!(
+    PoolingStrategy::from_mode("last").unwrap(),
+    PoolingStrategy::Last
+  );
+  // Round-trip: as_str() of Last is "last", which from_mode must accept.
+  assert_eq!(
+    PoolingStrategy::from_mode(PoolingStrategy::Last.as_str()).unwrap(),
+    PoolingStrategy::Last
+  );
+}
+
+// ───────── truncate_last_dim: rank-1, rank-3, and None-passthrough ────────
+
+#[test]
+fn truncate_last_dim_rank1() {
+  // ndim==1 path: a bare vector truncates to its first `dimension` entries.
+  let x = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &(4,)).unwrap();
+  let mut t = truncate_last_dim(&x, 2).unwrap();
+  assert_eq!(t.shape(), vec![2]);
+  assert!(vclose(&t.to_vec::<f32>().unwrap(), &[1.0, 2.0]));
+}
+
+#[test]
+fn truncate_last_dim_rank3_keeps_first_of_last_axis() {
+  // rank-3 (the PoolingStrategy::None passthrough shape): truncate only the
+  // last axis. (2,2,2) -> (2,2,1) keeping index 0 of the last axis.
+  // Row-major [[[1,2],[3,4]],[[5,6],[7,8]]] -> [[[1],[3]],[[5],[7]]].
+  let x = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &(2, 2, 2)).unwrap();
+  let mut t = truncate_last_dim(&x, 1).unwrap();
+  assert_eq!(t.shape(), vec![2, 2, 1]);
+  assert!(vclose(&t.to_vec::<f32>().unwrap(), &[1.0, 3.0, 5.0, 7.0]));
+}
+
+#[test]
+fn dispatcher_none_passthrough_with_matryoshka_truncation() {
+  // PoolingStrategy::None skips pooling but still honors `dimension`
+  // (last-axis truncation) on the rank-3 hidden states — documented in the
+  // `pool` doc but only the no-post-processing None path was tested. emb
+  // (1,2,3) -> None keeps (1,2,3) -> truncate last dim to 2 -> (1,2,2).
+  // [[[1,2,3],[4,5,6]]] -> [[[1,2],[4,5]]].
+  let emb = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0], &(1, 2, 3)).unwrap();
+  let mask = Array::ones::<f32>(&(1, 2)).unwrap();
+  let mut p = pool(
+    &emb,
+    &mask,
+    PoolingStrategy::None,
+    false,
+    Some(2),
+    false,
+    false,
+  )
+  .unwrap();
+  assert_eq!(p.shape(), vec![1, 2, 2]);
+  assert!(vclose(&p.to_vec::<f32>().unwrap(), &[1.0, 2.0, 4.0, 5.0]));
 }
