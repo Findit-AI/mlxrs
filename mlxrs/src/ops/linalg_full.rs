@@ -65,6 +65,29 @@ fn linalg_cpu_stream() -> mlxrs_sys::mlx_stream {
   })
 }
 
+/// Reject a matrix with a zero-length trailing dimension before it reaches an
+/// SVD-backed mlx kernel.
+///
+/// mlx core's `linalg::svd` only guards `ndim < 2`. For a `>= 2`-D input whose
+/// last two dims include a zero (`0×0` / `0×n` / `m×0`), `m * n == 0` and the
+/// CPU kernel's `num_matrices = a.size() / (m * n)` is then an integer
+/// divide-by-zero (`0 / 0`) — undefined behavior / a process crash
+/// (`mlx/backend/cpu/svd.cpp`). Every SVD-backed safe wrapper (`svd`, `pinv`,
+/// and — on its covariance — `random::multivariate_normal`) calls this first so
+/// an empty matrix can never reach that path; it returns the recoverable
+/// [`Error::EmptyInput`] instead.
+///
+/// `ndim < 2` is intentionally left unguarded here so mlx surfaces its own
+/// precise error for that case. The check is a cheap shape inspection with no
+/// `eval`, so it never enters mlx.
+pub(crate) fn reject_empty_matrix(a: &Array, op: &'static str) -> Result<()> {
+  let shape = a.shape();
+  if shape.len() >= 2 && (shape[shape.len() - 1] == 0 || shape[shape.len() - 2] == 0) {
+    return Err(Error::EmptyInput(EmptyInputPayload::new(op)));
+  }
+  Ok(())
+}
+
 // ─────────────────────────── inverses ───────────────────────────
 
 /// Matrix inverse (square `a`). Runs on the per-thread CPU stream
@@ -122,8 +145,25 @@ pub fn tri_inv(a: &Array, upper: bool) -> Result<Array> {
 
 /// Moore-Penrose pseudo-inverse.
 ///
+/// # Empty matrix (a zero-length last-two dimension)
+///
+/// `pinv` is computed via SVD (`mlx/mlx/linalg.cpp` `pinv` calls
+/// `linalg::svd(a, true, s)`), and mlx's `pinv` only guards `ndim < 2` — so a
+/// `>= 2`-D matrix with a zero-sized row or column dimension (`0×0` / `0×n` /
+/// `m×0`) would forward straight to the SVD kernel's divide-by-zero (the same
+/// path guarded in [`svd`]). This safe wrapper rejects it first with a
+/// recoverable [`Error::EmptyInput`]. (`ndim < 2` is still delegated to mlx,
+/// which raises its own precise error.)
+///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.linalg.pinv.html).
 pub fn pinv(a: &Array) -> Result<Array> {
+  // Guard the same SVD divide-by-zero as `svd`: `pinv` is SVD-backed and mlx's
+  // `pinv` only checks `ndim < 2`, so an empty trailing matrix dim would reach
+  // the kernel's `a.size() / (m * n)` (`0 / 0`, UB / SIGFPE). Reject before mlx.
+  reject_empty_matrix(
+    a,
+    "pinv: input matrix has a zero-length row or column dimension",
+  )?;
   // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)
   // per the mlx-c convention; it is wrapped in the RAII newtype FIRST so an
   // early return / panic frees it, then populated by the following call.
@@ -212,12 +252,10 @@ pub fn svd(a: &Array, compute_uv: bool) -> Result<Vec<Array>> {
   // kernel's `a.size() / (m * n)` is then `0 / 0` (UB / SIGFPE). mlx only checks
   // `ndim < 2`, so we reject the empty-matrix case here before entering mlx-c.
   // `ndim < 2` is intentionally left to mlx so it surfaces its own error.
-  let shape = a.shape();
-  if shape.len() >= 2 && (shape[shape.len() - 1] == 0 || shape[shape.len() - 2] == 0) {
-    return Err(Error::EmptyInput(EmptyInputPayload::new(
-      "svd: input matrix has a zero-length row or column dimension",
-    )));
-  }
+  reject_empty_matrix(
+    a,
+    "svd: input matrix has a zero-length row or column dimension",
+  )?;
   // Resolve the CPU stream FIRST — `linalg_cpu_stream()` runs the cleared-thread
   // poison guard (`assert_streams_not_cleared`) and installs the error handler
   // (`ensure_handler_installed`) before the fallible `mlx_vector_array_new()`

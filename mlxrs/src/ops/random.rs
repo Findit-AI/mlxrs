@@ -470,6 +470,16 @@ pub fn truncated_normal(
 /// because mlx implements `multivariate_normal` via SVD on the covariance,
 /// which is not yet supported on the Metal GPU backend.
 ///
+/// # Empty covariance (a zero-length last-two dimension)
+///
+/// Because mlx computes the covariance square-root via `linalg::svd(cov, ...)`
+/// (`mlx/mlx/random.cpp`), a covariance with a zero-sized trailing matrix
+/// dimension (`0×0`, etc.) hits the same SVD-kernel divide-by-zero as
+/// [`crate::ops::linalg_full::svd`]: mlx's `multivariate_normal` only checks
+/// `cov.ndim() < 2` and that `cov` is square, both of which a `0×0` cov passes.
+/// This safe wrapper rejects such a `cov` first with a recoverable
+/// [`crate::error::Error::EmptyInput`] (a cheap shape check, no `eval`).
+///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.random.multivariate_normal.html).
 pub fn multivariate_normal(
   mean: &Array,
@@ -478,6 +488,14 @@ pub fn multivariate_normal(
   dtype: Dtype,
   key: &Array,
 ) -> Result<Array> {
+  // Guard the SVD divide-by-zero on the covariance: mlx forwards `cov` to
+  // `linalg::svd` and only checks `ndim < 2` / squareness, so a `0×0` (or
+  // `0×n` / `m×0`) `cov` would reach the kernel's `a.size() / (m * n)` (`0 / 0`,
+  // UB / SIGFPE). Reuse the shared SVD-input guard before entering mlx.
+  crate::ops::linalg_full::reject_empty_matrix(
+    cov,
+    "multivariate_normal: covariance matrix has a zero-length row or column dimension",
+  )?;
   shape.with_shape(|s| {
     validate_dims(s)?;
     // SAFETY: `mlx_array_new()` returns a fresh empty out-param handle (NULL ctx)

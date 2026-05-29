@@ -249,3 +249,51 @@ fn cross_method_form_matches_freefn() {
   let v = c.to_vec::<f32>().unwrap();
   assert!(close_vec(&v, &[0.0, 0.0, 1.0]));
 }
+
+// ─────────────────── empty-matrix SVD guard (#257 M15 R2) ───────────────────
+//
+// Both `svd` and `pinv` are SVD-backed; mlx's CPU SVD kernel computes
+// `num_matrices = a.size() / (m * n)` and only guards `ndim < 2`, so a `>= 2`-D
+// matrix with a zero-length trailing dim (`0×0` / `0×n` / `m×0`) makes
+// `m * n == 0` and triggers a `0 / 0` integer divide-by-zero (UB / SIGFPE).
+// The shared `reject_empty_matrix` guard rejects these with `Error::EmptyInput`
+// via a cheap shape check, so the call returns `Err` WITHOUT entering mlx
+// (no `eval` / `to_vec`).
+
+/// Build a float matrix whose data is empty (product of `dims` is 0).
+fn empty_matrix(dims: &[i32]) -> Array {
+  Array::from_slice::<f32>(&[], dims).unwrap()
+}
+
+#[test]
+fn svd_rejects_empty_matrix_dims() {
+  for dims in [[0i32, 0], [0, 3], [3, 0]] {
+    let a = empty_matrix(&dims);
+    match linalg_full::svd(&a, true) {
+      Err(mlxrs::Error::EmptyInput(p)) => assert_eq!(
+        p.context(),
+        "svd: input matrix has a zero-length row or column dimension"
+      ),
+      other => panic!("expected EmptyInput for svd of {dims:?}, got {other:?}"),
+    }
+    // compute_uv = false must take the same guard.
+    match linalg_full::svd(&a, false) {
+      Err(mlxrs::Error::EmptyInput(_)) => {}
+      other => panic!("expected EmptyInput for svd(no-uv) of {dims:?}, got {other:?}"),
+    }
+  }
+}
+
+#[test]
+fn pinv_rejects_empty_matrix_dims() {
+  for dims in [[0i32, 0], [0, 3], [3, 0]] {
+    let a = empty_matrix(&dims);
+    match linalg_full::pinv(&a) {
+      Err(mlxrs::Error::EmptyInput(p)) => assert_eq!(
+        p.context(),
+        "pinv: input matrix has a zero-length row or column dimension"
+      ),
+      other => panic!("expected EmptyInput for pinv of {dims:?}, got {other:?}"),
+    }
+  }
+}
