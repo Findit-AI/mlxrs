@@ -54,14 +54,42 @@ fn kv(ids: &[f32]) -> Array {
   Array::from_slice::<f32>(ids, &(1usize, 1, ids.len(), 1)).unwrap()
 }
 
-/// A 4-D ramp `[1, 1, S, 64]` for the quantized cache: `group_size == 64`,
-/// so `head_dim` MUST be 64 for `mx.quantize` to produce one group per row.
-/// Mirrors `kv_cache_from_serialized.rs::kv_quant`.
-fn kv_quant(n_steps: usize) -> Array {
+/// Distinct, sequence-position-AND-column-varying KEY fixture `[1, 1, S, 64]`
+/// for the quantized round-trip (`head_dim == 64`, one affine quant group per
+/// row). Row `s`, column `j` holds `j + s*64`, so EVERY (step, column) cell is
+/// unique and rows differ by step. This is deliberately NOT row-repeated and
+/// NOT equal to [`kv_quant_values`] — so a persist bug that swaps K↔V,
+/// duplicates one side, or reorders sequence rows (all shape-preserving) is
+/// caught by the dequant-equality checks, which the old shared `kv_quant`
+/// fixture (identical `[0..63]` row for both K and V, every step) could not
+/// detect. Values stay small (max `63 + (S-1)*64`) so 8-bit affine
+/// quantization (group_size 64) round-trips deterministically.
+fn kv_quant_keys(n_steps: usize) -> Array {
   let mut data = Vec::with_capacity(n_steps * 64);
-  for _ in 0..n_steps {
+  for s in 0..n_steps {
     for j in 0..64 {
-      data.push(j as f32);
+      data.push(j as f32 + s as f32 * 64.0);
+    }
+  }
+  Array::from_slice::<f32>(&data, &(1usize, 1, n_steps, 64usize)).unwrap()
+}
+
+/// Distinct VALUE fixture `[1, 1, S, 64]` paired with [`kv_quant_keys`]. Row
+/// `s`, column `j` holds `(63 - j)*2 + s*128 + 4096` — column-reversed,
+/// sequence-position-varying, offset by +4096. Crucially the per-row SPAN is
+/// 126 (spacing 2) versus the keys' span of 63 (R5): a DIFFERENT per-row range
+/// yields a different affine SCALE, a different min yields a different BIAS, and
+/// the reversed pattern yields different packed WEIGHTS — so all three of the
+/// value's quantized slots differ from the key's, and a persist bug swapping
+/// ANY single one of the six on-disk arrays (incl. K-scales ↔ V-scales or
+/// K-biases ↔ V-biases) changes the dequantized output. The +128 per-step
+/// offset keeps rows non-overlapping; values stay bounded so 8-bit affine
+/// quantization (group_size 64) round-trips deterministically.
+fn kv_quant_values(n_steps: usize) -> Array {
+  let mut data = Vec::with_capacity(n_steps * 64);
+  for s in 0..n_steps {
+    for j in 0..64 {
+      data.push((63 - j) as f32 * 2.0 + s as f32 * 128.0 + 4096.0);
     }
   }
   Array::from_slice::<f32>(&data, &(1usize, 1, n_steps, 64usize)).unwrap()
@@ -179,7 +207,15 @@ fn quantized_kvcache_round_trips_through_persist() {
   let path = temp_path("quantized_rt.safetensors");
 
   let mut c = QuantizedKvCacheImpl::new(64, 8).unwrap();
-  c.update_quantized(&kv_quant(3), &kv_quant(3)).unwrap();
+  // Codex #3 R2: the keys/values fixtures are now DISTINCT and vary by
+  // sequence position (`kv_quant_keys` row = `j + s*64`; `kv_quant_values`
+  // row = `(63 - j) + s*64 + 4096`). The old test reused `kv_quant` (the
+  // identical `[0..63]` row for K, V, and EVERY step), so its dequant-equality
+  // checks were blind to a persist bug that swaps K↔V, duplicates one side, or
+  // reorders sequence rows (all shape-preserving). With distinct, per-step,
+  // per-column fixtures those bugs now change at least one dequantized cell.
+  c.update_quantized(&kv_quant_keys(3), &kv_quant_values(3))
+    .unwrap();
   let want_offset = c.offset();
   let want_meta = c.meta_state();
   assert_eq!(want_meta.len(), 3, "quantized meta is [offset, gs, bits]");
@@ -189,17 +225,55 @@ fn quantized_kvcache_round_trips_through_persist() {
   let want_state_shapes: Vec<Vec<usize>> = want_state.iter().map(|a| a.shape()).collect();
   // Capture the saved dense K/V CONTENTS (before `c` is moved into `cache`).
   let (mut want_dk, mut want_dv) = dequant_quant_state(&want_state);
+  // head_dim stays 64 (one affine quant group per row): dequantize reconstructs
+  // the original `[1, 1, 3, 64]` dense shape, confirming the fixtures kept a
+  // single quant group per row (group_size 64 == head_dim).
+  assert_eq!(
+    want_dk.shape(),
+    vec![1, 1, 3, 64],
+    "dequantized keys must be [1,1,3,64] -> head_dim stayed 64 (one group/row)"
+  );
+  assert_eq!(
+    want_dv.shape(),
+    vec![1, 1, 3, 64],
+    "dequantized values [1,1,3,64]"
+  );
   let want_dk_vec = want_dk.to_vec::<f32>().unwrap();
   let want_dv_vec = want_dv.to_vec::<f32>().unwrap();
   assert!(
     !want_dk_vec.is_empty() && !want_dv_vec.is_empty(),
     "dense state must be non-empty (3 steps x 64 dims)"
   );
+  // PRECONDITIONS (Codex #3 R2) — prove the fixtures genuinely exercise
+  // side (K vs V) and sequence-order sensitivity on the dequantized in-memory
+  // state, so the round-trip equality below is not vacuous:
+  //   (a) dequantized K differs from dequantized V (distinct sides, +4096
+  //       offset survives 8-bit affine quantization);
+  //   (b) within K, the first sequence row differs from the last (rows vary by
+  //       step, so a row-reorder/duplicate bug is observable).
+  assert_ne!(
+    want_dk_vec, want_dv_vec,
+    "K and V fixtures must dequantize to DIFFERENT dense values (else a K<->V \
+     swap or one-sided duplicate in persist would pass undetected)"
+  );
+  let row_len = 64; // head_dim
+  assert_eq!(want_dk_vec.len(), 3 * row_len, "3 steps x 64 dims");
+  assert_ne!(
+    &want_dk_vec[..row_len],
+    &want_dk_vec[(want_dk_vec.len() - row_len)..],
+    "K row 0 must differ from K row 2 (rows vary by sequence step, so a \
+     row-reorder/duplicate in persist would be observable)"
+  );
+  assert_ne!(
+    &want_dv_vec[..row_len],
+    &want_dv_vec[(want_dv_vec.len() - row_len)..],
+    "V row 0 must differ from V row 2 (rows vary by sequence step)"
+  );
 
   let cache: Vec<Box<dyn KvCache>> = vec![Box::new(c)];
   save_prompt_cache(&path, &cache, &HashMap::new()).unwrap();
 
-  let (_arrays, raw_meta) = io::load_safetensors_with_metadata(&path).unwrap();
+  let (mut arrays, raw_meta) = io::load_safetensors_with_metadata(&path).unwrap();
   assert_eq!(
     raw_meta.get("2.0").map(String::as_str),
     Some("QuantizedKVCache")
@@ -212,6 +286,74 @@ fn quantized_kvcache_round_trips_through_persist() {
     raw_meta.get("0.0.2").map(String::as_str),
     Some(want_meta[2].as_str())
   );
+
+  // Codex R3+R4: verify the RAW on-disk array slots against an oracle that is
+  // INDEPENDENT of `c.state()`. The six packed arrays are written under "0.{j}"
+  // (cache 0, array j) in order [k.w, k.scales, k.biases, v.w, v.scales,
+  // v.biases]. Dequantizing the on-disk slots IN ORDER and comparing them to the
+  // ORIGINAL dense INPUT fixtures (`kv_quant_keys`/`kv_quant_values`, created by
+  // the test — NOT derived from `state()`/`save_prompt_cache`) pins the semantic
+  // wire format: a save/load that writes arrays to the wrong slots, swaps K<->V,
+  // or reorders sequence rows diverges from the input here even if it round-trips
+  // self-consistently. (R4: the prior compare to `want_*` was self-referential —
+  // both `want_*` and the slots derive from `state()`.)
+  let mut raw_state: Vec<Array> = (0..6)
+    .map(|j| {
+      arrays
+        .remove(&format!("0.{j}"))
+        .unwrap_or_else(|| panic!("missing on-disk quantized array slot 0.{j}"))
+    })
+    .collect();
+  // R5: every one of the six slots must be individually distinguishable, so a
+  // swap/duplicate of ANY single on-disk array changes the dequantized output.
+  // Keys span 63 / values span 126 give DIFFERENT affine scales (slots 0.1 vs
+  // 0.4); different mins give different biases (slots 0.2 vs 0.5). Assert those
+  // slot pairs differ so a same-range regression cannot silently reappear.
+  assert_ne!(
+    raw_state[1].to_vec::<f32>().unwrap(),
+    raw_state[4].to_vec::<f32>().unwrap(),
+    "K-scales (slot 0.1) and V-scales (slot 0.4) must differ — distinct per-row ranges"
+  );
+  assert_ne!(
+    raw_state[2].to_vec::<f32>().unwrap(),
+    raw_state[5].to_vec::<f32>().unwrap(),
+    "K-biases (slot 0.2) and V-biases (slot 0.5) must differ — distinct per-row mins"
+  );
+  let (mut raw_dk, mut raw_dv) = dequant_quant_state(&raw_state);
+  let raw_dk_vec = raw_dk.to_vec::<f32>().unwrap();
+  let raw_dv_vec = raw_dv.to_vec::<f32>().unwrap();
+  // Independent oracle = the dense f32 inputs to `update_quantized`. Compare
+  // within the 8-bit affine quant band: keys span 63 (max error 63/510 ~= 0.124),
+  // values span 126 (max error 126/510 ~= 0.247); QUANT_TOL 0.5 sits above the
+  // larger error yet far below the 1.0 key element spacing and the 64/128-per-row
+  // and 4096-K-vs-V separations, so a wrong-slot / swap / reorder exceeds it.
+  const QUANT_TOL: f32 = 0.5;
+  let exp_keys = kv_quant_keys(3).to_vec::<f32>().unwrap();
+  let exp_values = kv_quant_values(3).to_vec::<f32>().unwrap();
+  assert_eq!(
+    raw_dk_vec.len(),
+    exp_keys.len(),
+    "raw key slots dequantize to the input key element count"
+  );
+  assert_eq!(
+    raw_dv_vec.len(),
+    exp_values.len(),
+    "raw value slots dequantize to the input value element count"
+  );
+  for (i, (got, exp)) in raw_dk_vec.iter().zip(exp_keys.iter()).enumerate() {
+    assert!(
+      (got - exp).abs() <= QUANT_TOL,
+      "RAW on-disk KEY slot element {i}: dequant {got} vs original input fixture \
+       {exp} exceeds the quant band (wrong wire slot / K<->V swap / row reorder)"
+    );
+  }
+  for (i, (got, exp)) in raw_dv_vec.iter().zip(exp_values.iter()).enumerate() {
+    assert!(
+      (got - exp).abs() <= QUANT_TOL,
+      "RAW on-disk VALUE slot element {i}: dequant {got} vs original input fixture \
+       {exp} exceeds the quant band (wrong wire slot / K<->V swap / row reorder)"
+    );
+  }
 
   let (loaded, _m) = load_prompt_cache(&path).unwrap();
   assert_eq!(loaded.len(), 1);

@@ -10,7 +10,7 @@
 #![cfg(feature = "lm")]
 
 use mlxrs::{
-  Array, Error,
+  Array, Error, Stream,
   lm::cache::{
     ArraysCache, BatchKvCache, BatchRotatingKvCache, CacheConfig, CacheList, ChunkedKvCache,
     KvCache, MaskMode, QuantizedKvCacheImpl, RopeOffset, RotatingKvCache, StandardKvCache,
@@ -2209,6 +2209,79 @@ fn rotating_materialize_noop_empty_and_eval_populated() {
   assert_eq!(k.to_vec::<f32>().unwrap(), vec![0.0, 1.0, 2.0, 3.0]);
   assert_eq!(c.meta_state(), vec!["4", "8", "4", "4"]);
   assert_eq!(c.nbytes(), 64, "decode reuses the same 8-row ring");
+}
+
+/// `StandardKvCache::materialize` is NOT a complete no-op — it force-evals the
+/// stored `self.keys`/`self.values` (standard.rs:94-101 via `Array::eval`).
+///
+/// Codex #2 R2: the `*_noop_empty_and_eval_populated` tests above use
+/// `nbytes()` (metadata-only) and `state().to_vec()` (which self-evals its own
+/// clone), so replacing `materialize` with `Ok(())` still passes them — no
+/// public-API assertion can observe a missed eval, because `eval` is
+/// value/shape-preserving. This test closes that gap with a side channel:
+/// `Array::eval` calls `assert_streams_not_cleared` (array/mod.rs:118), which
+/// PANICS once `Stream::clear_current_thread_streams` has poisoned the current
+/// OS thread (stream.rs:69-81). So on a cleared thread a CORRECT `materialize`
+/// (which evals) panics, while a no-op (`Ok(())`) returns cleanly.
+///
+/// `Array` is `!Send`, so the cache cannot cross a thread boundary — it is
+/// built, poisoned, and materialized entirely INSIDE the spawned closure. The
+/// populated cache is built via `update` only (NO `state()`/`to_vec()` — those
+/// would eval the buffers early and defeat the test); `update` stores the
+/// concatenated buffers lazily (standard.rs:60-76, no `eval`). The cleared
+/// state is per-thread and dies with the worker, so no other (main-thread)
+/// test is polluted.
+#[test]
+fn standard_materialize_is_not_a_noop_evals_buffers() {
+  let joined = std::thread::spawn(|| {
+    // (1) Populate via `update` only — leaves self.keys/self.values lazy.
+    let mut s = StandardKvCache::new();
+    s.update(&kv(&[0.0, 1.0, 2.0, 3.0]), &kv(&[0.0, 1.0, 2.0, 3.0]))
+      .unwrap();
+    // (2) Poison THIS thread (end-of-thread cleanup; exempt from the guard).
+    Stream::clear_current_thread_streams().unwrap();
+    // (3) materialize -> Array::eval -> assert_streams_not_cleared -> PANIC if
+    // it really evals; a no-op `Ok(())` would NOT panic and the thread would
+    // join cleanly, failing the assert below.
+    s.materialize().unwrap();
+  })
+  .join();
+  assert!(
+    joined.is_err(),
+    "materialize must force-eval the stored buffers (panic on a cleared-stream \
+     thread); a no-op would not"
+  );
+}
+
+/// `RotatingKvCache::materialize` is NOT a complete no-op — it force-evals the
+/// stored ring `self.keys`/`self.values` (rotating.rs:499-507 via `Array::eval`).
+///
+/// Same Codex #2 R2 mechanism as `standard_materialize_is_not_a_noop_evals_buffers`:
+/// on a thread poisoned by `Stream::clear_current_thread_streams`, the `eval`
+/// inside `materialize` trips `assert_streams_not_cleared` and panics, whereas
+/// a no-op `Ok(())` joins cleanly. Built/poisoned/materialized inside the
+/// closure (`Array: !Send`); populated by `update` only (rotating fills the
+/// ring lazily, no eval), so the buffers reach `materialize` unevaluated.
+#[test]
+fn rotating_materialize_is_not_a_noop_evals_buffers() {
+  let joined = std::thread::spawn(|| {
+    // (1) Populate via `update` only — leaves the ring buffers lazy.
+    let mut c = RotatingKvCache::new(8, 4);
+    for id in 0..3 {
+      let t = kv(&[id as f32]);
+      c.update(&t, &t).unwrap();
+    }
+    // (2) Poison THIS thread.
+    Stream::clear_current_thread_streams().unwrap();
+    // (3) materialize -> eval -> PANIC if it really evals the stored ring.
+    c.materialize().unwrap();
+  })
+  .join();
+  assert!(
+    joined.is_err(),
+    "materialize must force-eval the stored ring buffers (panic on a \
+     cleared-stream thread); a no-op would not"
+  );
 }
 
 /// `StandardKvCache::set_state` called DIRECTLY (mlx-lm `KVCache.state`
