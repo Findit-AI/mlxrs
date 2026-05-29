@@ -1182,6 +1182,19 @@ pub enum Error {
   ConvertDurabilityWarnings(#[from] ConvertDurabilityWarnings),
 }
 
+// M8 / M10 (#257): pin the `Error` enum size. It is feature-INVARIANT — 144
+// bytes under BOTH the default build and `--features lm,vlm,audio,embeddings`
+// (the largest variant, `ArithmeticOverflow`, is not feature-gated), so a
+// feature flag never changes `size_of::<Error>()`. This guard fails the build
+// if a feature-gated variant — or any payload change — grows `Error`, which
+// would silently bloat every `Result<T, Error>`. Reducing the current 144 bytes
+// (driven by the `ArithmeticOverflow` / `ShapePairMismatch` payloads) is tracked
+// as a separate perf follow-up.
+const _: () = assert!(
+  core::mem::size_of::<Error>() <= 144,
+  "Error enum grew beyond 144 bytes — box or shrink the offending variant payload (see the #257 M8/M10 size note)"
+);
+
 /// Structured aggregate of `convert()`-time durability warnings —
 /// the inner shape carried by [`Error::ConvertDurabilityWarnings`].
 ///
