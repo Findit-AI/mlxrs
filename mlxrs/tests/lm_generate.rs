@@ -170,7 +170,7 @@ impl Model for RecordingModel {
 /// A `Model` returning logits with a deliberately **degenerate** axis
 /// (`[1, 0, V]` when `zero_seq`, else `[1, 1, 0]`) — drives the
 /// `last_position` `S == 0` / `V == 0` recoverable-`Err` guard (must be a
-/// clean `Err(ShapeMismatch)` then a fused iterator, never a `usize`
+/// clean `Err(OutOfRange)` then a fused iterator, never a `usize`
 /// underflow / malformed slice / panic).
 struct ZeroAxisModel {
   zero_seq: bool,
@@ -364,7 +364,7 @@ fn generate_step_prefill_chunk_boundaries_are_exact() {
 
 /// Regression (Copilot fix #2): a buggy model returning logits with a
 /// zero-length sequence (`[1, 0, V]`) or vocab (`[1, S, 0]`) axis must
-/// surface a **recoverable** `Err(ShapeMismatch)` (mirroring Python
+/// surface a **recoverable** `Err(OutOfRange)` (mirroring Python
 /// `logits[:, -1, :]` raising `IndexError`) — never a `usize` underflow on
 /// `s - 1`, a malformed `[0, -1, 0]` slice, or a panic. The iterator yields
 /// the `Err` once and then fuses (spec §4).

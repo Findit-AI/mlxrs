@@ -21,7 +21,7 @@
 //!   `Array`s with the declared shapes / dtypes and the expected values.
 //! - `apply_rejects_shape_count_mismatch` — `MetalKernel::new` declares one
 //!   output_name but the per-call `MetalKernelApplyConfig` supplies two
-//!   output_shapes; `apply` returns `Error::ShapeMismatch` without touching
+//!   output_shapes; `apply` returns `Error::LengthMismatch` without touching
 //!   the device.
 //! - `apply_accepts_valid_multi_dim_output_shape` — a 1-input, 1-output
 //!   kernel produces a `[4, 8, 16]`-shaped output; sanity-checks that a
