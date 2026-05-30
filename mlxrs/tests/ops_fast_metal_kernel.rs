@@ -206,13 +206,11 @@ fn apply_rejects_shape_count_mismatch() {
     .apply(&[&input], &cfg)
     .expect_err("declared 1 output_name but supplied 2 output_shapes");
   match err {
-    mlxrs::Error::ShapeMismatch(message) => {
-      assert!(
-        message.contains("output_shapes.len()=2"),
-        "got: {message:?}"
-      );
-      assert!(message.contains("output_names.len()=1"), "got: {message:?}");
+    mlxrs::Error::LengthMismatch(payload) => {
+      // 1 output_name declared, 2 output_shapes supplied.
+      assert_eq!(payload.expected(), 1, "expected count: {:?}", payload);
+      assert_eq!(payload.actual(), 2, "actual count: {:?}", payload);
     }
-    other => panic!("expected ShapeMismatch, got: {other:?}"),
+    other => panic!("expected LengthMismatch, got: {other:?}"),
   }
 }

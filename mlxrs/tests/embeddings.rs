@@ -1797,7 +1797,7 @@ fn cosine_similarity_rejects_unequal_lengths() {
 
 #[test]
 fn cosine_similarity_rejects_non_rank1() {
-  // Wrong-rank inputs → RankMismatch (was Error::ShapeMismatch pre-migration).
+  // Wrong-rank inputs → RankMismatch.
   let m = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &(2, 2)).unwrap();
   let s = Array::from_slice(&[1.0_f32], &(1, 1)).unwrap();
   // rank-2 a, rank-2 b.

@@ -90,9 +90,13 @@ impl Model for MockModel {
       [b, s] => (*b, *s),
       [s] => (1, *s),
       _ => {
-        return Err(mlxrs::Error::ShapeMismatch(format!(
-          "MockModel::forward expects [B, S] tokens, got {shape:?}"
-        )));
+        return Err(mlxrs::Error::RankMismatch(
+          mlxrs::error::RankMismatchPayload::new(
+            "MockModel::forward expects [B, S] tokens",
+            shape.len() as u32,
+            shape.to_vec(),
+          ),
+        ));
       }
     };
     let vocab = self.bias.len();
@@ -152,9 +156,13 @@ impl Model for RecordingModel {
       [b, s] => (*b, *s),
       [s] => (1, *s),
       _ => {
-        return Err(mlxrs::Error::ShapeMismatch(format!(
-          "RecordingModel::forward expects [B, S] tokens, got {shape:?}"
-        )));
+        return Err(mlxrs::Error::RankMismatch(
+          mlxrs::error::RankMismatchPayload::new(
+            "RecordingModel::forward expects [B, S] tokens",
+            shape.len() as u32,
+            shape.to_vec(),
+          ),
+        ));
       }
     };
     self.seq_lens.borrow_mut().push(seq);

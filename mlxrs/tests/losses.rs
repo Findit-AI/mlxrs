@@ -667,10 +667,14 @@ fn kl_div_loss_real_device_shape_mismatch() {
   let b = Array::ones::<f32>(&[2, 8]).unwrap();
   let err = kl_div_loss(&a, &b).unwrap_err();
   match err {
-    Error::ShapeMismatch(message) => {
-      assert!(message.contains("kl_div_loss"), "got: {message:?}");
+    Error::ShapePairMismatch(payload) => {
+      assert!(
+        payload.context().contains("kl_div_loss"),
+        "got: {:?}",
+        payload.context()
+      );
     }
-    other => panic!("expected ShapeMismatch, got: {other:?}"),
+    other => panic!("expected ShapePairMismatch, got: {other:?}"),
   }
 }
 
