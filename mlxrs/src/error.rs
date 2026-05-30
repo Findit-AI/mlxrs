@@ -232,7 +232,11 @@ impl std::error::Error for MissingFieldPayload {}
 pub struct ArithmeticOverflowPayload {
   context: &'static str,
   op_type: &'static str,
-  operands: SmallVec<[(&'static str, u64); 4]>,
+  // Boxed slice (not an inline `SmallVec`) so this payload — and therefore the
+  // whole `Error` enum — stays small: overflow operand lists are tiny and
+  // built once on the cold error path, so the heap indirection is free and the
+  // 16-byte fat pointer beats a 112-byte inline buffer (#257 M8/M10 size).
+  operands: Box<[(&'static str, u64)]>,
 }
 
 impl ArithmeticOverflowPayload {
@@ -244,7 +248,7 @@ impl ArithmeticOverflowPayload {
     Self {
       context,
       op_type,
-      operands: SmallVec::new(),
+      operands: Box::default(),
     }
   }
 
@@ -1182,17 +1186,16 @@ pub enum Error {
   ConvertDurabilityWarnings(#[from] ConvertDurabilityWarnings),
 }
 
-// M8 / M10 (#257): pin the `Error` enum size. It is feature-INVARIANT — 144
-// bytes under BOTH the default build and `--features lm,vlm,audio,embeddings`
-// (the largest variant, `ArithmeticOverflow`, is not feature-gated), so a
-// feature flag never changes `size_of::<Error>()`. This guard fails the build
-// if a feature-gated variant — or any payload change — grows `Error`, which
-// would silently bloat every `Result<T, Error>`. Reducing the current 144 bytes
-// (driven by the `ArithmeticOverflow` / `ShapePairMismatch` payloads) is tracked
-// as a separate perf follow-up.
+// M8 / M10 (#257): pin the `Error` enum size. It is feature-INVARIANT (no
+// feature-gated variant exceeds the largest always-present one), so a feature
+// flag never changes `size_of::<Error>()`. The two formerly-largest payloads
+// (`ArithmeticOverflow` 144 B, `ShapePairMismatch` 120 B) now box their
+// variable-length fields (#281), so `Error` is ~80 B instead of 144 B. This
+// guard fails the build if a payload change regrows the enum and silently
+// bloats every `Result<T, Error>`.
 const _: () = assert!(
-  core::mem::size_of::<Error>() <= 144,
-  "Error enum grew beyond 144 bytes — box or shrink the offending variant payload (see the #257 M8/M10 size note)"
+  core::mem::size_of::<Error>() <= 96,
+  "Error enum exceeded 96 bytes — box or shrink the offending variant payload (see the #257 M8/M10 size note)"
 );
 
 /// Structured aggregate of `convert()`-time durability warnings —
@@ -2078,8 +2081,10 @@ impl std::error::Error for CapExceededPayload {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShapePairMismatchPayload {
   context: &'static str,
-  expected: SmallVec<[usize; 4]>,
-  actual: SmallVec<[usize; 4]>,
+  // Boxed slices keep this payload (and `Error`) small — shape pairs are built
+  // once on the cold error path (#257 M8/M10 size).
+  expected: Box<[usize]>,
+  actual: Box<[usize]>,
 }
 
 impl ShapePairMismatchPayload {
@@ -2091,8 +2096,8 @@ impl ShapePairMismatchPayload {
   ) -> Self {
     Self {
       context,
-      expected: expected.into(),
-      actual: actual.into(),
+      expected: expected.into().into_vec().into_boxed_slice(),
+      actual: actual.into().into_vec().into_boxed_slice(),
     }
   }
   /// Call-site label.
@@ -2118,8 +2123,8 @@ impl std::fmt::Display for ShapePairMismatchPayload {
       f,
       "shape mismatch: {}: expected {:?}, got {:?}",
       self.context,
-      self.expected.as_slice(),
-      self.actual.as_slice()
+      &self.expected[..],
+      &self.actual[..]
     )
   }
 }
