@@ -320,7 +320,7 @@ fn reject_bool_index(context: &'static str, idx: &Array) -> Result<()> {
   if idx.dtype()? == Dtype::Bool {
     return Err(Error::InvariantViolation(InvariantViolationPayload::new(
       context,
-      "indices must not be Bool (mlx indexing throws an uncaught C++ exception for bool indices)",
+      "indices must not be Bool (Bool indices are not supported by mlx indexing ops)",
     )));
   }
   Ok(())
