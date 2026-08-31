@@ -1,6 +1,6 @@
 //! `resample_linear` linear interpolation.
 //!
-//! Tracking: [#153](https://github.com/Findit-AI/mlxrs/issues/153).
+//! Tracking: [#153](https://github.com/findit-studio/mlxrs/issues/153).
 //!
 //! # The defect class
 //!

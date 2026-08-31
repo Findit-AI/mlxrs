@@ -12,7 +12,7 @@
 //! - HF `transformers` `ClapModel` (`laion/clap-htsat-unfused`) — the
 //!   authoritative architecture (`ClapAudioModel` + `ClapTextModel` + two
 //!   projection MLPs + L2-normalize).
-//! - The Findit-AI `textclap` crate — owns the mel front-end + the I/O
+//! - The findit-studio `textclap` crate — owns the mel front-end + the I/O
 //!   contract verbatim, and its committed `golden_mel.npy` /
 //!   `filterbank_row_*.npy` fixtures pin the mel front-end numerically (the
 //!   [`mel`] oracle).

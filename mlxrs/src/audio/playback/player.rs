@@ -136,7 +136,7 @@
 //!   maintain their own sample counter against
 //!   [`AudioPlayer::buffer_depth`].
 //!
-//! [swift-ap]: https://github.com/fintit-ai/mlx-audio-swift/blob/main/Sources/MLXAudioCore/AudioPlayer.swift
+//! [swift-ap]: https://github.com/Blaizzy/mlx-audio-swift/blob/main/Sources/MLXAudioCore/AudioPlayer.swift
 
 use std::{
   collections::VecDeque,

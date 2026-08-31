@@ -9,7 +9,7 @@
 //! Linear) that maps the `(B, hidden)` text feature into the shared
 //! contrastive space, followed by L2-normalize.
 //!
-//! The strong Rust reference is the Findit-AI `textclap` crate's `src/text.rs`
+//! The strong Rust reference is the findit-studio `textclap` crate's `src/text.rs`
 //! (the CLAP RoBERTa text side, ONNX-backed): it pins the **position-id offset**
 //! (`pad_id + 1 + cumsum(non_pad_mask)`, its design spec §7.4), the
 //! `512`-real-token cap (`TEXT_MAX_TOKENS = 512`, `text.rs:31`), and the final

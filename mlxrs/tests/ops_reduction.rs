@@ -79,31 +79,50 @@ fn max_axes_keepdims_preserves_axis() {
 }
 
 #[test]
-fn max_axes_empty_on_zero_size_errors() {
-  // MLX checks size==0 BEFORE the no-axes early return for max/min, so empty
-  // axes on a zero-size array must error (not silently return a clone).
-  // Same contract for min_axes.
+fn max_axes_on_zero_size_reduced_axis_errors() {
+  // A *reduced* axis of size 0 has no defined max/min, and MLX rejects it.
+  // Empty `axes` is the separate, non-erroring case covered below.
+  //
+  // Through MLX v0.31.2 the size-0 check ran before the no-axes early return,
+  // so `&[]` on a zero-size array errored too. v0.32.2's `compute_reduce_shape`
+  // only inspects axes actually in the reduce set, so naming the axis is now
+  // what triggers the error. mlxrs deliberately routes empty axes through
+  // `mlx_max_axes` rather than deciding locally, so it tracks MLX either way.
   let a = Array::from_slice::<f32>(&[], &[0i32]).unwrap();
   assert_eq!(a.size(), 0);
-  // mlx C++ surfaces `[max]` / `[min]` "Cannot reduce zero size array …"
-  // via the boundary handler; the typed-prefix parser maps the bracketed
-  // op-name to `MlxOpKind::Pool` (the reduction-family bucket).
-  let r_max = mlxrs::ops::reduction::max_axes(&a, &[], false);
+  // mlx C++ surfaces `[max]` / `[min]` "Cannot max reduce over axis 0 with
+  // size 0" via the boundary handler; the typed-prefix parser maps the
+  // bracketed op-name to `MlxOpKind::Pool` (the reduction-family bucket).
+  let r_max = mlxrs::ops::reduction::max_axes(&a, &[0], false);
   assert!(
     matches!(
       &r_max,
       Err(mlxrs::Error::MlxOp(p)) if matches!(p.op(), mlxrs::error::MlxOpKind::Pool)
     ),
-    "expected Err(MlxOp(Pool)) for max_axes(zero_size, &[]), got {r_max:?}",
+    "expected Err(MlxOp(Pool)) for max_axes(zero_size, &[0]), got {r_max:?}",
   );
-  let r_min = mlxrs::ops::reduction::min_axes(&a, &[], false);
+  let r_min = mlxrs::ops::reduction::min_axes(&a, &[0], false);
   assert!(
     matches!(
       &r_min,
       Err(mlxrs::Error::MlxOp(p)) if matches!(p.op(), mlxrs::error::MlxOpKind::Pool)
     ),
-    "expected Err(MlxOp(Pool)) for min_axes(zero_size, &[]), got {r_min:?}",
+    "expected Err(MlxOp(Pool)) for min_axes(zero_size, &[0]), got {r_min:?}",
   );
+}
+
+#[test]
+fn max_axes_empty_on_zero_size_is_identity() {
+  // Empty axes reduces over nothing, so it is the identity even when the
+  // input is zero-size (MLX v0.32.2 contract; see the sibling test above).
+  let a = Array::from_slice::<f32>(&[], &[0i32]).unwrap();
+  assert_eq!(a.size(), 0);
+  let r_max = mlxrs::ops::reduction::max_axes(&a, &[], false)
+    .expect("max_axes(zero_size, &[]) is the identity, not an error");
+  assert_eq!(r_max.shape(), vec![0]);
+  let r_min = mlxrs::ops::reduction::min_axes(&a, &[], false)
+    .expect("min_axes(zero_size, &[]) is the identity, not an error");
+  assert_eq!(r_min.shape(), vec![0]);
 }
 
 #[test]

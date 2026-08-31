@@ -1,6 +1,6 @@
 //! PCM sample decode → normalized f32 widen.
 //!
-//! Tracking: [#146](https://github.com/Findit-AI/mlxrs/issues/146).
+//! Tracking: [#146](https://github.com/findit-studio/mlxrs/issues/146).
 //!
 //! # The defect class
 //!

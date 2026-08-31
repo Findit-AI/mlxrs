@@ -11,6 +11,19 @@ use crate::{
   stream::default_stream,
 };
 
+/// "No accumulate-dtype override" for the `cum*` reductions.
+///
+/// mlx-c v0.32.2 gave `mlx_cumsum` / `mlx_cumprod` an optional dtype parameter
+/// that selects the accumulator type. `has_value: false` declines the override,
+/// leaving mlx to apply its own promotion rule — which is exactly what these
+/// wrappers did before v0.32.2, so the observable behavior is unchanged.
+/// `value` is never read while `has_value` is false; it is pinned to a valid
+/// discriminant rather than left arbitrary.
+const NO_DTYPE_OVERRIDE: mlxrs_sys::mlx_optional_dtype = mlxrs_sys::mlx_optional_dtype {
+  value: mlxrs_sys::mlx_dtype__MLX_BOOL,
+  has_value: false,
+};
+
 /// RAII guard for a temporary scalar `mlx_array` (e.g. clip bounds, full_like
 /// fill value). Local twin of `array::construction::ScalarGuard`; duplicated
 /// here intentionally so this module stays self-contained — promotion to a
@@ -126,12 +139,13 @@ pub fn cumsum(a: &Array, axis: i32, reverse: bool, inclusive: bool) -> Result<Ar
   // not retained by mlx past it); the out-param was freshly allocated above
   // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe {
-    mlxrs_sys::mlx_cumsum(
+    mlxrs_sys::mlx_cumsum_axis(
       &mut out.0,
       a.0,
       axis as c_int,
       reverse,
       inclusive,
+      NO_DTYPE_OVERRIDE,
       default_stream(),
     )
   })?;
@@ -150,12 +164,13 @@ pub fn cumprod(a: &Array, axis: i32, reverse: bool, inclusive: bool) -> Result<A
   // not retained by mlx past it); the out-param was freshly allocated above
   // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe {
-    mlxrs_sys::mlx_cumprod(
+    mlxrs_sys::mlx_cumprod_axis(
       &mut out.0,
       a.0,
       axis as c_int,
       reverse,
       inclusive,
+      NO_DTYPE_OVERRIDE,
       default_stream(),
     )
   })?;
@@ -174,7 +189,7 @@ pub fn cummax(a: &Array, axis: i32, reverse: bool, inclusive: bool) -> Result<Ar
   // not retained by mlx past it); the out-param was freshly allocated above
   // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe {
-    mlxrs_sys::mlx_cummax(
+    mlxrs_sys::mlx_cummax_axis(
       &mut out.0,
       a.0,
       axis as c_int,
@@ -198,7 +213,7 @@ pub fn cummin(a: &Array, axis: i32, reverse: bool, inclusive: bool) -> Result<Ar
   // not retained by mlx past it); the out-param was freshly allocated above
   // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe {
-    mlxrs_sys::mlx_cummin(
+    mlxrs_sys::mlx_cummin_axis(
       &mut out.0,
       a.0,
       axis as c_int,

@@ -1,6 +1,6 @@
 //! `mel_filter_bank` triangle construction.
 //!
-//! Tracking: [#155](https://github.com/Findit-AI/mlxrs/issues/155).
+//! Tracking: [#155](https://github.com/findit-studio/mlxrs/issues/155).
 //!
 //! # The defect class
 //!

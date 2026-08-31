@@ -436,7 +436,9 @@ pub struct Compiled {
   /// tape — returning empty outputs as a spurious success. mlx-c exposes no
   /// way to evict just that one entry for the high-level `mlx_compile` path
   /// (`mlx_detail_compile_erase` needs the internal `fun_id`, which
-  /// `mlx_compile` never hands back; `mlx_detail_compile_clear_cache` would
+  /// `mlx_compile` never hands back — and, as of mlx-c v0.32.2, an explicit
+  /// `mlx_compile_cache` handle the high-level path likewise never exposes;
+  /// `mlx_detail_compile_clear_cache` would
   /// nuke every *unrelated* compiled function process-wide), so we instead mark
   /// this wrapper poisoned on the first failing call and refuse all later ones.
   /// The observable contract: a failed trace never yields a later stale
@@ -550,7 +552,7 @@ impl Compiled {
     //     wrapper. #3620 does NOT fix this; only an `is_tracer` binding (skip the
     //     poison on the tracer-input path) or ml-explore/mlx#3624 (the upstream
     //     cache fix, after which the whole poison workaround is removed) does.
-    // Both are accepted, documented limitations tracked at Findit-AI/mlxrs#363.
+    // Both are accepted, documented limitations tracked at findit-studio/mlxrs#363.
     let _trace = self.cache_backed.then(TraceGuard::enter);
     // SAFETY: `self.inner` is the owned compiled closure (alive for the call);
     // `in_guard.0` is a freshly built vector of borrowed handles live for the

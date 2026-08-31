@@ -165,6 +165,13 @@ pub fn scaled_dot_product_attention(
       mask_mode.as_ptr(),
       mask_arr_ctx,
       sinks_ctx,
+      // `force_fused`, added in mlx-c v0.32.2. `false` is upstream's own
+      // default (mlx's C++ `scaled_dot_product_attention` declares
+      // `bool force_fused = false`, and the Python binding binds the same),
+      // so mlx keeps choosing the fused vs unfused kernel by its internal
+      // heuristic — the behavior this wrapper had before v0.32.2. Forcing
+      // the fused path would make mlx error on shapes it cannot fuse.
+      false,
       default_stream(),
     )
   })?;
