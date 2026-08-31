@@ -270,9 +270,10 @@ impl PlaybackConfig {
       Some(n) => cpal::BufferSize::Fixed(n),
       None => cpal::BufferSize::Default,
     };
-    // Note: `cpal::SampleRate` is a `pub type SampleRate = u32` alias
-    // in cpal 0.17 (the older `SampleRate(u32)` newtype was flattened
-    // into a raw `u32` upstream), so we pass the rate directly.
+    // Note: `cpal::SampleRate` is still a `pub type SampleRate = u32`
+    // alias as of cpal 0.18 (the older `SampleRate(u32)` newtype was
+    // flattened into a raw `u32` upstream before 0.17 and the 0.17→0.18
+    // bump left this alias untouched), so we pass the rate directly.
     Ok(cpal::StreamConfig {
       channels,
       sample_rate: self.sample_rate,

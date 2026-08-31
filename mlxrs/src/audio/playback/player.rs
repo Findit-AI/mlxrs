@@ -149,7 +149,7 @@ use std::{
 };
 
 use cpal::{
-  Stream, StreamError,
+  Stream,
   traits::{DeviceTrait, HostTrait, StreamTrait},
 };
 
@@ -277,12 +277,12 @@ struct SharedState {
   /// surface it on the next producer call (`write_samples`, `flush`,
   /// `pause`, `resume`).
   ///
-  /// `Mutex<Option<StreamError>>` — store the cpal error TYPED (not
+  /// `Mutex<Option<cpal::Error>>` — store the cpal error TYPED (not
   /// stringified) so `take_callback_error` can surface it as the typed
-  /// [`crate::Error::ExternalOp`] variant with `cpal::StreamError` boxed
+  /// [`crate::Error::ExternalOp`] variant with `cpal::Error` boxed
   /// into the source chain. If multiple device events fire we keep the
   /// first one. Cleared by [`AudioPlayer::stop`].
-  callback_error: Mutex<Option<StreamError>>,
+  callback_error: Mutex<Option<cpal::Error>>,
 }
 
 impl SharedState {
@@ -375,9 +375,12 @@ pub struct AudioPlayer {
   /// before the `SharedState` so the cpal callback thread is joined
   /// while the queue + atomics are still live.
   ///
-  /// `cpal::Stream` is `Send + Sync` (per cpal 0.17.x docs) so the
-  /// `AudioPlayer` can cross thread boundaries — the playback pipeline
-  /// can drive a player from any thread.
+  /// `cpal::Stream` is `Send + Sync` — cpal 0.18 enforces this per
+  /// backend with a compile-time `assert_stream_send!`/`assert_stream_sync!`
+  /// assertion (CoreAudio included), so it's a documented API requirement
+  /// rather than an incidental guarantee. The `AudioPlayer` can therefore
+  /// cross thread boundaries — the playback pipeline can drive a player
+  /// from any thread.
   stream: Option<Stream>,
   /// Shared callback + producer state. See [`SharedState`].
   shared: Arc<SharedState>,
@@ -509,15 +512,15 @@ impl AudioPlayer {
       }
     };
 
-    // cpal `err_fn`. Stash the first TYPED `StreamError`; surface it
+    // cpal `err_fn`. Stash the first TYPED `cpal::Error`; surface it
     // on the next producer call as `Error::ExternalOp` so the original
     // cpal error chain is preserved (no `format!`-stringification —
-    // callers branching on `payload.inner().downcast_ref::<StreamError>()`
-    // can recover the original device-backend variant). We don't have a
+    // callers branching on `payload.inner().downcast_ref::<cpal::Error>()`
+    // can recover the original `kind()` / `message()`). We don't have a
     // logger dep in mlxrs, so silent capture is the chosen behavior
     // (the producer will see it).
     let err_shared = Arc::clone(&shared);
-    let err_callback = move |err: StreamError| {
+    let err_callback = move |err: cpal::Error| {
       let mut slot = match err_shared.callback_error.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
@@ -528,7 +531,7 @@ impl AudioPlayer {
     };
 
     let stream = device
-      .build_output_stream(&stream_config, data_callback, err_callback, None)
+      .build_output_stream(stream_config, data_callback, err_callback, None)
       .map_err(|e| {
         Error::ExternalOp(ExternalOpPayload::new(
           "AudioPlayer: cpal build_output_stream failed",
@@ -1056,10 +1059,10 @@ mod tests {
     }
     {
       let mut e = shared.callback_error.lock().unwrap();
-      // The slot is now typed `Option<StreamError>` (to
+      // The slot is now typed `Option<cpal::Error>` (to
       // surface typed `Error::ExternalOp` from the async cpal callback
-      // path); use a real `StreamError` variant.
-      *e = Some(StreamError::DeviceNotAvailable);
+      // path); use a real `cpal::Error` value.
+      *e = Some(cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable));
     }
 
     // Mirror `AudioPlayer::stop`'s ordering: latch FIRST, then
