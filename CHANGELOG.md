@@ -7,7 +7,8 @@ architectures; 0.2.0 adds eleven of them, every one opt-in behind a feature —
 Whisper, Qwen3-ASR, SenseVoice, wav2vec2, Silero VAD, CLAP, EmbeddingGemma,
 SigLIP2 NaFlex, Qwen3, LFM2, and LFM2.5-VL — on top of new core work
 (convolutions, `mx.compile`, a shared quantized-layer module, a config/weight
-validation toolkit, and NumPy `.npy` / `.npz` I/O).
+validation toolkit, and NumPy `.npy` / `.npz` I/O) and a lockstep bump of the
+vendored stack to MLX v0.32.2.
 
 ### Added
 
@@ -56,6 +57,8 @@ validation toolkit, and NumPy `.npy` / `.npz` I/O).
 
 #### Build & deps
 
+- **MLX v0.31.2 → v0.32.2, bumped in lockstep with mlx-c.** The vendored `mlx-c` moves to `c74db53` (v0.6.0+7), the tip that declares `FetchContent_Declare(mlx ... GIT_TAG v0.32.2)`; the `mlx` submodule follows to exactly that tag, and `EXPECTED_MLX_REV` in the build script moves with it so the drift preflight still bites. The gguflib pin is unchanged — mlx v0.32.2's `mlx/io/CMakeLists.txt` still declares the same `8fa6eb6`. Two upstream behavior changes surface through mlxrs, both loosenings: MLX's safetensors writer now accepts zero-element arrays, which it used to reject (`float64` is still unwritable — safetensors has no name for it); and `ops::reduction::max_axes` / `min_axes` with **empty** axes are now the identity on a zero-size input instead of an error, because v0.32.2's `compute_reduce_shape` only rejects a size-0 axis that is actually in the reduce set. Naming the zero-size axis still errors.
+- **37 new mlx-c entry points in the regenerated bindings**, none dropped. Among them: `mlx_stream_new_thread_unsafe`, a first-class `mlx_compile_cache` handle (`mlx_compile_cache_new` / `_free`, `mlx_detail_compile_cache`), `mlx_fast_cross_entropy`, `mlx_gather_qqmm`, `mlx_searchsorted`, `mlx_vecdot`, native `mlx_linalg_det` / `mlx_linalg_slogdet`, `mlx_flip`, `mlx_unstack`, `mlx_diff`, `mlx_trunc`, `mlx_positive`, `mlx_logical_xor`, `mlx_count_nonzero`, the `mlx_cum{sum,prod,max,min}_axis` family, and the Metal metallib-path accessors.
 - **docs.rs builds again** — `mlxrs-sys`'s build script now returns early under `DOCS_RS` (rustdoc never links the native library, and the pre-committed bindings suffice), and both manifests point docs.rs at `aarch64-apple-darwin`.
 - **`serde_json` is a real feature**, not a bare `dep:serde_json` — so `#[cfg(feature = "serde_json")]` is an accurate gate, and `io::load_weights_from_dir` can gate its JSON index tier without forcing JSON onto the `serde_json`-free `embeddings` build.
 - New optional dependencies: `flate2` (Whisper's decode compression-ratio heuristic), `memmapix` (memory-mapped `.npy` / `.npz`), `unicode-general-category` (the aligner's exact General_Category keep-predicate), `zip` 8 (`npz` members), and the `objc2` / `objc2-foundation` / `objc2-core-ml` trio behind the Apple-silicon target gate.
@@ -65,7 +68,8 @@ validation toolkit, and NumPy `.npy` / `.npz` I/O).
 - **BREAKING — `cpal` 0.17 → 0.18.** `cpal` types appear in the public playback surface, so the bump is a caller-visible break: `AudioPlayer::with_device` now takes a 0.18 `&cpal::Device`, and `PlaybackConfig::cpal_config` returns a 0.18 `cpal::StreamConfig`.
 - **BREAKING — the async playback error changed type.** The typed device error boxed into `Error::ExternalOp`'s source chain is now `cpal::Error` (was `cpal::StreamError`). The documented recovery — `payload.inner().downcast_ref::<StreamError>()` — no longer matches; downcast to `cpal::Error` and read `kind()` / `message()` instead.
 - **BREAKING — `StandardKvCache` is a step buffer**, matching mlx-lm's `KVCache` and mlx-swift. Its growth and trim semantics differ from 0.1.0's for callers driving a cache directly.
-- **`mlxrs` requires `mlxrs-sys` 0.2** — the sys crate is republished for the docs.rs build fix.
+- **BREAKING (`mlxrs-sys`) — ten mlx-c FFI signatures changed under it in v0.32.2.** `mlx_median`, `mlx_trace`, `mlx_logcumsumexp`, `mlx_cumsum`, `mlx_cumprod`, `mlx_cummax` and `mlx_cummin` shed their axis parameter to new `_axis` / `_axes` siblings (and `mlx_cumsum` / `mlx_cumprod` additionally gained an `mlx_optional_dtype` accumulator override); `mlx_fast_scaled_dot_product_attention` gained a trailing `force_fused` flag; and `mlx_detail_compile_erase` / `mlx_detail_compile_clear_cache` now take an explicit `mlx_compile_cache` handle. **No mlxrs-level API changed** — `ops::cumsum` / `cumprod` / `cummax` / `cummin`, `ops::median`, `ops::linalg::trace` and the fast-SDPA path keep their signatures and their behavior, forwarding to the `_axis` / `_axes` siblings and declining the two new knobs the way mlx itself defaults them. Code calling `mlxrs-sys` directly must adjust.
+- **`mlxrs` requires `mlxrs-sys` 0.2** — the sys crate is republished both for the docs.rs build fix and for the mlx v0.32.2 FFI surface above.
 - **`zip` 2 → 8** for the `npz` feature.
 
 ### Fixed

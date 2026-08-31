@@ -149,12 +149,19 @@ pub fn mean(a: &Array, keepdims: bool) -> Result<Array> {
 /// NaN the result is NaN — and NaN dominates `±Inf` (see the module-level
 /// "NaN propagation" note). Integer inputs have no NaN concept.
 ///
-/// `max` errors on zero-size inputs (no defined max for an empty set). Unlike
-/// the identity-dtype reductions (`sum`/`prod`), we must NOT short-circuit
-/// `axes.is_empty()` to `try_clone` — MLX checks `a.size() == 0` BEFORE the
-/// no-axes early return, so a clone here would silently accept zero-size
-/// inputs that every other reduction path rejects.
-/// Empty axes route through `mlx_max_axes` with a `dim_ptr` sentinel.
+/// `max` errors when a *reduced* axis has size 0 — there is no defined max for
+/// an empty set. Empty `axes` is a different case: it reduces over nothing, so
+/// it is the identity for any input, zero-size included. (Through MLX v0.31.2
+/// the size-0 check ran before the no-axes early return and empty axes on a
+/// zero-size array errored; v0.32.2's `compute_reduce_shape` only inspects axes
+/// that are actually in the reduce set, making empty axes an unconditional
+/// no-op.)
+///
+/// We still must NOT short-circuit `axes.is_empty()` to `try_clone` here:
+/// deciding the empty-axes case locally would pin mlxrs to whichever contract
+/// happened to be current, and this exact reversal is why. Empty axes route
+/// through `mlx_max_axes` with a `dim_ptr` sentinel so MLX stays the single
+/// source of truth.
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.max.html).
 pub fn max_axes(a: &Array, axes: &[i32], keepdims: bool) -> Result<Array> {
@@ -195,8 +202,9 @@ pub fn max(a: &Array, keepdims: bool) -> Result<Array> {
 
 /// Minimum value along the given axes.
 ///
-/// Same contract as `max_axes`: zero-size inputs error, no `try_clone`
-/// short-circuit. See `max_axes` doc for the rationale. Also NaN-propagating
+/// Same contract as `max_axes`: a reduced axis of size 0 errors, empty `axes`
+/// is the identity, and there is no `try_clone` short-circuit. See the
+/// `max_axes` doc for the rationale. Also NaN-propagating
 /// for floating types (NaN dominates `±Inf`; see the module-level note).
 ///
 /// See [mlx docs](https://ml-explore.github.io/mlx/build/html/python/_autosummary/mlx.core.min.html).
@@ -511,9 +519,10 @@ pub fn logsumexp(a: &Array, keepdims: bool) -> Result<Array> {
 /// throws on (the numpy-style identity-promote for empty axes is not part of
 /// mlx). A rank-0 scalar is the exception: its only axis list is empty and mlx
 /// special-cases `ndim == 0` (flatten reshapes to length 1), so a scalar is
-/// allowed through to `mlx_median` and yields its own (float-promoted) value.
+/// allowed through to `mlx_median_axes` and yields its own (float-promoted)
+/// value.
 ///
-/// The result is a thin forward of `mlx_median` and may be strided (median
+/// The result is a thin forward of `mlx_median_axes` and may be strided (median
 /// transposes the reduce axes), so call `crate::ops::shape::contiguous` before
 /// [`Array::to_vec`] to read it.
 ///
@@ -542,7 +551,7 @@ pub fn median_axes(a: &Array, axes: &[i32], keepdims: bool) -> Result<Array> {
   // not retained by mlx past it); the out-param was freshly allocated above
   // and is written by this call; the backend rc is surfaced via `check()`.
   check(unsafe {
-    mlxrs_sys::mlx_median(
+    mlxrs_sys::mlx_median_axes(
       &mut out.0,
       a.0,
       dim_ptr(axes),

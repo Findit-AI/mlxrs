@@ -536,7 +536,8 @@ where
 ///   NOT rely on byte preservation across save failures.
 /// * **Partially mutated or zero-length** — if Err occurred during
 ///   `mlx_save_safetensors_writer` (eager `eval` failure, MLX-internal
-///   rejection of the array set such as zero-element arrays, header-build
+///   rejection of the array set such as a dtype safetensors cannot name
+///   (`float64`), header-build
 ///   failure, or any error returned by the underlying write callbacks).
 ///   The file has been truncated to zero and may contain a partial
 ///   safetensors header.

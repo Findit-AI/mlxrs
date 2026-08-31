@@ -17,7 +17,7 @@ use std::{
 // ───── Submodule revision pins ─────
 //
 // These MUST match what `mlxrs-sys/vendor/mlx-c/CMakeLists.txt` declares
-// in its `FetchContent_Declare(mlx ... GIT_TAG v0.31.2)`, and what
+// in its `FetchContent_Declare(mlx ... GIT_TAG v0.32.2)`, and what
 // `mlxrs-sys/vendor/mlx/mlx/io/CMakeLists.txt` declares in its
 // `FetchContent_Declare(gguflib ... GIT_TAG <sha>)`. With
 // `FETCHCONTENT_SOURCE_DIR_MLX` / `FETCHCONTENT_SOURCE_DIR_GGUFLIB` wired
@@ -34,7 +34,7 @@ use std::{
 //   2. Update the corresponding `EXPECTED_*_REV` const below.
 //   3. Both must land in the same change so CI catches drift.
 // ──────────────────────────────────
-const EXPECTED_MLX_REV: &str = "68cf2fddd8de5edd8ab3d926391772b2e2cedad8"; // v0.31.2
+const EXPECTED_MLX_REV: &str = "1f8e74e3f12f31365464a6867c6579f0e9b29d85"; // v0.32.2
 const EXPECTED_GGUFLIB_REV: &str = "8fa6eb65236618e28fd7710a0fba565f7faa1848";
 
 fn main() {
@@ -109,7 +109,7 @@ fn main() {
   // then proceeds to build it in-place exactly as if it had fetched it.
   // We wire two:
   //   * FETCHCONTENT_SOURCE_DIR_MLX  → redirects mlx-c/CMakeLists.txt's
-  //     `FetchContent_Declare(mlx GIT_REPOSITORY ... GIT_TAG v0.31.2)`.
+  //     `FetchContent_Declare(mlx GIT_REPOSITORY ... GIT_TAG v0.32.2)`.
   //   * FETCHCONTENT_SOURCE_DIR_GGUFLIB → redirects mlx core's
   //     mlx/io/CMakeLists.txt's `FetchContent_Declare(gguflib ... GIT_TAG
   //     8fa6eb65236618e28fd7710a0fba565f7faa1848)` (active when
@@ -203,7 +203,7 @@ fn main() {
   // wired above, cmake does NOT clone into `_deps/mlx-src/` — it uses the
   // vendored submodule path as the cmake source dir in-place. Pointing the
   // shim include at the submodule source guarantees the shim sees the same
-  // tagged-v0.31.2 headers that libmlx.a was compiled from, byte-identical
+  // tagged-v0.32.2 headers that libmlx.a was compiled from, byte-identical
   // to what FetchContent would have cloned.
   if !mlx_root.join("mlx/stream.h").exists() {
     panic!(

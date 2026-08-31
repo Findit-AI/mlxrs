@@ -3189,7 +3189,7 @@ fn save_safetensors_to_file_writer_construction_precedes_truncate() {
 
 /// **Documents the destructive contract for MLX-internal errors.**
 /// Pre-fills a file with 50 bytes, then calls
-/// `save_safetensors_to_file` with a zero-element `Array` that mlx-c
+/// `save_safetensors_to_file` with an `f64` `Array` whose dtype mlx
 /// rejects inside `mlx_save_safetensors_writer`. Asserts the call
 /// returns `Err` AND that the file is truncated to 0 bytes (NOT
 /// preserved).
@@ -3225,8 +3225,8 @@ fn save_safetensors_to_file_writer_construction_precedes_truncate() {
 /// test catches such a regression by asserting the file IS
 /// destructively truncated on the writer-error path.
 #[test]
-fn save_safetensors_to_file_truncates_on_mlx_internal_error_zero_element_array() {
-  let dir = fresh_dir("load1-fd-destructive-zero-elem");
+fn save_safetensors_to_file_truncates_on_mlx_internal_error_unwritable_dtype() {
+  let dir = fresh_dir("load1-fd-destructive-unwritable-dtype");
   let path = dir.join("destructive_contract.safetensors");
   let original_bytes: &[u8] = &[0xC3_u8; 50];
   std::fs::write(&path, original_bytes).unwrap();
@@ -3242,29 +3242,41 @@ fn save_safetensors_to_file_truncates_on_mlx_internal_error_zero_element_array()
     .write(true)
     .open(&path)
     .unwrap();
-  // A zero-element array constructs successfully in Rust (see e.g.
-  // `embeddings::colvision` tests), so all the up-front validation +
-  // FFI ctor steps succeed (input maps build, writer-new returns
-  // non-NULL). mlx-c's safetensors writer then rejects the
-  // zero-element shape inside `mlx_save_safetensors_writer` — AFTER
-  // the destructive `seek(0)` + `set_len(0)` have already run. This
-  // exercises the "Partially mutated or zero-length" branch of the
-  // documented Destructive mutation contract.
-  let zero_arr = Array::from_slice::<f32>(&[], &(0usize,)).unwrap();
+  // An `f64` array constructs successfully in Rust (`Dtype::F64` is a real
+  // mlx dtype; it simply has no native Apple-silicon acceleration), so all
+  // the up-front validation + FFI ctor steps succeed (input maps build,
+  // writer-new returns non-NULL). mlx's safetensors writer then rejects the
+  // dtype inside `mlx_save_safetensors_writer` — AFTER the destructive
+  // `seek(0)` + `set_len(0)` have already run. This exercises the
+  // "Partially mutated or zero-length" branch of the documented Destructive
+  // mutation contract.
+  //
+  // Why `f64` and not a zero-element array: through mlx v0.31.2 the writer
+  // rejected the zero-element shape, and this test used that. MLX v0.32.2
+  // accepts it, so the trigger moved to a dtype the writer still refuses.
+  // `mlx/io/safetensors.cpp`'s `dtype_to_safetensor_str` switch enumerates
+  // every dtype safetensors can name — float32/16, bfloat16, the sized
+  // ints, bool, and (since v0.32.2) complex64 — and sends everything else,
+  // `float64` included, to `default: throw "[save_safetensors] received
+  // invalid dtype."`. If a future MLX teaches the writer `float64` too,
+  // pick another MLX-internal-rejection trigger to keep coverage of the
+  // destructive-contract path.
+  let bad_dtype_arr = Array::from_slice::<f64>(&[1.0_f64], &(1usize,)).unwrap();
   let empty_metadata: HashMap<String, String> = HashMap::new();
 
   let result = crate::io::save_safetensors_to_file(
     &mut file,
-    std::iter::once(("zero", &zero_arr)),
+    std::iter::once(("bad_dtype", &bad_dtype_arr)),
     &empty_metadata,
   );
 
   assert!(
     result.is_err(),
-    "expected Err from save_safetensors_to_file on a zero-element array — mlx-c's \
-       safetensors writer rejects this shape. If the writer started accepting \
-       zero-element arrays, pick another MLX-internal-rejection trigger to keep \
-       coverage of the destructive-contract path."
+    "expected Err from save_safetensors_to_file on an f64 array — mlx's \
+       safetensors writer has no safetensors dtype string for float64 and \
+       throws. If the writer started accepting float64, pick another \
+       MLX-internal-rejection trigger to keep coverage of the \
+       destructive-contract path."
   );
 
   drop(file);
@@ -3273,7 +3285,7 @@ fn save_safetensors_to_file_truncates_on_mlx_internal_error_zero_element_array()
   // `mlx_save_safetensors_writer` is invoked, so the file is
   // truncated to 0 bytes (or written as a partial safetensors
   // header if mlx-c emitted some bytes before rejecting the
-  // zero-element shape). The strict assertion the documented
+  // dtype). The strict assertion the documented
   // contract makes is "not byte-identical to the prefill" — the
   // file is partially mutated or zero-length. Asserting
   // `post_len < original_len` covers both cases (early reject ⇒

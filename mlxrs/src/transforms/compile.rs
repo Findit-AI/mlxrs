@@ -436,7 +436,9 @@ pub struct Compiled {
   /// tape — returning empty outputs as a spurious success. mlx-c exposes no
   /// way to evict just that one entry for the high-level `mlx_compile` path
   /// (`mlx_detail_compile_erase` needs the internal `fun_id`, which
-  /// `mlx_compile` never hands back; `mlx_detail_compile_clear_cache` would
+  /// `mlx_compile` never hands back — and, as of mlx-c v0.32.2, an explicit
+  /// `mlx_compile_cache` handle the high-level path likewise never exposes;
+  /// `mlx_detail_compile_clear_cache` would
   /// nuke every *unrelated* compiled function process-wide), so we instead mark
   /// this wrapper poisoned on the first failing call and refuse all later ones.
   /// The observable contract: a failed trace never yields a later stale

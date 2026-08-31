@@ -283,7 +283,7 @@ pub fn diagonal(a: &Array, offset: i32, axis1: i32, axis2: i32) -> Result<Array>
 
 /// Sum along the diagonals of an array.
 ///
-/// Mirrors `mlx.core.trace(a, offset, axis1, axis2, dtype)` / `mlx_trace`.
+/// Mirrors `mlx.core.trace(a, offset, axis1, axis2, dtype)` / `mlx_trace_axes`.
 /// Equivalent to summing [`diagonal`] along its last axis. The python defaults
 /// are `offset = 0`, `axis1 = 0`, `axis2 = 1`, `dtype = None`; when `dtype` is
 /// `None` the output dtype is inferred from the input array (matching the
@@ -326,7 +326,7 @@ pub fn trace(
   // and is written by this call; `offset`/`axis1`/`axis2` are plain scalars and
   // `dtype` is a plain enum; the backend rc is surfaced via `check()`.
   check(unsafe {
-    mlxrs_sys::mlx_trace(
+    mlxrs_sys::mlx_trace_axes(
       &mut out.0,
       a.0,
       offset,

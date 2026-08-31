@@ -890,6 +890,9 @@ unsafe extern "C" {
   pub fn mlx_stream_new_device(dev: mlx_device) -> mlx_stream;
 }
 unsafe extern "C" {
+  pub fn mlx_stream_new_thread_unsafe(dev: mlx_device) -> mlx_stream;
+}
+unsafe extern "C" {
   pub fn mlx_stream_set(stream: *mut mlx_stream, src: mlx_stream) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
@@ -1564,6 +1567,25 @@ pub const mlx_compile_mode__MLX_COMPILE_MODE_NO_FUSE: mlx_compile_mode_ = 2;
 pub const mlx_compile_mode__MLX_COMPILE_MODE_ENABLED: mlx_compile_mode_ = 3;
 pub type mlx_compile_mode_ = ::std::os::raw::c_uint;
 pub use self::mlx_compile_mode_ as mlx_compile_mode;
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct mlx_compile_cache_ {
+  pub ctx: *mut ::std::os::raw::c_void,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+  ["Size of mlx_compile_cache_"][::std::mem::size_of::<mlx_compile_cache_>() - 8usize];
+  ["Alignment of mlx_compile_cache_"][::std::mem::align_of::<mlx_compile_cache_>() - 8usize];
+  ["Offset of field: mlx_compile_cache_::ctx"]
+    [::std::mem::offset_of!(mlx_compile_cache_, ctx) - 0usize];
+};
+pub type mlx_compile_cache = mlx_compile_cache_;
+unsafe extern "C" {
+  pub fn mlx_compile_cache_new() -> mlx_compile_cache;
+}
+unsafe extern "C" {
+  pub fn mlx_compile_cache_free(cache: mlx_compile_cache) -> ::std::os::raw::c_int;
+}
 unsafe extern "C" {
   pub fn mlx_compile(
     res: *mut mlx_closure,
@@ -1582,10 +1604,14 @@ unsafe extern "C" {
   ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
-  pub fn mlx_detail_compile_clear_cache() -> ::std::os::raw::c_int;
+  pub fn mlx_detail_compile_cache(res: *mut mlx_compile_cache) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
-  pub fn mlx_detail_compile_erase(fun_id: usize) -> ::std::os::raw::c_int;
+  pub fn mlx_detail_compile_clear_cache(cache: mlx_compile_cache) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+  pub fn mlx_detail_compile_erase(cache: mlx_compile_cache, fun_id: usize)
+    -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
   pub fn mlx_disable_compile() -> ::std::os::raw::c_int;
@@ -1765,6 +1791,14 @@ unsafe extern "C" {
     xfunc: mlx_imported_function,
     args: mlx_vector_array,
     kwargs: mlx_map_string_to_array,
+  ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+  pub fn mlx_fast_cross_entropy(
+    res: *mut mlx_array,
+    logits: mlx_array,
+    targets: mlx_array,
+    s: mlx_stream,
   ) -> ::std::os::raw::c_int;
 }
 #[repr(C)]
@@ -2051,6 +2085,7 @@ unsafe extern "C" {
     mask_mode: *const ::std::os::raw::c_char,
     mask_arr: mlx_array,
     sinks: mlx_array,
+    force_fused: bool,
     s: mlx_stream,
   ) -> ::std::os::raw::c_int;
 }
@@ -2364,6 +2399,9 @@ unsafe extern "C" {
   ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+  pub fn mlx_linalg_det(res: *mut mlx_array, a: mlx_array, s: mlx_stream) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
   pub fn mlx_linalg_eig(
     res_0: *mut mlx_array,
     res_1: *mut mlx_array,
@@ -2458,6 +2496,14 @@ unsafe extern "C" {
   ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+  pub fn mlx_linalg_slogdet(
+    res_0: *mut mlx_array,
+    res_1: *mut mlx_array,
+    a: mlx_array,
+    s: mlx_stream,
+  ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
   pub fn mlx_linalg_solve(
     res: *mut mlx_array,
     a: mlx_array,
@@ -2518,7 +2564,13 @@ unsafe extern "C" {
   pub fn mlx_set_wired_limit(res: *mut usize, limit: usize) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+  pub fn mlx_metal_get_metallib_path(res: *mut mlx_string) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
   pub fn mlx_metal_is_available(res: *mut bool) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+  pub fn mlx_metal_set_metallib_path(path: *const ::std::os::raw::c_char) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
   pub fn mlx_metal_start_capture(path: *const ::std::os::raw::c_char) -> ::std::os::raw::c_int;
@@ -2986,7 +3038,53 @@ unsafe extern "C" {
   pub fn mlx_cosh(res: *mut mlx_array, a: mlx_array, s: mlx_stream) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+  pub fn mlx_count_nonzero_axis(
+    res: *mut mlx_array,
+    a: mlx_array,
+    axis: ::std::os::raw::c_int,
+    keepdims: bool,
+    s: mlx_stream,
+  ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+  pub fn mlx_count_nonzero_axes(
+    res: *mut mlx_array,
+    a: mlx_array,
+    axes: *const ::std::os::raw::c_int,
+    axes_num: usize,
+    keepdims: bool,
+    s: mlx_stream,
+  ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+  pub fn mlx_count_nonzero(
+    res: *mut mlx_array,
+    a: mlx_array,
+    keepdims: bool,
+    s: mlx_stream,
+  ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+  pub fn mlx_cummax_axis(
+    res: *mut mlx_array,
+    a: mlx_array,
+    axis: ::std::os::raw::c_int,
+    reverse: bool,
+    inclusive: bool,
+    s: mlx_stream,
+  ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
   pub fn mlx_cummax(
+    res: *mut mlx_array,
+    a: mlx_array,
+    reverse: bool,
+    inclusive: bool,
+    s: mlx_stream,
+  ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+  pub fn mlx_cummin_axis(
     res: *mut mlx_array,
     a: mlx_array,
     axis: ::std::os::raw::c_int,
@@ -2999,9 +3097,19 @@ unsafe extern "C" {
   pub fn mlx_cummin(
     res: *mut mlx_array,
     a: mlx_array,
+    reverse: bool,
+    inclusive: bool,
+    s: mlx_stream,
+  ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+  pub fn mlx_cumprod_axis(
+    res: *mut mlx_array,
+    a: mlx_array,
     axis: ::std::os::raw::c_int,
     reverse: bool,
     inclusive: bool,
+    dtype: mlx_optional_dtype,
     s: mlx_stream,
   ) -> ::std::os::raw::c_int;
 }
@@ -3009,9 +3117,20 @@ unsafe extern "C" {
   pub fn mlx_cumprod(
     res: *mut mlx_array,
     a: mlx_array,
+    reverse: bool,
+    inclusive: bool,
+    dtype: mlx_optional_dtype,
+    s: mlx_stream,
+  ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+  pub fn mlx_cumsum_axis(
+    res: *mut mlx_array,
+    a: mlx_array,
     axis: ::std::os::raw::c_int,
     reverse: bool,
     inclusive: bool,
+    dtype: mlx_optional_dtype,
     s: mlx_stream,
   ) -> ::std::os::raw::c_int;
 }
@@ -3019,9 +3138,9 @@ unsafe extern "C" {
   pub fn mlx_cumsum(
     res: *mut mlx_array,
     a: mlx_array,
-    axis: ::std::os::raw::c_int,
     reverse: bool,
     inclusive: bool,
+    dtype: mlx_optional_dtype,
     s: mlx_stream,
   ) -> ::std::os::raw::c_int;
 }
@@ -3064,6 +3183,15 @@ unsafe extern "C" {
     offset: ::std::os::raw::c_int,
     axis1: ::std::os::raw::c_int,
     axis2: ::std::os::raw::c_int,
+    s: mlx_stream,
+  ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+  pub fn mlx_diff(
+    res: *mut mlx_array,
+    a: mlx_array,
+    n: ::std::os::raw::c_int,
+    axis: ::std::os::raw::c_int,
     s: mlx_stream,
   ) -> ::std::os::raw::c_int;
 }
@@ -3146,6 +3274,26 @@ unsafe extern "C" {
     end_axis: ::std::os::raw::c_int,
     s: mlx_stream,
   ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+  pub fn mlx_flip_axes(
+    res: *mut mlx_array,
+    a: mlx_array,
+    axes: *const ::std::os::raw::c_int,
+    axes_num: usize,
+    s: mlx_stream,
+  ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+  pub fn mlx_flip_axis(
+    res: *mut mlx_array,
+    a: mlx_array,
+    axis: ::std::os::raw::c_int,
+    s: mlx_stream,
+  ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+  pub fn mlx_flip(res: *mut mlx_array, a: mlx_array, s: mlx_stream) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
   pub fn mlx_floor(res: *mut mlx_array, a: mlx_array, s: mlx_stream) -> ::std::os::raw::c_int;
@@ -3232,6 +3380,23 @@ unsafe extern "C" {
     group_size: mlx_optional_int,
     bits: mlx_optional_int,
     mode: *const ::std::os::raw::c_char,
+    sorted_indices: bool,
+    s: mlx_stream,
+  ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+  pub fn mlx_gather_qqmm(
+    res: *mut mlx_array,
+    x: mlx_array,
+    w: mlx_array,
+    scales_w: mlx_array,
+    lhs_indices: mlx_array,
+    rhs_indices: mlx_array,
+    group_size: mlx_optional_int,
+    bits: mlx_optional_int,
+    mode: *const ::std::os::raw::c_char,
+    global_scale_x: mlx_array,
+    global_scale_w: mlx_array,
     sorted_indices: bool,
     s: mlx_stream,
   ) -> ::std::os::raw::c_int;
@@ -3352,6 +3517,17 @@ unsafe extern "C" {
   ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+  pub fn mlx_linspace_endpoint(
+    res: *mut mlx_array,
+    start: f64,
+    stop: f64,
+    num: ::std::os::raw::c_int,
+    endpoint: bool,
+    dtype: mlx_dtype,
+    s: mlx_stream,
+  ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
   pub fn mlx_linspace(
     res: *mut mlx_array,
     start: f64,
@@ -3382,10 +3558,19 @@ unsafe extern "C" {
   ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
-  pub fn mlx_logcumsumexp(
+  pub fn mlx_logcumsumexp_axis(
     res: *mut mlx_array,
     a: mlx_array,
     axis: ::std::os::raw::c_int,
+    reverse: bool,
+    inclusive: bool,
+    s: mlx_stream,
+  ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+  pub fn mlx_logcumsumexp(
+    res: *mut mlx_array,
+    a: mlx_array,
     reverse: bool,
     inclusive: bool,
     s: mlx_stream,
@@ -3405,6 +3590,14 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
   pub fn mlx_logical_or(
+    res: *mut mlx_array,
+    a: mlx_array,
+    b: mlx_array,
+    s: mlx_stream,
+  ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+  pub fn mlx_logical_xor(
     res: *mut mlx_array,
     a: mlx_array,
     b: mlx_array,
@@ -3518,11 +3711,28 @@ unsafe extern "C" {
   ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
-  pub fn mlx_median(
+  pub fn mlx_median_axes(
     res: *mut mlx_array,
     a: mlx_array,
     axes: *const ::std::os::raw::c_int,
     axes_num: usize,
+    keepdims: bool,
+    s: mlx_stream,
+  ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+  pub fn mlx_median_axis(
+    res: *mut mlx_array,
+    a: mlx_array,
+    axis: ::std::os::raw::c_int,
+    keepdims: bool,
+    s: mlx_stream,
+  ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+  pub fn mlx_median(
+    res: *mut mlx_array,
+    a: mlx_array,
     keepdims: bool,
     s: mlx_stream,
   ) -> ::std::os::raw::c_int;
@@ -3630,6 +3840,14 @@ unsafe extern "C" {
   ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+  pub fn mlx_ones_like_dtype(
+    res: *mut mlx_array,
+    a: mlx_array,
+    dtype: mlx_dtype,
+    s: mlx_stream,
+  ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
   pub fn mlx_ones_like(res: *mut mlx_array, a: mlx_array, s: mlx_stream) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
@@ -3681,6 +3899,9 @@ unsafe extern "C" {
     kth: ::std::os::raw::c_int,
     s: mlx_stream,
   ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+  pub fn mlx_positive(res: *mut mlx_array, a: mlx_array, s: mlx_stream) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
   pub fn mlx_power(
@@ -3970,6 +4191,15 @@ unsafe extern "C" {
     indices: mlx_array,
     updates: mlx_array,
     axis: ::std::os::raw::c_int,
+    s: mlx_stream,
+  ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+  pub fn mlx_searchsorted(
+    res: *mut mlx_array,
+    sorted_sequence: mlx_array,
+    values: mlx_array,
+    side: *const ::std::os::raw::c_char,
     s: mlx_stream,
   ) -> ::std::os::raw::c_int;
 }
@@ -4362,7 +4592,7 @@ unsafe extern "C" {
   ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
-  pub fn mlx_trace(
+  pub fn mlx_trace_axes(
     res: *mut mlx_array,
     a: mlx_array,
     offset: ::std::os::raw::c_int,
@@ -4371,6 +4601,9 @@ unsafe extern "C" {
     dtype: mlx_dtype,
     s: mlx_stream,
   ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+  pub fn mlx_trace(res: *mut mlx_array, a: mlx_array, s: mlx_stream) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
   pub fn mlx_transpose_axes(
@@ -4411,12 +4644,30 @@ unsafe extern "C" {
   ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+  pub fn mlx_trunc(res: *mut mlx_array, a: mlx_array, s: mlx_stream) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
   pub fn mlx_unflatten(
     res: *mut mlx_array,
     a: mlx_array,
     axis: ::std::os::raw::c_int,
     shape: *const ::std::os::raw::c_int,
     shape_num: usize,
+    s: mlx_stream,
+  ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+  pub fn mlx_unstack_axis(
+    res: *mut mlx_vector_array,
+    a: mlx_array,
+    axis: ::std::os::raw::c_int,
+    s: mlx_stream,
+  ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+  pub fn mlx_unstack(
+    res: *mut mlx_vector_array,
+    a: mlx_array,
     s: mlx_stream,
   ) -> ::std::os::raw::c_int;
 }
@@ -4451,6 +4702,15 @@ unsafe extern "C" {
   ) -> ::std::os::raw::c_int;
 }
 unsafe extern "C" {
+  pub fn mlx_vecdot(
+    res: *mut mlx_array,
+    a: mlx_array,
+    b: mlx_array,
+    axis: ::std::os::raw::c_int,
+    s: mlx_stream,
+  ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
   pub fn mlx_view(
     res: *mut mlx_array,
     a: mlx_array,
@@ -4472,6 +4732,14 @@ unsafe extern "C" {
     res: *mut mlx_array,
     shape: *const ::std::os::raw::c_int,
     shape_num: usize,
+    dtype: mlx_dtype,
+    s: mlx_stream,
+  ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+  pub fn mlx_zeros_like_dtype(
+    res: *mut mlx_array,
+    a: mlx_array,
     dtype: mlx_dtype,
     s: mlx_stream,
   ) -> ::std::os::raw::c_int;
