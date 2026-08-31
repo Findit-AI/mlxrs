@@ -16,14 +16,14 @@ default-members = [
 resolver = "3"
 
 [workspace.package]
-repository = "https://github.com/fintit-ai/mlxrs"
-homepage = "https://github.com/fintit-ai/mlxrs"
+repository = "https://github.com/findit-studio/mlxrs"
+homepage = "https://github.com/findit-studio/mlxrs"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-mlxrs-sys = { path = "mlxrs-sys", version = "0.1" }
+mlxrs-sys = { path = "mlxrs-sys", version = "0.2" }
 thiserror = "2"
 half = "2"
 smallvec = "1"

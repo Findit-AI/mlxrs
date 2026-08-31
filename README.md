@@ -5,10 +5,10 @@
 
 Safe Rust bindings for Apple MLX — core arrays &amp; ops, plus LM, VLM, audio, and embeddings
 
-[<img alt="github" src="https://img.shields.io/badge/github-findit--ai/mlxrs-8da0cb?style=for-the-badge&logo=Github" height="22">][Github-url]
+[<img alt="github" src="https://img.shields.io/badge/github-findit--studio/mlxrs-8da0cb?style=for-the-badge&logo=Github" height="22">][Github-url]
 <img alt="LoC" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fal8n%2F327b2a8aef9003246e45c6e47fe63937%2Fraw%2Fmlxrs" height="22">
-[<img alt="Build" src="https://img.shields.io/github/actions/workflow/status/findit-ai/mlxrs/mlxrs.yml?logo=Github-Actions&style=for-the-badge" height="22">][CI-url]
-[<img alt="codecov" src="https://img.shields.io/codecov/c/gh/findit-ai/mlxrs?style=for-the-badge&token=6R3QFWRWHL&logo=codecov" height="22">][codecov-url]
+[<img alt="Build" src="https://img.shields.io/github/actions/workflow/status/findit-studio/mlxrs/mlxrs.yml?logo=Github-Actions&style=for-the-badge" height="22">][CI-url]
+[<img alt="codecov" src="https://img.shields.io/codecov/c/gh/findit-studio/mlxrs?style=for-the-badge&token=6R3QFWRWHL&logo=codecov" height="22">][codecov-url]
 
 [<img alt="docs.rs" src="https://img.shields.io/badge/docs.rs-mlxrs-66c2a5?style=for-the-badge&labelColor=555555&logo=data:image/svg+xml;base64,PHN2ZyByb2xlPSJpbWciIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIgdmlld0JveD0iMCAwIDUxMiA1MTIiPjxwYXRoIGZpbGw9IiNmNWY1ZjUiIGQ9Ik00ODguNiAyNTAuMkwzOTIgMjE0VjEwNS41YzAtMTUtOS4zLTI4LjQtMjMuNC0zMy43bC0xMDAtMzcuNWMtOC4xLTMuMS0xNy4xLTMuMS0yNS4zIDBsLTEwMCAzNy41Yy0xNC4xIDUuMy0yMy40IDE4LjctMjMuNCAzMy43VjIxNGwtOTYuNiAzNi4yQzkuMyAyNTUuNSAwIDI2OC45IDAgMjgzLjlWMzk0YzAgMTMuNiA3LjcgMjYuMSAxOS45IDMyLjJsMTAwIDUwYzEwLjEgNS4xIDIyLjEgNS4xIDMyLjIgMGwxMDMuOS01MiAxMDMuOSA1MmMxMC4xIDUuMSAyMi4xIDUuMSAzMi4yIDBsMTAwLTUwYzEyLjItNi4xIDE5LjktMTguNiAxOS45LTMyLjJWMjgzLjljMC0xNS05LjMtMjguNC0yMy40LTMzLjd6TTM1OCAyMTQuOGwtODUgMzEuOXYtNjguMmw4NS0zN3Y3My4zek0xNTQgMTA0LjFsMTAyLTM4LjIgMTAyIDM4LjJ2LjZsLTEwMiA0MS40LTEwMi00MS40di0uNnptODQgMjkxLjFsLTg1IDQyLjV2LTc5LjFsODUtMzguOHY3NS40em0wLTExMmwtMTAyIDQxLjQtMTAyLTQxLjR2LS42bDEwMi0zOC4yIDEwMiAzOC4ydi42em0yNDAgMTEybC04NSA0Mi41di03OS4xbDg1LTM4Ljh2NzUuNHptMC0xMTJsLTEwMiA0MS40LTEwMi00MS40di0uNmwxMDItMzguMiAxMDIgMzguMnYuNnoiPjwvcGF0aD48L3N2Zz4K" height="20">][doc-url]
 [<img alt="crates.io" src="https://img.shields.io/crates/v/mlxrs?style=for-the-badge&logo=data:image/svg+xml;base64,PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iaXNvLTg4NTktMSI/Pg0KPCEtLSBHZW5lcmF0b3I6IEFkb2JlIElsbHVzdHJhdG9yIDE5LjAuMCwgU1ZHIEV4cG9ydCBQbHVnLUluIC4gU1ZHIFZlcnNpb246IDYuMDAgQnVpbGQgMCkgIC0tPg0KPHN2ZyB2ZXJzaW9uPSIxLjEiIGlkPSJMYXllcl8xIiB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHhtbG5zOnhsaW5rPSJodHRwOi8vd3d3LnczLm9yZy8xOTk5L3hsaW5rIiB4PSIwcHgiIHk9IjBweCINCgkgdmlld0JveD0iMCAwIDUxMiA1MTIiIHhtbDpzcGFjZT0icHJlc2VydmUiPg0KPGc+DQoJPGc+DQoJCTxwYXRoIGQ9Ik0yNTYsMEwzMS41MjgsMTEyLjIzNnYyODcuNTI4TDI1Niw1MTJsMjI0LjQ3Mi0xMTIuMjM2VjExMi4yMzZMMjU2LDB6IE0yMzQuMjc3LDQ1Mi41NjRMNzQuOTc0LDM3Mi45MTNWMTYwLjgxDQoJCQlsMTU5LjMwMyw3OS42NTFWNDUyLjU2NHogTTEwMS44MjYsMTI1LjY2MkwyNTYsNDguNTc2bDE1NC4xNzQsNzcuMDg3TDI1NiwyMDIuNzQ5TDEwMS44MjYsMTI1LjY2MnogTTQzNy4wMjYsMzcyLjkxMw0KCQkJbC0xNTkuMzAzLDc5LjY1MVYyNDAuNDYxbDE1OS4zMDMtNzkuNjUxVjM3Mi45MTN6IiBmaWxsPSIjRkZGIi8+DQoJPC9nPg0KPC9nPg0KPGc+DQo8L2c+DQo8Zz4NCjwvZz4NCjxnPg0KPC9nPg0KPGc+DQo8L2c+DQo8Zz4NCjwvZz4NCjxnPg0KPC9nPg0KPGc+DQo8L2c+DQo8Zz4NCjwvZz4NCjxnPg0KPC9nPg0KPGc+DQo8L2c+DQo8Zz4NCjwvZz4NCjxnPg0KPC9nPg0KPGc+DQo8L2c+DQo8Zz4NCjwvZz4NCjxnPg0KPC9nPg0KPC9zdmc+DQo=" height="22">][crates-url]
@@ -36,7 +36,7 @@ Core only:
 
 ```toml
 [dependencies]
-mlxrs = "0.1"
+mlxrs = "0.2"
 ```
 
 Or enable one of the higher-level feature sets:
@@ -44,25 +44,25 @@ Or enable one of the higher-level feature sets:
 ```toml
 # language models
 [dependencies]
-mlxrs = { version = "0.1", features = ["lm"] }
+mlxrs = { version = "0.2", features = ["lm"] }
 ```
 
 ```toml
 # vision-language models (implies lm)
 [dependencies]
-mlxrs = { version = "0.1", features = ["vlm"] }
+mlxrs = { version = "0.2", features = ["vlm"] }
 ```
 
 ```toml
 # audio (implies lm)
 [dependencies]
-mlxrs = { version = "0.1", features = ["audio"] }
+mlxrs = { version = "0.2", features = ["audio"] }
 ```
 
 ```toml
 # embedding utilities
 [dependencies]
-mlxrs = { version = "0.1", features = ["embeddings"] }
+mlxrs = { version = "0.2", features = ["embeddings"] }
 ```
 
 ## Quick start
@@ -97,7 +97,13 @@ Higher-level surfaces are off by default — enable what you need:
 - **`audio`** — audio (implies `lm`): STFT/mel DSP, WAV I/O, STT/TTS, playback.
 - **`embeddings`** — embedding-model loading, pooling, and the encode pipeline.
 
-Finer-grained flags (individual `tokenizer-*`, `gguf`, `llguidance`,
+Per-model flags build on those and each ship a concrete architecture —
+`qwen3` and `lfm2-vl` (LM / VLM); `whisper`, `qwen3-asr` (plus
+`qwen3-asr-aligner`), `sensevoice` and `wav2vec2` (speech-to-text); `vad`
+(Silero voice-activity detection); `embeddinggemma`, `siglip2-naflex` and
+`clap` (embeddings).
+
+Finer-grained flags (individual `tokenizer-*`, `gguf`, `npz`, `llguidance`,
 `unstable-ops-overload`) are listed in [`mlxrs/Cargo.toml`](mlxrs/Cargo.toml) and
 the [API docs][doc-url].
 
@@ -139,11 +145,12 @@ mlxrs targets `aarch64-apple-darwin` (Apple silicon). Other platforms
   unionize across the dep graph). End-user binaries may opt in for
   prototyping. The fallible `a.add(&b)?` form is always available and is
   the load-bearing API.
-- **Per-model architectures** for the `lm` / `vlm` / `audio` / `embeddings`
-  features are added per-usecase rather than bulk-ported from the upstream
-  Python projects. These features ship the support surface (loaders, tokenizers,
-  pooling, generation loops, processors, audio I/O) — not the model
-  implementations.
+- **Per-model architectures are opt-in, one cargo feature each.** The
+  `lm` / `vlm` / `audio` / `embeddings` features ship the support surface
+  (loaders, tokenizers, pooling, generation loops, processors, audio I/O),
+  never a model. A concrete architecture arrives behind its own flag (see
+  Features), added per-usecase rather than bulk-ported from the upstream
+  Python projects — so enabling `audio` alone still gets you no model.
 
 #### License
 
@@ -154,9 +161,9 @@ See [LICENSE-APACHE](LICENSE-APACHE), [LICENSE-MIT](LICENSE-MIT) for details.
 
 Copyright (c) 2026 FinDIT Studio authors.
 
-[Github-url]: https://github.com/findit-ai/mlxrs/
-[CI-url]: https://github.com/findit-ai/mlxrs/actions/workflows/mlxrs.yml
+[Github-url]: https://github.com/findit-studio/mlxrs/
+[CI-url]: https://github.com/findit-studio/mlxrs/actions/workflows/mlxrs.yml
 [doc-url]: https://docs.rs/mlxrs
 [crates-url]: https://crates.io/crates/mlxrs
-[codecov-url]: https://app.codecov.io/gh/findit-ai/mlxrs/
+[codecov-url]: https://app.codecov.io/gh/findit-studio/mlxrs/
 
