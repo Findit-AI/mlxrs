@@ -188,8 +188,8 @@ fn playback_config_cpal_config_passes_buffer_hint() {
     .with_queue_capacity_frames(1024);
   let cpal_cfg = with_hint.cpal_config().unwrap();
   assert_eq!(cpal_cfg.channels, 1);
-  // `cpal::SampleRate` is a `pub type SampleRate = u32` alias in
-  // cpal 0.17 — compare as a plain `u32`.
+  // `cpal::SampleRate` is a `pub type SampleRate = u32` alias
+  // (unchanged across the 0.17→0.18 bump) — compare as a plain `u32`.
   assert_eq!(cpal_cfg.sample_rate, 16_000);
   assert!(matches!(cpal_cfg.buffer_size, cpal::BufferSize::Fixed(256)));
 
