@@ -13,11 +13,11 @@
 //!
 //! - **[`assert_eq_over_lane_sweep`]** — the `Exact` class. Used for
 //!   data-movement / lossless-widening kernels:
-//!     - integer arms of PCM decode-widen ([#146](https://github.com/Findit-AI/mlxrs/issues/146)),
-//!     - u8→f32 RGB widen ([#148](https://github.com/Findit-AI/mlxrs/issues/148)),
-//!     - BGR R↔B swap widen ([#149](https://github.com/Findit-AI/mlxrs/issues/149)),
-//!     - `pad_to_square` fill ([#151](https://github.com/Findit-AI/mlxrs/issues/151)),
-//!     - `rotate_buf` permutation ([#150](https://github.com/Findit-AI/mlxrs/issues/150)).
+//!     - integer arms of PCM decode-widen ([#146](https://github.com/findit-studio/mlxrs/issues/146)),
+//!     - u8→f32 RGB widen ([#148](https://github.com/findit-studio/mlxrs/issues/148)),
+//!     - BGR R↔B swap widen ([#149](https://github.com/findit-studio/mlxrs/issues/149)),
+//!     - `pad_to_square` fill ([#151](https://github.com/findit-studio/mlxrs/issues/151)),
+//!     - `rotate_buf` permutation ([#150](https://github.com/findit-studio/mlxrs/issues/150)).
 //!
 //!   The SIMD output **must be bit-identical** to scalar; the helper
 //!   asserts `scalar_out == simd_out`. For `f32`/`f64` outputs you
@@ -33,7 +33,7 @@
 //!   scalar tree mirrors NEON's, but the generic `Tolerance` shape is
 //!   the right shape for *new* fp reductions where that property has
 //!   not been engineered):
-//!     - loudness sum-of-squares ([#147](https://github.com/Findit-AI/mlxrs/issues/147)),
+//!     - loudness sum-of-squares ([#147](https://github.com/findit-studio/mlxrs/issues/147)),
 //!     - any future fp reduction without a matched reduction tree.
 //!
 //!   The helper asserts
@@ -43,9 +43,9 @@
 //!   class, *vector* output. The elementwise twin of
 //!   [`assert_close_over_lane_sweep`] for fp kernels that return a
 //!   `Vec<f64>`:
-//!     - `rotate_buf` permutation, vector output ([#150](https://github.com/Findit-AI/mlxrs/issues/150)),
-//!     - `mel_filter_bank` triangle construction ([#155](https://github.com/Findit-AI/mlxrs/issues/155)),
-//!     - window generation, Hann / Hamming ([#157](https://github.com/Findit-AI/mlxrs/issues/157)),
+//!     - `rotate_buf` permutation, vector output ([#150](https://github.com/findit-studio/mlxrs/issues/150)),
+//!     - `mel_filter_bank` triangle construction ([#155](https://github.com/findit-studio/mlxrs/issues/155)),
+//!     - window generation, Hann / Hamming ([#157](https://github.com/findit-studio/mlxrs/issues/157)),
 //!     - any future fp kernel that emits a vector rather than a scalar.
 //!
 //!   The helper asserts the dispatcher and scalar outputs have the

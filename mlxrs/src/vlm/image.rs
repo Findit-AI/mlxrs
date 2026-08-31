@@ -383,7 +383,7 @@ impl ColorOrder {
 ///   `clip_image_processor`) call `np.transpose(arr, (2, 0, 1))` after
 ///   the ImageNet pipeline for the `Chw` arm.
 ///
-/// Tracking issue: [#120](https://github.com/Findit-AI/mlxrs/issues/120).
+/// Tracking issue: [#120](https://github.com/findit-studio/mlxrs/issues/120).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
 #[display("{}", self.as_str())]
 pub enum Layout {
@@ -448,7 +448,7 @@ pub struct ImageProcessorConfig {
   /// See [`Layout`] for the full per-arm rationale + cost analysis
   /// (zero copy — lazy `Array` metadata update only).
   ///
-  /// Tracking issue: [#120](https://github.com/Findit-AI/mlxrs/issues/120).
+  /// Tracking issue: [#120](https://github.com/findit-studio/mlxrs/issues/120).
   layout: Layout,
 }
 
@@ -2508,7 +2508,7 @@ pub fn patchify(arr: &Array, patch_size: usize) -> Result<Array> {
 // change; per-model encoders that want `[1, C, H, W]` request
 // `Layout::Bchw` and the composer applies one lazy transpose +
 // expand_dims at zero memory cost). See [`Layout`] for the per-arm
-// rationale; tracking issue [#120](https://github.com/Findit-AI/mlxrs/issues/120).
+// rationale; tracking issue [#120](https://github.com/findit-studio/mlxrs/issues/120).
 pub fn preprocess(img: &::image::DynamicImage, cfg: &ImageProcessorConfig) -> Result<Array> {
   let resized;
   let src = if cfg.do_resize {
@@ -2568,7 +2568,7 @@ pub fn preprocess(img: &::image::DynamicImage, cfg: &ImageProcessorConfig) -> Re
 /// - [`Error::RankMismatch`] if the input is not rank-3;
 ///   [`Error::LengthMismatch`] if the trailing channel dim is not 3.
 ///
-/// Tracking issue: [#120](https://github.com/Findit-AI/mlxrs/issues/120).
+/// Tracking issue: [#120](https://github.com/findit-studio/mlxrs/issues/120).
 pub fn apply_layout(arr: Array, layout: Layout) -> Result<Array> {
   use crate::ops::shape::expand_dims_axes;
   // Validate rank-3 `[H, W, 3]` shape before any FFI call — surfaces a

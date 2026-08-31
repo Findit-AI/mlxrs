@@ -1,7 +1,7 @@
 //! `pad_to_square` canvas fill: tile a `&mut [MaybeUninit<u8>]`
 //! with a repeating 3-byte RGB pattern.
 //!
-//! Tracking: [#151](https://github.com/Findit-AI/mlxrs/issues/151).
+//! Tracking: [#151](https://github.com/findit-studio/mlxrs/issues/151).
 //!
 //! # The defect class
 //!
@@ -265,7 +265,7 @@ pub(crate) unsafe fn pad_canvas_fill_neon(out: &mut [MaybeUninit<u8>], rgb: [u8;
 /// `Vec::set_len` over the covered region after passing
 /// `spare_capacity_mut()`).
 ///
-/// Tracking: [#151](https://github.com/Findit-AI/mlxrs/issues/151).
+/// Tracking: [#151](https://github.com/findit-studio/mlxrs/issues/151).
 /// No intrinsics strictly required. The hand-rolled NEON 48-byte
 /// (`LCM(3, 16)`) pre-broadcast tile ships unconditionally; if the bench
 /// regresses (LLVM auto-vec catches up, future toolchain), the NEON

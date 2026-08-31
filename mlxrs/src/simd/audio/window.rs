@@ -2,7 +2,7 @@
 //! Blackman / Bartlett) + Kaldi-style window (Hamming / Hanning /
 //! Povey / Rectangular).
 //!
-//! Tracking: [#157](https://github.com/Findit-AI/mlxrs/issues/157).
+//! Tracking: [#157](https://github.com/findit-studio/mlxrs/issues/157).
 //!
 //! # The defect class
 //!

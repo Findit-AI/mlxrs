@@ -2,7 +2,7 @@
 
 These fixtures pin the CLAP mel / spectrogram front-end
 (`src/embeddings/clap/mel.rs`) numerically, **before** any checkpoint. They are
-copied from the Findit-AI `textclap` crate
+copied from the findit-studio `textclap` crate
 (`textclap/tests/fixtures/`), which generates them from the real HF
 `laion/clap-htsat-unfused` model via `transformers.ClapFeatureExtractor` +
 `librosa` (`textclap/tests/fixtures/regen_golden.py`).

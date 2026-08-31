@@ -20,25 +20,25 @@
 //!
 //! # Shipped kernels
 //!
-//! - `save_wav` f32 → i16 quantize ([#152](https://github.com/Findit-AI/mlxrs/issues/152),
+//! - `save_wav` f32 → i16 quantize ([#152](https://github.com/findit-studio/mlxrs/issues/152),
 //!   `audio/io.rs`). Class: `Exact` (pinned `round_half_to_even`
 //!   semantics via NEON `vcvtnq_s32_f32`). Module: [`quantize`].
-//! - PCM sample decode → normalized f32 widen ([#146](https://github.com/Findit-AI/mlxrs/issues/146),
+//! - PCM sample decode → normalized f32 widen ([#146](https://github.com/findit-studio/mlxrs/issues/146),
 //!   `audio/io.rs::push_samples`). Class: `Exact` (lossless
 //!   integer-to-fp widen with a constant scale). Multi-dtype
 //!   (i8/i16/i24/i32 + offset-binary u-variants). Module:
 //!   [`pcm_decode`].
-//! - Window generation `symmetric_window` / `build_kaldi_window` ([#157](https://github.com/Findit-AI/mlxrs/issues/157),
+//! - Window generation `symmetric_window` / `build_kaldi_window` ([#157](https://github.com/findit-studio/mlxrs/issues/157),
 //!   `audio/dsp.rs`, `audio/features.rs`). Class: `Tolerance` (cosine
 //!   evaluation via NEON polynomial approximation). Module: [`window`].
-//! - `mel_filter_bank` triangle construction ([#155](https://github.com/Findit-AI/mlxrs/issues/155),
+//! - `mel_filter_bank` triangle construction ([#155](https://github.com/findit-studio/mlxrs/issues/155),
 //!   `audio/dsp.rs`). Class: `Tolerance` (per-row triangular
 //!   construction over `all_freqs` vector). Module: [`mel_triangle`].
-//! - `get_mel_banks_kaldi` triangle construction ([#156](https://github.com/Findit-AI/mlxrs/issues/156),
+//! - `get_mel_banks_kaldi` triangle construction ([#156](https://github.com/findit-studio/mlxrs/issues/156),
 //!   `audio/features.rs`). Class: `Tolerance` (per-row triangular
 //!   construction with on-the-fly `mel_scale_kaldi`). Module:
 //!   [`kaldi_mel`].
-//! - `resample_linear` linear interpolation ([#153](https://github.com/Findit-AI/mlxrs/issues/153),
+//! - `resample_linear` linear interpolation ([#153](https://github.com/findit-studio/mlxrs/issues/153),
 //!   `audio/io.rs`). Class: `Tolerance` (fp mul/add ordering across
 //!   lanes; NEON FMA pattern `s1 + (s2-s1)*frac`). Module: [`resample`].
 //!

@@ -2,7 +2,7 @@
 //! a `&[u8]` of packed RGB pixels into a `&mut [MaybeUninit<f32>]`
 //! channel-last `[R, G, B]` f32 triples (same plane order as input).
 //!
-//! Tracking: [#148](https://github.com/Findit-AI/mlxrs/issues/148).
+//! Tracking: [#148](https://github.com/findit-studio/mlxrs/issues/148).
 //! The NEON kernel ships unconditionally regardless of how the scalar
 //! bench compares: auto-vectorization is compiler-version-dependent and
 //! could silently de-vectorize on a toolchain upgrade, so the

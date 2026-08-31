@@ -1,6 +1,6 @@
 //! `get_mel_banks_kaldi` triangle construction.
 //!
-//! Tracking: [#156](https://github.com/Findit-AI/mlxrs/issues/156).
+//! Tracking: [#156](https://github.com/findit-studio/mlxrs/issues/156).
 //!
 //! # The defect class
 //!

@@ -8,13 +8,13 @@
 //!
 //! # Shipped kernels
 //!
-//! - `pad_to_square` canvas fill ([#151](https://github.com/Findit-AI/mlxrs/issues/151),
+//! - `pad_to_square` canvas fill ([#151](https://github.com/findit-studio/mlxrs/issues/151),
 //!   `vlm/image.rs`). Class: `Exact`. The `pad_canvas_fill` submodule
 //!   holds the dispatcher, the scalar reference, and the 48-byte
 //!   LCM(3, 16) NEON kernel. The submodule is `#[doc(hidden)]` so the
 //!   only public surface is the [`crate::vlm::image::pad_to_square`]
 //!   call site that consumes it.
-//! - `image_to_array` BGR R↔B swap widen ([#149](https://github.com/Findit-AI/mlxrs/issues/149),
+//! - `image_to_array` BGR R↔B swap widen ([#149](https://github.com/findit-studio/mlxrs/issues/149),
 //!   `vlm/image.rs`). Class: `Exact`. The `bgr_widen` submodule holds
 //!   the dispatcher, the scalar reference (`chunks_exact_mut(3) +
 //!   MaybeUninit::write` — LLVM auto-vectorizes this shape on aarch64
@@ -37,11 +37,11 @@
 //!
 //! # Additional shipped kernels
 //!
-//! - `image_to_array` u8 → f32 RGB widening ([#148](https://github.com/Findit-AI/mlxrs/issues/148),
+//! - `image_to_array` u8 → f32 RGB widening ([#148](https://github.com/findit-studio/mlxrs/issues/148),
 //!   `vlm/image.rs`). Class: `Exact`. The `rgb_widen` submodule holds
 //!   the dispatcher, the scalar reference, and the 16-byte tile NEON
 //!   kernel, which ships unconditionally on aarch64.
-//! - `rotate_buf` pixel permutation ([#150](https://github.com/Findit-AI/mlxrs/issues/150),
+//! - `rotate_buf` pixel permutation ([#150](https://github.com/findit-studio/mlxrs/issues/150),
 //!   `vlm/image.rs`). Class: `Exact`. The `rotate_buf` submodule
 //!   specialises the **u8 + channels=4** (Rgba8) hot path with a
 //!   4-pixel-tile `vld1q_u8` + per-pixel u32 scattered store; all other

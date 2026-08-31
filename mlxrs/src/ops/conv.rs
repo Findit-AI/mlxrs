@@ -24,7 +24,7 @@
 //! batch times output-spatial size exceeds about 2.1 billion elements, i.e. a
 //! multi-gigabyte tensor that is not a usable convolution. Guarding them
 //! precisely would require recomputing the output shape, so it is deferred
-//! (Findit-AI/mlxrs#306); the underlying fix is upstream (widening MLX's conv
+//! (findit-studio/mlxrs#306); the underlying fix is upstream (widening MLX's conv
 //! shape and GEMM arithmetic to int64).
 
 use crate::{
@@ -84,7 +84,7 @@ fn conv_overflow_err(context: &'static str) -> Error {
 /// dilation/stride/padding above ~18900) or a single axis above ~350M elements.
 /// It does not cover MLX's metal-backend GEMM dimensions (products of output
 /// dimensions), which overflow int32 only for multi-gigabyte convolutions — an
-/// upstream limitation deferred to Findit-AI/mlxrs#306.
+/// upstream limitation deferred to findit-studio/mlxrs#306.
 #[allow(clippy::too_many_arguments)]
 fn check_conv_no_overflow(
   context: &'static str,

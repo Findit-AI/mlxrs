@@ -1,6 +1,6 @@
 //! `rotate_buf` pixel permutation.
 //!
-//! Tracking: [#150](https://github.com/Findit-AI/mlxrs/issues/150).
+//! Tracking: [#150](https://github.com/findit-studio/mlxrs/issues/150).
 //! The NEON kernel ships unconditionally: auto-vectorization is
 //! compiler-version-dependent and could silently de-vectorize on a
 //! toolchain upgrade, so the hand-rolled arm pins the SIMD contract.

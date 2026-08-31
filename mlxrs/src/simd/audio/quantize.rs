@@ -1,6 +1,6 @@
 //! `save_wav` f32 → i16 quantize.
 //!
-//! Tracking: [#152](https://github.com/Findit-AI/mlxrs/issues/152).
+//! Tracking: [#152](https://github.com/findit-studio/mlxrs/issues/152).
 //!
 //! # The defect class
 //!

@@ -1,6 +1,6 @@
 //! `lfilter` IIR recurrence (BS.1770 K-weighting hot loop).
 //!
-//! Tracking: [#154](https://github.com/Findit-AI/mlxrs/issues/154).
+//! Tracking: [#154](https://github.com/findit-studio/mlxrs/issues/154).
 //! The IIR recurrence has a loop-carried dependency (every `y[n]` depends
 //! on `y[n-1]`, the next state cell on `y[n]`, etc. — no within-stream
 //! parallelism), so a wide NEON kernel over the sample axis is

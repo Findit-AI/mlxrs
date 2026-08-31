@@ -3,7 +3,7 @@
 //! channel-last `[R, G, B]` f32 triples (R and B swapped from the
 //! input order).
 //!
-//! Tracking: [#149](https://github.com/Findit-AI/mlxrs/issues/149).
+//! Tracking: [#149](https://github.com/findit-studio/mlxrs/issues/149).
 //! The BGR arm is the one LLVM most likely fails to auto-vectorize
 //! because of the 3-element shuffle on the destination side.
 //!
@@ -475,7 +475,7 @@ pub(crate) unsafe fn bgr_widen_neon(out: &mut [MaybeUninit<f32>], src: &[u8]) {
 /// `Vec::set_len` over the covered region after passing
 /// `spare_capacity_mut()`).
 ///
-/// Tracking: [#149](https://github.com/Findit-AI/mlxrs/issues/149).
+/// Tracking: [#149](https://github.com/findit-studio/mlxrs/issues/149).
 /// This is the BGR arm that LLVM
 /// originally failed to auto-vectorize (the destination-side 3-element
 /// shuffle was opaque to the iterator-level loop analysis the

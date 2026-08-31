@@ -550,7 +550,7 @@ impl Compiled {
     //     wrapper. #3620 does NOT fix this; only an `is_tracer` binding (skip the
     //     poison on the tracer-input path) or ml-explore/mlx#3624 (the upstream
     //     cache fix, after which the whole poison workaround is removed) does.
-    // Both are accepted, documented limitations tracked at Findit-AI/mlxrs#363.
+    // Both are accepted, documented limitations tracked at findit-studio/mlxrs#363.
     let _trace = self.cache_backed.then(TraceGuard::enter);
     // SAFETY: `self.inner` is the owned compiled closure (alive for the call);
     // `in_guard.0` is a freshly built vector of borrowed handles live for the
